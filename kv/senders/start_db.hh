@@ -11,7 +11,7 @@
 #include "pump/sender/then.hh"
 #include "pump/sender/submit.hh"
 
-#include "../../../3rd/popl/popl.hh"
+#include "../../3rd/popl/popl.hh"
 
 #include "pump/sender/generate.hh"
 #include "pump/sender/repeat.hh"

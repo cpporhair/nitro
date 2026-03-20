@@ -17,64 +17,26 @@ namespace sider::store {
         std::move_only_function<void(kv_store&)> fn;
     };
 
-    // Owned copies of key/value data for lifetime safety across async boundaries.
-    struct owned_kv {
-        char* key = nullptr;
-        uint16_t key_len = 0;
-        char* value = nullptr;
-        uint16_t value_len = 0;
-
-        owned_kv() = default;
-        ~owned_kv() { delete[] key; delete[] value; }
-
-        owned_kv(owned_kv&& o) noexcept
-            : key(o.key), key_len(o.key_len), value(o.value), value_len(o.value_len) {
-            o.key = nullptr; o.value = nullptr;
-        }
-        owned_kv& operator=(owned_kv&& o) noexcept {
-            if (this != &o) {
-                delete[] key; delete[] value;
-                key = o.key; key_len = o.key_len;
-                value = o.value; value_len = o.value_len;
-                o.key = nullptr; o.value = nullptr;
-            }
-            return *this;
-        }
-        owned_kv(const owned_kv&) = delete;
-        owned_kv& operator=(const owned_kv&) = delete;
-
-        static owned_kv make_key(const char* k, uint16_t kl) {
-            owned_kv r;
-            r.key = new char[kl]; std::memcpy(r.key, k, kl); r.key_len = kl;
-            return r;
-        }
-        static owned_kv make_kv(const char* k, uint16_t kl, const char* v, uint16_t vl) {
-            auto r = make_key(k, kl);
-            r.value = new char[vl]; std::memcpy(r.value, v, vl); r.value_len = vl;
-            return r;
-        }
-    };
-
     struct store_scheduler;
 
     namespace _store_ops {
 
         // ── lookup: key → get_result ──
+        // Phase 1: key pointer borrowed from caller (frame in context keeps it alive).
+        // Phase 2: will need owned copy for cross-core routing.
 
         template<typename sched_t>
         struct lookup_op {
             constexpr static bool store_op = true;
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope) {
-                char* k = data.key; data.key = nullptr;
-                uint16_t kl = data.key_len;
                 sched->schedule(new store_req{
-                    [k, kl, ctx, scope](kv_store& store) mutable {
+                    [k = key, kl = key_len, ctx, scope](kv_store& store) mutable {
                         auto result = store.get(k, kl);
-                        delete[] k;
                         pump::core::op_pusher<pos + 1, scope_t>::push_value(
                             ctx, scope, std::move(result));
                     }
@@ -85,9 +47,10 @@ namespace sider::store {
         template<typename sched_t>
         struct lookup_sender {
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
 
-            auto make_op() { return lookup_op<sched_t>{sched, std::move(data)}; }
+            auto make_op() { return lookup_op<sched_t>{sched, key, key_len}; }
 
             template<typename ctx_t>
             auto connect() {
@@ -101,20 +64,18 @@ namespace sider::store {
         struct put_op {
             constexpr static bool store_op = true;
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
+            const char* value;
+            uint16_t value_len;
             int64_t expire_at;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope) {
-                char* k = data.key; data.key = nullptr;
-                uint16_t kl = data.key_len;
-                char* v = data.value; data.value = nullptr;
-                uint16_t vl = data.value_len;
-                int64_t ea = expire_at;
                 sched->schedule(new store_req{
-                    [k, kl, v, vl, ea, ctx, scope](kv_store& store) mutable {
+                    [k = key, kl = key_len, v = value, vl = value_len,
+                     ea = expire_at, ctx, scope](kv_store& store) mutable {
                         store.set(k, kl, v, vl, ea);
-                        delete[] k; delete[] v;
                         pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
                     }
                 });
@@ -124,10 +85,13 @@ namespace sider::store {
         template<typename sched_t>
         struct put_sender {
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
+            const char* value;
+            uint16_t value_len;
             int64_t expire_at;
 
-            auto make_op() { return put_op<sched_t>{sched, std::move(data), expire_at}; }
+            auto make_op() { return put_op<sched_t>{sched, key, key_len, value, value_len, expire_at}; }
 
             template<typename ctx_t>
             auto connect() {
@@ -141,16 +105,14 @@ namespace sider::store {
         struct del_op {
             constexpr static bool store_op = true;
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope) {
-                char* k = data.key; data.key = nullptr;
-                uint16_t kl = data.key_len;
                 sched->schedule(new store_req{
-                    [k, kl, ctx, scope](kv_store& store) mutable {
+                    [k = key, kl = key_len, ctx, scope](kv_store& store) mutable {
                         int count = store.del(k, kl);
-                        delete[] k;
                         pump::core::op_pusher<pos + 1, scope_t>::push_value(
                             ctx, scope, count);
                     }
@@ -161,9 +123,10 @@ namespace sider::store {
         template<typename sched_t>
         struct del_sender {
             sched_t* sched;
-            owned_kv data;
+            const char* key;
+            uint16_t key_len;
 
-            auto make_op() { return del_op<sched_t>{sched, std::move(data)}; }
+            auto make_op() { return del_op<sched_t>{sched, key, key_len}; }
 
             template<typename ctx_t>
             auto connect() {
@@ -175,8 +138,9 @@ namespace sider::store {
 
     // ── store_scheduler ──
     //
-    // Phase 1.3: local::queue (single-core, same thread).
-    // Phase 2.x: switch to per_core::queue for cross-core routing.
+    // Phase 1: local::queue (single-core, same thread).
+    //   Key/value pointers borrow from caller (net_frame in context).
+    // Phase 2: switch to per_core::queue, will need owned data transfer.
 
     struct store_scheduler {
         kv_store store;
@@ -204,20 +168,18 @@ namespace sider::store {
         }
 
         auto lookup(const char* key, uint16_t key_len) {
-            return _store_ops::lookup_sender<store_scheduler>{
-                this, owned_kv::make_key(key, key_len)};
+            return _store_ops::lookup_sender<store_scheduler>{this, key, key_len};
         }
 
         auto put(const char* key, uint16_t key_len,
                  const char* value, uint16_t value_len,
                  int64_t expire_at = -1) {
             return _store_ops::put_sender<store_scheduler>{
-                this, owned_kv::make_kv(key, key_len, value, value_len), expire_at};
+                this, key, key_len, value, value_len, expire_at};
         }
 
         auto del(const char* key, uint16_t key_len) {
-            return _store_ops::del_sender<store_scheduler>{
-                this, owned_kv::make_key(key, key_len)};
+            return _store_ops::del_sender<store_scheduler>{this, key, key_len};
         }
 
         uint64_t memory_used_bytes() const { return store.memory_used_bytes(); }

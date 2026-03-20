@@ -34,9 +34,9 @@ namespace sider::server {
         resp::resp_buffer buf;
         bool quit = false;
     };
-    struct get_cmd { std::string key; };
-    struct set_cmd { std::string key; std::string value; int64_t expire_ms = -1; };
-    struct del_cmd { std::string key; };
+    struct get_cmd { std::string_view key; };
+    struct set_cmd { std::string_view key; std::string_view value; int64_t expire_ms = -1; };
+    struct del_cmd { std::string_view key; };
 
     using cmd_action = std::variant<simple_resp, get_cmd, set_cmd, del_cmd>;
 
@@ -100,7 +100,7 @@ namespace sider::server {
         if (resp::cmd_is(cmd, "GET")) {
             if (cmd.argc < 2)
                 return simple_resp{resp::error("wrong number of arguments for 'get' command")};
-            return get_cmd{std::string(cmd.arg(1))};
+            return get_cmd{cmd.arg(1)};
         }
 
         if (resp::cmd_is(cmd, "SET")) {
@@ -117,13 +117,13 @@ namespace sider::server {
                     break;
                 }
             }
-            return set_cmd{std::string(cmd.arg(1)), std::string(cmd.arg(2)), expire_ms};
+            return set_cmd{cmd.arg(1), cmd.arg(2), expire_ms};
         }
 
         if (resp::cmd_is(cmd, "DEL")) {
             if (cmd.argc < 2)
                 return simple_resp{resp::error("wrong number of arguments for 'del' command")};
-            return del_cmd{std::string(cmd.arg(1))};
+            return del_cmd{cmd.arg(1)};
         }
 
         return simple_resp{unknown_command_error(cmd)};
@@ -135,6 +135,77 @@ namespace sider::server {
     send_resp(session_ptr_t session, resp::resp_buffer&& resp) {
         auto len = resp.size();
         return tcp::send(session, resp.release(), len);
+    }
+
+    // ── Zero-copy bulk string send ──
+    // Sends "$<len>\r\n" + value_data + "\r\n" via 3-iovec scatter-gather.
+    // Header is heap-allocated and freed on completion. Value data is borrowed.
+
+    namespace _bulk_send {
+
+        static constexpr char crlf[2] = {'\r', '\n'};
+
+        template<typename session_t>
+        struct op {
+            constexpr static bool bulk_send_op = true;
+            session_t* session;
+            const char* value;
+            uint32_t value_len;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope) {
+                char tmp[16];
+                int hdr_len;
+                if (value) {
+                    hdr_len = snprintf(tmp, sizeof(tmp), "$%u\r\n", value_len);
+                } else {
+                    hdr_len = 5;
+                    std::memcpy(tmp, "$-1\r\n", 5);
+                }
+                auto* hdr = new char[hdr_len];
+                std::memcpy(hdr, tmp, hdr_len);
+
+                auto* req = new pump::scheduler::net::frame_send_req{
+                    hdr, static_cast<uint32_t>(hdr_len),
+                    [ctx, scope](bool ok) mutable {
+                        pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope, ok);
+                    }
+                };
+                if (value) {
+                    req->send_vec[0] = {hdr, static_cast<size_t>(hdr_len)};
+                    req->send_vec[1] = {const_cast<char*>(value), value_len};
+                    req->send_vec[2] = {const_cast<char*>(crlf), 2};
+                    req->send_cnt = 3;
+                } else {
+                    req->send_vec[0] = {hdr, static_cast<size_t>(hdr_len)};
+                    req->send_cnt = 1;
+                }
+                session->invoke(pump::scheduler::net::do_send, req);
+            }
+        };
+
+        template<typename session_t>
+        struct sender {
+            session_t* session;
+            const char* value;
+            uint32_t value_len;
+
+            auto make_op() { return op<session_t>{session, value, value_len}; }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>().push_back(make_op());
+            }
+        };
+
+    } // namespace _bulk_send
+
+    template<typename session_ptr_t>
+    static inline auto
+    send_bulk_string_zero_copy(session_ptr_t session,
+                               const char* value, uint32_t value_len) {
+        return _bulk_send::sender<std::remove_pointer_t<session_ptr_t>>{
+            session, value, value_len};
     }
 
     // ── Per-command execution ──
@@ -158,10 +229,9 @@ namespace sider::server {
                 action.key.data(),
                 static_cast<uint16_t>(action.key.size()))
             >> flat_map([cs](store::get_result r) {
-                auto resp = r.found()
-                    ? resp::bulk_string(r.data, r.len)
-                    : resp::nil();
-                return send_resp(cs->session, std::move(resp));
+                if (r.found())
+                    return send_bulk_string_zero_copy(cs->session, r.data, r.len);
+                return send_bulk_string_zero_copy(cs->session, nullptr, 0);
             });
     }
 
@@ -231,7 +301,9 @@ namespace sider::server {
             >> flat_map([](session_t *session) {
                 return tcp::recv(session);
             })
-            >> then([](pump::scheduler::net::net_frame &&frame) -> cmd_action {
+            >> push_result_to_context()
+            >> get_context<pump::scheduler::net::net_frame>()
+            >> then([](pump::scheduler::net::net_frame &frame) -> cmd_action {
                 auto cmd = resp::parse_command(frame);
                 return classify_command(cmd);
             })
@@ -244,6 +316,7 @@ namespace sider::server {
                     store_sched
                 );
             })
+            >> pop_context()
             >> any_exception([](std::exception_ptr e) mutable {
                 return just()
                     >> get_context<conn_state<session_sched_t> >()
@@ -254,3 +327,27 @@ namespace sider::server {
     }
 
 } // namespace sider::server
+
+// ── pump::core specializations for bulk_send ──
+namespace pump::core {
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::bulk_send_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static inline void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t, typename session_t>
+    struct compute_sender_type<ctx_t,
+            sider::server::_bulk_send::sender<session_t>> {
+        consteval static uint32_t count_value() { return 1; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<bool>{};
+        }
+    };
+
+} // namespace pump::core

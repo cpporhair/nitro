@@ -4,8 +4,8 @@
 
 ## 应用
 
-- **[KV](kv/)** — 快照隔离 KV 存储引擎。五类 Scheduler 协作，MVCC 多版本并发，Leader/Follower 批量合并写入。
-- **[AiSAQ](aisaq/)** — NVMe 向量搜索引擎。DiskANN/Vamana 图索引 + 内联 PQ 编码，SPDK 直读 NVMe 搜索十亿级向量，对比基线 11.6×–13.1× 加速。
+- **[KV](apps/kv/)** — 快照隔离 KV 存储引擎。五类 Scheduler 协作，MVCC 多版本并发，Leader/Follower 批量合并写入。
+- **[AiSAQ](apps/aisaq/)** — NVMe 向量搜索引擎。DiskANN/Vamana 图索引 + 内联 PQ 编码，SPDK 直读 NVMe 搜索十亿级向量，对比基线 11.6×–13.1× 加速。
 
 ## 构建
 

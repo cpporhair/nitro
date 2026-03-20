@@ -8,7 +8,7 @@
 #include <vector>
 #include <stdexcept>
 
-#include "third_party/nlohmann/json.hpp"
+#include "3rd/nlohmann/json.hpp"
 
 namespace aisaq::runtime {
 

@@ -44,6 +44,11 @@ add_executable(sider apps/sider/main.cc)
 target_include_directories(sider PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider)
 target_link_libraries(sider PRIVATE ${URING_LIBRARY} pthread)
 
+# Sider tests
+add_executable(sider_test_store apps/sider/test_store.cc)
+target_include_directories(sider_test_store PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider)
+target_link_libraries(sider_test_store PRIVATE pthread)
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

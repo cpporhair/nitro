@@ -1,0 +1,23 @@
+{
+    "batch": {
+        "core": [0]
+    },
+    "index": {
+        "core": [1]
+    },
+    "fs": {
+        "core": [0]
+    },
+    "io": {
+        "nvme": [
+            {
+                "name": "0000:02:00.0",
+                "page_manager": 0,
+                "qpair_count": 1,
+                "qpair_depth": 1024,
+                "fua": true,
+                "core": [2]
+            }
+        ]
+    }
+}

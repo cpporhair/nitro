@@ -1,0 +1,24 @@
+{
+  "index_prefix": "test_data/sift1m_b03_pump/sift1m",
+  "build": {
+    "R": 64,
+    "L": 100,
+    "alpha": 1.2,
+    "max_candidates": 500,
+    "n_chunks": 128,
+    "sample_size": 256000,
+    "kmeans_iters": 12,
+    "num_entries": 10,
+    "reorder": true
+  },
+  "cores": [
+    { "id": 0,  "task": {} },
+    { "id": 2,  "task": {} },
+    { "id": 4,  "task": {} },
+    { "id": 6,  "task": {} },
+    { "id": 8,  "task": {} },
+    { "id": 10, "task": {} },
+    { "id": 12, "task": {} },
+    { "id": 14, "task": {} }
+  ]
+}

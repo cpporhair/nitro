@@ -9,6 +9,7 @@
 #include "store/slab.hh"
 #include "store/entry.hh"
 #include "store/hash_table.hh"
+#include "store/store.hh"
 
 using namespace sider::store;
 
@@ -412,6 +413,86 @@ static void test_integrated_update_different_class() {
     assert(std::memcmp(ptr, "large-value-here", 16) == 0);
 }
 
+// ── kv_store ──
+
+static void test_store_set_get() {
+    kv_store s;
+    s.set("key", 3, "value", 5);
+    auto r = s.get("key", 3);
+    assert(r.found());
+    assert(r.len == 5);
+    assert(std::memcmp(r.data, "value", 5) == 0);
+}
+
+static void test_store_get_missing() {
+    kv_store s;
+    assert(!s.get("nope", 4).found());
+}
+
+static void test_store_del() {
+    kv_store s;
+    s.set("k", 1, "v", 1);
+    assert(s.del("k", 1) == 1);
+    assert(s.del("k", 1) == 0);
+    assert(!s.get("k", 1).found());
+}
+
+static void test_store_update_same_class() {
+    kv_store s;
+    s.set("k", 1, "aaa", 3);
+    s.set("k", 1, "bbb", 3);
+    auto r = s.get("k", 1);
+    assert(r.len == 3);
+    assert(std::memcmp(r.data, "bbb", 3) == 0);
+}
+
+static void test_store_update_different_class() {
+    kv_store s;
+    s.set("k", 1, "small", 5);   // SC_64
+
+    char big[200];
+    std::memset(big, 'X', 200);
+    s.set("k", 1, big, 200);     // SC_256
+
+    auto r = s.get("k", 1);
+    assert(r.found());
+    assert(r.len == 200);
+    assert(r.data[0] == 'X');
+}
+
+static void test_store_many_keys() {
+    kv_store s;
+    for (int i = 0; i < 1000; i++) {
+        auto key = std::to_string(i);
+        auto val = "val_" + key;
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()),
+              val.c_str(), static_cast<uint16_t>(val.size()));
+    }
+    for (int i = 0; i < 1000; i++) {
+        auto key = std::to_string(i);
+        auto expected = "val_" + key;
+        auto r = s.get(key.c_str(), static_cast<uint16_t>(key.size()));
+        assert(r.found());
+        assert(r.len == expected.size());
+        assert(std::memcmp(r.data, expected.c_str(), r.len) == 0);
+    }
+}
+
+static void test_store_no_leak_on_repeated_update() {
+    kv_store s;
+    // Repeatedly SET same key with varying sizes — slab pages should be recycled.
+    for (int i = 0; i < 500; i++) {
+        uint16_t vlen = static_cast<uint16_t>((i % 7) * 100 + 10);  // 10..610
+        char buf[700];
+        std::memset(buf, 'a' + (i % 26), vlen);
+        s.set("key", 3, buf, vlen);
+    }
+    // Should have exactly 1 key.
+    assert(s.key_count() == 1);
+    // Memory should be minimal (1-2 pages).
+    assert(s.memory_used_bytes() <= 2 * PAGE_SIZE);
+}
+
 // ── main ──
 
 int main() {
@@ -446,6 +527,15 @@ int main() {
     RUN(test_integrated_set_get_del);
     RUN(test_integrated_update_same_class);
     RUN(test_integrated_update_different_class);
+
+    printf("kv_store:\n");
+    RUN(test_store_set_get);
+    RUN(test_store_get_missing);
+    RUN(test_store_del);
+    RUN(test_store_update_same_class);
+    RUN(test_store_update_different_class);
+    RUN(test_store_many_keys);
+    RUN(test_store_no_leak_on_repeated_update);
 
     printf("\nAll %d tests passed.\n", pass_count);
     return 0;

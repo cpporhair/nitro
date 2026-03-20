@@ -11,6 +11,7 @@
 #include "pump/sender/any_exception.hh"
 #include "pump/core/context.hh"
 
+#include "store/scheduler.hh"
 #include "server/session.hh"
 #include "server/handler.hh"
 
@@ -32,24 +33,22 @@ namespace sider {
         return 6379;
     }
 
-    // Accept one connection, handle it, then schedule the next accept.
     static void accept_loop(server::accept_sched_t* accept_sched,
-                            server::session_sched_t* session_sched) {
+                            server::session_sched_t* session_sched,
+                            store::store_scheduler* store_sched) {
         just()
+            >> forever()
             >> flat_map([accept_sched](auto&&...) {
                 return tcp::wait_connection(accept_sched);
             })
-            >> then([accept_sched, session_sched](int fd) {
+            >> then([session_sched, store_sched](int fd) {
                 auto* session = server::sider_factory::create(fd, session_sched);
-                server::handle_connection(session_sched, session);
-                // Schedule next accept
-                accept_loop(accept_sched, session_sched);
+                server::handle_connection(session_sched, session, store_sched);
             })
-            >> any_exception([accept_sched, session_sched](std::exception_ptr) {
-                // On error, try again
-                accept_loop(accept_sched, session_sched);
+            >> any_exception([](std::exception_ptr) {
                 return just();
             })
+            >> reduce()
             >> submit(pump::core::make_root_context());
     }
 }
@@ -62,27 +61,28 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sider::signal_handler);
     std::signal(SIGTERM, sider::signal_handler);
 
-    auto* accept_sched = new sider::server::accept_sched_t();
+    auto* accept_sched  = new sider::server::accept_sched_t();
     auto* session_sched = new sider::server::session_sched_t();
+    auto* store_sched   = new sider::store::store_scheduler();
 
     if (accept_sched->init("0.0.0.0", port) < 0) {
         fprintf(stderr, "failed to listen on port %u\n", port);
         return 1;
     }
 
-    // epoll session_scheduler doesn't need init
-
-    sider::accept_loop(accept_sched, session_sched);
+    sider::accept_loop(accept_sched, session_sched, store_sched);
 
     printf("sider listening on port %u\n", port);
 
     while (sider::running.load(std::memory_order_relaxed)) {
         accept_sched->advance();
         session_sched->advance();
+        store_sched->advance();
     }
 
     printf("shutting down\n");
     delete accept_sched;
     delete session_sched;
+    delete store_sched;
     return 0;
 }

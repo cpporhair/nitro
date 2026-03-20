@@ -39,6 +39,11 @@ target_link_libraries(aisaq PRIVATE
         CUDA::cuda_driver
         pthread isal ssl rt uuid crypto m aio numa dl)
 
+# Sider
+add_executable(sider apps/sider/main.cc)
+target_include_directories(sider PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider)
+target_link_libraries(sider PRIVATE ${URING_LIBRARY} pthread)
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

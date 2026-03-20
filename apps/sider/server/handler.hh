@@ -35,7 +35,7 @@ namespace sider::server {
         bool quit = false;
     };
     struct get_cmd { std::string key; };
-    struct set_cmd { std::string key; std::string value; };
+    struct set_cmd { std::string key; std::string value; int64_t expire_ms = -1; };
     struct del_cmd { std::string key; };
 
     using cmd_action = std::variant<simple_resp, get_cmd, set_cmd, del_cmd>;
@@ -106,7 +106,18 @@ namespace sider::server {
         if (resp::cmd_is(cmd, "SET")) {
             if (cmd.argc < 3)
                 return simple_resp{resp::error("wrong number of arguments for 'set' command")};
-            return set_cmd{std::string(cmd.arg(1)), std::string(cmd.arg(2))};
+            int64_t expire_ms = -1;
+            for (uint8_t i = 3; i + 1 < cmd.argc; i++) {
+                if (resp::cmd_is_arg(cmd, i, "EX")) {
+                    expire_ms = std::strtoll(cmd.arg(i + 1).data(), nullptr, 10) * 1000;
+                    break;
+                }
+                if (resp::cmd_is_arg(cmd, i, "PX")) {
+                    expire_ms = std::strtoll(cmd.arg(i + 1).data(), nullptr, 10);
+                    break;
+                }
+            }
+            return set_cmd{std::string(cmd.arg(1)), std::string(cmd.arg(2)), expire_ms};
         }
 
         if (resp::cmd_is(cmd, "DEL")) {
@@ -158,11 +169,14 @@ namespace sider::server {
     static inline auto
     exec_set(set_cmd&& action, conn_state<session_sched_t>* cs,
              store::store_scheduler* store_sched) {
+        int64_t expire_at = action.expire_ms >= 0
+            ? store::now_ms() + action.expire_ms : -1;
         return store_sched->put(
                 action.key.data(),
                 static_cast<uint16_t>(action.key.size()),
                 action.value.data(),
-                static_cast<uint16_t>(action.value.size()))
+                static_cast<uint16_t>(action.value.size()),
+                expire_at)
             >> flat_map([cs]() {
                 return send_resp(cs->session, resp::ok());
             });

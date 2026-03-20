@@ -43,6 +43,12 @@ namespace sider::store {
         uint32_t count()    const { return count_; }
         uint32_t capacity() const { return capacity_; }
 
+        // Access entry at slot position (for scanning). Returns nullptr if empty.
+        entry* entry_at(uint32_t pos) {
+            if (pos >= capacity_ || slots_[pos].psl == 0) return nullptr;
+            return &slots_[pos].e;
+        }
+
         // Lookup by key. Returns nullptr if not found.
         entry* lookup(const char* key, uint16_t key_len) {
             if (count_ == 0) return nullptr;

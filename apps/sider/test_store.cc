@@ -493,6 +493,91 @@ static void test_store_no_leak_on_repeated_update() {
     assert(s.memory_used_bytes() <= 2 * PAGE_SIZE);
 }
 
+// ── TTL ──
+
+static void test_store_set_with_ttl_no_expiry_yet() {
+    kv_store s;
+    // expire_at far in the future — should still be found.
+    int64_t future = now_ms() + 60000;
+    s.set("k", 1, "v", 1, future);
+    auto r = s.get("k", 1);
+    assert(r.found());
+    assert(r.len == 1);
+}
+
+static void test_store_get_lazy_expiry() {
+    kv_store s;
+    // Set with expire_at in the past → GET should return not found (lazy expiry).
+    int64_t past = now_ms() - 1;
+    s.set("k", 1, "v", 1, past);
+    auto r = s.get("k", 1);
+    assert(!r.found());
+    // Entry and slab slot should be cleaned up.
+    assert(s.key_count() == 0);
+}
+
+static void test_store_del_lazy_expiry() {
+    kv_store s;
+    int64_t past = now_ms() - 1;
+    s.set("k", 1, "v", 1, past);
+    // DEL on expired key → returns 0 (not found).
+    assert(s.del("k", 1) == 0);
+    assert(s.key_count() == 0);
+}
+
+static void test_store_set_updates_expire() {
+    kv_store s;
+    int64_t past = now_ms() - 1;
+    s.set("k", 1, "v", 1, past);
+    // Overwrite with no expiry — should be alive.
+    s.set("k", 1, "v2", 2, -1);
+    auto r = s.get("k", 1);
+    assert(r.found());
+    assert(r.len == 2);
+}
+
+static void test_store_expire_scan() {
+    kv_store s;
+    int64_t past = now_ms() - 1;
+    // Insert 100 keys, all already expired.
+    for (int i = 0; i < 100; i++) {
+        auto key = std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "v", 1, past);
+    }
+    assert(s.key_count() == 100);
+
+    // Scan enough times to clean all.
+    for (int round = 0; round < 20; round++)
+        s.expire_scan(50);
+
+    assert(s.key_count() == 0);
+    assert(s.memory_used_bytes() == 0);
+}
+
+static void test_store_expire_scan_keeps_live() {
+    kv_store s;
+    int64_t past = now_ms() - 1;
+    int64_t future = now_ms() + 60000;
+
+    for (int i = 0; i < 50; i++) {
+        auto key = "exp_" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "v", 1, past);
+    }
+    for (int i = 0; i < 50; i++) {
+        auto key = "live_" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "v", 1, future);
+    }
+    assert(s.key_count() == 100);
+
+    for (int round = 0; round < 20; round++)
+        s.expire_scan(50);
+
+    assert(s.key_count() == 50);
+    // Live keys are still accessible.
+    auto r = s.get("live_0", 6);
+    assert(r.found());
+}
+
 // ── main ──
 
 int main() {
@@ -536,6 +621,14 @@ int main() {
     RUN(test_store_update_different_class);
     RUN(test_store_many_keys);
     RUN(test_store_no_leak_on_repeated_update);
+
+    printf("ttl:\n");
+    RUN(test_store_set_with_ttl_no_expiry_yet);
+    RUN(test_store_get_lazy_expiry);
+    RUN(test_store_del_lazy_expiry);
+    RUN(test_store_set_updates_expire);
+    RUN(test_store_expire_scan);
+    RUN(test_store_expire_scan_keeps_live);
 
     printf("\nAll %d tests passed.\n", pass_count);
     return 0;

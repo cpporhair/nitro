@@ -95,13 +95,14 @@ namespace sider::store {
             }
         };
 
-        // ── put: key + value → (no value) ──
+        // ── put: key + value + expire_at → (no value) ──
 
         template<typename sched_t>
         struct put_op {
             constexpr static bool store_op = true;
             sched_t* sched;
             owned_kv data;
+            int64_t expire_at;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope) {
@@ -109,9 +110,10 @@ namespace sider::store {
                 uint16_t kl = data.key_len;
                 char* v = data.value; data.value = nullptr;
                 uint16_t vl = data.value_len;
+                int64_t ea = expire_at;
                 sched->schedule(new store_req{
-                    [k, kl, v, vl, ctx, scope](kv_store& store) mutable {
-                        store.set(k, kl, v, vl);
+                    [k, kl, v, vl, ea, ctx, scope](kv_store& store) mutable {
+                        store.set(k, kl, v, vl, ea);
                         delete[] k; delete[] v;
                         pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
                     }
@@ -123,8 +125,9 @@ namespace sider::store {
         struct put_sender {
             sched_t* sched;
             owned_kv data;
+            int64_t expire_at;
 
-            auto make_op() { return put_op<sched_t>{sched, std::move(data)}; }
+            auto make_op() { return put_op<sched_t>{sched, std::move(data), expire_at}; }
 
             template<typename ctx_t>
             auto connect() {
@@ -178,6 +181,7 @@ namespace sider::store {
     struct store_scheduler {
         kv_store store;
         pump::core::local::queue<store_req*> req_q{4096};
+        int advance_count_ = 0;
 
         void schedule(store_req* r) { req_q.try_enqueue(r); }
 
@@ -189,6 +193,13 @@ namespace sider::store {
                 delete r;
                 progress = true;
             }
+
+            // Active expiry: sample every 64 advance() calls.
+            if (++advance_count_ >= 64) {
+                advance_count_ = 0;
+                store.expire_scan(20);
+            }
+
             return progress;
         }
 
@@ -198,9 +209,10 @@ namespace sider::store {
         }
 
         auto put(const char* key, uint16_t key_len,
-                 const char* value, uint16_t value_len) {
+                 const char* value, uint16_t value_len,
+                 int64_t expire_at = -1) {
             return _store_ops::put_sender<store_scheduler>{
-                this, owned_kv::make_kv(key, key_len, value, value_len)};
+                this, owned_kv::make_kv(key, key_len, value, value_len), expire_at};
         }
 
         auto del(const char* key, uint16_t key_len) {

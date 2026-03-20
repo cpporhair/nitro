@@ -99,4 +99,9 @@ namespace sider::resp {
         return detail::ci_equal(cmd.name(), name);
     }
 
+    static inline bool
+    cmd_is_arg(const parsed_command& cmd, uint8_t idx, std::string_view name) {
+        return idx < cmd.argc && detail::ci_equal(cmd.argv[idx], name);
+    }
+
 } // namespace sider::resp

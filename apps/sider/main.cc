@@ -88,9 +88,11 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sider::signal_handler);
     std::signal(SIGTERM, sider::signal_handler);
 
-    auto* accept_sched  = new sider::server::accept_sched_t();
-    auto* session_sched = new sider::server::session_sched_t();
+    auto* accept_sched  = new sider::server::accept_sched_t(256);
+    auto* session_sched = new sider::server::session_sched_t(4096);
     auto* store_sched   = new sider::store::store_scheduler();
+
+    session_sched->init();
 
     if (memory_limit > 0) {
         store_sched->set_eviction_config(

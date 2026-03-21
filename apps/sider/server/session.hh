@@ -1,7 +1,7 @@
 #pragma once
 
 #include "env/scheduler/net/tcp/tcp.hh"
-#include "env/scheduler/net/tcp/epoll/scheduler.hh"
+#include "env/scheduler/net/tcp/io_uring/scheduler.hh"
 #include "resp/unpacker.hh"
 
 namespace sider::server {
@@ -26,8 +26,8 @@ namespace sider::server {
         }
     };
 
-    using accept_sched_t = tcp::epoll::accept_scheduler<tcp::senders::conn::op>;
-    using session_sched_t = tcp::epoll::session_scheduler<sider_factory>;
+    using accept_sched_t = tcp::io_uring::accept_scheduler<tcp::senders::conn::op>;
+    using session_sched_t = tcp::io_uring::session_scheduler<sider_factory>;
     using session_t = session_sched_t::session_t;
 
 } // namespace sider::server

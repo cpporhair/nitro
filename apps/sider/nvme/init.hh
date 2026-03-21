@@ -153,8 +153,8 @@ namespace sider::nvme {
 
         qp = new nvme_qpair_t{raw_qp, 0, 128, 0, ssd_dev};
 
-        // 5. Create NVMe scheduler
-        scheduler = new nvme_scheduler_t(qp);
+        // 5. Create NVMe scheduler (large queue for burst cold reads)
+        scheduler = new nvme_scheduler_t(qp, 65536, 16384);
 
         // 6. Deallocate (TRIM) the entire disk — tells SSD all blocks are free,
         //    reduces write amplification and stabilizes write latency.

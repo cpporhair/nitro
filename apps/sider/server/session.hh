@@ -20,7 +20,7 @@ namespace sider::server {
         static auto* create(int fd, sched_t* sche) {
             return new session_type<sched_t>(
                 tcp::common::tcp_bind<sched_t>(fd, sche),
-                tcp::common::tcp_ring_buffer<resp::resp2_unpacker>(65536),
+                tcp::common::tcp_ring_buffer<resp::resp2_unpacker>(2 * 1024 * 1024),
                 pump::scheduler::net::frame_receiver()
             );
         }

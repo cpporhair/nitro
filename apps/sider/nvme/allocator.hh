@@ -98,6 +98,52 @@ namespace sider::nvme {
             used_pages_--;
         }
 
+        // Allocate n contiguous free pages. Returns starting LBA or INVALID_LBA.
+        uint64_t allocate_contiguous(uint32_t n) {
+            if (n == 0) return INVALID_LBA;
+            if (n == 1) return allocate();
+            if (used_pages_ + n > total_pages_) return INVALID_LBA;
+
+            // Scan L1 for a run of n consecutive free bits.
+            uint64_t run_start = 0;
+            uint32_t run_len = 0;
+
+            for (uint64_t lba = 0; lba < total_pages_; lba++) {
+                uint64_t l1_idx = lba / 64;
+                uint32_t bit = lba % 64;
+
+                if (l1_[l1_idx] & (1ULL << bit)) {
+                    // Free bit.
+                    if (run_len == 0) run_start = lba;
+                    run_len++;
+                    if (run_len >= n) {
+                        // Found a run. Mark all as used.
+                        for (uint64_t i = run_start; i < run_start + n; i++) {
+                            uint64_t wi = i / 64;
+                            uint32_t bi = i % 64;
+                            l1_[wi] &= ~(1ULL << bi);
+                            if (l1_[wi] == 0) {
+                                uint64_t l0i = wi / 64;
+                                uint32_t l0b = wi % 64;
+                                l0_[l0i] &= ~(1ULL << l0b);
+                            }
+                        }
+                        used_pages_ += n;
+                        return run_start;
+                    }
+                } else {
+                    run_len = 0;
+                }
+            }
+            return INVALID_LBA;
+        }
+
+        // Free n contiguous pages starting at lba.
+        void free_contiguous(uint64_t lba, uint32_t n) {
+            for (uint32_t i = 0; i < n; i++)
+                free(lba + i);
+        }
+
         bool full() const { return used_pages_ >= total_pages_; }
         uint64_t used() const { return used_pages_; }
         uint64_t total() const { return total_pages_; }

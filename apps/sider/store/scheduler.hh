@@ -72,7 +72,7 @@ namespace sider::store {
             const char* key;
             uint16_t key_len;
             const char* value;
-            uint16_t value_len;
+            uint32_t value_len;
             int64_t expire_at;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -93,7 +93,7 @@ namespace sider::store {
             const char* key;
             uint16_t key_len;
             const char* value;
-            uint16_t value_len;
+            uint32_t value_len;
             int64_t expire_at;
 
             auto make_op() { return put_op<sched_t>{sched, key, key_len, value, value_len, expire_at}; }
@@ -153,7 +153,7 @@ namespace sider::store {
         nvme_sched_t*      nvme_sched_ = nullptr;
         nvme::nvme_allocator* nvme_alloc_ = nullptr;
         const pump::scheduler::nvme::ssd<nvme::sider_page>* ssd_info_ = nullptr;
-        uint32_t           in_flight_evictions_ = 0;
+        uint64_t           in_flight_eviction_bytes_ = 0;
 
         void schedule(store_req* r) { req_q.try_enqueue(r); }
 
@@ -169,15 +169,16 @@ namespace sider::store {
             ssd_info_ = ssd;
         }
 
-        bool advance();            // defined in scheduler_impl.hh
-        bool try_start_eviction(); // defined in scheduler_impl.hh
+        bool advance();                // defined in scheduler_impl.hh
+        bool try_start_eviction();     // defined in scheduler_impl.hh
+        bool try_start_large_eviction(); // defined in scheduler_impl.hh
 
         auto lookup(const char* key, uint16_t key_len) {
             return _store_ops::lookup_sender<store_scheduler>{this, key, key_len};
         }
 
         auto put(const char* key, uint16_t key_len,
-                 const char* value, uint16_t value_len,
+                 const char* value, uint32_t value_len,
                  int64_t expire_at = -1) {
             return _store_ops::put_sender<store_scheduler>{
                 this, key, key_len, value, value_len, expire_at};

@@ -48,6 +48,10 @@ namespace sider::store {
         return static_cast<uint32_t>(slot_index) * size_class_bytes[sc];
     }
 
+    // Large value: value_len > PAGE_SIZE
+    static inline bool is_large_value(uint32_t size) { return size > PAGE_SIZE; }
+    static inline uint32_t pages_for(uint32_t size) { return (size + PAGE_SIZE - 1) / PAGE_SIZE; }
+
     // Pluggable page allocator.
     // Default: aligned_alloc/free (used by tests without SPDK).
     // main.cc sets these to DMA versions after SPDK init.
@@ -63,6 +67,23 @@ namespace sider::store {
 
     static inline void free_page(char* ptr) {
         if (_page_alloc::free_fn) _page_alloc::free_fn(ptr);
+        else std::free(ptr);
+    }
+
+    // Pluggable large value allocator (contiguous DMA-safe memory).
+    namespace _large_alloc {
+        inline char* (*alloc_fn)(uint32_t size) = nullptr;
+        inline void (*free_fn)(char* ptr) = nullptr;
+    }
+
+    static inline char* alloc_large(uint32_t size) {
+        uint32_t aligned = pages_for(size) * PAGE_SIZE;
+        if (_large_alloc::alloc_fn) return _large_alloc::alloc_fn(aligned);
+        return static_cast<char*>(std::aligned_alloc(PAGE_SIZE, aligned));
+    }
+
+    static inline void free_large(char* ptr) {
+        if (_large_alloc::free_fn) _large_alloc::free_fn(ptr);
         else std::free(ptr);
     }
 

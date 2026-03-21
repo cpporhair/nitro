@@ -8,22 +8,26 @@ namespace sider::store {
     struct entry {
         uint32_t key_hash    = 0;
         uint16_t key_len     = 0;
-        uint16_t value_len   = 0;
+        uint32_t value_len   = 0;       // supports large values (> 4KB)
         uint32_t page_id     = 0;
-        uint8_t  slot_index  = 0;
-        uint8_t  type        = 0;       // 0 = STRING
-        uint32_t last_access = 0;
+        uint8_t  slot_index  = 0;       // 0 for large values
+        uint8_t  type        = 0;       // bit 0-6: type (0=STRING), bit 7: large flag
+        uint32_t last_access = 0;       // per-key LRU for large values
         uint32_t version     = 0;
         int64_t  expire_at   = -1;      // -1 = no expiry
         char*    key_data    = nullptr;  // heap-allocated key bytes
+
+        bool is_large() const { return type & 0x80; }
+        void set_large(bool v) { if (v) type |= 0x80; else type &= ~0x80; }
 
         entry() = default;
 
         ~entry() { delete[] key_data; }
 
         entry(entry&& o) noexcept
-            : key_hash(o.key_hash), key_len(o.key_len), value_len(o.value_len),
-              page_id(o.page_id), slot_index(o.slot_index), type(o.type),
+            : key_hash(o.key_hash), key_len(o.key_len),
+              value_len(o.value_len), page_id(o.page_id),
+              slot_index(o.slot_index), type(o.type),
               last_access(o.last_access), version(o.version),
               expire_at(o.expire_at), key_data(o.key_data) {
             o.key_data = nullptr;

@@ -697,6 +697,211 @@ static void test_store_evict_no_pages() {
     assert(s.discard_one_page() == 0);
 }
 
+// ── large values ──
+
+static void test_large_value_set_get_8k() {
+    kv_store s;
+    char val[8192];
+    std::memset(val, 'A', sizeof(val));
+    s.set("bigkey", 6, val, 8192);
+    assert(s.key_count() == 1);
+
+    auto r = G(s.get("bigkey", 6));
+    assert(r.found());
+    assert(r.len == 8192);
+    assert(r.data[0] == 'A');
+    assert(r.data[8191] == 'A');
+    // Large value: memory = pages_for(8192) * 4096 = 2 * 4096
+    assert(s.memory_used_bytes() == 2 * PAGE_SIZE);
+}
+
+static void test_large_value_set_get_16k() {
+    kv_store s;
+    char val[16384];
+    std::memset(val, 'B', sizeof(val));
+    s.set("bigkey", 6, val, 16384);
+
+    auto r = G(s.get("bigkey", 6));
+    assert(r.found());
+    assert(r.len == 16384);
+    assert(r.data[0] == 'B');
+    assert(r.data[16383] == 'B');
+    assert(s.memory_used_bytes() == 4 * PAGE_SIZE);
+}
+
+static void test_large_value_set_get_64k() {
+    kv_store s;
+    auto* val = new char[65536];
+    std::memset(val, 'C', 65536);
+    s.set("bigkey", 6, val, 65536);
+    delete[] val;
+
+    auto r = G(s.get("bigkey", 6));
+    assert(r.found());
+    assert(r.len == 65536);
+    assert(r.data[0] == 'C');
+    assert(r.data[65535] == 'C');
+    assert(s.memory_used_bytes() == 16 * PAGE_SIZE);
+}
+
+static void test_large_value_del() {
+    kv_store s;
+    char val[8192];
+    std::memset(val, 'D', sizeof(val));
+    s.set("k", 1, val, 8192);
+    assert(s.memory_used_bytes() == 2 * PAGE_SIZE);
+
+    assert(s.del("k", 1) == 1);
+    assert(s.key_count() == 0);
+    assert(s.memory_used_bytes() == 0);
+    assert(s.large_memory_bytes_ == 0);
+}
+
+static void test_large_value_update_large_same_size() {
+    kv_store s;
+    char val1[8192], val2[8192];
+    std::memset(val1, 'E', sizeof(val1));
+    std::memset(val2, 'F', sizeof(val2));
+
+    s.set("k", 1, val1, 8192);
+    s.set("k", 1, val2, 8192);  // same page_count → overwrite in place
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 8192);
+    assert(r.data[0] == 'F');
+    assert(s.memory_used_bytes() == 2 * PAGE_SIZE);
+    assert(s.key_count() == 1);
+}
+
+static void test_large_value_update_large_diff_size() {
+    kv_store s;
+    char val1[8192];
+    std::memset(val1, 'G', sizeof(val1));
+    s.set("k", 1, val1, 8192);
+    assert(s.memory_used_bytes() == 2 * PAGE_SIZE);
+
+    char val2[16384];
+    std::memset(val2, 'H', sizeof(val2));
+    s.set("k", 1, val2, 16384);  // different page_count → free old, alloc new
+    assert(s.memory_used_bytes() == 4 * PAGE_SIZE);
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 16384);
+    assert(r.data[0] == 'H');
+    assert(s.key_count() == 1);
+}
+
+static void test_large_value_small_to_large() {
+    kv_store s;
+    s.set("k", 1, "small", 5);
+    assert(s.large_memory_bytes_ == 0);
+
+    char big[8192];
+    std::memset(big, 'I', sizeof(big));
+    s.set("k", 1, big, 8192);
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 8192);
+    assert(r.data[0] == 'I');
+    assert(s.large_memory_bytes_ == 2 * PAGE_SIZE);
+    assert(s.key_count() == 1);
+}
+
+static void test_large_value_large_to_small() {
+    kv_store s;
+    char big[8192];
+    std::memset(big, 'J', sizeof(big));
+    s.set("k", 1, big, 8192);
+    assert(s.large_memory_bytes_ == 2 * PAGE_SIZE);
+
+    s.set("k", 1, "tiny", 4);
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 4);
+    assert(std::memcmp(r.data, "tiny", 4) == 0);
+    assert(s.large_memory_bytes_ == 0);
+    assert(s.key_count() == 1);
+}
+
+static void test_large_value_discard() {
+    kv_store s;
+    s.evict_cfg_ = {5 * PAGE_SIZE, 0.60, 0.90};
+
+    // Insert 3 large values, each 2 pages (6 pages total > 5 page limit).
+    for (int i = 0; i < 3; i++) {
+        auto key = "big" + std::to_string(i);
+        char val[8192];
+        std::memset(val, 'K' + i, sizeof(val));
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 8192);
+    }
+
+    // At least one large value should have been discarded.
+    assert(s.memory_used_bytes() <= 5 * PAGE_SIZE);
+    assert(s.key_count() < 3);
+}
+
+static void test_large_value_mixed_eviction() {
+    kv_store s;
+    // 20 pages limit — mix of small and large values.
+    s.evict_cfg_ = {20 * PAGE_SIZE, 0.50, 0.80};
+
+    // Insert small values (SC_64, 64 per page).
+    for (int i = 0; i < 200; i++) {
+        auto key = "s" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "v", 1);
+    }
+
+    // Insert large values.
+    for (int i = 0; i < 5; i++) {
+        auto key = "big" + std::to_string(i);
+        char val[8192];
+        std::memset(val, 'X', sizeof(val));
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 8192);
+    }
+
+    // Memory should stay bounded.
+    assert(s.memory_used_bytes() <= 21 * PAGE_SIZE);
+    assert(s.key_count() > 0);
+}
+
+static void test_large_value_no_leak_repeated_update() {
+    kv_store s;
+    // Repeatedly update with varying large sizes — no memory leak.
+    for (int i = 0; i < 100; i++) {
+        uint32_t vlen = static_cast<uint32_t>(((i % 5) + 2) * PAGE_SIZE);  // 8K-24K
+        auto* val = new char[vlen];
+        std::memset(val, 'a' + (i % 26), vlen);
+        s.set("key", 3, val, vlen);
+        delete[] val;
+    }
+    assert(s.key_count() == 1);
+    // Should have exactly 1 large value worth of memory.
+    auto expected_pc = pages_for(static_cast<uint32_t>(((99 % 5) + 2) * PAGE_SIZE));
+    assert(s.memory_used_bytes() == expected_pc * PAGE_SIZE);
+}
+
+static void test_large_value_entry_flag() {
+    kv_store s;
+    // Set a large value.
+    char big[8192];
+    std::memset(big, 'Z', sizeof(big));
+    s.set("k", 1, big, 8192);
+
+    auto* e = s.ht.lookup("k", 1);
+    assert(e != nullptr);
+    assert(e->is_large());
+    assert(e->slot_index == 0);
+
+    // Update to small.
+    s.set("k", 1, "sm", 2);
+    e = s.ht.lookup("k", 1);
+    assert(e != nullptr);
+    assert(!e->is_large());
+}
+
 // ── main ──
 
 int main() {
@@ -756,6 +961,20 @@ int main() {
     RUN(test_store_evict_preserves_hot_keys);
     RUN(test_store_evict_sync_on_max);
     RUN(test_store_evict_memory_stable);
+
+    printf("large values:\n");
+    RUN(test_large_value_set_get_8k);
+    RUN(test_large_value_set_get_16k);
+    RUN(test_large_value_set_get_64k);
+    RUN(test_large_value_del);
+    RUN(test_large_value_update_large_same_size);
+    RUN(test_large_value_update_large_diff_size);
+    RUN(test_large_value_small_to_large);
+    RUN(test_large_value_large_to_small);
+    RUN(test_large_value_discard);
+    RUN(test_large_value_mixed_eviction);
+    RUN(test_large_value_no_leak_repeated_update);
+    RUN(test_large_value_entry_flag);
 
     printf("\nAll %d tests passed.\n", pass_count);
     return 0;

@@ -47,6 +47,18 @@ namespace sider::nvme {
             std::free(ptr);
     }
 
+    // Large value DMA allocation (contiguous, not from pool).
+    inline char* dma_alloc_large(uint32_t size) {
+        auto* p = spdk_dma_zmalloc(size, 4096, nullptr);
+        if (!p) [[unlikely]]
+            return static_cast<char*>(std::aligned_alloc(4096, size));
+        return static_cast<char*>(p);
+    }
+
+    inline void dma_free_large(char* ptr) {
+        spdk_dma_free(ptr);
+    }
+
     // ── SPDK probe/attach callbacks ──
 
     struct probe_ctx {
@@ -116,6 +128,8 @@ namespace sider::nvme {
         // Wire up alloc/free
         store::_page_alloc::alloc_fn = dma_alloc_page;
         store::_page_alloc::free_fn = dma_free_page;
+        store::_large_alloc::alloc_fn = dma_alloc_large;
+        store::_large_alloc::free_fn = dma_free_large;
 
         // 3. Probe NVMe device
         ssd_dev = new nvme_ssd_t{};

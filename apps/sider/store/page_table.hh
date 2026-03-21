@@ -12,6 +12,7 @@ namespace sider::store {
         uint8_t   size_class = 0;
         uint16_t  live_count = 0;
         uint32_t  hotness = 0;
+        uint32_t  page_count = 1;    // number of 4KB pages (>1 for large values)
         char*     mem_ptr = nullptr;
         uint64_t  slot_bitmap = 0;   // 1 = occupied, 0 = free
         uint64_t  nvme_lba = 0;      // valid when ON_NVME (page position on disk)

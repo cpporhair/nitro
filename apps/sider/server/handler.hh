@@ -239,17 +239,28 @@ namespace sider::server {
                     return send_bulk_string_zero_copy(cs->session, nullptr, 0);
                 } else {
                     // cold_result: NVMe read → extract value → promote → send.
-                    auto* read_buf = store::alloc_page();
+                    constexpr uint32_t pg_sz = 4096;
+                    uint32_t buf_size = result.page_count * pg_sz;
+                    bool is_large = (result.page_count > 1);
+                    auto* read_buf = is_large
+                        ? store::alloc_large(buf_size)
+                        : store::alloc_page();
                     auto* page = new nvme::sider_page{
-                        result.nvme_lba, read_buf, store_sched->ssd_info_};
+                        result.nvme_lba, read_buf, store_sched->ssd_info_,
+                        static_cast<uint64_t>(buf_size)};
 
                     return store_sched->nvme_sched_->get(page)
                         >> flat_map([cs, store_sched, key_data, key_len,
-                                     result, page, read_buf]
+                                     result, page, read_buf, is_large]
                                     (pump::scheduler::nvme::get::res<nvme::sider_page>&& res) {
                             if (res.is_success()) {
-                                auto sc = static_cast<store::size_class_t>(result.size_class);
-                                char* val = read_buf + store::slot_offset(sc, result.slot_index);
+                                char* val;
+                                if (is_large) {
+                                    val = read_buf;
+                                } else {
+                                    auto sc = static_cast<store::size_class_t>(result.size_class);
+                                    val = read_buf + store::slot_offset(sc, result.slot_index);
+                                }
                                 auto resp = resp::bulk_string(val, result.value_len);
 
                                 // Best-effort promote: copy to hot slot.
@@ -257,11 +268,13 @@ namespace sider::server {
                                     key_data, key_len, result.version,
                                     val, result.value_len);
 
-                                store::free_page(read_buf);
+                                if (is_large) store::free_large(read_buf);
+                                else store::free_page(read_buf);
                                 delete page;
                                 return send_resp(cs->session, std::move(resp));
                             }
-                            store::free_page(read_buf);
+                            if (is_large) store::free_large(read_buf);
+                            else store::free_page(read_buf);
                             delete page;
                             return send_resp(cs->session, resp::nil());
                         });
@@ -280,7 +293,7 @@ namespace sider::server {
                 action.key.data(),
                 static_cast<uint16_t>(action.key.size()),
                 action.value.data(),
-                static_cast<uint16_t>(action.value.size()),
+                static_cast<uint32_t>(action.value.size()),
                 expire_at)
             >> flat_map([cs]() {
                 return send_resp(cs->session, resp::ok());

@@ -98,6 +98,19 @@ namespace sider::store {
             return pe.mem_ptr + slot_offset(sc, slot_index);
         }
 
+        // Force-free an entire page during eviction.
+        // All hash table entries on this page must already be erased.
+        void evict_page(uint32_t page_id) {
+            auto& pe = pt_[page_id];
+            auto sc = static_cast<size_class_t>(pe.size_class);
+            bool full = (pe.slot_bitmap & full_mask_for(sc)) == full_mask_for(sc);
+            if (!full)
+                remove_from_partials(sc, page_id);
+            free_page(pe.mem_ptr);
+            total_pages_--;
+            pt_.free_page_id(page_id);
+        }
+
         uint64_t memory_used_bytes() const {
             return static_cast<uint64_t>(total_pages_) * PAGE_SIZE;
         }

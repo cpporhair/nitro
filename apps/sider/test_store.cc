@@ -578,6 +578,122 @@ static void test_store_expire_scan_keeps_live() {
     assert(r.found());
 }
 
+// ── eviction ──
+
+static void test_store_evict_one_page() {
+    kv_store s;
+    // Insert 200 keys (SC_64: 64 slots/page → ~4 pages).
+    for (int i = 0; i < 200; i++) {
+        auto key = "k" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "value", 5);
+    }
+    auto before_count = s.key_count();
+    auto before_mem = s.memory_used_bytes();
+    assert(before_count == 200);
+    assert(before_mem > 0);
+
+    int evicted = s.evict_one_page();
+    assert(evicted > 0);
+    assert(s.key_count() < before_count);
+    assert(s.memory_used_bytes() < before_mem);
+
+    // Evicted keys should return nil.
+    int missing = 0;
+    for (int i = 0; i < 200; i++) {
+        auto key = "k" + std::to_string(i);
+        if (!s.get(key.c_str(), static_cast<uint16_t>(key.size())).found())
+            missing++;
+    }
+    assert(missing == evicted);
+}
+
+static void test_store_evict_returns_nil() {
+    kv_store s;
+    s.set("only", 4, "v", 1);
+    assert(s.key_count() == 1);
+
+    s.evict_one_page();
+    assert(!s.get("only", 4).found());
+    assert(s.key_count() == 0);
+    assert(s.memory_used_bytes() == 0);
+}
+
+static void test_store_evict_preserves_hot_keys() {
+    kv_store s;
+    // Use 200-byte values → SC_256 (16 slots/page) → ~13 pages.
+    char val[200];
+    std::memset(val, 'x', 200);
+    for (int i = 0; i < 200; i++) {
+        auto key = "k" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 200);
+    }
+    // 200 keys / 16 per page = 12.5 → 13 pages.
+    // Keys 0-15 on page 0, 16-31 on page 1, 32-47 on page 2, 48-63 on page 3.
+
+    // Access keys 0-49 repeatedly to make pages 0-3 hot.
+    for (int round = 0; round < 10; round++) {
+        for (int i = 0; i < 50; i++) {
+            auto key = "k" + std::to_string(i);
+            s.get(key.c_str(), static_cast<uint16_t>(key.size()));
+        }
+    }
+
+    // Evict 5 pages — should target cold pages (4-12).
+    for (int i = 0; i < 5; i++)
+        s.evict_one_page();
+
+    // All 50 hot keys should survive (5 cold pages evicted from 9 cold pages).
+    int hot_found = 0;
+    for (int i = 0; i < 50; i++) {
+        auto key = "k" + std::to_string(i);
+        if (s.get(key.c_str(), static_cast<uint16_t>(key.size())).found())
+            hot_found++;
+    }
+    assert(hot_found >= 45);  // conservative margin for sampling randomness
+}
+
+static void test_store_evict_sync_on_max() {
+    kv_store s;
+    // 10 pages limit. SC_64: 64 slots/page → 640 keys at capacity.
+    s.evict_cfg_ = {10 * PAGE_SIZE, 0.60, 0.90};
+
+    // Insert 2000 keys — sync eviction in set() keeps memory bounded.
+    for (int i = 0; i < 2000; i++) {
+        auto key = "k" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "value", 5);
+    }
+
+    // Memory should not exceed limit + 1 page (overshoot from final alloc).
+    assert(s.memory_used_bytes() <= 11 * PAGE_SIZE);
+    // Some keys were evicted.
+    assert(s.key_count() < 2000);
+    assert(s.key_count() > 0);
+}
+
+static void test_store_evict_memory_stable() {
+    kv_store s;
+    // 20 pages limit, SC_128 values (100 bytes → 32 slots/page → 640 max keys).
+    s.evict_cfg_ = {20 * PAGE_SIZE, 0.50, 0.80};
+
+    char val[100];
+    std::memset(val, 'x', 100);
+    for (int i = 0; i < 5000; i++) {
+        auto key = "k" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 100);
+    }
+
+    // Memory stays within limit.
+    assert(s.memory_used_bytes() <= 21 * PAGE_SIZE);
+    assert(s.key_count() > 0);
+    assert(s.key_count() < 5000);
+}
+
+static void test_store_evict_no_pages() {
+    kv_store s;
+    // Nothing to evict.
+    assert(s.evict_one_page() == 0);
+}
+
 // ── main ──
 
 int main() {
@@ -629,6 +745,14 @@ int main() {
     RUN(test_store_set_updates_expire);
     RUN(test_store_expire_scan);
     RUN(test_store_expire_scan_keeps_live);
+
+    printf("eviction:\n");
+    RUN(test_store_evict_no_pages);
+    RUN(test_store_evict_one_page);
+    RUN(test_store_evict_returns_nil);
+    RUN(test_store_evict_preserves_hot_keys);
+    RUN(test_store_evict_sync_on_max);
+    RUN(test_store_evict_memory_stable);
 
     printf("\nAll %d tests passed.\n", pass_count);
     return 0;

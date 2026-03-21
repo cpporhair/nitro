@@ -149,6 +149,11 @@ namespace sider::store {
 
         void schedule(store_req* r) { req_q.try_enqueue(r); }
 
+        void set_eviction_config(uint64_t memory_limit,
+                                 double begin_pct, double urgent_pct) {
+            store.evict_cfg_ = {memory_limit, begin_pct, urgent_pct};
+        }
+
         bool advance() {
             bool progress = false;
             store_req* r;
@@ -162,6 +167,27 @@ namespace sider::store {
             if (++advance_count_ >= 64) {
                 advance_count_ = 0;
                 store.expire_scan(20);
+            }
+
+            // Eviction: water-level based.
+            auto& cfg = store.evict_cfg_;
+            if (cfg.memory_limit > 0) {
+                auto used = store.memory_used_bytes();
+                if (used >= cfg.max_bytes()) {
+                    // At hard limit: aggressive eviction until below urgent.
+                    while (store.memory_used_bytes() >= cfg.urgent_bytes()) {
+                        if (store.evict_one_page() == 0) break;
+                    }
+                } else if (used >= cfg.urgent_bytes()) {
+                    // High water: evict several pages per advance.
+                    for (int i = 0; i < 8; i++) {
+                        if (store.memory_used_bytes() < cfg.begin_bytes()) break;
+                        if (store.evict_one_page() == 0) break;
+                    }
+                } else if (used >= cfg.begin_bytes() && !progress) {
+                    // Low water + idle: evict one page.
+                    store.evict_one_page();
+                }
             }
 
             return progress;

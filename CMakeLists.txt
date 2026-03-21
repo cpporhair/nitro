@@ -41,7 +41,7 @@ target_link_libraries(aisaq PRIVATE
 
 # Sider
 add_executable(sider apps/sider/main.cc)
-target_include_directories(sider PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider)
+target_include_directories(sider PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider ${CMAKE_SOURCE_DIR})
 target_link_libraries(sider PRIVATE
         -Wl,--whole-archive ${SPDK_LIBRARIES} -Wl,--no-whole-archive
         ${URING_LIBRARY} pthread numa dl)

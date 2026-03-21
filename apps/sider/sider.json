@@ -1,0 +1,10 @@
+{
+  "port": 6379,
+  "memory": "256M",
+  "evict_begin": 60,
+  "evict_urgent": 90,
+  "dma_pages": 8192,
+  "accept_core": 0,
+  "nvme": ["0000:02:00.0"],
+  "cores": [0]
+}

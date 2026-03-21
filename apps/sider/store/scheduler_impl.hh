@@ -20,10 +20,10 @@ namespace sider::store {
             progress = true;
         }
 
-        // Drain pending NVMe LBA frees (from SET/DEL on ON_NVME keys).
-        if (nvme_alloc_ && !store.pending_nvme_frees_.empty()) {
-            for (auto lba : store.pending_nvme_frees_)
-                nvme_alloc_->free(lba);
+        // Drain pending NVMe LBA frees — route to correct disk's allocator.
+        if (!disks_.empty() && !store.pending_nvme_frees_.empty()) {
+            for (auto& pf : store.pending_nvme_frees_)
+                disks_[pf.disk_id].allocator->free(pf.lba);
             store.pending_nvme_frees_.clear();
         }
 
@@ -41,24 +41,20 @@ namespace sider::store {
                 ? used - in_flight_eviction_bytes_ : 0ULL;
 
             if (effective >= cfg.max_bytes()) {
-                // At hard limit: sync discard until below urgent.
                 while (store.memory_used_bytes() >= cfg.urgent_bytes()) {
                     if (store.discard_one_large() > 0) continue;
                     if (store.discard_one_page() == 0) break;
                 }
             } else if (effective >= cfg.urgent_bytes()) {
-                // High water: evict several pages per advance.
                 for (int i = 0; i < 8; i++) {
                     auto eff = store.memory_used_bytes()
                         - std::min(store.memory_used_bytes(), in_flight_eviction_bytes_);
                     if (eff < cfg.begin_bytes()) break;
-                    // Try large eviction first (frees more memory per op).
                     if (!try_start_large_eviction()) {
                         if (!try_start_eviction()) break;
                     }
                 }
             } else if (effective >= cfg.begin_bytes() && !progress) {
-                // Low water + idle: evict one.
                 if (!try_start_large_eviction())
                     try_start_eviction();
             }
@@ -67,20 +63,32 @@ namespace sider::store {
         return progress;
     }
 
-    // Start an async NVMe eviction for a slab page. Returns true if started.
+    // Pick a non-full disk via round-robin. Returns index or UINT8_MAX if all full.
+    inline uint8_t store_scheduler_pick_disk(
+            std::vector<store_scheduler::nvme_disk>& disks, uint8_t& next) {
+        auto n = static_cast<uint8_t>(disks.size());
+        for (uint8_t i = 0; i < n; i++) {
+            uint8_t d = next++ % n;
+            if (!disks[d].allocator->full()) return d;
+        }
+        return UINT8_MAX;
+    }
+
     inline bool store_scheduler::try_start_eviction() {
-        if (!nvme_sched_ || !nvme_alloc_) {
+        if (disks_.empty()) {
             return store.discard_one_page() > 0;
         }
 
-        if (nvme_alloc_->full()) {
+        uint8_t disk_id = store_scheduler_pick_disk(disks_, next_disk_);
+        if (disk_id == UINT8_MAX) {
             return store.discard_one_page() > 0;
         }
 
         uint32_t victim = store.begin_eviction();
         if (victim == UINT32_MAX) return false;
 
-        auto lba = nvme_alloc_->allocate();
+        auto& disk = disks_[disk_id];
+        auto lba = disk.allocator->allocate();
         if (lba == nvme::nvme_allocator::INVALID_LBA) {
             store.pt[victim].state = page_entry::IN_MEMORY;
             return store.discard_one_page() > 0;
@@ -88,17 +96,18 @@ namespace sider::store {
 
         auto& pe = store.pt[victim];
         pe.nvme_lba = lba;
+        pe.disk_id = disk_id;
 
-        auto* page = new nvme::sider_page{lba, pe.mem_ptr, ssd_info_, PAGE_SIZE};
+        auto* page = new nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, PAGE_SIZE};
         in_flight_eviction_bytes_ += PAGE_SIZE;
 
-        // Fire-and-forget: NVMe write → completion callback.
-        nvme_sched_->put(page)
+        disk.scheduler->put(page)
             >> pump::sender::then(
-                [this, victim, page](pump::scheduler::nvme::put::res<nvme::sider_page>&& res) {
+                [this, victim, disk_id, page]
+                (pump::scheduler::nvme::put::res<nvme::sider_page>&& res) {
                     bool free_lba = store.complete_eviction(victim, res.is_success());
                     if (free_lba)
-                        nvme_alloc_->free(page->lba);
+                        disks_[disk_id].allocator->free(page->lba);
                     in_flight_eviction_bytes_ -= PAGE_SIZE;
                     delete page;
                 })
@@ -107,14 +116,15 @@ namespace sider::store {
         return true;
     }
 
-    // Start an async NVMe eviction for a large value. Returns true if started.
     inline bool store_scheduler::try_start_large_eviction() {
-        if (!nvme_sched_ || !nvme_alloc_) {
+        if (disks_.empty()) {
             return store.discard_one_large() > 0;
         }
 
         if (store.large_page_ids_.empty()) return false;
 
+        // Large values need contiguous LBAs on one disk.
+        // If no disk has contiguous space, discard.
         uint32_t victim = store.begin_large_eviction();
         if (victim == UINT32_MAX) return false;
 
@@ -122,26 +132,40 @@ namespace sider::store {
         uint32_t pc = pe.page_count;
         uint64_t evict_bytes = static_cast<uint64_t>(pc) * PAGE_SIZE;
 
-        auto lba = nvme_alloc_->allocate_contiguous(pc);
-        if (lba == nvme::nvme_allocator::INVALID_LBA) {
-            // Can't allocate contiguous — revert to IN_MEMORY and discard.
+        // Try each disk for contiguous allocation.
+        uint64_t lba = nvme::nvme_allocator::INVALID_LBA;
+        uint8_t disk_id = UINT8_MAX;
+        auto n = static_cast<uint8_t>(disks_.size());
+        for (uint8_t i = 0; i < n; i++) {
+            uint8_t d = next_disk_++ % n;
+            lba = disks_[d].allocator->allocate_contiguous(pc);
+            if (lba != nvme::nvme_allocator::INVALID_LBA) {
+                disk_id = d;
+                break;
+            }
+        }
+
+        if (disk_id == UINT8_MAX) {
+            // No disk has contiguous space — revert and discard.
             pe.state = page_entry::IN_MEMORY;
             store.large_page_ids_.push_back(victim);
             return store.discard_one_large() > 0;
         }
 
         pe.nvme_lba = lba;
+        pe.disk_id = disk_id;
 
-        auto* page = new nvme::sider_page{lba, pe.mem_ptr, ssd_info_, evict_bytes};
+        auto& disk = disks_[disk_id];
+        auto* page = new nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, evict_bytes};
         in_flight_eviction_bytes_ += evict_bytes;
 
-        nvme_sched_->put(page)
+        disk.scheduler->put(page)
             >> pump::sender::then(
-                [this, victim, pc, evict_bytes, page]
+                [this, victim, disk_id, pc, evict_bytes, page]
                 (pump::scheduler::nvme::put::res<nvme::sider_page>&& res) {
                     bool free_lba = store.complete_eviction(victim, res.is_success());
                     if (free_lba)
-                        nvme_alloc_->free_contiguous(page->lba, pc);
+                        disks_[disk_id].allocator->free_contiguous(page->lba, pc);
                     in_flight_eviction_bytes_ -= evict_bytes;
                     delete page;
                 })

@@ -246,10 +246,11 @@ namespace sider::server {
                         ? store::alloc_large(buf_size)
                         : store::alloc_page();
                     auto* page = new nvme::sider_page{
-                        result.nvme_lba, read_buf, store_sched->ssd_info_,
+                        result.nvme_lba, read_buf,
+                        store_sched->ssd_info_for(result.disk_id),
                         static_cast<uint64_t>(buf_size)};
 
-                    return store_sched->nvme_sched_->get(page)
+                    return store_sched->nvme_sched_for(result.disk_id)->get(page)
                         >> flat_map([cs, store_sched, key_data, key_len,
                                      result, page, read_buf, is_large]
                                     (pump::scheduler::nvme::get::res<nvme::sider_page>&& res) {

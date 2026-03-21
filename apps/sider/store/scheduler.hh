@@ -148,12 +148,19 @@ namespace sider::store {
         pump::core::local::queue<store_req*> req_q{4096};
         int advance_count_ = 0;
 
-        // NVMe eviction support (nullptr = no NVMe, discard-only).
+        // NVMe eviction support (empty = no NVMe, discard-only).
         using nvme_sched_t = pump::scheduler::nvme::scheduler<nvme::sider_page>;
-        nvme_sched_t*      nvme_sched_ = nullptr;
-        nvme::nvme_allocator* nvme_alloc_ = nullptr;
-        const pump::scheduler::nvme::ssd<nvme::sider_page>* ssd_info_ = nullptr;
-        uint64_t           in_flight_eviction_bytes_ = 0;
+        using nvme_ssd_info_t = const pump::scheduler::nvme::ssd<nvme::sider_page>*;
+
+        struct nvme_disk {
+            nvme_sched_t*        scheduler = nullptr;
+            nvme::nvme_allocator* allocator = nullptr;
+            nvme_ssd_info_t      ssd_info  = nullptr;
+        };
+
+        std::vector<nvme_disk> disks_;
+        uint8_t  next_disk_ = 0;
+        uint64_t in_flight_eviction_bytes_ = 0;
 
         void schedule(store_req* r) { req_q.try_enqueue(r); }
 
@@ -162,11 +169,18 @@ namespace sider::store {
             store.evict_cfg_ = {memory_limit, begin_pct, urgent_pct};
         }
 
-        void set_nvme(nvme_sched_t* sched, nvme::nvme_allocator* alloc,
-                      const pump::scheduler::nvme::ssd<nvme::sider_page>* ssd) {
-            nvme_sched_ = sched;
-            nvme_alloc_ = alloc;
-            ssd_info_ = ssd;
+        void add_nvme_disk(nvme_sched_t* sched, nvme::nvme_allocator* alloc,
+                           nvme_ssd_info_t ssd) {
+            disks_.push_back({sched, alloc, ssd});
+        }
+
+        bool has_nvme() const { return !disks_.empty(); }
+
+        nvme_sched_t* nvme_sched_for(uint8_t disk_id) {
+            return disks_[disk_id].scheduler;
+        }
+        nvme_ssd_info_t ssd_info_for(uint8_t disk_id) {
+            return disks_[disk_id].ssd_info;
         }
 
         bool advance();                // defined in scheduler_impl.hh

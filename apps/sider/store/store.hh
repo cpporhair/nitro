@@ -44,6 +44,7 @@ namespace sider::store {
         uint32_t version;
         uint64_t nvme_lba;
         uint32_t page_count;   // 1 for slab, >1 for large values
+        uint8_t  disk_id;      // which NVMe disk
     };
     struct nil_result {};
 
@@ -59,7 +60,8 @@ namespace sider::store {
         eviction_config evict_cfg_;
 
         // NVMe LBAs pending free — drained by scheduler after each advance.
-        std::vector<uint64_t> pending_nvme_frees_;
+        struct pending_free { uint8_t disk_id; uint64_t lba; };
+        std::vector<pending_free> pending_nvme_frees_;
 
         // Large value tracking.
         uint64_t large_memory_bytes_ = 0;
@@ -81,7 +83,7 @@ namespace sider::store {
             if (pe.state == page_entry::ON_NVME)
                 return cold_result{e->page_id, e->slot_index, pe.size_class,
                                    e->value_len, e->version, pe.nvme_lba,
-                                   pe.page_count};
+                                   pe.page_count, pe.disk_id};
 
             // IN_MEMORY or EVICTING: page is in RAM, read directly.
             pe.hotness = ++access_clock_;
@@ -446,7 +448,7 @@ namespace sider::store {
             pe.live_count--;
             if (pe.live_count == 0) {
                 for (uint32_t i = 0; i < pe.page_count; i++)
-                    pending_nvme_frees_.push_back(pe.nvme_lba + i);
+                    pending_nvme_frees_.push_back({pe.disk_id, pe.nvme_lba + i});
                 pt.free_page_id(page_id);
             }
         }

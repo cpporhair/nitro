@@ -16,6 +16,7 @@ namespace sider::store {
         char*     mem_ptr = nullptr;
         uint64_t  slot_bitmap = 0;   // 1 = occupied, 0 = free
         uint64_t  nvme_lba = 0;      // valid when ON_NVME (page position on disk)
+        uint8_t   disk_id = 0;      // which NVMe disk (valid when ON_NVME)
     };
 
     struct page_table {

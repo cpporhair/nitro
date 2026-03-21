@@ -17,21 +17,24 @@
 
 namespace sider::nvme {
 
-    // ── Global state ──
+    // ── Types ──
 
     using nvme_ssd_t = pump::scheduler::nvme::ssd<sider_page>;
     using nvme_qpair_t = pump::scheduler::nvme::qpair<sider_page>;
     using nvme_scheduler_t = pump::scheduler::nvme::scheduler<sider_page>;
 
-    inline nvme_ssd_t* ssd_dev = nullptr;
-    inline nvme_qpair_t* qp = nullptr;
-    inline nvme_scheduler_t* scheduler = nullptr;
+    struct nvme_device {
+        nvme_ssd_t* ssd = nullptr;
+        nvme_qpair_t* qp = nullptr;
+        nvme_scheduler_t* scheduler = nullptr;
+        uint64_t disk_pages = 0;
+    };
+
+    // ── Global shared state ──
+
     inline spdk_mempool* page_pool = nullptr;
 
-    // PCI address of the device to use (set from --nvme arg).
-    inline std::string nvme_pci_addr;
-
-    // ── DMA pool functions (set as alloc/free after init) ──
+    // ── DMA pool functions ──
 
     inline char* dma_alloc_page() {
         auto* p = spdk_mempool_get(page_pool);
@@ -47,7 +50,6 @@ namespace sider::nvme {
             std::free(ptr);
     }
 
-    // Large value DMA allocation (contiguous, not from pool).
     inline char* dma_alloc_large(uint32_t size) {
         auto* p = spdk_dma_zmalloc(size, 4096, nullptr);
         if (!p) [[unlikely]]
@@ -102,22 +104,17 @@ namespace sider::nvme {
         ctx->found = true;
     }
 
-    // ── Init sequence ──
+    // ── Init SPDK environment + DMA pool (call once) ──
 
-    // Call once at startup, before creating store_scheduler.
-    // pci_addr: e.g. "0000:02:00.0"
-    // dma_pool_pages: number of 4KB pages in the DMA pool
-    inline void init(const char* pci_addr, uint64_t dma_pool_pages) {
-        // 1. SPDK environment
+    inline void init_env(uint64_t dma_pool_pages) {
         spdk_env_opts opts;
         spdk_env_opts_init(&opts);
         opts.name = "sider";
-        opts.core_mask = "0x1";  // single core
+        opts.core_mask = "0x1";
 
         if (spdk_env_init(&opts) < 0)
             throw std::runtime_error("spdk_env_init failed");
 
-        // 2. DMA page pool
         page_pool = spdk_mempool_create("sider_pages",
             dma_pool_pages, 4096,
             SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
@@ -131,10 +128,16 @@ namespace sider::nvme {
         store::_large_alloc::alloc_fn = dma_alloc_large;
         store::_large_alloc::free_fn = dma_free_large;
 
-        // 3. Probe NVMe device
-        ssd_dev = new nvme_ssd_t{};
+        printf("DMA pool: %lu pages (%luMB)\n",
+               dma_pool_pages, dma_pool_pages * 4096 / (1024*1024));
+    }
 
-        probe_ctx pctx{pci_addr, ssd_dev, false};
+    // ── Init one NVMe device ──
+
+    inline nvme_device init_device(const char* pci_addr) {
+        auto* ssd = new nvme_ssd_t{};
+
+        probe_ctx pctx{pci_addr, ssd, false};
 
         spdk_nvme_transport_id trid{};
         spdk_nvme_trid_populate_transport(&trid, SPDK_NVME_TRANSPORT_PCIE);
@@ -147,44 +150,42 @@ namespace sider::nvme {
             throw std::runtime_error("NVMe device not found");
         }
 
-        uint64_t disk_bytes = static_cast<uint64_t>(ssd_dev->max_sector) * ssd_dev->sector_size;
+        uint64_t disk_bytes = static_cast<uint64_t>(ssd->max_sector) * ssd->sector_size;
         uint64_t disk_pages = disk_bytes / 4096;
         printf("NVMe %s: %lu sectors × %u bytes = %luMB (%lu pages)\n",
-               pci_addr, ssd_dev->max_sector, ssd_dev->sector_size,
+               pci_addr, ssd->max_sector, ssd->sector_size,
                disk_bytes / (1024*1024), disk_pages);
 
-        // 4. Create qpair
+        // Create qpair
         spdk_nvme_io_qpair_opts qp_opts{};
         spdk_nvme_ctrlr_get_default_io_qpair_opts(
-            ssd_dev->ctrlr, &qp_opts, sizeof(qp_opts));
+            ssd->ctrlr, &qp_opts, sizeof(qp_opts));
         qp_opts.delay_cmd_submit = false;
         qp_opts.create_only = false;
 
         auto* raw_qp = spdk_nvme_ctrlr_alloc_io_qpair(
-            ssd_dev->ctrlr, &qp_opts, sizeof(qp_opts));
+            ssd->ctrlr, &qp_opts, sizeof(qp_opts));
         if (!raw_qp)
             throw std::runtime_error("spdk_nvme_ctrlr_alloc_io_qpair failed");
 
-        qp = new nvme_qpair_t{raw_qp, 0, 128, 0, ssd_dev};
+        auto* qp = new nvme_qpair_t{raw_qp, 0, 128, 0, ssd};
 
-        // 5. Create NVMe scheduler (large queue for burst cold reads)
-        scheduler = new nvme_scheduler_t(qp, 65536, 16384);
+        // Create NVMe scheduler
+        auto* scheduler = new nvme_scheduler_t(qp, 65536, 16384);
 
-        // 6. Deallocate (TRIM) the entire disk — tells SSD all blocks are free,
-        //    reduces write amplification and stabilizes write latency.
-        //    Sider doesn't persist data, so on every startup the disk is blank.
-        {   // Always try TRIM — non-fatal if unsupported.
+        // TRIM — tells SSD all blocks are free, reduces write amplification.
+        {
             struct trim_ctx { bool done = false; int status = 0; };
             trim_ctx tc;
 
-            uint64_t total_sectors = ssd_dev->max_sector;
+            uint64_t total_sectors = ssd->max_sector;
             spdk_nvme_dsm_range range{};
             range.starting_lba = 0;
             range.length = static_cast<uint32_t>(
                 std::min(total_sectors, static_cast<uint64_t>(UINT32_MAX)));
 
             spdk_nvme_ns_cmd_dataset_management(
-                ssd_dev->ns, raw_qp,
+                ssd->ns, raw_qp,
                 SPDK_NVME_DSM_ATTR_DEALLOCATE,
                 &range, 1,
                 [](void* arg, const spdk_nvme_cpl* cpl) {
@@ -198,17 +199,13 @@ namespace sider::nvme {
                 spdk_nvme_qpair_process_completions(raw_qp, 0);
 
             if (tc.status == 0)
-                printf("NVMe TRIM: deallocated %lu sectors\n",
-                       static_cast<unsigned long>(range.length));
+                printf("NVMe %s TRIM: deallocated %lu sectors\n",
+                       pci_addr, static_cast<unsigned long>(range.length));
             else
-                printf("NVMe TRIM: failed (non-fatal, continuing)\n");
+                printf("NVMe %s TRIM: failed (non-fatal)\n", pci_addr);
         }
-    }
 
-    inline uint64_t disk_page_count() {
-        if (!ssd_dev || !ssd_dev->ns) return 0;
-        uint64_t disk_bytes = static_cast<uint64_t>(ssd_dev->max_sector) * ssd_dev->sector_size;
-        return disk_bytes / 4096;
+        return {ssd, qp, scheduler, disk_pages};
     }
 
 } // namespace sider::nvme

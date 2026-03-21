@@ -7,8 +7,15 @@
 #include "pump/core/compute_sender_type.hh"
 #include "pump/core/op_tuple_builder.hh"
 #include "pump/core/lock_free_queue.hh"
+#include "pump/core/context.hh"
+#include "pump/sender/just.hh"
+#include "pump/sender/then.hh"
+#include "pump/sender/submit.hh"
 
 #include "store/store.hh"
+#include "nvme/page.hh"
+#include "nvme/allocator.hh"
+#include "env/scheduler/nvme/scheduler.hh"
 
 namespace sider::store {
 
@@ -22,8 +29,6 @@ namespace sider::store {
     namespace _store_ops {
 
         // ── lookup: key → get_result ──
-        // Phase 1: key pointer borrowed from caller (frame in context keeps it alive).
-        // Phase 2: will need owned copy for cross-core routing.
 
         template<typename sched_t>
         struct lookup_op {
@@ -137,15 +142,18 @@ namespace sider::store {
     } // namespace _store_ops
 
     // ── store_scheduler ──
-    //
-    // Phase 1: local::queue (single-core, same thread).
-    //   Key/value pointers borrow from caller (net_frame in context).
-    // Phase 2: switch to per_core::queue, will need owned data transfer.
 
     struct store_scheduler {
         kv_store store;
         pump::core::local::queue<store_req*> req_q{4096};
         int advance_count_ = 0;
+
+        // NVMe eviction support (nullptr = no NVMe, discard-only).
+        using nvme_sched_t = pump::scheduler::nvme::scheduler<nvme::sider_page>;
+        nvme_sched_t*      nvme_sched_ = nullptr;
+        nvme::nvme_allocator* nvme_alloc_ = nullptr;
+        const pump::scheduler::nvme::ssd<nvme::sider_page>* ssd_info_ = nullptr;
+        uint32_t           in_flight_evictions_ = 0;
 
         void schedule(store_req* r) { req_q.try_enqueue(r); }
 
@@ -154,44 +162,15 @@ namespace sider::store {
             store.evict_cfg_ = {memory_limit, begin_pct, urgent_pct};
         }
 
-        bool advance() {
-            bool progress = false;
-            store_req* r;
-            while (req_q.try_dequeue(r)) {
-                r->fn(store);
-                delete r;
-                progress = true;
-            }
-
-            // Active expiry: sample every 64 advance() calls.
-            if (++advance_count_ >= 64) {
-                advance_count_ = 0;
-                store.expire_scan(20);
-            }
-
-            // Eviction: water-level based.
-            auto& cfg = store.evict_cfg_;
-            if (cfg.memory_limit > 0) {
-                auto used = store.memory_used_bytes();
-                if (used >= cfg.max_bytes()) {
-                    // At hard limit: aggressive eviction until below urgent.
-                    while (store.memory_used_bytes() >= cfg.urgent_bytes()) {
-                        if (store.evict_one_page() == 0) break;
-                    }
-                } else if (used >= cfg.urgent_bytes()) {
-                    // High water: evict several pages per advance.
-                    for (int i = 0; i < 8; i++) {
-                        if (store.memory_used_bytes() < cfg.begin_bytes()) break;
-                        if (store.evict_one_page() == 0) break;
-                    }
-                } else if (used >= cfg.begin_bytes() && !progress) {
-                    // Low water + idle: evict one page.
-                    store.evict_one_page();
-                }
-            }
-
-            return progress;
+        void set_nvme(nvme_sched_t* sched, nvme::nvme_allocator* alloc,
+                      const pump::scheduler::nvme::ssd<nvme::sider_page>* ssd) {
+            nvme_sched_ = sched;
+            nvme_alloc_ = alloc;
+            ssd_info_ = ssd;
         }
+
+        bool advance();            // defined in scheduler_impl.hh
+        bool try_start_eviction(); // defined in scheduler_impl.hh
 
         auto lookup(const char* key, uint16_t key_len) {
             return _store_ops::lookup_sender<store_scheduler>{this, key, key_len};
@@ -218,7 +197,6 @@ namespace sider::store {
 
 namespace pump::core {
 
-    // Single op_pusher for all store ops (shared store_op tag).
     template<uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
         && (get_current_op_type_t<pos, scope_t>::store_op)

@@ -42,29 +42,39 @@ namespace sider::store {
         uint32_t       rng_state_ = 12345;
         eviction_config evict_cfg_;
 
+        // NVMe LBAs pending free — drained by scheduler after each advance.
+        std::vector<uint64_t> pending_nvme_frees_;
+
         get_result get(const char* key, uint16_t key_len) {
             auto* e = ht.lookup(key, key_len);
             if (!e) return {};
 
             // Lazy expiry.
             if (e->expire_at >= 0 && now_ms() >= e->expire_at) {
-                slab.free_slot(e->page_id, e->slot_index);
+                free_entry_slot(e);
                 ht.erase(key, key_len);
                 return {};
             }
 
-            pt[e->page_id].hotness = ++access_clock_;
+            auto& pe = pt[e->page_id];
+
+            // ON_NVME: cold key — Phase 1.7 will implement cold read.
+            if (pe.state == page_entry::ON_NVME)
+                return {};
+
+            // IN_MEMORY or EVICTING: page is in RAM, read directly.
+            pe.hotness = ++access_clock_;
             return {slab.slot_ptr(e->page_id, e->slot_index), e->value_len};
         }
 
         void set(const char* key, uint16_t key_len,
                  const char* value, uint16_t value_len,
                  int64_t expire_at = -1) {
-            // Sync eviction at hard limit.
+            // Sync eviction at hard limit — discard only (no NVMe from here).
             if (evict_cfg_.memory_limit > 0 &&
                 memory_used_bytes() >= evict_cfg_.max_bytes()) {
                 while (memory_used_bytes() >= evict_cfg_.urgent_bytes()) {
-                    if (evict_one_page() == 0) break;
+                    if (discard_one_page() == 0) break;
                 }
             }
 
@@ -72,11 +82,31 @@ namespace sider::store {
             auto* e = ht.lookup(key, key_len);
 
             if (e) {
-                auto old_sc = static_cast<size_class_t>(pt[e->page_id].size_class);
+                auto& old_pe = pt[e->page_id];
 
-                if (old_sc == new_sc) {
+                if (old_pe.state == page_entry::ON_NVME) {
+                    // Key is on NVMe — allocate fresh hot slot.
+                    uint32_t old_page_id = e->page_id;
+                    auto ar = slab.allocate(new_sc);
+                    std::memcpy(ar.slot_ptr, value, value_len);
+                    e->page_id    = ar.page_id;
+                    e->slot_index = ar.slot_index;
+                    e->value_len  = value_len;
+                    e->expire_at  = expire_at;
+                    e->version++;
+                    pt[e->page_id].hotness = ++access_clock_;
+                    nvme_page_dec_live(old_page_id);
+                    return;
+                }
+
+                // IN_MEMORY or EVICTING: page is in RAM.
+                auto old_sc = static_cast<size_class_t>(old_pe.size_class);
+
+                if (old_sc == new_sc && old_pe.state == page_entry::IN_MEMORY) {
+                    // Same size class, non-evicting: overwrite in place.
                     std::memcpy(slab.slot_ptr(e->page_id, e->slot_index), value, value_len);
                 } else {
+                    // Different size class, or EVICTING: migrate to new page.
                     slab.free_slot(e->page_id, e->slot_index);
                     auto ar = slab.allocate(new_sc);
                     std::memcpy(ar.slot_ptr, value, value_len);
@@ -107,12 +137,12 @@ namespace sider::store {
 
             // Lazy expiry on del: expired key counts as not found.
             if (e->expire_at >= 0 && now_ms() >= e->expire_at) {
-                slab.free_slot(e->page_id, e->slot_index);
+                free_entry_slot(e);
                 ht.erase(key, key_len);
                 return 0;
             }
 
-            slab.free_slot(e->page_id, e->slot_index);
+            free_entry_slot(e);
             ht.erase(key, key_len);
             return 1;
         }
@@ -130,7 +160,7 @@ namespace sider::store {
                 scan_cursor_++;
                 if (!e) continue;
                 if (e->expire_at >= 0 && ts >= e->expire_at) {
-                    slab.free_slot(e->page_id, e->slot_index);
+                    free_entry_slot(e);
                     ht.erase(e->key_data, e->key_len);
                     expired++;
                 }
@@ -170,39 +200,112 @@ namespace sider::store {
             return best_id;
         }
 
-        // Evict the coldest sampled page: remove all its entries, free page.
-        // Returns number of entries evicted, or 0 if nothing to evict.
-        int evict_one_page() {
+        // Discard a page: erase all entries, free memory. No NVMe.
+        // Used as fallback when NVMe is full or for sync eviction at hard limit.
+        int discard_one_page() {
             uint32_t victim = sample_coldest_page();
             if (victim == UINT32_MAX) return 0;
 
-            // Collect keys on this page (copies, since erase invalidates pointers).
+            discard_page_entries(victim);
+            slab.evict_page(victim);
+            return 1;
+        }
+
+        // Mark a page for async NVMe eviction.
+        // Returns the victim page_id, or UINT32_MAX if nothing to evict.
+        uint32_t begin_eviction() {
+            uint32_t victim = sample_coldest_page();
+            if (victim == UINT32_MAX) return UINT32_MAX;
+
+            auto& pe = pt[victim];
+            pe.state = page_entry::EVICTING;
+
+            // Remove from slab partials — no new allocations on this page.
+            auto sc = static_cast<size_class_t>(pe.size_class);
+            auto& partials = slab.partial_pages_[sc];
+            for (size_t i = 0; i < partials.size(); i++) {
+                if (partials[i] == victim) {
+                    partials[i] = partials.back();
+                    partials.pop_back();
+                    break;
+                }
+            }
+
+            return victim;
+        }
+
+        // Called when NVMe write completes (success or failure).
+        // Returns true if the NVMe LBA should be freed (write useless).
+        bool complete_eviction(uint32_t page_id, bool success) {
+            auto& pe = pt[page_id];
+
+            if (pe.state != page_entry::EVICTING) {
+                return true;  // shouldn't happen — free LBA to be safe
+            }
+
+            if (pe.live_count == 0) {
+                // All entries were deleted during the write.
+                slab.release_page_memory(page_id);
+                pt.free_page_id(page_id);
+                return true;  // NVMe LBA is useless
+            }
+
+            if (!success) {
+                // Write failed — revert to IN_MEMORY.
+                pe.state = page_entry::IN_MEMORY;
+                return true;  // NVMe LBA was never valid
+            }
+
+            // Success — transition to ON_NVME, release memory.
+            pe.state = page_entry::ON_NVME;
+            slab.release_page_memory(page_id);
+            return false;  // NVMe LBA is in use
+        }
+
+        uint64_t memory_used_bytes() const { return slab.memory_used_bytes(); }
+        uint32_t key_count()         const { return ht.count(); }
+
+    private:
+        // Free the slot for an entry, handling ON_NVME pages.
+        void free_entry_slot(entry* e) {
+            auto& pe = pt[e->page_id];
+            if (pe.state == page_entry::ON_NVME) {
+                nvme_page_dec_live(e->page_id);
+            } else {
+                slab.free_slot(e->page_id, e->slot_index);
+            }
+        }
+
+        // Decrement live_count on an ON_NVME page.
+        // If zero, queue NVMe LBA for freeing and release page_id.
+        void nvme_page_dec_live(uint32_t page_id) {
+            auto& pe = pt[page_id];
+            pe.live_count--;
+            if (pe.live_count == 0) {
+                pending_nvme_frees_.push_back(pe.nvme_lba);
+                pt.free_page_id(page_id);
+            }
+        }
+
+        // Erase all hash table entries pointing to a page.
+        void discard_page_entries(uint32_t page_id) {
             struct key_copy { char* data; uint16_t len; };
             std::vector<key_copy> keys;
 
             auto cap = ht.capacity();
             for (uint32_t i = 0; i < cap; i++) {
                 auto* e = ht.entry_at(i);
-                if (!e || e->page_id != victim) continue;
+                if (!e || e->page_id != page_id) continue;
                 auto* kd = new char[e->key_len];
                 std::memcpy(kd, e->key_data, e->key_len);
                 keys.push_back({kd, e->key_len});
             }
 
-            // Erase all entries from hash table.
             for (auto& k : keys) {
                 ht.erase(k.data, k.len);
                 delete[] k.data;
             }
-
-            // Free the entire page.
-            slab.evict_page(victim);
-
-            return static_cast<int>(keys.size());
         }
-
-        uint64_t memory_used_bytes() const { return slab.memory_used_bytes(); }
-        uint32_t key_count()         const { return ht.count(); }
     };
 
 } // namespace sider::store

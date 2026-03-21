@@ -48,14 +48,22 @@ namespace sider::store {
         return static_cast<uint32_t>(slot_index) * size_class_bytes[sc];
     }
 
-    // Allocate a 4KB-aligned page.
-    // Phase 1.2: aligned_alloc. Later phases: spdk_dma_malloc for DMA safety.
+    // Pluggable page allocator.
+    // Default: aligned_alloc/free (used by tests without SPDK).
+    // main.cc sets these to DMA versions after SPDK init.
+    namespace _page_alloc {
+        inline char* (*alloc_fn)() = nullptr;
+        inline void (*free_fn)(char*) = nullptr;
+    }
+
     static inline char* alloc_page() {
+        if (_page_alloc::alloc_fn) return _page_alloc::alloc_fn();
         return static_cast<char*>(std::aligned_alloc(PAGE_SIZE, PAGE_SIZE));
     }
 
     static inline void free_page(char* ptr) {
-        std::free(ptr);
+        if (_page_alloc::free_fn) _page_alloc::free_fn(ptr);
+        else std::free(ptr);
     }
 
 } // namespace sider::store

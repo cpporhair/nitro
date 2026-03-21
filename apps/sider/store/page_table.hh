@@ -6,7 +6,7 @@
 namespace sider::store {
 
     struct page_entry {
-        enum state_t : uint8_t { FREE = 0, IN_MEMORY, ON_NVME };
+        enum state_t : uint8_t { FREE = 0, IN_MEMORY, EVICTING, ON_NVME };
 
         state_t   state = FREE;
         uint8_t   size_class = 0;
@@ -14,6 +14,7 @@ namespace sider::store {
         uint32_t  hotness = 0;
         char*     mem_ptr = nullptr;
         uint64_t  slot_bitmap = 0;   // 1 = occupied, 0 = free
+        uint64_t  nvme_lba = 0;      // valid when ON_NVME (page position on disk)
     };
 
     struct page_table {

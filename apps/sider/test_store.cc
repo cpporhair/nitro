@@ -580,7 +580,7 @@ static void test_store_expire_scan_keeps_live() {
 
 // ── eviction ──
 
-static void test_store_evict_one_page() {
+static void test_store_discard_one_page() {
     kv_store s;
     // Insert 200 keys (SC_64: 64 slots/page → ~4 pages).
     for (int i = 0; i < 200; i++) {
@@ -592,7 +592,7 @@ static void test_store_evict_one_page() {
     assert(before_count == 200);
     assert(before_mem > 0);
 
-    int evicted = s.evict_one_page();
+    int evicted = s.discard_one_page();
     assert(evicted > 0);
     assert(s.key_count() < before_count);
     assert(s.memory_used_bytes() < before_mem);
@@ -612,7 +612,7 @@ static void test_store_evict_returns_nil() {
     s.set("only", 4, "v", 1);
     assert(s.key_count() == 1);
 
-    s.evict_one_page();
+    s.discard_one_page();
     assert(!s.get("only", 4).found());
     assert(s.key_count() == 0);
     assert(s.memory_used_bytes() == 0);
@@ -640,7 +640,7 @@ static void test_store_evict_preserves_hot_keys() {
 
     // Evict 5 pages — should target cold pages (4-12).
     for (int i = 0; i < 5; i++)
-        s.evict_one_page();
+        s.discard_one_page();
 
     // All 50 hot keys should survive (5 cold pages evicted from 9 cold pages).
     int hot_found = 0;
@@ -691,7 +691,7 @@ static void test_store_evict_memory_stable() {
 static void test_store_evict_no_pages() {
     kv_store s;
     // Nothing to evict.
-    assert(s.evict_one_page() == 0);
+    assert(s.discard_one_page() == 0);
 }
 
 // ── main ──
@@ -748,7 +748,7 @@ int main() {
 
     printf("eviction:\n");
     RUN(test_store_evict_no_pages);
-    RUN(test_store_evict_one_page);
+    RUN(test_store_discard_one_page);
     RUN(test_store_evict_returns_nil);
     RUN(test_store_evict_preserves_hot_keys);
     RUN(test_store_evict_sync_on_max);

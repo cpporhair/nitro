@@ -77,18 +77,27 @@ namespace sider::store {
             pe.live_count--;
 
             if (pe.live_count == 0) {
+                if (pe.state == page_entry::EVICTING) {
+                    // DMA in progress — can't free memory yet.
+                    // Remove from partials; eviction callback handles cleanup.
+                    if (!was_full)
+                        remove_from_partials(sc, page_id);
+                    return;
+                }
+
                 // Page empty — reclaim.
                 free_page(pe.mem_ptr);
                 total_pages_--;
 
-                // Remove from partial list if it was there (wasn't full before).
                 if (!was_full)
                     remove_from_partials(sc, page_id);
 
                 pt_.free_page_id(page_id);
             } else if (was_full) {
                 // Was full, now has space — add to partials.
-                partial_pages_[sc].push_back(page_id);
+                // But NOT for EVICTING pages (no new allocations on them).
+                if (pe.state != page_entry::EVICTING)
+                    partial_pages_[sc].push_back(page_id);
             }
         }
 
@@ -113,6 +122,19 @@ namespace sider::store {
 
         uint64_t memory_used_bytes() const {
             return static_cast<uint64_t>(total_pages_) * PAGE_SIZE;
+        }
+
+        // Free an entire page's memory without touching bitmap/live_count.
+        // Used by eviction completion callback.
+        void release_page_memory(uint32_t page_id) {
+            auto& pe = pt_[page_id];
+            auto sc = static_cast<size_class_t>(pe.size_class);
+            remove_from_partials(sc, page_id);
+            if (pe.mem_ptr) {
+                free_page(pe.mem_ptr);
+                pe.mem_ptr = nullptr;
+            }
+            total_pages_--;
         }
 
     private:

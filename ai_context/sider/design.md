@@ -170,7 +170,60 @@ bitmap: [1][1][1][0][0]...    ← 1=占用, 0=空闲
 - 释放：bitmap 置 0 → O(1)
 - 同一页内 slot 大小相同，无外部碎片
 - 内部浪费平均 ~25%（远优于 per-value 占整页的 97%）
-- 页从 DMA 安全内存池分配（spdk_dma_malloc），可直接 DMA 到 NVMe
+- 页从 DMA 内存池分配（见 3.1.1），可直接 DMA 到 NVMe
+
+### 3.1.1 DMA 内存池
+
+所有 slab 页必须是 DMA 安全内存（SPDK NVMe DMA 要求）。
+
+**为什么不能按需分配**：`spdk_dma_malloc` 每次调用需要 hugepage 映射 + IOMMU 注册，单次开销数十微秒，远高于一次 GET/SET 的 3μs。如果每分配一个 4KB 页都调一次，性能不可接受。
+
+**为什么不自建内存池**：可以用 `spdk_dma_malloc` 一次性分配大块内存，然后自己用 `mpmc::queue` + per-core 本地缓存管理 4KB 页的分配/释放。但 DPDK 的 `rte_mempool`（通过 `spdk_mempool` 封装）已经精确实现了这套机制——hugepage 预分配 + per-lcore 本地缓存 + lock-free 全局 ring。没必要重复造轮子。
+
+**为什么能用 `spdk_mempool`**：`spdk_mempool` 的 per-core cache 依赖 DPDK 的 `rte_lcore_id()` 识别当前线程。如果用普通 `std::thread`，DPDK 不认识这些线程，per-core cache 不生效，每次 `get`/`put` 都走全局 CAS，失去本地缓存的性能优势。因此框架的 `share_nothing.hh` 已扩展支持注入线程启动方式——通过 DPDK launcher 启动 lcore 线程，使 `rte_lcore_id()` 正确返回核心编号，`spdk_mempool` 的 per-core cache 即可正常工作。
+
+**架构**：
+
+```
+┌───────────────────────────────────┐
+│  spdk_mempool("sider_pages")      │
+│                                   │
+│  ┌─────────────────────────────┐  │
+│  │  全局 lock-free ring         │  │
+│  │  (hugepage DMA 内存)         │  │
+│  └──────────┬──────────────────┘  │
+│        批量补充/归还                │
+│  ┌──────┐ ┌──────┐ ┌──────┐     │
+│  │ LC 0 │ │ LC 1 │ │ LC 2 │ ... │
+│  │per   │ │per   │ │per   │     │
+│  │lcore │ │lcore │ │lcore │     │
+│  └──────┘ └──────┘ └──────┘     │
+└───────────────────────────────────┘
+```
+
+```cpp
+// 启动时创建
+auto* pool = spdk_mempool_create("sider_pages",
+    total_pages, PAGE_SIZE,
+    SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,  // per-lcore 本地缓存（默认 256）
+    SPDK_ENV_NUMA_ID_ANY);
+
+// types.hh 替换两个函数，上层零改动
+char* alloc_page() {
+    return static_cast<char*>(spdk_mempool_get(pool));
+}
+void free_page(char* ptr) {
+    spdk_mempool_put(pool, ptr);
+}
+```
+
+| 项目 | 说明 |
+|------|------|
+| 内存来源 | `spdk_mempool_create` 从 hugepage 一次性预分配，运行期零系统调用 |
+| per-lcore cache | DPDK `rte_mempool` 内置，`get`/`put` 优先走本地缓存，O(1) 无竞争 |
+| 多核均衡 | 本地缓存空/满时自动批量从全局 ring 补充/归还，内存自然流向需求大的核心 |
+| 线程要求 | 通过框架 `share_nothing.hh` 的 DPDK launcher 启动 lcore 线程 |
+| 上层透明 | `slab_allocator` 只调 `alloc_page()`/`free_page()`，无需感知底层 |
 
 ### 3.2 Page Table
 

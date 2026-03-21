@@ -94,9 +94,21 @@
 
 ---
 
-### Phase 1.6：NVMe 淘汰写入
+### Phase 1.6：NVMe 淘汰写入 + DMA 内存池
 
-**目标**：淘汰不再丢弃，而是写入 NVMe 保留
+**目标**：淘汰不再丢弃，而是写入 NVMe 保留；slab 页切换为 DMA 安全内存
+
+#### 1.6a：DMA 内存池 + DPDK lcore 线程
+
+将 slab 页从 `aligned_alloc` 切换为 `spdk_mempool`（DPDK `rte_mempool`）。
+
+- SPDK 环境初始化（`spdk_env_init`，配置核心掩码）
+- 通过框架 `share_nothing.hh` 的 DPDK launcher 启动 lcore 线程（per-core cache 依赖 `rte_lcore_id()`）
+- `spdk_mempool_create` 创建页池（hugepage DMA 内存 + per-lcore 本地缓存）
+- `types.hh` 替换 `alloc_page()`/`free_page()` → `spdk_mempool_get`/`put`，上层零改动
+- Phase 1.6 单核运行验证，但逻辑上完整支持多核
+
+#### 1.6b：NVMe 淘汰写入
 
 - NVMe scheduler 初始化（SPDK probe + qpair）
 - NVMe 空间分配器（free page 栈，O(1)）
@@ -109,10 +121,12 @@
   - DEL 命中 EVICTING 页上的 key → 正常删除，live_count--
 
 **验收**：
+- DMA 池分配/释放正确，`spdk_mempool_get`/`put` 正常工作
 - 设置 `--memory 10M`，持续写入 > 10M 数据 → 淘汰的页写到 NVMe
 - NVMe 使用量随淘汰增长
 - EVICTING 期间 GET/SET/DEL 正确（手动控制时序或高并发压测）
 - 此阶段 GET 已淘汰 key → 返回 nil（冷读尚未实现）
+- Phase 2 多核时 DMA 池和 lcore 线程零改动可用
 
 ---
 

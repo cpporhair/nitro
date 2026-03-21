@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 project(nitro)
 
 set(CMAKE_CXX_STANDARD 26)
-add_compile_options(-Wno-interference-size -march=native)
+add_compile_options(-Wno-interference-size -march=native -flto)
+add_link_options(-flto)
 
 # pump framework
 include_directories(pump/src)

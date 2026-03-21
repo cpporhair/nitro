@@ -14,8 +14,8 @@ namespace sider {
     struct config {
         uint16_t port = 6379;
         uint64_t memory_bytes = 0;      // 0 = no eviction
-        int      evict_begin = 60;      // %
-        int      evict_urgent = 90;     // %
+        int      evict_begin = 90;      // %
+        int      evict_urgent = 95;     // %
         uint64_t dma_pages = 8192;
         uint32_t accept_core = 0;
         std::vector<std::string> nvme;  // PCIe addresses

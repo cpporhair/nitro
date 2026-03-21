@@ -83,15 +83,17 @@ namespace sider::resp {
     } // namespace detail
 
     static inline parsed_command
-    parse_command(const pump::scheduler::net::net_frame& frame) {
-        auto* data = frame.data();
-        auto len = frame.size();
+    parse_command(const char* data, size_t len) {
         if (len == 0) return {};
-
         if (data[0] == '*')
             return detail::parse_multibulk(data, len);
         else
             return detail::parse_inline(data, len);
+    }
+
+    static inline parsed_command
+    parse_command(const pump::scheduler::net::net_frame& frame) {
+        return parse_command(frame.data(), frame.size());
     }
 
     static inline bool

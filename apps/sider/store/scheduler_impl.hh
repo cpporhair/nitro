@@ -98,7 +98,8 @@ namespace sider::store {
         pe.nvme_lba = lba;
         pe.disk_id = disk_id;
 
-        auto* page = new nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, PAGE_SIZE};
+        auto* page = nvme::page_obj_pool.get();
+        *page = nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, PAGE_SIZE};
         in_flight_eviction_bytes_ += PAGE_SIZE;
 
         disk.scheduler->put(page)
@@ -109,7 +110,7 @@ namespace sider::store {
                     if (free_lba)
                         disks_[disk_id].allocator->free(page->lba);
                     in_flight_eviction_bytes_ -= PAGE_SIZE;
-                    delete page;
+                    nvme::page_obj_pool.put(page);
                 })
             >> pump::sender::submit(pump::core::make_root_context());
 
@@ -156,7 +157,8 @@ namespace sider::store {
         pe.disk_id = disk_id;
 
         auto& disk = disks_[disk_id];
-        auto* page = new nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, evict_bytes};
+        auto* page = nvme::page_obj_pool.get();
+        *page = nvme::sider_page{lba, pe.mem_ptr, disk.ssd_info, evict_bytes};
         in_flight_eviction_bytes_ += evict_bytes;
 
         disk.scheduler->put(page)
@@ -167,7 +169,7 @@ namespace sider::store {
                     if (free_lba)
                         disks_[disk_id].allocator->free_contiguous(page->lba, pc);
                     in_flight_eviction_bytes_ -= evict_bytes;
-                    delete page;
+                    nvme::page_obj_pool.put(page);
                 })
             >> pump::sender::submit(pump::core::make_root_context());
 

@@ -207,13 +207,13 @@ namespace pump::core {
         }
     };
 
-    // lookup → get_result
+    // lookup → lookup_result (variant<hot_result, cold_result, nil_result>)
     template<typename ctx_t, typename sched_t>
     struct compute_sender_type<ctx_t,
             sider::store::_store_ops::lookup_sender<sched_t>> {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
-            return std::type_identity<sider::store::get_result>{};
+            return std::type_identity<sider::store::lookup_result>{};
         }
     };
 

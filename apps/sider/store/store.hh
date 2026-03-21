@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <variant>
 #include <vector>
 
 #include "store/types.hh"
@@ -27,11 +28,25 @@ namespace sider::store {
         uint64_t max_bytes()    const { return memory_limit; }
     };
 
+    // Legacy helper for tests (no NVMe).
     struct get_result {
         const char* data = nullptr;
         uint16_t len = 0;
         bool found() const { return data != nullptr; }
     };
+
+    struct hot_result { const char* data; uint16_t len; };
+    struct cold_result {
+        uint32_t page_id;
+        uint8_t  slot_index;
+        uint8_t  size_class;
+        uint16_t value_len;
+        uint32_t version;
+        uint64_t nvme_lba;
+    };
+    struct nil_result {};
+
+    using lookup_result = std::variant<hot_result, cold_result, nil_result>;
 
     struct kv_store {
         page_table     pt;
@@ -45,26 +60,52 @@ namespace sider::store {
         // NVMe LBAs pending free — drained by scheduler after each advance.
         std::vector<uint64_t> pending_nvme_frees_;
 
-        get_result get(const char* key, uint16_t key_len) {
+        lookup_result get(const char* key, uint16_t key_len) {
             auto* e = ht.lookup(key, key_len);
-            if (!e) return {};
+            if (!e) return nil_result{};
 
             // Lazy expiry.
             if (e->expire_at >= 0 && now_ms() >= e->expire_at) {
                 free_entry_slot(e);
                 ht.erase(key, key_len);
-                return {};
+                return nil_result{};
             }
 
             auto& pe = pt[e->page_id];
 
-            // ON_NVME: cold key — Phase 1.7 will implement cold read.
             if (pe.state == page_entry::ON_NVME)
-                return {};
+                return cold_result{e->page_id, e->slot_index, pe.size_class,
+                                   e->value_len, e->version, pe.nvme_lba};
 
             // IN_MEMORY or EVICTING: page is in RAM, read directly.
             pe.hotness = ++access_clock_;
-            return {slab.slot_ptr(e->page_id, e->slot_index), e->value_len};
+            return hot_result{slab.slot_ptr(e->page_id, e->slot_index), e->value_len};
+        }
+
+        // Promote a cold key to hot after NVMe read. Best-effort: version mismatch → skip.
+        void promote(const char* key, uint16_t key_len, uint32_t version,
+                     const char* value, uint16_t value_len) {
+            auto* e = ht.lookup(key, key_len);
+            if (!e || e->version != version) return;
+
+            auto& pe = pt[e->page_id];
+            if (pe.state != page_entry::ON_NVME) return;
+
+            uint32_t old_page_id = e->page_id;
+            auto sc = size_class_for(value_len);
+            auto ar = slab.allocate(sc);
+            std::memcpy(ar.slot_ptr, value, value_len);
+            e->page_id    = ar.page_id;
+            e->slot_index = ar.slot_index;
+            pt[e->page_id].hotness = ++access_clock_;
+            nvme_page_dec_live(old_page_id);
+        }
+
+        // Test helper: extract hot/nil as legacy get_result.
+        static get_result as_get_result(const lookup_result& r) {
+            if (auto* h = std::get_if<hot_result>(&r))
+                return {h->data, h->len};
+            return {};
         }
 
         void set(const char* key, uint16_t key_len,

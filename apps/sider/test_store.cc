@@ -17,6 +17,9 @@ static int pass_count = 0;
 
 #define RUN(fn) do { printf("  %-55s", #fn); fn(); printf("OK\n"); pass_count++; } while(0)
 
+// Helper: extract hot/nil as legacy get_result (no NVMe in tests).
+static get_result G(const lookup_result& r) { return kv_store::as_get_result(r); }
+
 // ── types ──
 
 static void test_size_class_for() {
@@ -418,7 +421,7 @@ static void test_integrated_update_different_class() {
 static void test_store_set_get() {
     kv_store s;
     s.set("key", 3, "value", 5);
-    auto r = s.get("key", 3);
+    auto r = G(s.get("key", 3));
     assert(r.found());
     assert(r.len == 5);
     assert(std::memcmp(r.data, "value", 5) == 0);
@@ -426,7 +429,7 @@ static void test_store_set_get() {
 
 static void test_store_get_missing() {
     kv_store s;
-    assert(!s.get("nope", 4).found());
+    assert(!G(s.get("nope", 4)).found());
 }
 
 static void test_store_del() {
@@ -434,14 +437,14 @@ static void test_store_del() {
     s.set("k", 1, "v", 1);
     assert(s.del("k", 1) == 1);
     assert(s.del("k", 1) == 0);
-    assert(!s.get("k", 1).found());
+    assert(!G(s.get("k", 1)).found());
 }
 
 static void test_store_update_same_class() {
     kv_store s;
     s.set("k", 1, "aaa", 3);
     s.set("k", 1, "bbb", 3);
-    auto r = s.get("k", 1);
+    auto r = G(s.get("k", 1));
     assert(r.len == 3);
     assert(std::memcmp(r.data, "bbb", 3) == 0);
 }
@@ -454,7 +457,7 @@ static void test_store_update_different_class() {
     std::memset(big, 'X', 200);
     s.set("k", 1, big, 200);     // SC_256
 
-    auto r = s.get("k", 1);
+    auto r = G(s.get("k", 1));
     assert(r.found());
     assert(r.len == 200);
     assert(r.data[0] == 'X');
@@ -471,7 +474,7 @@ static void test_store_many_keys() {
     for (int i = 0; i < 1000; i++) {
         auto key = std::to_string(i);
         auto expected = "val_" + key;
-        auto r = s.get(key.c_str(), static_cast<uint16_t>(key.size()));
+        auto r = G(s.get(key.c_str(), static_cast<uint16_t>(key.size())));
         assert(r.found());
         assert(r.len == expected.size());
         assert(std::memcmp(r.data, expected.c_str(), r.len) == 0);
@@ -500,7 +503,7 @@ static void test_store_set_with_ttl_no_expiry_yet() {
     // expire_at far in the future — should still be found.
     int64_t future = now_ms() + 60000;
     s.set("k", 1, "v", 1, future);
-    auto r = s.get("k", 1);
+    auto r = G(s.get("k", 1));
     assert(r.found());
     assert(r.len == 1);
 }
@@ -510,7 +513,7 @@ static void test_store_get_lazy_expiry() {
     // Set with expire_at in the past → GET should return not found (lazy expiry).
     int64_t past = now_ms() - 1;
     s.set("k", 1, "v", 1, past);
-    auto r = s.get("k", 1);
+    auto r = G(s.get("k", 1));
     assert(!r.found());
     // Entry and slab slot should be cleaned up.
     assert(s.key_count() == 0);
@@ -531,7 +534,7 @@ static void test_store_set_updates_expire() {
     s.set("k", 1, "v", 1, past);
     // Overwrite with no expiry — should be alive.
     s.set("k", 1, "v2", 2, -1);
-    auto r = s.get("k", 1);
+    auto r = G(s.get("k", 1));
     assert(r.found());
     assert(r.len == 2);
 }
@@ -574,7 +577,7 @@ static void test_store_expire_scan_keeps_live() {
 
     assert(s.key_count() == 50);
     // Live keys are still accessible.
-    auto r = s.get("live_0", 6);
+    auto r = G(s.get("live_0", 6));
     assert(r.found());
 }
 
@@ -601,7 +604,7 @@ static void test_store_discard_one_page() {
     int missing = 0;
     for (int i = 0; i < 200; i++) {
         auto key = "k" + std::to_string(i);
-        if (!s.get(key.c_str(), static_cast<uint16_t>(key.size())).found())
+        if (!G(s.get(key.c_str(), static_cast<uint16_t>(key.size()))).found())
             missing++;
     }
     assert(missing == evicted);
@@ -613,7 +616,7 @@ static void test_store_evict_returns_nil() {
     assert(s.key_count() == 1);
 
     s.discard_one_page();
-    assert(!s.get("only", 4).found());
+    assert(!G(s.get("only", 4)).found());
     assert(s.key_count() == 0);
     assert(s.memory_used_bytes() == 0);
 }
@@ -634,7 +637,7 @@ static void test_store_evict_preserves_hot_keys() {
     for (int round = 0; round < 10; round++) {
         for (int i = 0; i < 50; i++) {
             auto key = "k" + std::to_string(i);
-            s.get(key.c_str(), static_cast<uint16_t>(key.size()));
+            G(s.get(key.c_str(), static_cast<uint16_t>(key.size())));
         }
     }
 
@@ -646,7 +649,7 @@ static void test_store_evict_preserves_hot_keys() {
     int hot_found = 0;
     for (int i = 0; i < 50; i++) {
         auto key = "k" + std::to_string(i);
-        if (s.get(key.c_str(), static_cast<uint16_t>(key.size())).found())
+        if (G(s.get(key.c_str(), static_cast<uint16_t>(key.size()))).found())
             hot_found++;
     }
     assert(hot_found >= 45);  // conservative margin for sampling randomness

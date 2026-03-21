@@ -22,6 +22,7 @@
 #include "resp/parser.hh"
 #include "resp/response.hh"
 #include "store/scheduler.hh"
+#include "env/scheduler/nvme/get_page.hh"
 
 namespace sider::server {
 
@@ -225,14 +226,48 @@ namespace sider::server {
     static inline auto
     exec_get(get_cmd&& action, conn_state<session_sched_t>* cs,
              store::store_scheduler* store_sched) {
-        return store_sched->lookup(
-                action.key.data(),
-                static_cast<uint16_t>(action.key.size()))
-            >> flat_map([cs](store::get_result r) {
-                if (r.found())
-                    return send_bulk_string_zero_copy(cs->session, r.data, r.len);
-                return send_bulk_string_zero_copy(cs->session, nullptr, 0);
-            });
+        auto key_data = action.key.data();
+        auto key_len  = static_cast<uint16_t>(action.key.size());
+
+        return store_sched->lookup(key_data, key_len)
+            >> visit()
+            >> then([cs, store_sched, key_data, key_len](auto&& result) {
+                using T = std::decay_t<decltype(result)>;
+                if constexpr (std::is_same_v<T, store::hot_result>) {
+                    return send_bulk_string_zero_copy(cs->session, result.data, result.len);
+                } else if constexpr (std::is_same_v<T, store::nil_result>) {
+                    return send_bulk_string_zero_copy(cs->session, nullptr, 0);
+                } else {
+                    // cold_result: NVMe read → extract value → promote → send.
+                    auto* read_buf = store::alloc_page();
+                    auto* page = new nvme::sider_page{
+                        result.nvme_lba, read_buf, store_sched->ssd_info_};
+
+                    return store_sched->nvme_sched_->get(page)
+                        >> flat_map([cs, store_sched, key_data, key_len,
+                                     result, page, read_buf]
+                                    (pump::scheduler::nvme::get::res<nvme::sider_page>&& res) {
+                            if (res.is_success()) {
+                                auto sc = static_cast<store::size_class_t>(result.size_class);
+                                char* val = read_buf + store::slot_offset(sc, result.slot_index);
+                                auto resp = resp::bulk_string(val, result.value_len);
+
+                                // Best-effort promote: copy to hot slot.
+                                store_sched->store.promote(
+                                    key_data, key_len, result.version,
+                                    val, result.value_len);
+
+                                store::free_page(read_buf);
+                                delete page;
+                                return send_resp(cs->session, std::move(resp));
+                            }
+                            store::free_page(read_buf);
+                            delete page;
+                            return send_resp(cs->session, resp::nil());
+                        });
+                }
+            })
+            >> flat();
     }
 
     template <typename session_sched_t>

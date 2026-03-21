@@ -14,6 +14,15 @@ namespace sider::resp {
         const char* data = nullptr;   // BULK: points to slab memory; ERR: error message
         uint32_t len = 0;             // BULK: value length; ERR: message length
         int64_t int_val = 0;          // INTEGER: value
+        char small_buf[16] = {};      // inline value storage (stable through batch_send)
+
+        // Set BULK from inline data — copies into small_buf for lifetime safety.
+        void set_inline(const char* src, uint32_t src_len) {
+            type = BULK;
+            std::memcpy(small_buf, src, src_len);
+            data = small_buf;
+            len = src_len;
+        }
 
         // Compute RESP wire size for this slot.
         uint32_t wire_size() const {

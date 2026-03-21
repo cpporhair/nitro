@@ -585,10 +585,13 @@ static void test_store_expire_scan_keeps_live() {
 
 static void test_store_discard_one_page() {
     kv_store s;
-    // Insert 200 keys (SC_64: 64 slots/page → ~4 pages).
+    // Insert 200 keys with 32-byte values (SC_64: 64 slots/page → ~4 pages).
+    // Must be > INLINE_VALUE_MAX (16) to use slab.
+    char val32[32];
+    std::memset(val32, 'V', sizeof(val32));
     for (int i = 0; i < 200; i++) {
         auto key = "k" + std::to_string(i);
-        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "value", 5);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val32, 32);
     }
     auto before_count = s.key_count();
     auto before_mem = s.memory_used_bytes();
@@ -612,7 +615,10 @@ static void test_store_discard_one_page() {
 
 static void test_store_evict_returns_nil() {
     kv_store s;
-    s.set("only", 4, "v", 1);
+    // Must use > INLINE_VALUE_MAX to create a slab page.
+    char val32[32];
+    std::memset(val32, 'x', sizeof(val32));
+    s.set("only", 4, val32, 32);
     assert(s.key_count() == 1);
 
     s.discard_one_page();
@@ -660,10 +666,12 @@ static void test_store_evict_sync_on_max() {
     // 10 pages limit. SC_64: 64 slots/page → 640 keys at capacity.
     s.evict_cfg_ = {10 * PAGE_SIZE, 0.60, 0.90};
 
-    // Insert 2000 keys — sync eviction in set() keeps memory bounded.
+    // Insert 2000 keys with 32-byte values (> INLINE_VALUE_MAX) to use slab.
+    char val32[32];
+    std::memset(val32, 'V', sizeof(val32));
     for (int i = 0; i < 2000; i++) {
         auto key = "k" + std::to_string(i);
-        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "value", 5);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val32, 32);
     }
 
     // Memory should not exceed limit + 1 page (overshoot from final alloc).
@@ -902,6 +910,194 @@ static void test_large_value_entry_flag() {
     assert(!e->is_large());
 }
 
+// ── inline values ──
+
+static void test_inline_set_get() {
+    kv_store s;
+    s.set("k", 1, "hello", 5);
+    auto* e = s.ht.lookup("k", 1);
+    assert(e != nullptr);
+    assert(e->is_inline());
+    assert(!e->is_large());
+    assert(e->value_len == 5);
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 5);
+    assert(std::memcmp(r.data, "hello", 5) == 0);
+    // Inline uses no slab memory.
+    assert(s.memory_used_bytes() == 0);
+}
+
+static void test_inline_set_get_16b() {
+    kv_store s;
+    char val[16];
+    std::memset(val, 'X', 16);
+    s.set("k", 1, val, 16);
+
+    auto* e = s.ht.lookup("k", 1);
+    assert(e->is_inline());
+    assert(e->value_len == 16);
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 16);
+    assert(r.data[0] == 'X' && r.data[15] == 'X');
+}
+
+static void test_inline_set_get_0b() {
+    kv_store s;
+    s.set("k", 1, "", 0);
+
+    auto* e = s.ht.lookup("k", 1);
+    assert(e->is_inline());
+    assert(e->value_len == 0);
+
+    auto r = G(s.get("k", 1));
+    assert(r.found());
+    assert(r.len == 0);
+}
+
+static void test_inline_del() {
+    kv_store s;
+    s.set("k", 1, "v", 1);
+    assert(s.del("k", 1) == 1);
+    assert(!G(s.get("k", 1)).found());
+    assert(s.key_count() == 0);
+}
+
+static void test_inline_to_inline() {
+    kv_store s;
+    s.set("k", 1, "aaa", 3);
+    s.set("k", 1, "bbb", 3);
+    auto r = G(s.get("k", 1));
+    assert(r.len == 3);
+    assert(std::memcmp(r.data, "bbb", 3) == 0);
+    assert(s.ht.lookup("k", 1)->is_inline());
+}
+
+static void test_inline_to_slab() {
+    kv_store s;
+    s.set("k", 1, "tiny", 4);
+    assert(s.ht.lookup("k", 1)->is_inline());
+    assert(s.memory_used_bytes() == 0);
+
+    // Update to 32 bytes → slab.
+    char val[32];
+    std::memset(val, 'B', sizeof(val));
+    s.set("k", 1, val, 32);
+    auto* e = s.ht.lookup("k", 1);
+    assert(!e->is_inline());
+    assert(!e->is_large());
+    assert(s.memory_used_bytes() == PAGE_SIZE);
+
+    auto r = G(s.get("k", 1));
+    assert(r.len == 32);
+    assert(r.data[0] == 'B');
+}
+
+static void test_slab_to_inline() {
+    kv_store s;
+    char val[32];
+    std::memset(val, 'A', sizeof(val));
+    s.set("k", 1, val, 32);
+    assert(!s.ht.lookup("k", 1)->is_inline());
+    assert(s.memory_used_bytes() == PAGE_SIZE);
+
+    s.set("k", 1, "tiny", 4);
+    assert(s.ht.lookup("k", 1)->is_inline());
+    // Slab page freed since it had only 1 entry.
+    assert(s.memory_used_bytes() == 0);
+
+    auto r = G(s.get("k", 1));
+    assert(r.len == 4);
+    assert(std::memcmp(r.data, "tiny", 4) == 0);
+}
+
+static void test_inline_to_large() {
+    kv_store s;
+    s.set("k", 1, "tiny", 4);
+    assert(s.ht.lookup("k", 1)->is_inline());
+
+    char big[8192];
+    std::memset(big, 'L', sizeof(big));
+    s.set("k", 1, big, 8192);
+    auto* e = s.ht.lookup("k", 1);
+    assert(!e->is_inline());
+    assert(e->is_large());
+    assert(s.large_memory_bytes_ == 2 * PAGE_SIZE);
+}
+
+static void test_large_to_inline() {
+    kv_store s;
+    char big[8192];
+    std::memset(big, 'L', sizeof(big));
+    s.set("k", 1, big, 8192);
+    assert(s.large_memory_bytes_ == 2 * PAGE_SIZE);
+
+    s.set("k", 1, "tiny", 4);
+    assert(s.ht.lookup("k", 1)->is_inline());
+    assert(s.large_memory_bytes_ == 0);
+
+    auto r = G(s.get("k", 1));
+    assert(r.len == 4);
+    assert(std::memcmp(r.data, "tiny", 4) == 0);
+}
+
+static void test_inline_not_evicted() {
+    kv_store s;
+    // All inline — no slab pages to evict.
+    for (int i = 0; i < 100; i++) {
+        auto key = "k" + std::to_string(i);
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()), "v", 1);
+    }
+    assert(s.memory_used_bytes() == 0);
+    assert(s.discard_one_page() == 0);
+    assert(s.key_count() == 100);
+}
+
+static void test_inline_many_keys() {
+    kv_store s;
+    for (int i = 0; i < 1000; i++) {
+        auto key = std::to_string(i);
+        auto val = "v" + key;
+        s.set(key.c_str(), static_cast<uint16_t>(key.size()),
+              val.c_str(), static_cast<uint16_t>(val.size()));
+    }
+    for (int i = 0; i < 1000; i++) {
+        auto key = std::to_string(i);
+        auto expected = "v" + key;
+        auto r = G(s.get(key.c_str(), static_cast<uint16_t>(key.size())));
+        assert(r.found());
+        assert(r.len == expected.size());
+        assert(std::memcmp(r.data, expected.c_str(), r.len) == 0);
+    }
+    // All values ≤ 16 bytes → all inline, no slab.
+    assert(s.memory_used_bytes() == 0);
+}
+
+static void test_inline_entry_flag() {
+    kv_store s;
+    s.set("k", 1, "v", 1);
+    auto* e = s.ht.lookup("k", 1);
+    assert(e->is_inline());
+    assert(!e->is_large());
+
+    // Update to slab.
+    char val[32];
+    std::memset(val, 'Z', sizeof(val));
+    s.set("k", 1, val, 32);
+    e = s.ht.lookup("k", 1);
+    assert(!e->is_inline());
+    assert(!e->is_large());
+
+    // Update back to inline.
+    s.set("k", 1, "w", 1);
+    e = s.ht.lookup("k", 1);
+    assert(e->is_inline());
+    assert(!e->is_large());
+}
+
 // ── main ──
 
 int main() {
@@ -961,6 +1157,20 @@ int main() {
     RUN(test_store_evict_preserves_hot_keys);
     RUN(test_store_evict_sync_on_max);
     RUN(test_store_evict_memory_stable);
+
+    printf("inline values:\n");
+    RUN(test_inline_set_get);
+    RUN(test_inline_set_get_16b);
+    RUN(test_inline_set_get_0b);
+    RUN(test_inline_del);
+    RUN(test_inline_to_inline);
+    RUN(test_inline_to_slab);
+    RUN(test_slab_to_inline);
+    RUN(test_inline_to_large);
+    RUN(test_large_to_inline);
+    RUN(test_inline_not_evicted);
+    RUN(test_inline_many_keys);
+    RUN(test_inline_entry_flag);
 
     printf("large values:\n");
     RUN(test_large_value_set_get_8k);

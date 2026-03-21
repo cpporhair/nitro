@@ -135,6 +135,9 @@ namespace sider::server {
                 if constexpr (std::is_same_v<T, store::hot_result>) {
                     *slot = {resp::resp_slot::BULK, result.data, result.len};
                     return just();
+                } else if constexpr (std::is_same_v<T, store::inline_result>) {
+                    slot->set_inline(result.data, result.len);
+                    return just();
                 } else if constexpr (std::is_same_v<T, store::nil_result>) {
                     slot->type = resp::resp_slot::NIL;
                     return just();

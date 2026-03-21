@@ -32,10 +32,15 @@ namespace sider::store {
     struct get_result {
         const char* data = nullptr;
         uint32_t len = 0;
+        char small_buf[INLINE_VALUE_MAX] = {};
         bool found() const { return data != nullptr; }
     };
 
     struct hot_result { const char* data; uint32_t len; };
+    struct inline_result {
+        char data[INLINE_VALUE_MAX];
+        uint32_t len;
+    };
     struct cold_result {
         uint32_t page_id;
         uint8_t  slot_index;
@@ -48,7 +53,7 @@ namespace sider::store {
     };
     struct nil_result {};
 
-    using lookup_result = std::variant<hot_result, cold_result, nil_result>;
+    using lookup_result = std::variant<hot_result, cold_result, nil_result, inline_result>;
 
     struct kv_store {
         page_table     pt;
@@ -78,6 +83,14 @@ namespace sider::store {
                 return nil_result{};
             }
 
+            if (e->is_inline()) {
+                // Inline value — copy data into result (safe from hash table resize).
+                inline_result ir;
+                std::memcpy(ir.data, e->inline_value, e->value_len);
+                ir.len = e->value_len;
+                return ir;
+            }
+
             auto& pe = pt[e->page_id];
 
             if (pe.state == page_entry::ON_NVME)
@@ -103,6 +116,16 @@ namespace sider::store {
 
             uint32_t old_page_id = e->page_id;
 
+            if (is_inline_value(value_len)) {
+                // Promote to inline — no slab allocation needed.
+                std::memcpy(e->inline_value, value, value_len);
+                e->value_len = value_len;
+                e->set_inline(true);
+                e->set_large(false);
+                nvme_page_dec_live(old_page_id);
+                return;
+            }
+
             if (is_large_value(value_len)) {
                 alloc_large_for_entry(e, value, value_len);
             } else {
@@ -112,15 +135,23 @@ namespace sider::store {
                 e->page_id    = ar.page_id;
                 e->slot_index = ar.slot_index;
                 e->set_large(false);
+                e->set_inline(false);
             }
             pt[e->page_id].hotness = ++access_clock_;
             nvme_page_dec_live(old_page_id);
         }
 
-        // Test helper: extract hot/nil as legacy get_result.
+        // Test helper: extract hot/nil/inline as legacy get_result.
         static get_result as_get_result(const lookup_result& r) {
             if (auto* h = std::get_if<hot_result>(&r))
                 return {h->data, h->len};
+            if (auto* ir = std::get_if<inline_result>(&r)) {
+                get_result gr;
+                std::memcpy(gr.small_buf, ir->data, ir->len);
+                gr.data = gr.small_buf;
+                gr.len = ir->len;
+                return gr;
+            }
             return {};
         }
 
@@ -136,16 +167,49 @@ namespace sider::store {
                 }
             }
 
-            bool new_large = is_large_value(value_len);
+            bool new_inline = is_inline_value(value_len);
+            bool new_large  = is_large_value(value_len);
             auto* e = ht.lookup(key, key_len);
 
             if (e) {
+                // ── Existing key ──
+
+                if (e->is_inline()) {
+                    // Old value is inline.
+                    if (new_inline) {
+                        // inline → inline: overwrite in place.
+                        std::memcpy(e->inline_value, value, value_len);
+                    } else if (new_large) {
+                        // inline → large
+                        alloc_large_for_entry(e, value, value_len);
+                    } else {
+                        // inline → slab
+                        auto new_sc = size_class_for(value_len);
+                        auto ar = slab.allocate(new_sc);
+                        std::memcpy(ar.slot_ptr, value, value_len);
+                        e->page_id    = ar.page_id;
+                        e->slot_index = ar.slot_index;
+                        e->set_large(false);
+                        e->set_inline(false);
+                    }
+                    e->value_len = value_len;
+                    e->expire_at = expire_at;
+                    e->version++;
+                    if (!e->is_inline())
+                        pt[e->page_id].hotness = ++access_clock_;
+                    return;
+                }
+
                 auto& old_pe = pt[e->page_id];
 
                 if (old_pe.state == page_entry::ON_NVME) {
                     // Key is on NVMe — allocate fresh hot storage.
                     uint32_t old_page_id = e->page_id;
-                    if (new_large) {
+                    if (new_inline) {
+                        std::memcpy(e->inline_value, value, value_len);
+                        e->set_inline(true);
+                        e->set_large(false);
+                    } else if (new_large) {
                         alloc_large_for_entry(e, value, value_len);
                     } else {
                         auto new_sc = size_class_for(value_len);
@@ -154,11 +218,13 @@ namespace sider::store {
                         e->page_id    = ar.page_id;
                         e->slot_index = ar.slot_index;
                         e->set_large(false);
+                        e->set_inline(false);
                     }
                     e->value_len  = value_len;
                     e->expire_at  = expire_at;
                     e->version++;
-                    pt[e->page_id].hotness = ++access_clock_;
+                    if (!e->is_inline())
+                        pt[e->page_id].hotness = ++access_clock_;
                     nvme_page_dec_live(old_page_id);
                     return;
                 }
@@ -166,7 +232,16 @@ namespace sider::store {
                 // IN_MEMORY or EVICTING: page is in RAM.
                 bool old_large = e->is_large();
 
-                if (!old_large && !new_large) {
+                if (new_inline) {
+                    // slab/large → inline: free old storage.
+                    if (old_large)
+                        free_large_entry_mem(e);
+                    else
+                        slab.free_slot(e->page_id, e->slot_index);
+                    std::memcpy(e->inline_value, value, value_len);
+                    e->set_inline(true);
+                    e->set_large(false);
+                } else if (!old_large && !new_large) {
                     // small → small (existing logic)
                     auto old_sc = static_cast<size_class_t>(old_pe.size_class);
                     auto new_sc = size_class_for(value_len);
@@ -180,6 +255,7 @@ namespace sider::store {
                         e->page_id    = ar.page_id;
                         e->slot_index = ar.slot_index;
                     }
+                    e->set_inline(false);
                 } else if (old_large && new_large) {
                     // large → large
                     uint32_t new_pc = pages_for(value_len);
@@ -192,7 +268,7 @@ namespace sider::store {
                         alloc_large_for_entry(e, value, value_len);
                     }
                 } else if (old_large) {
-                    // large → small
+                    // large → small (slab)
                     free_large_entry_mem(e);
                     auto new_sc = size_class_for(value_len);
                     auto ar = slab.allocate(new_sc);
@@ -200,8 +276,9 @@ namespace sider::store {
                     e->page_id    = ar.page_id;
                     e->slot_index = ar.slot_index;
                     e->set_large(false);
+                    e->set_inline(false);
                 } else {
-                    // small → large
+                    // small (slab) → large
                     slab.free_slot(e->page_id, e->slot_index);
                     alloc_large_for_entry(e, value, value_len);
                 }
@@ -210,8 +287,13 @@ namespace sider::store {
                 e->expire_at  = expire_at;
                 e->version++;
             } else {
-                // New key.
-                if (new_large) {
+                // ── New key ──
+                if (new_inline) {
+                    e = ht.insert(key, key_len);
+                    std::memcpy(e->inline_value, value, value_len);
+                    e->set_inline(true);
+                    e->set_large(false);
+                } else if (new_large) {
                     e = ht.insert(key, key_len);
                     alloc_large_for_entry(e, value, value_len);
                 } else {
@@ -223,13 +305,15 @@ namespace sider::store {
                     e->page_id    = ar.page_id;
                     e->slot_index = ar.slot_index;
                     e->set_large(false);
+                    e->set_inline(false);
                 }
                 e->value_len  = value_len;
                 e->expire_at  = expire_at;
                 e->version    = 0;
             }
 
-            pt[e->page_id].hotness = ++access_clock_;
+            if (!e->is_inline())
+                pt[e->page_id].hotness = ++access_clock_;
         }
 
         int del(const char* key, uint16_t key_len) {
@@ -429,8 +513,10 @@ namespace sider::store {
         uint32_t key_count() const { return ht.count(); }
 
     private:
-        // Free the slot for an entry, handling ON_NVME pages and large values.
+        // Free the slot for an entry, handling inline, ON_NVME, large, and slab.
         void free_entry_slot(entry* e) {
+            if (e->is_inline()) return;  // inline: no storage to free
+
             auto& pe = pt[e->page_id];
             if (pe.state == page_entry::ON_NVME) {
                 nvme_page_dec_live(e->page_id);
@@ -472,6 +558,7 @@ namespace sider::store {
             e->page_id    = pid;
             e->slot_index = 0;
             e->set_large(true);
+            e->set_inline(false);
 
             large_memory_bytes_ += static_cast<uint64_t>(pc) * PAGE_SIZE;
             large_page_ids_.push_back(pid);
@@ -513,7 +600,9 @@ namespace sider::store {
             auto cap = ht.capacity();
             for (uint32_t i = 0; i < cap; i++) {
                 auto* e = ht.entry_at(i);
-                if (!e || e->page_id != page_id) continue;
+                if (!e) continue;
+                if (e->is_inline()) continue;  // inline entries have no page_id
+                if (e->page_id != page_id) continue;
                 auto* kd = new char[e->key_len];
                 std::memcpy(kd, e->key_data, e->key_len);
                 keys.push_back({kd, e->key_len});

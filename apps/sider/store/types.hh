@@ -48,6 +48,10 @@ namespace sider::store {
         return static_cast<uint32_t>(slot_index) * size_class_bytes[sc];
     }
 
+    // Inline value: value_len <= INLINE_VALUE_MAX (stored in entry struct, no slab/page).
+    static constexpr uint32_t INLINE_VALUE_MAX = 16;
+    static inline bool is_inline_value(uint32_t size) { return size <= INLINE_VALUE_MAX; }
+
     // Large value: value_len > PAGE_SIZE
     static inline bool is_large_value(uint32_t size) { return size > PAGE_SIZE; }
     static inline uint32_t pages_for(uint32_t size) { return (size + PAGE_SIZE - 1) / PAGE_SIZE; }

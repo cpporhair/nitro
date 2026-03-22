@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     std::vector<sider::nvme::nvme_device> nvme_devs;
 
     if (cfg.has_nvme()) {
-        sider::nvme::init_env(cfg.dma_pages);
+        sider::nvme::init_env(cfg.effective_dma_pages());
 
         for (auto& addr : cfg.nvme) {
             auto dev = sider::nvme::init_device(addr.c_str());

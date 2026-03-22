@@ -126,17 +126,10 @@ namespace sider::store {
                 return;
             }
 
-            if (is_large_value(value_len)) {
-                alloc_large_for_entry(e, value, value_len);
-            } else {
-                auto sc = size_class_for(value_len);
-                auto ar = slab.allocate(sc);
-                std::memcpy(ar.slot_ptr, value, value_len);
-                e->page_id    = ar.page_id;
-                e->slot_index = ar.slot_index;
-                e->set_large(false);
-                e->set_inline(false);
-            }
+            bool ok = is_large_value(value_len)
+                ? try_alloc_large(e, value, value_len)
+                : try_alloc_slab(e, value, value_len);
+            if (!ok) return;  // alloc failed, keep on NVMe
             record_slot_key_hash(e);
             pt[e->page_id].hotness = ++access_clock_;
             nvme_page_dec_live(old_page_id);
@@ -178,20 +171,12 @@ namespace sider::store {
                 if (e->is_inline()) {
                     // Old value is inline.
                     if (new_inline) {
-                        // inline → inline: overwrite in place.
                         std::memcpy(e->inline_value, value, value_len);
-                    } else if (new_large) {
-                        // inline → large
-                        alloc_large_for_entry(e, value, value_len);
                     } else {
-                        // inline → slab
-                        auto new_sc = size_class_for(value_len);
-                        auto ar = slab.allocate(new_sc);
-                        std::memcpy(ar.slot_ptr, value, value_len);
-                        e->page_id    = ar.page_id;
-                        e->slot_index = ar.slot_index;
-                        e->set_large(false);
-                        e->set_inline(false);
+                        bool ok = new_large
+                            ? try_alloc_large(e, value, value_len)
+                            : try_alloc_slab(e, value, value_len);
+                        if (!ok) return;  // alloc failed, keep old inline value
                     }
                     e->value_len = value_len;
                     e->expire_at = expire_at;
@@ -206,22 +191,16 @@ namespace sider::store {
                 auto& old_pe = pt[e->page_id];
 
                 if (old_pe.state == page_entry::ON_NVME) {
-                    // Key is on NVMe — allocate fresh hot storage.
                     uint32_t old_page_id = e->page_id;
                     if (new_inline) {
                         std::memcpy(e->inline_value, value, value_len);
                         e->set_inline(true);
                         e->set_large(false);
-                    } else if (new_large) {
-                        alloc_large_for_entry(e, value, value_len);
                     } else {
-                        auto new_sc = size_class_for(value_len);
-                        auto ar = slab.allocate(new_sc);
-                        std::memcpy(ar.slot_ptr, value, value_len);
-                        e->page_id    = ar.page_id;
-                        e->slot_index = ar.slot_index;
-                        e->set_large(false);
-                        e->set_inline(false);
+                        bool ok = new_large
+                            ? try_alloc_large(e, value, value_len)
+                            : try_alloc_slab(e, value, value_len);
+                        if (!ok) return;  // alloc failed, keep on NVMe
                     }
                     e->value_len  = value_len;
                     e->expire_at  = expire_at;
@@ -247,7 +226,7 @@ namespace sider::store {
                     e->set_inline(true);
                     e->set_large(false);
                 } else if (!old_large && !new_large) {
-                    // small → small (existing logic)
+                    // slab → slab
                     auto old_sc = static_cast<size_class_t>(old_pe.size_class);
                     auto new_sc = size_class_for(value_len);
 
@@ -255,37 +234,25 @@ namespace sider::store {
                         std::memcpy(slab.slot_ptr(e->page_id, e->slot_index), value, value_len);
                     } else {
                         slab.free_slot(e->page_id, e->slot_index);
-                        auto ar = slab.allocate(new_sc);
-                        std::memcpy(ar.slot_ptr, value, value_len);
-                        e->page_id    = ar.page_id;
-                        e->slot_index = ar.slot_index;
+                        if (!try_alloc_slab(e, value, value_len)) return;
                     }
                     e->set_inline(false);
                 } else if (old_large && new_large) {
-                    // large → large
                     uint32_t new_pc = pages_for(value_len);
                     if (new_pc == old_pe.page_count && old_pe.state == page_entry::IN_MEMORY) {
-                        // Same page_count, in memory: overwrite in place.
                         std::memcpy(old_pe.mem_ptr, value, value_len);
                     } else {
-                        // Different page_count or EVICTING: free old, alloc new.
                         free_large_entry_mem(e);
-                        alloc_large_for_entry(e, value, value_len);
+                        if (!try_alloc_large(e, value, value_len)) return;
                     }
                 } else if (old_large) {
-                    // large → small (slab)
+                    // large → slab
                     free_large_entry_mem(e);
-                    auto new_sc = size_class_for(value_len);
-                    auto ar = slab.allocate(new_sc);
-                    std::memcpy(ar.slot_ptr, value, value_len);
-                    e->page_id    = ar.page_id;
-                    e->slot_index = ar.slot_index;
-                    e->set_large(false);
-                    e->set_inline(false);
+                    if (!try_alloc_slab(e, value, value_len)) return;
                 } else {
-                    // small (slab) → large
+                    // slab → large
                     slab.free_slot(e->page_id, e->slot_index);
-                    alloc_large_for_entry(e, value, value_len);
+                    if (!try_alloc_large(e, value, value_len)) return;
                 }
 
                 e->value_len  = value_len;
@@ -300,12 +267,16 @@ namespace sider::store {
                     e->set_large(false);
                 } else if (new_large) {
                     e = ht.insert(key, key_len);
-                    alloc_large_for_entry(e, value, value_len);
+                    if (!try_alloc_large(e, value, value_len)) {
+                        ht.erase(key, key_len);
+                        return;
+                    }
                 } else {
                     auto new_sc = size_class_for(value_len);
                     auto ar = slab.allocate(new_sc);
-                    std::memcpy(ar.slot_ptr, value, value_len);
+                    if (!ar.slot_ptr) return;  // DMA alloc failed, drop key
 
+                    std::memcpy(ar.slot_ptr, value, value_len);
                     e = ht.insert(key, key_len);
                     e->page_id    = ar.page_id;
                     e->slot_index = ar.slot_index;
@@ -512,6 +483,47 @@ namespace sider::store {
         uint32_t key_count() const { return ht.count(); }
 
     private:
+        // Try to allocate a slab slot and copy value. Returns false on DMA alloc failure.
+        bool try_alloc_slab(entry* e, const char* value, uint32_t value_len) {
+            auto new_sc = size_class_for(value_len);
+            auto ar = slab.allocate(new_sc);
+            if (!ar.slot_ptr) [[unlikely]] return false;
+            std::memcpy(ar.slot_ptr, value, value_len);
+            e->page_id    = ar.page_id;
+            e->slot_index = ar.slot_index;
+            e->set_large(false);
+            e->set_inline(false);
+            return true;
+        }
+
+        // Try to allocate large value DMA memory. Returns false on failure.
+        bool try_alloc_large(entry* e, const char* value, uint32_t value_len) {
+            auto* mem = alloc_large(value_len);
+            if (!mem) [[unlikely]] return false;
+            uint32_t pc = pages_for(value_len);
+            std::memcpy(mem, value, value_len);
+
+            uint32_t pid = pt.alloc_page_id();
+            auto& pe = pt[pid];
+            pe.state      = page_entry::IN_MEMORY;
+            pe.size_class = 0;
+            pe.live_count = 1;
+            pe.page_count = pc;
+            pe.hotness    = 0;
+            pe.mem_ptr    = mem;
+            pe.slot_bitmap = 1ULL;
+            pe.slot_key_hashes = new uint32_t[1]{};
+
+            e->page_id    = pid;
+            e->slot_index = 0;
+            e->set_large(true);
+            e->set_inline(false);
+
+            large_memory_bytes_ += static_cast<uint64_t>(pc) * PAGE_SIZE;
+            large_page_ids_.push_back(pid);
+            return true;
+        }
+
         // Free the slot for an entry, handling inline, ON_NVME, large, and slab.
         void free_entry_slot(entry* e) {
             if (e->is_inline()) return;  // inline: no storage to free
@@ -543,32 +555,6 @@ namespace sider::store {
                     pending_nvme_frees_.push_back({pe.disk_id, pe.nvme_lba + i});
                 pt.free_page_id(page_id);
             }
-        }
-
-        // Allocate contiguous DMA memory for a large value, set up page_entry and entry.
-        void alloc_large_for_entry(entry* e, const char* value, uint32_t value_len) {
-            uint32_t pc = pages_for(value_len);
-            auto* mem = alloc_large(value_len);
-            std::memcpy(mem, value, value_len);
-
-            uint32_t pid = pt.alloc_page_id();
-            auto& pe = pt[pid];
-            pe.state      = page_entry::IN_MEMORY;
-            pe.size_class = 0;
-            pe.live_count = 1;
-            pe.page_count = pc;
-            pe.hotness    = 0;
-            pe.mem_ptr    = mem;
-            pe.slot_bitmap = 1ULL;   // slot 0 occupied (single large value)
-            pe.slot_key_hashes = new uint32_t[1]{};
-
-            e->page_id    = pid;
-            e->slot_index = 0;
-            e->set_large(true);
-            e->set_inline(false);
-
-            large_memory_bytes_ += static_cast<uint64_t>(pc) * PAGE_SIZE;
-            large_page_ids_.push_back(pid);
         }
 
         // Free large value memory for an IN_MEMORY or EVICTING entry.

@@ -7,6 +7,7 @@
 
 #include "spdk/env.h"
 #include "spdk/nvme.h"
+#include "rte_mempool.h"
 
 #include "env/scheduler/nvme/dma.hh"
 #include "env/scheduler/nvme/ssd.hh"
@@ -35,26 +36,29 @@ namespace sider::nvme {
     inline spdk_mempool* page_pool = nullptr;
 
     // ── DMA pool functions ──
+    // All allocated memory is DMA-safe (hugepage-backed).
+    // Never falls back to aligned_alloc — returns nullptr on failure.
 
     inline char* dma_alloc_page() {
         auto* p = spdk_mempool_get(page_pool);
-        if (!p) [[unlikely]]
-            return static_cast<char*>(std::aligned_alloc(4096, 4096));
-        return static_cast<char*>(p);
+        if (p) [[likely]] return static_cast<char*>(p);
+        // Pool exhausted — try hugepage heap as fallback (still DMA-safe).
+        p = spdk_dma_zmalloc(4096, 4096, nullptr);
+        if (p) return static_cast<char*>(p);
+        return nullptr;  // caller handles: discard key
     }
 
     inline void dma_free_page(char* ptr) {
-        if (page_pool)
+        if (rte_mempool_from_obj(ptr) != nullptr)
             spdk_mempool_put(page_pool, ptr);
         else
-            std::free(ptr);
+            spdk_dma_free(ptr);
     }
 
     inline char* dma_alloc_large(uint32_t size) {
         auto* p = spdk_dma_zmalloc(size, 4096, nullptr);
-        if (!p) [[unlikely]]
-            return static_cast<char*>(std::aligned_alloc(4096, size));
-        return static_cast<char*>(p);
+        if (p) return static_cast<char*>(p);
+        return nullptr;  // caller handles: discard key
     }
 
     inline void dma_free_large(char* ptr) {
@@ -105,8 +109,9 @@ namespace sider::nvme {
     }
 
     // ── Init SPDK environment + DMA pool (call once) ──
+    // pool_pages: auto-calculated from memory_limit, or explicit override.
 
-    inline void init_env(uint64_t dma_pool_pages) {
+    inline void init_env(uint64_t pool_pages) {
         spdk_env_opts opts;
         spdk_env_opts_init(&opts);
         opts.name = "sider";
@@ -116,20 +121,20 @@ namespace sider::nvme {
             throw std::runtime_error("spdk_env_init failed");
 
         page_pool = spdk_mempool_create("sider_pages",
-            dma_pool_pages, 4096,
+            pool_pages, 4096,
             SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
             SPDK_ENV_NUMA_ID_ANY);
         if (!page_pool)
             throw std::runtime_error("spdk_mempool_create failed — not enough hugepages?");
 
-        // Wire up alloc/free
+        // Wire up alloc/free — all paths produce DMA-safe memory, never aligned_alloc.
         store::_page_alloc::alloc_fn = dma_alloc_page;
         store::_page_alloc::free_fn = dma_free_page;
         store::_large_alloc::alloc_fn = dma_alloc_large;
         store::_large_alloc::free_fn = dma_free_large;
 
         printf("DMA pool: %lu pages (%luMB)\n",
-               dma_pool_pages, dma_pool_pages * 4096 / (1024*1024));
+               pool_pages, pool_pages * 4096 / (1024*1024));
     }
 
     // ── Init one NVMe device ──

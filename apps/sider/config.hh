@@ -16,7 +16,7 @@ namespace sider {
         uint64_t memory_bytes = 0;      // 0 = no eviction
         int      evict_begin = 90;      // %
         int      evict_urgent = 95;     // %
-        uint64_t dma_pages = 8192;
+        uint64_t dma_pages = 0;   // 0 = auto (memory_bytes / 4KB + headroom)
         uint32_t accept_core = 0;
         std::vector<std::string> nvme;  // PCIe addresses
         std::vector<uint32_t>   cores;  // store core IDs
@@ -33,6 +33,14 @@ namespace sider {
         }
 
         bool has_nvme() const { return !nvme.empty(); }
+
+        // Auto-calculate DMA pool pages if not explicitly configured.
+        uint64_t effective_dma_pages() const {
+            if (dma_pages > 0) return dma_pages;
+            if (memory_bytes == 0) return 8192;  // fallback for no-eviction mode
+            // memory_limit / PAGE_SIZE + headroom for cold read buffers and in-flight evictions
+            return memory_bytes / 4096 + 4096;
+        }
     };
 
     // ── Parse memory string: "256M", "8G", "1024K", "1073741824" ──

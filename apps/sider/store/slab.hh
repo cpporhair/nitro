@@ -52,13 +52,17 @@ namespace sider::store {
             }
 
             // Allocate a new page.
+            auto* mem = alloc_page();
+            if (!mem) [[unlikely]]
+                return {UINT32_MAX, 0, nullptr};  // DMA alloc failed
+
             uint32_t pid = pt_.alloc_page_id();
             auto& pe = pt_[pid];
             pe.state    = page_entry::IN_MEMORY;
             pe.size_class = sc;
             pe.live_count = 1;
             pe.hotness  = 0;
-            pe.mem_ptr  = alloc_page();
+            pe.mem_ptr  = mem;
             pe.slot_bitmap = 1ULL;   // slot 0 occupied
             pe.slot_key_hashes = new uint32_t[slots_per_page[sc]]{};
             total_pages_++;
@@ -69,7 +73,7 @@ namespace sider::store {
                 partials.push_back(pid);
             }
 
-            return {pid, 0, pe.mem_ptr};
+            return {pid, 0, mem};
         }
 
         void free_slot(uint32_t page_id, uint8_t slot_index) {

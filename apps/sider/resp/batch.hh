@@ -17,6 +17,18 @@ namespace sider::resp {
         int64_t int_val = 0;          // INTEGER: value
         char small_buf[16] = {};      // inline value storage (stable through batch_send)
 
+        // Per-slot DMA buffer ownership (cold GET promote failure).
+        char* owned_buf = nullptr;
+        void (*owned_free)(char*) = nullptr;
+
+        void set_owned(char* buf, void (*free_fn)(char*)) {
+            owned_buf = buf;
+            owned_free = free_fn;
+        }
+        void free_owned() {
+            if (owned_buf) { owned_free(owned_buf); owned_buf = nullptr; }
+        }
+
         // Set BULK from inline data — copies into small_buf for lifetime safety.
         void set_inline(const char* src, uint32_t src_len) {
             assert(src_len <= sizeof(small_buf));
@@ -108,13 +120,6 @@ namespace sider::resp {
         std::vector<resp_slot> responses;
         bool has_quit = false;
 
-        // DMA buffers from cold reads — returned to pool on destruction.
-        struct owned_dma {
-            char* ptr;
-            void (*free_fn)(char*);
-        };
-        std::vector<owned_dma> owned_bufs;
-
         const char* cmd_data(uint32_t i) const { return data + offsets[i]; }
         uint32_t    cmd_len(uint32_t i)  const { return offsets[i + 1] - offsets[i]; }
 
@@ -122,18 +127,16 @@ namespace sider::resp {
 
         cmd_batch(cmd_batch&& o) noexcept
             : data(o.data), data_len(o.data_len), count(o.count)
-            , responses(std::move(o.responses)), has_quit(o.has_quit)
-            , owned_bufs(std::move(o.owned_bufs)) {
+            , responses(std::move(o.responses)), has_quit(o.has_quit) {
             std::memcpy(offsets, o.offsets, (count + 1) * sizeof(uint32_t));
             o.data = nullptr; o.data_len = 0; o.count = 0;
         }
         cmd_batch& operator=(cmd_batch&& o) noexcept {
             if (this != &o) {
-                for (auto& d : owned_bufs) d.free_fn(d.ptr);
+                free_owned_bufs();
                 delete[] data;
                 data = o.data; data_len = o.data_len; count = o.count;
                 responses = std::move(o.responses); has_quit = o.has_quit;
-                owned_bufs = std::move(o.owned_bufs);
                 std::memcpy(offsets, o.offsets, (count + 1) * sizeof(uint32_t));
                 o.data = nullptr; o.data_len = 0; o.count = 0;
             }
@@ -142,8 +145,13 @@ namespace sider::resp {
         cmd_batch(const cmd_batch&) = delete;
         cmd_batch& operator=(const cmd_batch&) = delete;
         ~cmd_batch() {
-            for (auto& d : owned_bufs) d.free_fn(d.ptr);
+            free_owned_bufs();
             delete[] data;
+        }
+
+    private:
+        void free_owned_bufs() {
+            for (auto& s : responses) s.free_owned();
         }
     };
 

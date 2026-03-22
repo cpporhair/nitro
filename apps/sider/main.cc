@@ -83,19 +83,20 @@ namespace sider {
     // ── Accept loop with round-robin connection distribution ──
 
     static void accept_loop(server::accept_sched_t* accept_sched,
-                            std::span<core_state> cores) {
+                            std::span<core_state> cores,
+                            store::store_scheduler** stores, uint32_t num_stores) {
         just()
             >> forever()
             >> flat_map([accept_sched](auto&&...) {
                 return tcp::wait_connection(accept_sched);
             })
-            >> then([cores](int fd) {
+            >> then([cores, stores, num_stores](int fd) {
                 static uint32_t rr = 0;
                 auto& target = cores[rr++ % cores.size()];
                 auto* session = server::sider_factory::create(
                     fd, target.session_sched);
                 server::handle_connection(
-                    target.session_sched, session, target.store_sched);
+                    target.session_sched, session, stores, num_stores);
             })
             >> any_exception([](std::exception_ptr) {
                 return just();
@@ -218,9 +219,16 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, sider::signal_handler);
     std::signal(SIGTERM, sider::signal_handler);
 
+    // ── Build store routing table (all cores' store_schedulers) ──
+
+    std::vector<sider::store::store_scheduler*> all_stores(num_cores);
+    for (uint32_t ci = 0; ci < num_cores; ci++)
+        all_stores[ci] = cores[ci].store_sched;
+
     // ── Fire accept loop (non-blocking pipeline submission) ──
 
-    sider::accept_loop(accept_sched, cores);
+    sider::accept_loop(accept_sched, cores,
+                       all_stores.data(), num_cores);
 
     printf("sider listening on port %u (%u cores)\n", cfg.port, num_cores);
 

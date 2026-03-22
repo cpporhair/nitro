@@ -123,14 +123,13 @@ namespace sider::server {
     static inline auto
     exec_get_slot(get_cmd&& action,
                   store::store_scheduler* store_sched,
-                  resp::resp_slot* slot,
-                  resp::cmd_batch* batch) {
+                  resp::resp_slot* slot) {
         auto key_data = action.key.data();
         auto key_len  = static_cast<uint16_t>(action.key.size());
 
         return store_sched->lookup(key_data, key_len)
             >> visit()
-            >> then([slot, batch, store_sched, key_data, key_len](auto&& result) {
+            >> then([slot, store_sched, key_data, key_len](auto&& result) {
                 using T = std::decay_t<decltype(result)>;
                 if constexpr (std::is_same_v<T, store::hot_result>) {
                     *slot = {resp::resp_slot::BULK, result.data, result.len};
@@ -156,7 +155,7 @@ namespace sider::server {
                         static_cast<uint64_t>(buf_size)};
 
                     return store_sched->nvme_sched_for(result.disk_id)->get(page)
-                        >> then([slot, batch, store_sched, key_data, key_len,
+                        >> then([slot, store_sched, key_data, key_len,
                                  result, page, read_buf, is_large]
                                 (pump::scheduler::nvme::get::res<nvme::sider_page>&& res) {
                             if (res.is_success()) {
@@ -178,10 +177,10 @@ namespace sider::server {
                                     if (is_large) store::free_large(read_buf);
                                     else store::free_page(read_buf);
                                 } else {
-                                    // Promote failed — keep DMA buf alive, batch owns it.
+                                    // Promote failed — keep DMA buf alive, slot owns it.
                                     *slot = {resp::resp_slot::BULK, val, result.value_len};
-                                    batch->owned_bufs.push_back({read_buf,
-                                        is_large ? store::free_large : store::free_page});
+                                    slot->set_owned(read_buf,
+                                        is_large ? store::free_large : store::free_page);
                                 }
                             } else {
                                 slot->type = resp::resp_slot::NIL;
@@ -352,9 +351,16 @@ namespace sider::server {
         resp::resp_slot* resp;  // points to batch.responses[slot]
     };
 
+    // Route key to target store: hash(key) % num_stores.
+    static inline store::store_scheduler*
+    route_store(const char* key, uint16_t key_len,
+                store::store_scheduler** stores, uint32_t num_stores) {
+        return stores[store::hash_key(key, key_len) % num_stores];
+    }
+
     static inline void
     handle_connection(session_sched_t* sched, session_t* session,
-                      store::store_scheduler* store_sched) {
+                      store::store_scheduler** stores, uint32_t num_stores) {
         tcp::join(sched, session)
             >> get_context<conn_state<session_sched_t> >()
             >> then([](conn_state<session_sched_t> &state) {
@@ -368,7 +374,7 @@ namespace sider::server {
             })
             // Step 2: set up batch context, inner for_each + concurrent execute
             >> get_context<conn_state<session_sched_t> >()
-            >> then([store_sched](auto &&state, resp::cmd_batch &&batch) {
+            >> then([stores, num_stores](auto &&state, resp::cmd_batch &&batch) {
                 auto *sess = state.session;
                 return just()
                     >> for_each(std::views::iota(0u, batch.count))
@@ -384,20 +390,26 @@ namespace sider::server {
                     })
                     >> visit()
                     >> get_context<resp::cmd_batch, cmd_slot>()
-                    >> flat_map([store_sched]<typename T0>(resp::cmd_batch &b, cmd_slot &s, T0 &&act) {
+                    >> flat_map([stores, num_stores]<typename T0>(resp::cmd_batch &b, cmd_slot &s, T0 &&act) {
                         if constexpr (std::is_same_v<T0, simple_resp>) {
                             *s.resp = act.slot;
                             if (act.quit) b.has_quit = true;
                             return just();
                         } else if constexpr (std::is_same_v<T0, get_cmd>) {
+                            auto* target = route_store(
+                                act.key.data(), act.key.size(), stores, num_stores);
                             return exec_get_slot(
-                                std::forward<T0>(act), store_sched, s.resp, &b);
+                                std::forward<T0>(act), target, s.resp);
                         } else if constexpr (std::is_same_v<T0, set_cmd>) {
+                            auto* target = route_store(
+                                act.key.data(), act.key.size(), stores, num_stores);
                             return exec_set_slot(
-                                std::forward<T0>(act), store_sched, s.resp);
+                                std::forward<T0>(act), target, s.resp);
                         } else {
+                            auto* target = route_store(
+                                act.key.data(), act.key.size(), stores, num_stores);
                             return exec_del_slot(
-                                std::forward<T0>(act), store_sched, s.resp);
+                                std::forward<T0>(act), target, s.resp);
                         }
                     })
                     >> pop_context()

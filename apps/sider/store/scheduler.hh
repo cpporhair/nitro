@@ -145,8 +145,13 @@ namespace sider::store {
 
     struct store_scheduler {
         kv_store store;
-        pump::core::local::queue<store_req*> req_q{4096};
+        pump::core::per_core::queue<store_req*, false> req_q;
         int advance_count_ = 0;
+
+        // owner_core defaults to this_core_id at construction time.
+        // Caller must set pump::core::this_core_id before creating.
+        explicit store_scheduler()
+            : req_q(4096, pump::core::this_core_id) {}
 
         // NVMe eviction support (empty = no NVMe, discard-only).
         using nvme_sched_t = pump::scheduler::nvme::scheduler<nvme::sider_page>;

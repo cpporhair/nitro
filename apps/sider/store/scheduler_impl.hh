@@ -12,13 +12,10 @@
 namespace sider::store {
 
     inline bool store_scheduler::advance() {
-        bool progress = false;
-        store_req* r;
-        while (req_q.try_dequeue(r)) {
+        bool progress = req_q.drain([this](store_req* r) {
             r->fn(store);
             delete r;
-            progress = true;
-        }
+        });
 
         // Drain pending NVMe LBA frees — route to correct disk's allocator.
         if (!disks_.empty() && !store.pending_nvme_frees_.empty()) {

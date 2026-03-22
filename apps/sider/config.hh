@@ -16,7 +16,7 @@ namespace sider {
         uint64_t memory_bytes = 0;      // 0 = no eviction
         int      evict_begin = 90;      // %
         int      evict_urgent = 95;     // %
-        uint64_t dma_pages = 0;   // 0 = auto (memory_bytes / 4KB + headroom)
+        // dma_pages is auto-calculated from memory_bytes, not user-configurable.
         uint32_t accept_core = 0;
         std::vector<std::string> nvme;  // PCIe addresses
         std::vector<uint32_t>   cores;  // store core IDs
@@ -34,11 +34,9 @@ namespace sider {
 
         bool has_nvme() const { return !nvme.empty(); }
 
-        // Auto-calculate DMA pool pages if not explicitly configured.
-        uint64_t effective_dma_pages() const {
-            if (dma_pages > 0) return dma_pages;
-            if (memory_bytes == 0) return 8192;  // fallback for no-eviction mode
-            // memory_limit / PAGE_SIZE + headroom for cold read buffers and in-flight evictions
+        // Auto-calculate DMA pool pages from memory limit.
+        uint64_t dma_pages() const {
+            if (memory_bytes == 0) return 8192;
             return memory_bytes / 4096 + 4096;
         }
     };
@@ -71,7 +69,6 @@ namespace sider {
         cfg.port         = j.value("port", cfg.port);
         cfg.evict_begin  = j.value("evict_begin", cfg.evict_begin);
         cfg.evict_urgent = j.value("evict_urgent", cfg.evict_urgent);
-        cfg.dma_pages    = j.value("dma_pages", cfg.dma_pages);
         cfg.accept_core  = j.value("accept_core", cfg.accept_core);
 
         if (j.contains("memory")) {
@@ -120,7 +117,6 @@ namespace sider {
         cfg.port = static_cast<uint16_t>(get_int("--port", 6379));
         cfg.evict_begin  = get_int("--evict-begin", 60);
         cfg.evict_urgent = get_int("--evict-urgent", 90);
-        cfg.dma_pages    = static_cast<uint64_t>(get_int("--dma-pages", 8192));
 
         if (auto* m = get_str("--memory"))
             cfg.memory_bytes = parse_memory_string(m);
@@ -166,7 +162,6 @@ namespace sider {
             for (size_t i = 0; i < cfg.nvme.size(); i++)
                 printf("%s%s", i ? ", " : "", cfg.nvme[i].c_str());
             printf("]\n");
-            printf("  dma_pages: %lu\n", cfg.dma_pages);
         }
     }
 

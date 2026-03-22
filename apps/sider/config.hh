@@ -34,6 +34,12 @@ namespace sider {
 
         bool has_nvme() const { return !nvme.empty(); }
 
+        std::string core_mask_str() const {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "0x%lx", core_mask());
+            return buf;
+        }
+
         // Auto-calculate DMA pool pages from memory limit.
         uint64_t dma_pages() const {
             if (memory_bytes == 0) return 8192;

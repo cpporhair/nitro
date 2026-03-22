@@ -26,9 +26,13 @@ namespace sider::nvme {
 
     struct nvme_device {
         nvme_ssd_t* ssd = nullptr;
-        nvme_qpair_t* qp = nullptr;
-        nvme_scheduler_t* scheduler = nullptr;
         uint64_t disk_pages = 0;
+
+        struct per_core_nvme {
+            nvme_qpair_t* qp = nullptr;
+            nvme_scheduler_t* scheduler = nullptr;
+        };
+        std::vector<per_core_nvme> per_core;  // one per store core
     };
 
     // ── Global shared state ──
@@ -70,6 +74,7 @@ namespace sider::nvme {
     struct probe_ctx {
         const char* target_addr;
         nvme_ssd_t* dev;
+        uint32_t num_cores;
         bool found;
     };
 
@@ -79,7 +84,7 @@ namespace sider::nvme {
             return false;
         auto* ctx = static_cast<probe_ctx*>(cb_ctx);
         if (strcmp(ctx->target_addr, trid->traddr) == 0) {
-            opts->num_io_queues = 1;
+            opts->num_io_queues = ctx->num_cores;
             opts->io_queue_size = UINT16_MAX;
             return true;
         }
@@ -111,11 +116,11 @@ namespace sider::nvme {
     // ── Init SPDK environment + DMA pool (call once) ──
     // pool_pages: auto-calculated from memory_limit, or explicit override.
 
-    inline void init_env(uint64_t pool_pages) {
+    inline void init_env(const char* core_mask, uint64_t pool_pages) {
         spdk_env_opts opts;
         spdk_env_opts_init(&opts);
         opts.name = "sider";
-        opts.core_mask = "0x1";
+        opts.core_mask = core_mask;
 
         if (spdk_env_init(&opts) < 0)
             throw std::runtime_error("spdk_env_init failed");
@@ -137,12 +142,12 @@ namespace sider::nvme {
                pool_pages, pool_pages * 4096 / (1024*1024));
     }
 
-    // ── Init one NVMe device ──
+    // ── Init one NVMe device (creates num_cores qpairs + schedulers) ──
 
-    inline nvme_device init_device(const char* pci_addr) {
+    inline nvme_device init_device(const char* pci_addr, uint32_t num_cores) {
         auto* ssd = new nvme_ssd_t{};
 
-        probe_ctx pctx{pci_addr, ssd, false};
+        probe_ctx pctx{pci_addr, ssd, num_cores, false};
 
         spdk_nvme_transport_id trid{};
         spdk_nvme_trid_populate_transport(&trid, SPDK_NVME_TRANSPORT_PCIE);
@@ -161,28 +166,36 @@ namespace sider::nvme {
                pci_addr, ssd->max_sector, ssd->sector_size,
                disk_bytes / (1024*1024), disk_pages);
 
-        // Create qpair
+        // Create one qpair + scheduler per core.
         spdk_nvme_io_qpair_opts qp_opts{};
         spdk_nvme_ctrlr_get_default_io_qpair_opts(
             ssd->ctrlr, &qp_opts, sizeof(qp_opts));
         qp_opts.delay_cmd_submit = false;
         qp_opts.create_only = false;
 
-        auto* raw_qp = spdk_nvme_ctrlr_alloc_io_qpair(
-            ssd->ctrlr, &qp_opts, sizeof(qp_opts));
-        if (!raw_qp)
-            throw std::runtime_error("spdk_nvme_ctrlr_alloc_io_qpair failed");
+        nvme_device dev;
+        dev.ssd = ssd;
+        dev.disk_pages = disk_pages;
+        dev.per_core.resize(num_cores);
 
-        auto* qp = new nvme_qpair_t{raw_qp, 0, 128, 0, ssd};
+        for (uint32_t i = 0; i < num_cores; i++) {
+            auto* raw_qp = spdk_nvme_ctrlr_alloc_io_qpair(
+                ssd->ctrlr, &qp_opts, sizeof(qp_opts));
+            if (!raw_qp)
+                throw std::runtime_error("spdk_nvme_ctrlr_alloc_io_qpair failed");
 
-        // Create NVMe scheduler
-        auto* scheduler = new nvme_scheduler_t(qp, 65536, 16384);
+            auto* qp = new nvme_qpair_t{raw_qp, i, 128, 0, ssd};
+            auto* scheduler = new nvme_scheduler_t(qp, 65536, 16384);
+            dev.per_core[i] = {qp, scheduler};
+        }
 
         // TRIM — tells SSD all blocks are free, reduces write amplification.
+        // Use first core's qpair for the TRIM command.
         {
             struct trim_ctx { bool done = false; int status = 0; };
             trim_ctx tc;
 
+            auto* trim_qp = dev.per_core[0].qp->impl;
             uint64_t total_sectors = ssd->max_sector;
             spdk_nvme_dsm_range range{};
             range.starting_lba = 0;
@@ -190,7 +203,7 @@ namespace sider::nvme {
                 std::min(total_sectors, static_cast<uint64_t>(UINT32_MAX)));
 
             spdk_nvme_ns_cmd_dataset_management(
-                ssd->ns, raw_qp,
+                ssd->ns, trim_qp,
                 SPDK_NVME_DSM_ATTR_DEALLOCATE,
                 &range, 1,
                 [](void* arg, const spdk_nvme_cpl* cpl) {
@@ -201,7 +214,7 @@ namespace sider::nvme {
                 &tc);
 
             while (!tc.done)
-                spdk_nvme_qpair_process_completions(raw_qp, 0);
+                spdk_nvme_qpair_process_completions(trim_qp, 0);
 
             if (tc.status == 0)
                 printf("NVMe %s TRIM: deallocated %lu sectors\n",
@@ -210,7 +223,7 @@ namespace sider::nvme {
                 printf("NVMe %s TRIM: failed (non-fatal)\n", pci_addr);
         }
 
-        return {ssd, qp, scheduler, disk_pages};
+        return dev;
     }
 
 } // namespace sider::nvme

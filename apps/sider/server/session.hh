@@ -26,6 +26,25 @@ namespace sider::server {
         std::move_only_function<void(std::exception_ptr)> cb_err;
     };
 
+    // Thread-local pool to avoid per-recv heap allocation.
+    struct batch_recv_pool {
+        static constexpr uint32_t CAP = 16;
+        batch_recv_req* pool_[CAP];
+        uint32_t top_ = 0;
+
+        batch_recv_req* get() {
+            if (top_ > 0) return pool_[--top_];
+            return new batch_recv_req{};
+        }
+        void put(batch_recv_req* p) {
+            p->cb = {};
+            p->cb_err = {};
+            if (top_ < CAP) pool_[top_++] = p;
+            else delete p;
+        }
+    };
+    static inline thread_local batch_recv_pool recv_req_pool;
+
     // ── batch_receiver: queue-based async bridge for cmd_batch ──
 
     struct batch_receiver {
@@ -38,7 +57,7 @@ namespace sider::server {
                     resp::cmd_batch&& batch) {
             if (auto opt = recv_q.try_dequeue()) {
                 opt.value()->cb(std::move(batch));
-                delete opt.value();
+                recv_req_pool.put(opt.value());
             } else {
                 ready_q.try_enqueue(new resp::cmd_batch(std::move(batch)));
             }
@@ -50,18 +69,18 @@ namespace sider::server {
             if (closed) {
                 req->cb_err(std::make_exception_ptr(
                     pump::scheduler::net::session_closed_error()));
-                delete req;
+                recv_req_pool.put(req);
                 return;
             }
             if (auto opt = ready_q.try_dequeue()) {
                 req->cb(std::move(*opt.value()));
                 delete opt.value();
-                delete req;
+                recv_req_pool.put(req);
             } else {
                 if (!recv_q.try_enqueue(req)) {
                     req->cb_err(std::make_exception_ptr(
                         pump::scheduler::net::enqueue_failed_error()));
-                    delete req;
+                    recv_req_pool.put(req);
                 }
             }
         }
@@ -72,7 +91,7 @@ namespace sider::server {
             closed = true;
             while (auto opt = recv_q.try_dequeue()) {
                 opt.value()->cb_err(ex);
-                delete opt.value();
+                recv_req_pool.put(opt.value());
             }
             while (auto opt = ready_q.try_dequeue())
                 delete opt.value();
@@ -117,18 +136,16 @@ namespace sider::server {
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope) {
-                session->invoke(
-                    pump::scheduler::net::do_recv,
-                    new batch_recv_req{
-                        [ctx, scope](resp::cmd_batch&& batch) mutable {
-                            pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                                ctx, scope, std::move(batch));
-                        },
-                        [ctx, scope](std::exception_ptr ex) mutable {
-                            pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                                ctx, scope, ex);
-                        }
-                    });
+                auto* req = recv_req_pool.get();
+                req->cb = [ctx, scope](resp::cmd_batch&& batch) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope, std::move(batch));
+                };
+                req->cb_err = [ctx, scope](std::exception_ptr ex) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_exception(
+                        ctx, scope, ex);
+                };
+                session->invoke(pump::scheduler::net::do_recv, req);
             }
         };
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,21 +19,34 @@ namespace sider::resp {
 
         // Set BULK from inline data — copies into small_buf for lifetime safety.
         void set_inline(const char* src, uint32_t src_len) {
+            assert(src_len <= sizeof(small_buf));
             type = BULK;
             std::memcpy(small_buf, src, src_len);
             data = small_buf;
             len = src_len;
         }
 
+        // Fast digit count for uint32_t.
+        static uint32_t uint_digits(uint32_t n) {
+            if (n < 10) return 1; if (n < 100) return 2;
+            if (n < 1000) return 3; if (n < 10000) return 4;
+            if (n < 100000) return 5; if (n < 1000000) return 6;
+            if (n < 10000000) return 7; if (n < 100000000) return 8;
+            if (n < 1000000000) return 9; return 10;
+        }
+
+        // Write uint32_t to buf, return digit count.
+        static uint32_t write_uint(char* buf, uint32_t n) {
+            uint32_t d = uint_digits(n);
+            char* p = buf + d;
+            do { *--p = '0' + (n % 10); n /= 10; } while (n);
+            return d;
+        }
+
         // Compute RESP wire size for this slot.
         uint32_t wire_size() const {
             switch (type) {
-                case BULK: {
-                    // "$<len>\r\n<data>\r\n"
-                    char tmp[16];
-                    int hdr = snprintf(tmp, sizeof(tmp), "$%u\r\n", len);
-                    return hdr + len + 2;
-                }
+                case BULK:        return 1 + uint_digits(len) + 2 + len + 2;
                 case NIL:         return 5;   // "$-1\r\n"
                 case OK:          return 5;   // "+OK\r\n"
                 case PONG:        return 7;   // "+PONG\r\n"
@@ -41,10 +55,7 @@ namespace sider::resp {
                     char tmp[32];
                     return snprintf(tmp, sizeof(tmp), ":%ld\r\n", int_val);
                 }
-                case ERR: {
-                    // "-ERR <msg>\r\n"
-                    return 5 + len + 2;
-                }
+                case ERR:         return 5 + len + 2;
                 default: return 0;
             }
         }
@@ -53,7 +64,10 @@ namespace sider::resp {
         uint32_t write_to(char* buf) const {
             switch (type) {
                 case BULK: {
-                    int hdr = snprintf(buf, 16, "$%u\r\n", len);
+                    buf[0] = '$';
+                    uint32_t d = write_uint(buf + 1, len);
+                    buf[1 + d] = '\r'; buf[2 + d] = '\n';
+                    uint32_t hdr = 3 + d;
                     std::memcpy(buf + hdr, data, len);
                     buf[hdr + len] = '\r';
                     buf[hdr + len + 1] = '\n';

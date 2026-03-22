@@ -72,16 +72,27 @@ namespace sider::store {
         // Caller fills value-related fields (page_id, slot_index, value_len, ...).
         // WARNING: returned pointer is invalidated by a subsequent insert that triggers resize.
         entry* insert(const char* key, uint16_t key_len) {
-            if (auto* e = lookup(key, key_len))
-                return e;
+            uint32_t h = hash_key(key, key_len);
+
+            // Lookup with pre-computed hash.
+            if (count_ > 0) {
+                uint32_t pos = h & mask_;
+                uint8_t  d   = 1;
+                for (;;) {
+                    auto& s = slots_[pos];
+                    if (s.psl == 0)  break;
+                    if (s.psl < d)   break;
+                    if (s.e.key_hash == h && s.e.key_equals(key, key_len))
+                        return &s.e;
+                    pos = (pos + 1) & mask_;
+                    d++;
+                }
+            }
 
             if (count_ * 4 >= capacity_ * 3)   // load > 0.75
                 grow();
 
-            uint32_t h = hash_key(key, key_len);
-            robin_insert(h, key, key_len);
-
-            return lookup(key, key_len);
+            return robin_insert(h, key, key_len);
         }
 
         // Erase by key. Returns true if found and removed.
@@ -117,22 +128,25 @@ namespace sider::store {
             slots_    = new slot[cap]{};
         }
 
-        void robin_insert(uint32_t h, const char* key, uint16_t key_len) {
+        entry* robin_insert(uint32_t h, const char* key, uint16_t key_len) {
             slot ns{};
             ns.e.key_hash = h;
             ns.e.set_key(key, key_len);
             ns.psl = 1;
 
+            entry* result = nullptr;
             uint32_t pos = h & mask_;
             for (;;) {
                 auto& s = slots_[pos];
                 if (s.psl == 0) {
                     s = std::move(ns);
                     count_++;
-                    return;
+                    return result ? result : &s.e;
                 }
-                if (ns.psl > s.psl)
+                if (ns.psl > s.psl) {
+                    if (!result) result = &s.e;  // our entry lands here after swap
                     std::swap(ns, s);
+                }
                 pos = (pos + 1) & mask_;
                 ns.psl++;
             }

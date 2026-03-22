@@ -33,6 +33,7 @@ namespace sider::store {
 
                 uint64_t free_bits = ~pe.slot_bitmap & fmask;
                 if (free_bits == 0) {
+                    pe.partial_index = page_entry::NO_PARTIAL;
                     partials.pop_back();
                     continue;
                 }
@@ -42,8 +43,10 @@ namespace sider::store {
                 pe.live_count++;
 
                 // Remove from partials if now full.
-                if ((pe.slot_bitmap & fmask) == fmask)
+                if ((pe.slot_bitmap & fmask) == fmask) {
+                    pe.partial_index = page_entry::NO_PARTIAL;
                     partials.pop_back();
+                }
 
                 return {pid, idx, pe.mem_ptr + slot_offset(sc, idx)};
             }
@@ -60,8 +63,10 @@ namespace sider::store {
             total_pages_++;
 
             // Multi-slot page goes to partial list (still has free slots).
-            if (slots_per_page[sc] > 1)
+            if (slots_per_page[sc] > 1) {
+                pe.partial_index = static_cast<uint32_t>(partials.size());
                 partials.push_back(pid);
+            }
 
             return {pid, 0, pe.mem_ptr};
         }
@@ -79,7 +84,6 @@ namespace sider::store {
             if (pe.live_count == 0) {
                 if (pe.state == page_entry::EVICTING) {
                     // DMA in progress — can't free memory yet.
-                    // Remove from partials; eviction callback handles cleanup.
                     if (!was_full)
                         remove_from_partials(sc, page_id);
                     return;
@@ -96,8 +100,10 @@ namespace sider::store {
             } else if (was_full) {
                 // Was full, now has space — add to partials.
                 // But NOT for EVICTING pages (no new allocations on them).
-                if (pe.state != page_entry::EVICTING)
+                if (pe.state != page_entry::EVICTING) {
+                    pe.partial_index = static_cast<uint32_t>(partial_pages_[sc].size());
                     partial_pages_[sc].push_back(page_id);
+                }
             }
         }
 
@@ -112,12 +118,15 @@ namespace sider::store {
         void evict_page(uint32_t page_id) {
             auto& pe = pt_[page_id];
             auto sc = static_cast<size_class_t>(pe.size_class);
-            bool full = (pe.slot_bitmap & full_mask_for(sc)) == full_mask_for(sc);
-            if (!full)
+            if (pe.partial_index != page_entry::NO_PARTIAL)
                 remove_from_partials(sc, page_id);
             free_page(pe.mem_ptr);
             total_pages_--;
             pt_.free_page_id(page_id);
+        }
+
+        void remove_from_partials_public(uint8_t sc, uint32_t page_id) {
+            remove_from_partials(static_cast<size_class_t>(sc), page_id);
         }
 
         uint64_t memory_used_bytes() const {
@@ -138,15 +147,20 @@ namespace sider::store {
         }
 
     private:
+        // O(1) removal via partial_index tracking.
         void remove_from_partials(size_class_t sc, uint32_t page_id) {
+            auto& pe = pt_[page_id];
+            if (pe.partial_index == page_entry::NO_PARTIAL) return;
+
             auto& v = partial_pages_[sc];
-            for (size_t i = 0; i < v.size(); i++) {
-                if (v[i] == page_id) {
-                    v[i] = v.back();
-                    v.pop_back();
-                    return;
-                }
+            uint32_t idx = pe.partial_index;
+            if (idx < v.size()) {
+                uint32_t back_pid = v.back();
+                v[idx] = back_pid;
+                pt_[back_pid].partial_index = idx;
+                v.pop_back();
             }
+            pe.partial_index = page_entry::NO_PARTIAL;
         }
     };
 

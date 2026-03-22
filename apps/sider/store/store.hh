@@ -60,7 +60,7 @@ namespace sider::store {
         slab_allocator slab{pt};
         hash_table     ht;
         uint32_t       scan_cursor_ = 0;
-        uint32_t       access_clock_ = 0;
+        uint64_t       access_clock_ = 0;
         uint32_t       rng_state_ = 12345;
         eviction_config evict_cfg_;
 
@@ -368,7 +368,7 @@ namespace sider::store {
             if (page_count == 0) return UINT32_MAX;
 
             uint32_t best_id = UINT32_MAX;
-            uint32_t best_hotness = UINT32_MAX;
+            uint64_t best_hotness = UINT64_MAX;
             int found = 0;
 
             for (int attempt = 0; attempt < samples * 4 && found < samples; attempt++) {
@@ -390,7 +390,7 @@ namespace sider::store {
             if (large_page_ids_.empty()) return UINT32_MAX;
 
             uint32_t best_id = UINT32_MAX;
-            uint32_t best_hotness = UINT32_MAX;
+            uint64_t best_hotness = UINT64_MAX;
             int n = static_cast<int>(large_page_ids_.size());
 
             for (int i = 0; i < std::min(samples, n); i++) {
@@ -440,15 +440,7 @@ namespace sider::store {
             pe.state = page_entry::EVICTING;
 
             // Remove from slab partials — no new allocations on this page.
-            auto sc = static_cast<size_class_t>(pe.size_class);
-            auto& partials = slab.partial_pages_[sc];
-            for (size_t i = 0; i < partials.size(); i++) {
-                if (partials[i] == victim) {
-                    partials[i] = partials.back();
-                    partials.pop_back();
-                    break;
-                }
-            }
+            slab.remove_from_partials_public(pe.size_class, victim);
 
             return victim;
         }
@@ -593,25 +585,30 @@ namespace sider::store {
         }
 
         // Erase all hash table entries pointing to a page.
+        // Uses stack buffer to avoid heap allocation for key copies.
         void discard_page_entries(uint32_t page_id) {
-            struct key_copy { char* data; uint16_t len; };
-            std::vector<key_copy> keys;
+            static constexpr uint32_t MAX_ENTRIES = 64;  // SC_64 max
+            static constexpr uint32_t KEY_BUF_SIZE = 64 * 64;  // 4KB
+
+            struct key_ref { uint32_t buf_offset; uint16_t len; };
+            key_ref keys[MAX_ENTRIES];
+            char key_buf[KEY_BUF_SIZE];
+            uint32_t nkeys = 0, buf_pos = 0;
 
             auto cap = ht.capacity();
             for (uint32_t i = 0; i < cap; i++) {
                 auto* e = ht.entry_at(i);
                 if (!e) continue;
-                if (e->is_inline()) continue;  // inline entries have no page_id
+                if (e->is_inline()) continue;
                 if (e->page_id != page_id) continue;
-                auto* kd = new char[e->key_len];
-                std::memcpy(kd, e->key_data, e->key_len);
-                keys.push_back({kd, e->key_len});
+                if (nkeys >= MAX_ENTRIES || buf_pos + e->key_len > KEY_BUF_SIZE) break;
+                std::memcpy(key_buf + buf_pos, e->key_data, e->key_len);
+                keys[nkeys++] = {buf_pos, e->key_len};
+                buf_pos += e->key_len;
             }
 
-            for (auto& k : keys) {
-                ht.erase(k.data, k.len);
-                delete[] k.data;
-            }
+            for (uint32_t i = 0; i < nkeys; i++)
+                ht.erase(key_buf + keys[i].buf_offset, keys[i].len);
         }
     };
 

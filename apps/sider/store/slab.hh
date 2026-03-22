@@ -60,6 +60,7 @@ namespace sider::store {
             pe.hotness  = 0;
             pe.mem_ptr  = alloc_page();
             pe.slot_bitmap = 1ULL;   // slot 0 occupied
+            pe.slot_key_hashes = new uint32_t[slots_per_page[sc]]{};
             total_pages_++;
 
             // Multi-slot page goes to partial list (still has free slots).

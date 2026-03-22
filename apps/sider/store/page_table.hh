@@ -19,6 +19,7 @@ namespace sider::store {
         uint64_t  nvme_lba = 0;      // valid when ON_NVME (page position on disk)
         uint8_t   disk_id = 0;       // which NVMe disk (valid when ON_NVME)
         uint32_t  partial_index = NO_PARTIAL;  // index in slab partial_pages_ vector
+        uint32_t* slot_key_hashes = nullptr;   // reverse index: key_hash per slot for O(1) discard
     };
 
     struct page_table {
@@ -37,6 +38,7 @@ namespace sider::store {
         }
 
         void free_page_id(uint32_t id) {
+            delete[] pages_[id].slot_key_hashes;
             pages_[id] = page_entry{};
             free_ids_.push_back(id);
         }

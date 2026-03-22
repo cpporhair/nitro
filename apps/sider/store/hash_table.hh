@@ -95,6 +95,31 @@ namespace sider::store {
             return robin_insert(h, key, key_len);
         }
 
+        // Erase by (key_hash, page_id, slot_index) — O(1) amortized, no full key needed.
+        // Used by discard_page_entries for fast page eviction.
+        bool erase_by_page(uint32_t key_hash, uint32_t page_id, uint8_t slot_index) {
+            if (count_ == 0) return false;
+
+            uint32_t pos = key_hash & mask_;
+            uint8_t  d   = 1;
+
+            for (;;) {
+                auto& s = slots_[pos];
+                if (s.psl == 0)  return false;
+                if (s.psl < d)   return false;
+                if (s.e.key_hash == key_hash && !s.e.is_inline() &&
+                    s.e.page_id == page_id && s.e.slot_index == slot_index) {
+                    s.e.free_key();
+                    s.psl = 0;
+                    backward_shift(pos);
+                    count_--;
+                    return true;
+                }
+                pos = (pos + 1) & mask_;
+                d++;
+            }
+        }
+
         // Erase by key. Returns true if found and removed.
         bool erase(const char* key, uint16_t key_len) {
             if (count_ == 0) return false;

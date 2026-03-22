@@ -137,6 +137,7 @@ namespace sider::store {
                 e->set_large(false);
                 e->set_inline(false);
             }
+            record_slot_key_hash(e);
             pt[e->page_id].hotness = ++access_clock_;
             nvme_page_dec_live(old_page_id);
         }
@@ -195,8 +196,10 @@ namespace sider::store {
                     e->value_len = value_len;
                     e->expire_at = expire_at;
                     e->version++;
-                    if (!e->is_inline())
+                    if (!e->is_inline()) {
+                        record_slot_key_hash(e);
                         pt[e->page_id].hotness = ++access_clock_;
+                    }
                     return;
                 }
 
@@ -223,8 +226,10 @@ namespace sider::store {
                     e->value_len  = value_len;
                     e->expire_at  = expire_at;
                     e->version++;
-                    if (!e->is_inline())
+                    if (!e->is_inline()) {
+                        record_slot_key_hash(e);
                         pt[e->page_id].hotness = ++access_clock_;
+                    }
                     nvme_page_dec_live(old_page_id);
                     return;
                 }
@@ -312,8 +317,10 @@ namespace sider::store {
                 e->version    = 0;
             }
 
-            if (!e->is_inline())
+            if (!e->is_inline()) {
+                record_slot_key_hash(e);
                 pt[e->page_id].hotness = ++access_clock_;
+            }
         }
 
         int del(const char* key, uint16_t key_len) {
@@ -519,6 +526,13 @@ namespace sider::store {
             }
         }
 
+        // Record key_hash in page's reverse index for O(1) discard.
+        void record_slot_key_hash(entry* e) {
+            auto& pe = pt[e->page_id];
+            if (pe.slot_key_hashes)
+                pe.slot_key_hashes[e->slot_index] = e->key_hash;
+        }
+
         // Decrement live_count on an ON_NVME page.
         // If zero, queue NVMe LBA(s) for freeing and release page_id.
         void nvme_page_dec_live(uint32_t page_id) {
@@ -545,7 +559,8 @@ namespace sider::store {
             pe.page_count = pc;
             pe.hotness    = 0;
             pe.mem_ptr    = mem;
-            pe.slot_bitmap = 0;
+            pe.slot_bitmap = 1ULL;   // slot 0 occupied (single large value)
+            pe.slot_key_hashes = new uint32_t[1]{};
 
             e->page_id    = pid;
             e->slot_index = 0;
@@ -585,30 +600,20 @@ namespace sider::store {
         }
 
         // Erase all hash table entries pointing to a page.
-        // Uses stack buffer to avoid heap allocation for key copies.
+        // Uses slot_key_hashes reverse index — O(slots_per_page) instead of O(hash_table_capacity).
         void discard_page_entries(uint32_t page_id) {
-            static constexpr uint32_t MAX_ENTRIES = 64;  // SC_64 max
-            static constexpr uint32_t KEY_BUF_SIZE = 64 * 64;  // 4KB
+            auto& pe = pt[page_id];
+            if (!pe.slot_key_hashes) return;  // large values without key_hashes (shouldn't happen)
 
-            struct key_ref { uint32_t buf_offset; uint16_t len; };
-            key_ref keys[MAX_ENTRIES];
-            char key_buf[KEY_BUF_SIZE];
-            uint32_t nkeys = 0, buf_pos = 0;
+            auto sc = static_cast<size_class_t>(pe.size_class);
+            uint32_t n_slots = (pe.page_count > 1) ? 1 : slots_per_page[sc];
+            uint64_t bitmap = pe.slot_bitmap;
 
-            auto cap = ht.capacity();
-            for (uint32_t i = 0; i < cap; i++) {
-                auto* e = ht.entry_at(i);
-                if (!e) continue;
-                if (e->is_inline()) continue;
-                if (e->page_id != page_id) continue;
-                if (nkeys >= MAX_ENTRIES || buf_pos + e->key_len > KEY_BUF_SIZE) break;
-                std::memcpy(key_buf + buf_pos, e->key_data, e->key_len);
-                keys[nkeys++] = {buf_pos, e->key_len};
-                buf_pos += e->key_len;
+            for (uint32_t si = 0; si < n_slots && bitmap; si++) {
+                if (!(bitmap & (1ULL << si))) continue;
+                ht.erase_by_page(pe.slot_key_hashes[si], page_id, static_cast<uint8_t>(si));
+                bitmap &= ~(1ULL << si);
             }
-
-            for (uint32_t i = 0; i < nkeys; i++)
-                ht.erase(key_buf + keys[i].buf_offset, keys[i].len);
         }
     };
 

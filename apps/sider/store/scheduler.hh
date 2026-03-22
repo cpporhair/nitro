@@ -148,10 +148,13 @@ namespace sider::store {
         pump::core::per_core::queue<store_req*, false> req_q;
         int advance_count_ = 0;
 
+        uint32_t owner_core_;
+
         // owner_core defaults to this_core_id at construction time.
         // Caller must set pump::core::this_core_id before creating.
         explicit store_scheduler()
-            : req_q(4096, pump::core::this_core_id) {}
+            : req_q(4096, pump::core::this_core_id)
+            , owner_core_(pump::core::this_core_id) {}
 
         // NVMe eviction support (empty = no NVMe, discard-only).
         using nvme_sched_t = pump::scheduler::nvme::scheduler<nvme::sider_page>;
@@ -167,7 +170,14 @@ namespace sider::store {
         uint8_t  next_disk_ = 0;
         uint64_t in_flight_eviction_bytes_ = 0;
 
-        void schedule(store_req* r) { req_q.try_enqueue(r); }
+        void schedule(store_req* r) {
+            if (pump::core::this_core_id == owner_core_) {
+                r->fn(store);
+                delete r;
+            } else {
+                req_q.try_enqueue(r);
+            }
+        }
 
         void set_eviction_config(uint64_t memory_limit,
                                  double begin_pct, double urgent_pct) {

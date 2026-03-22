@@ -232,6 +232,15 @@ int main(int argc, char** argv) {
 
     printf("sider listening on port %u (%u cores)\n", cfg.port, num_cores);
 
+    // ── Pin main thread to accept_core ──
+
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cfg.accept_core, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
+
     // ── Launch per-core threads and block on main core ──
 
     auto no_init = [](auto*, uint32_t) {};

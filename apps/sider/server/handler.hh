@@ -56,7 +56,10 @@ namespace sider::server {
         bool is_closed() const { return closed; }
 
         conn_state(session_sched_t* s, session_t* sess) : sched(s), session(sess) {}
-        ~conn_state() { delete session; }
+        ~conn_state() {
+            if (session)
+                session->broadcast(::pump::scheduler::net::pipeline_end);
+        }
 
         conn_state(conn_state&& o) noexcept
             : sched(o.sched), session(o.session), closed(o.closed) {
@@ -64,7 +67,6 @@ namespace sider::server {
         }
         conn_state& operator=(conn_state&& o) noexcept {
             if (this != &o) {
-                delete session;
                 sched = o.sched; session = o.session; closed = o.closed;
                 o.session = nullptr;
             }

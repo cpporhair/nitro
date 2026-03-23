@@ -260,6 +260,28 @@
 
 ---
 
+### Phase 2 已知问题
+
+#### 问题 1：UAF crash（多客户端同时断连）— 已修复
+
+- 根因：`handle_session_error()` 中 `broadcast(on_error)` 同步触发 pipeline 终止 → `conn_state::~conn_state()` delete session → 返回后访问已释放 session
+- Session 有两个独立使用者：pipeline（conn_state）和 io_uring read chain（uring_req->user_data）
+- 修复：框架新增 `session_lifecycle` 层（`pump/src/env/scheduler/net/common/session_lifecycle.hh`），追踪 `pipeline_active` 和 `read_active` 两个状态，最后一个归零的触发 `do_close + delete`
+  - `conn_state::~conn_state()` → `broadcast(pipeline_end)` 清除 pipeline_active
+  - CQE handler read chain 结束时 → `broadcast(read_end)` 清除 read_active
+  - `handle_session_error()` 只做 `broadcast(on_error) + invoke(do_close)`，不 delete
+  - 应用按需将 `session_lifecycle` 组合进 session（不加则 broadcast 自动跳过，不影响其他项目）
+- A/B 测试：单核 P32 GET 5.60M → 5.42M（-3%，CPU 频率波动范围内），无性能回归
+
+#### 问题 2：多核跨核路由性能低于单核
+
+- Phase 2.2 双核 P32 GET 吞吐低于单核（4.01M vs 5.33M with bypass）
+- FNV-1a `% N` 对 redis-benchmark key 格式分布严重偏斜（实测 4:1，但 Python 验证是 50/50）
+- 偏斜导致一个 store 核心过载，另一个空闲
+- 需要先解决 hash 分布偏斜问题，才能准确测量跨核路由的真实性能开销
+
+---
+
 ### Phase 2.3：多核稳定性
 
 - 跨核淘汰/过期独立运行

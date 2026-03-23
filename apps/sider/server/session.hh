@@ -10,6 +10,7 @@
 #include "env/scheduler/net/tcp/tcp.hh"
 #include "env/scheduler/net/tcp/io_uring/scheduler.hh"
 #include "env/scheduler/net/common/session_tags.hh"
+#include "env/scheduler/net/common/session_lifecycle.hh"
 #include "env/scheduler/net/common/errors.hh"
 
 #include "resp/unpacker.hh"
@@ -105,7 +106,8 @@ namespace sider::server {
         using session_type = pump::scheduler::net::session_t<
             tcp::common::tcp_bind<sched_t>,
             tcp::common::tcp_ring_buffer<resp::resp2_batch_unpacker>,
-            batch_receiver
+            batch_receiver,
+            pump::scheduler::net::session_lifecycle
         >;
 
         template<typename sched_t>
@@ -113,7 +115,8 @@ namespace sider::server {
             return new session_type<sched_t>(
                 tcp::common::tcp_bind<sched_t>(fd, sche),
                 tcp::common::tcp_ring_buffer<resp::resp2_batch_unpacker>(2 * 1024 * 1024),
-                batch_receiver()
+                batch_receiver(),
+                pump::scheduler::net::session_lifecycle()
             );
         }
     };

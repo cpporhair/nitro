@@ -38,9 +38,15 @@ namespace sider::store {
                 ? used - in_flight_eviction_bytes_ : 0ULL;
 
             if (effective >= cfg.max_bytes()) {
-                while (store.memory_used_bytes() >= cfg.urgent_bytes()) {
-                    if (store.discard_one_large() > 0) continue;
-                    if (store.discard_one_page() == 0) break;
+                // Aggressive async eviction — no sync discard.
+                // SET backpressure (return false) handles new key rejection.
+                for (int i = 0; i < 32; i++) {
+                    auto eff = store.memory_used_bytes()
+                        - std::min(store.memory_used_bytes(), in_flight_eviction_bytes_);
+                    if (eff < cfg.begin_bytes()) break;
+                    if (!try_start_large_eviction()) {
+                        if (!try_start_eviction()) break;
+                    }
                 }
             } else if (effective >= cfg.urgent_bytes()) {
                 for (int i = 0; i < 8; i++) {
@@ -72,14 +78,10 @@ namespace sider::store {
     }
 
     inline bool store_scheduler::try_start_eviction() {
-        if (disks_.empty()) {
-            return store.discard_one_page() > 0;
-        }
+        if (disks_.empty()) return false;  // no NVMe → backpressure, not discard
 
         uint8_t disk_id = store_scheduler_pick_disk(disks_, next_disk_);
-        if (disk_id == UINT8_MAX) {
-            return store.discard_one_page() > 0;
-        }
+        if (disk_id == UINT8_MAX) return false;  // all disks full
 
         uint32_t victim = store.begin_eviction();
         if (victim == UINT32_MAX) return false;
@@ -88,7 +90,7 @@ namespace sider::store {
         auto lba = disk.allocator->allocate();
         if (lba == nvme::nvme_allocator::INVALID_LBA) {
             store.pt[victim].state = page_entry::IN_MEMORY;
-            return store.discard_one_page() > 0;
+            return false;  // LBA alloc failed
         }
 
         auto& pe = store.pt[victim];
@@ -115,9 +117,7 @@ namespace sider::store {
     }
 
     inline bool store_scheduler::try_start_large_eviction() {
-        if (disks_.empty()) {
-            return store.discard_one_large() > 0;
-        }
+        if (disks_.empty()) return false;  // no NVMe → backpressure, not discard
 
         if (store.large_page_ids_.empty()) return false;
 
@@ -144,10 +144,10 @@ namespace sider::store {
         }
 
         if (disk_id == UINT8_MAX) {
-            // No disk has contiguous space — revert and discard.
+            // No disk has contiguous space — revert, rely on backpressure.
             pe.state = page_entry::IN_MEMORY;
             store.large_page_ids_.push_back(victim);
-            return store.discard_one_large() > 0;
+            return false;
         }
 
         pe.nvme_lba = lba;

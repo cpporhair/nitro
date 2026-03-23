@@ -149,16 +149,14 @@ namespace sider::store {
             return {};
         }
 
-        void set(const char* key, uint16_t key_len,
+        // Returns false when memory is at hard limit (backpressure).
+        // Async NVMe eviction (in scheduler advance) will free memory.
+        bool set(const char* key, uint16_t key_len,
                  const char* value, uint32_t value_len,
                  int64_t expire_at = -1) {
-            // Sync eviction at hard limit — discard only (no NVMe from here).
             if (evict_cfg_.memory_limit > 0 &&
                 memory_used_bytes() >= evict_cfg_.max_bytes()) {
-                while (memory_used_bytes() >= evict_cfg_.urgent_bytes()) {
-                    if (discard_one_large() > 0) continue;
-                    if (discard_one_page() == 0) break;
-                }
+                return false;
             }
 
             bool new_inline = is_inline_value(value_len);
@@ -176,7 +174,7 @@ namespace sider::store {
                         bool ok = new_large
                             ? try_alloc_large(e, value, value_len)
                             : try_alloc_slab(e, value, value_len);
-                        if (!ok) return;  // alloc failed, keep old inline value
+                        if (!ok) return true;  // alloc failed, keep old inline value
                     }
                     e->value_len = value_len;
                     e->expire_at = expire_at;
@@ -185,7 +183,7 @@ namespace sider::store {
                         record_slot_key_hash(e);
                         pt[e->page_id].hotness = ++access_clock_;
                     }
-                    return;
+                    return true;
                 }
 
                 auto& old_pe = pt[e->page_id];
@@ -200,7 +198,7 @@ namespace sider::store {
                         bool ok = new_large
                             ? try_alloc_large(e, value, value_len)
                             : try_alloc_slab(e, value, value_len);
-                        if (!ok) return;  // alloc failed, keep on NVMe
+                        if (!ok) return true;  // alloc failed, keep on NVMe
                     }
                     e->value_len  = value_len;
                     e->expire_at  = expire_at;
@@ -210,7 +208,7 @@ namespace sider::store {
                         pt[e->page_id].hotness = ++access_clock_;
                     }
                     nvme_page_dec_live(old_page_id);
-                    return;
+                    return true;
                 }
 
                 // IN_MEMORY or EVICTING: page is in RAM.
@@ -234,7 +232,7 @@ namespace sider::store {
                         std::memcpy(slab.slot_ptr(e->page_id, e->slot_index), value, value_len);
                     } else {
                         slab.free_slot(e->page_id, e->slot_index);
-                        if (!try_alloc_slab(e, value, value_len)) return;
+                        if (!try_alloc_slab(e, value, value_len)) return true;
                     }
                     e->set_inline(false);
                 } else if (old_large && new_large) {
@@ -243,16 +241,16 @@ namespace sider::store {
                         std::memcpy(old_pe.mem_ptr, value, value_len);
                     } else {
                         free_large_entry_mem(e);
-                        if (!try_alloc_large(e, value, value_len)) return;
+                        if (!try_alloc_large(e, value, value_len)) return true;
                     }
                 } else if (old_large) {
                     // large → slab
                     free_large_entry_mem(e);
-                    if (!try_alloc_slab(e, value, value_len)) return;
+                    if (!try_alloc_slab(e, value, value_len)) return true;
                 } else {
                     // slab → large
                     slab.free_slot(e->page_id, e->slot_index);
-                    if (!try_alloc_large(e, value, value_len)) return;
+                    if (!try_alloc_large(e, value, value_len)) return true;
                 }
 
                 e->value_len  = value_len;
@@ -269,12 +267,12 @@ namespace sider::store {
                     e = ht.insert(key, key_len);
                     if (!try_alloc_large(e, value, value_len)) {
                         ht.erase(key, key_len);
-                        return;
+                        return true;
                     }
                 } else {
                     auto new_sc = size_class_for(value_len);
                     auto ar = slab.allocate(new_sc);
-                    if (!ar.slot_ptr) return;  // DMA alloc failed, drop key
+                    if (!ar.slot_ptr) return true;  // DMA alloc failed, drop key
 
                     std::memcpy(ar.slot_ptr, value, value_len);
                     e = ht.insert(key, key_len);
@@ -292,6 +290,7 @@ namespace sider::store {
                 record_slot_key_hash(e);
                 pt[e->page_id].hotness = ++access_clock_;
             }
+            return true;
         }
 
         int del(const char* key, uint16_t key_len) {

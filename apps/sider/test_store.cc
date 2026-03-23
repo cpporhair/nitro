@@ -604,13 +604,15 @@ static void test_store_discard_one_page() {
     assert(s.memory_used_bytes() < before_mem);
 
     // Evicted keys should return nil.
+    auto after_count = s.key_count();
     int missing = 0;
     for (int i = 0; i < 200; i++) {
         auto key = "k" + std::to_string(i);
         if (!G(s.get(key.c_str(), static_cast<uint16_t>(key.size()))).found())
             missing++;
     }
-    assert(missing == evicted);
+    assert(missing > 0);
+    assert(missing == static_cast<int>(before_count - after_count));
 }
 
 static void test_store_evict_returns_nil() {
@@ -663,22 +665,25 @@ static void test_store_evict_preserves_hot_keys() {
 
 static void test_store_evict_sync_on_max() {
     kv_store s;
-    // 10 pages limit. SC_64: 64 slots/page → 640 keys at capacity.
+    // 10 pages limit. SC_64: 64 slots/page.
+    // Backpressure rejects new keys when memory_used_bytes >= max_bytes.
+    // Page granularity: 9 pages fill (576 keys), 10th page alloc (1 key) → at limit.
     s.evict_cfg_ = {10 * PAGE_SIZE, 0.60, 0.90};
 
-    // Insert 2000 keys with 32-byte values (> INLINE_VALUE_MAX) to use slab.
     char val32[32];
     std::memset(val32, 'V', sizeof(val32));
+    int accepted = 0;
     for (int i = 0; i < 2000; i++) {
         auto key = "k" + std::to_string(i);
-        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val32, 32);
+        if (s.set(key.c_str(), static_cast<uint16_t>(key.size()), val32, 32))
+            accepted++;
     }
 
-    // Memory should not exceed limit + 1 page (overshoot from final alloc).
-    assert(s.memory_used_bytes() <= 11 * PAGE_SIZE);
-    // Some keys were evicted.
-    assert(s.key_count() < 2000);
-    assert(s.key_count() > 0);
+    // Backpressure: set() returns false at hard limit, no keys discarded.
+    assert(s.memory_used_bytes() <= 10 * PAGE_SIZE);
+    assert(s.key_count() == static_cast<uint32_t>(accepted));
+    assert(accepted > 0);
+    assert(accepted < 2000);
 }
 
 static void test_store_evict_memory_stable() {
@@ -697,6 +702,42 @@ static void test_store_evict_memory_stable() {
     assert(s.memory_used_bytes() <= 21 * PAGE_SIZE);
     assert(s.key_count() > 0);
     assert(s.key_count() < 5000);
+}
+
+static void test_store_set_backpressure() {
+    kv_store s;
+    // 5 pages limit. SC_4K: 1 slot/page → each key = 1 page, 5 keys max.
+    s.evict_cfg_ = {5 * PAGE_SIZE, 0.60, 0.90};
+
+    char val[3000];
+    std::memset(val, 'B', sizeof(val));
+
+    int accepted = 0, rejected = 0;
+    for (int i = 0; i < 10; i++) {
+        auto key = "k" + std::to_string(i);
+        bool ok = s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 3000);
+        if (ok) accepted++; else rejected++;
+    }
+
+    // 5 accepted (one per page), 5 rejected at hard limit.
+    assert(accepted == 5);
+    assert(rejected == 5);
+    assert(s.memory_used_bytes() == 5 * PAGE_SIZE);
+    assert(s.key_count() == 5);
+
+    // All accepted keys readable.
+    for (int i = 0; i < 5; i++) {
+        auto key = "k" + std::to_string(i);
+        auto r = G(s.get(key.c_str(), static_cast<uint16_t>(key.size())));
+        assert(r.found());
+        assert(r.len == 3000);
+    }
+
+    // Rejected keys don't exist.
+    for (int i = 5; i < 10; i++) {
+        auto key = "k" + std::to_string(i);
+        assert(!G(s.get(key.c_str(), static_cast<uint16_t>(key.size()))).found());
+    }
 }
 
 static void test_store_evict_no_pages() {
@@ -839,16 +880,22 @@ static void test_large_value_discard() {
     s.evict_cfg_ = {5 * PAGE_SIZE, 0.60, 0.90};
 
     // Insert 3 large values, each 2 pages (6 pages total > 5 page limit).
+    // Backpressure: check is before allocation, so a single large alloc can
+    // overshoot. All 3 inserts pass (4 pages < 5 page limit when big2 starts).
+    int accepted = 0;
     for (int i = 0; i < 3; i++) {
         auto key = "big" + std::to_string(i);
         char val[8192];
         std::memset(val, 'K' + i, sizeof(val));
-        s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 8192);
+        if (s.set(key.c_str(), static_cast<uint16_t>(key.size()), val, 8192))
+            accepted++;
     }
 
-    // At least one large value should have been discarded.
-    assert(s.memory_used_bytes() <= 5 * PAGE_SIZE);
-    assert(s.key_count() < 3);
+    // All 3 accepted (memory was below limit before each alloc).
+    assert(accepted == 3);
+    assert(s.key_count() == 3);
+    // Overshoot: 6 pages > 5 page limit (no sync discard, scheduler handles it).
+    assert(s.memory_used_bytes() == 6 * PAGE_SIZE);
 }
 
 static void test_large_value_mixed_eviction() {
@@ -1157,6 +1204,7 @@ int main() {
     RUN(test_store_evict_preserves_hot_keys);
     RUN(test_store_evict_sync_on_max);
     RUN(test_store_evict_memory_stable);
+    RUN(test_store_set_backpressure);
 
     printf("inline values:\n");
     RUN(test_inline_set_get);

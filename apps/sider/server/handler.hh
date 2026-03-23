@@ -209,8 +209,10 @@ namespace sider::server {
                 action.value.data(),
                 static_cast<uint32_t>(action.value.size()),
                 expire_at)
-            >> then([slot]() {
-                slot->type = resp::resp_slot::OK;
+            >> then([slot](bool ok) {
+                if (ok) slot->type = resp::resp_slot::OK;
+                else *slot = {resp::resp_slot::ERR,
+                    "OOM memory limit exceeded", 25};
             });
     }
 
@@ -522,10 +524,12 @@ namespace sider::server {
                                 } else if constexpr (std::is_same_v<A, set_cmd>) {
                                     int64_t ea = act.expire_ms >= 0
                                         ? store::now_ms() + act.expire_ms : -1;
-                                    stores[local_idx]->store.set(
+                                    bool ok = stores[local_idx]->store.set(
                                         key, key_len, act.value.data(),
                                         static_cast<uint32_t>(act.value.size()), ea);
-                                    resp->type = resp::resp_slot::OK;
+                                    if (ok) resp->type = resp::resp_slot::OK;
+                                    else *resp = {resp::resp_slot::ERR,
+                                        "OOM memory limit exceeded", 25};
                                 } else {
                                     int cnt = stores[local_idx]->store.del(key, key_len);
                                     *resp = {resp::resp_slot::INTEGER, nullptr, 0, cnt};
@@ -602,11 +606,14 @@ namespace sider::server {
                                         }
                                         break;
                                     }
-                                    case 1: // SET
-                                        store.set(c.key, c.key_len,
+                                    case 1: { // SET
+                                        bool ok = store.set(c.key, c.key_len,
                                                   c.value, c.value_len, c.expire_at);
-                                        c.resp->type = resp::resp_slot::OK;
+                                        if (ok) c.resp->type = resp::resp_slot::OK;
+                                        else *c.resp = {resp::resp_slot::ERR,
+                                            "OOM memory limit exceeded", 25};
                                         break;
+                                    }
                                     case 2: { // DEL
                                         int cnt = store.del(c.key, c.key_len);
                                         *c.resp = {resp::resp_slot::INTEGER, nullptr, 0, cnt};

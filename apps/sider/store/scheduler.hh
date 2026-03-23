@@ -80,8 +80,8 @@ namespace sider::store {
                 sched->schedule(new store_req{
                     [k = key, kl = key_len, v = value, vl = value_len,
                      ea = expire_at, ctx, scope](kv_store& store) mutable {
-                        store.set(k, kl, v, vl, ea);
-                        pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
+                        bool ok = store.set(k, kl, v, vl, ea);
+                        pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope, ok);
                     }
                 });
             }
@@ -247,13 +247,13 @@ namespace pump::core {
         }
     };
 
-    // put → void (0 values)
+    // put → bool (true = success, false = backpressure/OOM)
     template<typename ctx_t, typename sched_t>
     struct compute_sender_type<ctx_t,
             sider::store::_store_ops::put_sender<sched_t>> {
-        consteval static uint32_t count_value() { return 0; }
+        consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
-            return std::type_identity<void>{};
+            return std::type_identity<bool>{};
         }
     };
 

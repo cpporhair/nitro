@@ -131,6 +131,8 @@ int main(int argc, char** argv) {
 
     std::vector<sider::nvme::nvme_device> nvme_devs;
 
+    sider::server::g_has_nvme = cfg.has_nvme();
+
     if (cfg.has_nvme()) {
         auto mask_str = cfg.core_mask_str();
         sider::nvme::init_env(mask_str.c_str(), cfg.dma_pages());

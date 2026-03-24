@@ -52,6 +52,34 @@ add_executable(sider_test_store apps/sider/test_store.cc)
 target_include_directories(sider_test_store PRIVATE ${CMAKE_SOURCE_DIR}/apps/sider)
 target_link_libraries(sider_test_store PRIVATE pthread)
 
+# Sider benchmark (standalone, no SPDK — based on Valkey redis-benchmark, BSD-3-Clause)
+set(SIDER_BENCH_DIR ${CMAKE_SOURCE_DIR}/apps/sider/bench)
+add_executable(sider_bench
+    ${SIDER_BENCH_DIR}/sider-benchmark.c
+    ${SIDER_BENCH_DIR}/ae.c
+    ${SIDER_BENCH_DIR}/anet.c
+    ${SIDER_BENCH_DIR}/adlist.c
+    ${SIDER_BENCH_DIR}/dict.c
+    ${SIDER_BENCH_DIR}/zmalloc.c
+    ${SIDER_BENCH_DIR}/serverassert.c
+    ${SIDER_BENCH_DIR}/release.c
+    ${SIDER_BENCH_DIR}/crcspeed.c
+    ${SIDER_BENCH_DIR}/crccombine.c
+    ${SIDER_BENCH_DIR}/crc64.c
+    ${SIDER_BENCH_DIR}/siphash.c
+    ${SIDER_BENCH_DIR}/crc16.c
+    ${SIDER_BENCH_DIR}/monotonic.c
+    ${SIDER_BENCH_DIR}/cli_common.c
+    ${SIDER_BENCH_DIR}/mt19937-64.c
+    ${SIDER_BENCH_DIR}/strl.c
+    ${SIDER_BENCH_DIR}/hdr_histogram.c)
+target_include_directories(sider_bench PRIVATE ${SIDER_BENCH_DIR} /usr/include/hiredis)
+target_link_libraries(sider_bench PRIVATE hiredis pthread m)
+set_target_properties(sider_bench PROPERTIES
+    C_STANDARD 11
+    C_EXTENSIONS ON)
+target_compile_options(sider_bench PRIVATE -Wno-unused-result -Wno-deprecated-declarations)
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

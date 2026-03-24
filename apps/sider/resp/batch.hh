@@ -10,7 +10,7 @@ namespace sider::resp {
 
     // Response descriptor — no copy, just describes what to write at send time.
     struct resp_slot {
-        enum type_t : uint8_t { EMPTY, BULK, NIL, OK, PONG, INTEGER, ERR, EMPTY_ARRAY };
+        enum type_t : uint8_t { EMPTY, BULK, NIL, OK, PONG, INTEGER, ERR, EMPTY_ARRAY, BACKPRESSURE };
         type_t type = EMPTY;
         const char* data = nullptr;   // BULK: points to slab memory; ERR: error message
         uint32_t len = 0;             // BULK: value length; ERR: message length
@@ -68,6 +68,8 @@ namespace sider::resp {
                     return snprintf(tmp, sizeof(tmp), ":%ld\r\n", int_val);
                 }
                 case ERR:         return 5 + len + 2;
+                case BACKPRESSURE: // "-BACKPRESSURE retry N\r\n"
+                    return 20 + uint_digits(static_cast<uint32_t>(int_val)) + 2;
                 default: return 0;
             }
         }
@@ -101,6 +103,13 @@ namespace sider::resp {
                     buf[5 + len] = '\r';
                     buf[5 + len + 1] = '\n';
                     return 5 + len + 2;
+                }
+                case BACKPRESSURE: {
+                    std::memcpy(buf, "-BACKPRESSURE retry ", 20);
+                    uint32_t d = write_uint(buf + 20, static_cast<uint32_t>(int_val));
+                    buf[20 + d] = '\r';
+                    buf[20 + d + 1] = '\n';
+                    return 20 + d + 2;
                 }
                 default: return 0;
             }

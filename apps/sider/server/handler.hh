@@ -34,6 +34,9 @@ namespace sider::server {
     namespace tcp = pump::scheduler::tcp;
     using namespace pump::sender;
 
+    // Set at startup: true if NVMe disks are configured (backpressure can recover).
+    inline bool g_has_nvme = false;
+
     // ── Command classification ──
 
     struct simple_resp {
@@ -211,8 +214,9 @@ namespace sider::server {
                 expire_at)
             >> then([slot](bool ok) {
                 if (ok) slot->type = resp::resp_slot::OK;
-                else *slot = {resp::resp_slot::ERR,
-                    "OOM memory limit exceeded", 25};
+                else *slot = (g_has_nvme
+                                        ? resp::resp_slot{resp::resp_slot::BACKPRESSURE, nullptr, 0, 10}
+                                        : resp::resp_slot{resp::resp_slot::ERR, "OOM memory limit exceeded", 25});
             });
     }
 
@@ -528,8 +532,9 @@ namespace sider::server {
                                         key, key_len, act.value.data(),
                                         static_cast<uint32_t>(act.value.size()), ea);
                                     if (ok) resp->type = resp::resp_slot::OK;
-                                    else *resp = {resp::resp_slot::ERR,
-                                        "OOM memory limit exceeded", 25};
+                                    else *resp = (g_has_nvme
+                                        ? resp::resp_slot{resp::resp_slot::BACKPRESSURE, nullptr, 0, 10}
+                                        : resp::resp_slot{resp::resp_slot::ERR, "OOM memory limit exceeded", 25});
                                 } else {
                                     int cnt = stores[local_idx]->store.del(key, key_len);
                                     *resp = {resp::resp_slot::INTEGER, nullptr, 0, cnt};
@@ -610,8 +615,9 @@ namespace sider::server {
                                         bool ok = store.set(c.key, c.key_len,
                                                   c.value, c.value_len, c.expire_at);
                                         if (ok) c.resp->type = resp::resp_slot::OK;
-                                        else *c.resp = {resp::resp_slot::ERR,
-                                            "OOM memory limit exceeded", 25};
+                                        else *c.resp = (g_has_nvme
+                                        ? resp::resp_slot{resp::resp_slot::BACKPRESSURE, nullptr, 0, 10}
+                                        : resp::resp_slot{resp::resp_slot::ERR, "OOM memory limit exceeded", 25});
                                         break;
                                     }
                                     case 2: { // DEL

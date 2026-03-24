@@ -4,7 +4,7 @@
 
 Redis 的数据必须全部放在内存中——内存不够，数据就放不下。Sider 把冷数据透明地淘汰到 NVMe SSD，热数据留在内存直接访问，冷数据按需从 NVMe 异步读回。对客户端完全透明，协议兼容 RESP2。
 
-基于 PUMP 异步管道框架，share-nothing 多核架构，SPDK 用户态 NVMe 驱动。4 核热读 7.23M ops/s（5.16x Redis），冷读 3.75M ops/s。
+基于 PUMP 异步管道框架，share-nothing 多核架构，SPDK 用户态 NVMe 驱动。4 核热读 6.37M ops/s，冷读 3.55M ops/s。
 
 ## 开发方式
 
@@ -51,8 +51,10 @@ NVMe scheduler (SPDK, per-core qpair) ── 冷数据落盘 / 冷读回填
 
 - **60% (begin)**: 空闲时启动 async NVMe 淘汰
 - **90% (urgent)**: 每轮 advance 启动 8 次 async 淘汰
-- **100% (max)**: SET 返回 `-ERR OOM`，32 次 aggressive async 淘汰
-- 无 NVMe 时不做任何 discard，纯背压拒绝
+- **100% (max)**: 有 NVMe 返回 `-BACKPRESSURE retry N`（客户端等待后重试），无 NVMe 返回 `-ERR OOM`
+- 32 次 aggressive async 淘汰
+
+设计文档: `ai_context/sider/backpressure.md`
 
 ## 构建
 
@@ -113,22 +115,24 @@ sudo ./build/sider --config apps/sider/sider.json
 ## 性能
 
 测试环境: Intel i9-12900HX, 128GB DDR5, 3x Samsung 980 PRO NVMe, GCC 15.2.1
+测试工具: sider_bench（基于 Valkey redis-benchmark）
 
-### 纯内存 (--memory 4G)
+### 纯内存 (--memory 512M, 无 NVMe)
 
-| 场景 | Redis | Sider 1C | Sider 4C | Sider/Redis |
-|------|-------|----------|----------|-------------|
-| P1 GET | 268K | 256K | 666K | 2.49x |
-| P32 GET | 1.40M | 2.01M | 7.23M | 5.16x |
+| 场景 | Sider 1C | Sider 2C | Sider 4C |
+|------|----------|----------|----------|
+| P32 GET | 1.79M | 4.00M | 6.37M |
+| P1 GET | 241K | 444K | 666K |
 
-### 冷读 (--memory 512M + NVMe)
+### 冷读 (--memory 512M + NVMe, 3 倍 key)
 
-| 场景 | Sider 1C | Sider 4C | scaling |
-|------|----------|----------|---------|
-| P1 GET | 228K | 615K | 2.70x |
-| P32 GET | 1.23M | 3.75M | 3.05x |
+| 场景 | Sider 1C | Sider 4C | 冷/热 |
+|------|----------|----------|-------|
+| P32 GET | 995K | 3.55M | 0.56x |
+| P1 GET | 249K | 615K | 0.92x |
 
 测试标准: `ai_context/sider/benchmark.md`
+测试报告: `ai_context/sider/stage2_report.md`
 
 ## 目录结构
 
@@ -149,12 +153,15 @@ apps/sider/
 │   └── scheduler_impl.hh # advance(): 请求处理、淘汰水位线
 ├── resp/
 │   ├── parser.hh        # RESP2 命令解析
-│   ├── batch.hh         # cmd_batch + resp_slot（零拷贝响应）
+│   ├── batch.hh         # cmd_batch + resp_slot（零拷贝响应，含 BACKPRESSURE 类型）
 │   ├── response.hh      # RESP2 序列化
 │   └── unpacker.hh      # TCP ring buffer 解包
 ├── server/
 │   ├── session.hh       # TCP session 组合（layers）
-│   └── handler.hh       # 命令分发、batch_route、NVMe 冷读
+│   └── handler.hh       # 命令分发、batch_route、NVMe 冷读、背压
+├── bench/               # sider_bench 测试工具（基于 Valkey，BSD-3-Clause）
+│   ├── sider-benchmark.c # 主文件（新增 BACKPRESSURE 重试 + OOM 退出）
+│   └── ...              # Valkey 依赖文件
 └── nvme/
     ├── init.hh          # SPDK 环境初始化、DMA 内存池
     ├── page.hh          # sider_page（PUMP NVMe page_concept）
@@ -168,7 +175,15 @@ apps/sider/
 cmake --build build --target sider_test_store
 ./build/sider_test_store
 
+# 构建 sider_bench
+cmake --build build --target sider_bench
+
 # 基准测试（参考 ai_context/sider/benchmark.md）
-redis-benchmark -p 6379 -t set -r 1000000 -n 10000000 -P 32 -d 256 -q
-redis-benchmark -p 6379 -t get -r 1000000 -n 3000000 -P 32 -d 256 -q
+# 热读
+./build/sider_bench -h 127.0.0.1 -p 6379 -t set -c 50 -n 18000000 -P 32 -q -d 256 -r 1800000
+./build/sider_bench -h 127.0.0.1 -p 6379 -t get -c 50 -n 3000000 -P 32 -q -d 256 -r 1800000
+
+# 冷读（需 NVMe，sider_bench 遇 BACKPRESSURE 自动重试）
+./build/sider_bench -h 127.0.0.1 -p 6379 -t set -c 50 -n 54000000 -P 32 -q -d 256 -r 5400000
+./build/sider_bench -h 127.0.0.1 -p 6379 -t get -c 50 -n 3000000 -P 32 -q -d 256 -r 5400000
 ```

@@ -121,8 +121,8 @@ namespace sider {
         };
 
         cfg.port = static_cast<uint16_t>(get_int("--port", 6379));
-        cfg.evict_begin  = get_int("--evict-begin", 60);
-        cfg.evict_urgent = get_int("--evict-urgent", 90);
+        cfg.evict_begin  = get_int("--evict-begin", cfg.evict_begin);
+        cfg.evict_urgent = get_int("--evict-urgent", cfg.evict_urgent);
 
         if (auto* m = get_str("--memory"))
             cfg.memory_bytes = parse_memory_string(m);
@@ -141,9 +141,23 @@ namespace sider {
             if (!cur.empty()) cfg.nvme.push_back(cur);
         }
 
-        // Single core (core 0) for CLI mode
-        cfg.accept_core = 0;
-        cfg.cores.push_back(0);
+        if (auto* c = get_str("--cores")) {
+            // Comma-separated core IDs
+            std::string s(c);
+            std::string cur;
+            for (char ch : s) {
+                if (ch == ',') {
+                    if (!cur.empty()) { cfg.cores.push_back(std::atoi(cur.c_str())); cur.clear(); }
+                } else {
+                    cur += ch;
+                }
+            }
+            if (!cur.empty()) cfg.cores.push_back(std::atoi(cur.c_str()));
+        } else {
+            cfg.cores.push_back(0);
+        }
+
+        cfg.accept_core = get_int("--accept-core", cfg.cores[0]);
 
         return cfg;
     }

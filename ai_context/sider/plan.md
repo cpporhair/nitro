@@ -268,7 +268,8 @@
 
 ### Phase 2 遗留问题
 
-- **hash 路由分布偏斜**（优先级降低）：FNV-1a % N 对 redis-benchmark key 偏斜，batch_route 后性能已达标
+- **hash 路由分布偏斜**（已排除）：离线模拟 + 运行时插桩验证，FNV-1a % N 对 redis-benchmark key 分布完美均匀（4C 最大偏差 0.05%），不存在此问题
+- **CLI 模式只支持单核**（已修复）：`config_from_args()` 支持 `--cores 0,2,4,6`、`--accept-core`，eviction 默认值与 JSON 模式统一（90%/95%）
 - **背压透明化**（待定）：当前返回 -ERR OOM（redis-benchmark 遇错中止），可改为延迟响应（hold SET 等淘汰完成再回 +OK），TCP 流控自然背压
 
 ---

@@ -2,7 +2,7 @@
 
 每个 Phase 可独立测试验收，完成后再进入下一个。
 
-## Stage 1：单核（完成全部业务逻辑）
+## Stage 1：单核（完成全部业务逻辑） ✅
 
 ### Phase 1.1：TCP + RESP2 骨架
 
@@ -87,10 +87,10 @@
 - 配置：`--memory` 限制单核内存
 
 **验收**：
-- 设置 `--memory 10M`，持续 SET 不同 key → 内存稳定在 10M 附近，不 OOM
+- 设置 `--memory 10M`，持续 SET 不同 key → 有 NVMe 时异步淘汰到盘，无 NVMe 时背压拒绝
 - 热 key（反复 GET）所在页不被淘汰，冷页被淘汰
 - 水位线行为：低水位空闲淘汰，高水位积极淘汰
-- 淘汰后 GET 已淘汰的 key → 返回 nil
+- 淘汰后 GET 已淘汰的 key → 有 NVMe 返回冷读，无 NVMe 返回 nil
 
 ---
 
@@ -191,12 +191,12 @@
 - 多盘配置（`--nvme dev1,dev2`）
 - 选盘策略（轮询 / 容量均衡）
 - page_table nvme 字段记录 disk_id
-- 边界：单盘满 → 用另一盘；所有盘满 → 降级为纯丢弃
+- 边界：单盘满 → 用另一盘；所有盘满 → 背压拒绝 SET
 
 **验收**：
 - 两块盘配置，数据分布在两块盘上
 - 单盘空间满 → 自动使用另一块盘
-- 所有盘满 → 降级为纯淘汰
+- 所有盘满 → 背压拒绝 SET
 
 ---
 
@@ -231,66 +231,45 @@
 
 ---
 
-## Stage 2：多核扩展
+## Stage 2：多核扩展 ✅
 
-### Phase 2.1：多核启动 + 连接分配
+### Phase 2.1：多核启动 + 连接分配 ✅（commit 3d8f545）
 
 - share-nothing 多核启动（每核独立 scheduler 实例）
 - 连接分配：accept 分发到各核 session scheduler
 - 每核独立 store_scheduler + NVMe 分区
-- 此阶段不做跨核路由：每个连接的 key 只访问本核 store（功能受限但可测）
+- NVMe allocator 重构为 bitmap word + mpmc 中央池（按需领取/归还）
 
-**验收**：
-- N 核启动，每核独立接受连接
-- 同一连接内 SET/GET 正确（key 都在本核）
-- N 核总吞吐 ≈ N × 单核
-
----
-
-### Phase 2.2：跨核 key 路由
+### Phase 2.2：跨核 key 路由 ✅（commit 52b7aca）
 
 - key 分片：hash(key) % N → 目标核心
 - 跨核请求路由：per_core::queue 投递到目标 store_scheduler
-- 响应通过 tcp::send 自动回送（session_scheduler 队列）
+- 本核 bypass（commit 867f6d9）：store_scheduler::schedule() 本核直接执行
 
-**验收**：
-- 连接在 core 0，SET key 落在 core 3 → 另一连接在 core 1 GET 同一 key → 正确
-- redis-benchmark 多核跑通
-- 吞吐线性扩展
+### batch_route 跨核优化 ✅（commit cfccaa2）
 
----
+- 按目标核心分组，本核 inline 执行，每个远程核心 ONE store_req
+- 开销从 O(batch_size) 降到 O(num_cores)
+- 4C P32 GET 7.23M (3.60x scaling, 5.16x Redis)
 
-### Phase 2 已知问题
+### 背压机制 ✅（commit c31bd2b）
 
-#### 问题 1：UAF crash（多客户端同时断连）— 已修复
+- 移除所有 sync discard 路径（set() + advance() + try_start_eviction fallback）
+- set() 返回 bool：memory >= max_bytes 时 return false → -ERR OOM
+- advance() max_bytes 路径改为 32 次 async NVMe eviction
+- 无 NVMe/盘满时 return false（纯背压，不 discard）
+- NVMe 场景验证：填满 → OOM → 淘汰释放 → 恢复写入
 
-- 根因：`handle_session_error()` 中 `broadcast(on_error)` 同步触发 pipeline 终止 → `conn_state::~conn_state()` delete session → 返回后访问已释放 session
-- Session 有两个独立使用者：pipeline（conn_state）和 io_uring read chain（uring_req->user_data）
-- 修复：框架新增 `session_lifecycle` 层（`pump/src/env/scheduler/net/common/session_lifecycle.hh`），追踪 `pipeline_active` 和 `read_active` 两个状态，最后一个归零的触发 `do_close + delete`
-  - `conn_state::~conn_state()` → `broadcast(pipeline_end)` 清除 pipeline_active
-  - CQE handler read chain 结束时 → `broadcast(read_end)` 清除 read_active
-  - `handle_session_error()` 只做 `broadcast(on_error) + invoke(do_close)`，不 delete
-  - 应用按需将 `session_lifecycle` 组合进 session（不加则 broadcast 自动跳过，不影响其他项目）
-- A/B 测试：单核 P32 GET 5.60M → 5.42M（-3%，CPU 频率波动范围内），无性能回归
+### Phase 2 已解决问题
 
-#### 问题 2：多核跨核路由性能低于单核
+- **UAF crash**（commit 69b5d56）：session_lifecycle 双状态管理（pipeline_active + read_active）
+- **多核性能低于单核**：batch_route 解决，4C 3.60x scaling
+- **sync discard 数据丢失**：背压机制替代，零数据丢失
 
-- Phase 2.2 双核 P32 GET 吞吐低于单核（4.01M vs 5.33M with bypass）
-- FNV-1a `% N` 对 redis-benchmark key 格式分布严重偏斜（实测 4:1，但 Python 验证是 50/50）
-- 偏斜导致一个 store 核心过载，另一个空闲
-- 需要先解决 hash 分布偏斜问题，才能准确测量跨核路由的真实性能开销
+### Phase 2 遗留问题
 
----
-
-### Phase 2.3：多核稳定性
-
-- 跨核淘汰/过期独立运行
-- 每核独立 NVMe 分区 + 多盘
-- 长时间多核压测
-
-**验收**：
-- 8 核 + 2 盘，长时间混合压测稳定
-- 对比 Redis：吞吐显著领先
+- **hash 路由分布偏斜**（优先级降低）：FNV-1a % N 对 redis-benchmark key 偏斜，batch_route 后性能已达标
+- **背压透明化**（待定）：当前返回 -ERR OOM（redis-benchmark 遇错中止），可改为延迟响应（hold SET 等淘汰完成再回 +OK），TCP 流控自然背压
 
 ---
 

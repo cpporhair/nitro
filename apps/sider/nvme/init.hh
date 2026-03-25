@@ -189,38 +189,19 @@ namespace sider::nvme {
             dev.per_core[i] = {qp, scheduler};
         }
 
-        // TRIM — tells SSD all blocks are free, reduces write amplification.
-        // Use first core's qpair for the TRIM command.
+        // Format — reset SSD FTL to clean state (faster GC, no write amplification).
         {
-            struct trim_ctx { bool done = false; int status = 0; };
-            trim_ctx tc;
+            spdk_nvme_format fmt{};
+            fmt.lbaf = 0;  // use current LBA format
+            fmt.ses  = 0;  // no secure erase
 
-            auto* trim_qp = dev.per_core[0].qp->impl;
-            uint64_t total_sectors = ssd->max_sector;
-            spdk_nvme_dsm_range range{};
-            range.starting_lba = 0;
-            range.length = static_cast<uint32_t>(
-                std::min(total_sectors, static_cast<uint64_t>(UINT32_MAX)));
+            uint32_t nsid = spdk_nvme_ns_get_id(ssd->ns);
+            int rc = spdk_nvme_ctrlr_format(ssd->ctrlr, nsid, &fmt);
 
-            spdk_nvme_ns_cmd_dataset_management(
-                ssd->ns, trim_qp,
-                SPDK_NVME_DSM_ATTR_DEALLOCATE,
-                &range, 1,
-                [](void* arg, const spdk_nvme_cpl* cpl) {
-                    auto* c = static_cast<trim_ctx*>(arg);
-                    c->status = (cpl && !spdk_nvme_cpl_is_error(cpl)) ? 0 : 1;
-                    c->done = true;
-                },
-                &tc);
-
-            while (!tc.done)
-                spdk_nvme_qpair_process_completions(trim_qp, 0);
-
-            if (tc.status == 0)
-                printf("NVMe %s TRIM: deallocated %lu sectors\n",
-                       pci_addr, static_cast<unsigned long>(range.length));
+            if (rc == 0)
+                printf("NVMe %s format: success\n", pci_addr);
             else
-                printf("NVMe %s TRIM: failed (non-fatal)\n", pci_addr);
+                printf("NVMe %s format: failed rc=%d (non-fatal)\n", pci_addr, rc);
         }
 
         return dev;

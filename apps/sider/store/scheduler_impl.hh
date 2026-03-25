@@ -80,11 +80,16 @@ namespace sider::store {
     inline bool store_scheduler::try_start_eviction() {
         if (disks_.empty()) return false;  // no NVMe → backpressure, not discard
 
-        uint8_t disk_id = store_scheduler_pick_disk(disks_, next_disk_);
-        if (disk_id == UINT8_MAX) return false;  // all disks full
-
-        uint32_t victim = store.begin_eviction();
+        bool clean_freed = false;
+        uint32_t victim = store.begin_eviction(clean_freed);
+        if (clean_freed) return true;
         if (victim == UINT32_MAX) return false;
+
+        uint8_t disk_id = store_scheduler_pick_disk(disks_, next_disk_);
+        if (disk_id == UINT8_MAX) {
+            store.pt[victim].state = page_entry::IN_MEMORY;
+            return false;
+        }
 
         auto& disk = disks_[disk_id];
         auto lba = disk.allocator->allocate();
@@ -123,7 +128,9 @@ namespace sider::store {
 
         // Large values need contiguous LBAs on one disk.
         // If no disk has contiguous space, discard.
-        uint32_t victim = store.begin_large_eviction();
+        bool clean_freed = false;
+        uint32_t victim = store.begin_large_eviction(clean_freed);
+        if (clean_freed) return true;
         if (victim == UINT32_MAX) return false;
 
         auto& pe = store.pt[victim];

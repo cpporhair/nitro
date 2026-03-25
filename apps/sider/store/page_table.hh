@@ -16,6 +16,7 @@ namespace sider::store {
         uint64_t  hotness = 0;       // LRU clock (uint64 to avoid wraparound)
         char*     mem_ptr = nullptr;
         uint64_t  slot_bitmap = 0;   // 1 = occupied, 0 = free
+        uint64_t  dirty_bitmap = 0;  // 1 = dirty (needs NVMe write), 0 = clean (has backup)
         uint64_t  nvme_lba = 0;      // valid when ON_NVME (page position on disk)
         uint8_t   disk_id = 0;       // which NVMe disk (valid when ON_NVME)
         uint32_t  partial_index = NO_PARTIAL;  // index in slab partial_pages_ vector

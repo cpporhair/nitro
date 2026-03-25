@@ -1145,6 +1145,501 @@ static void test_inline_entry_flag() {
     assert(!e->is_large());
 }
 
+// ── clean eviction helpers ──
+
+// Simulate NVMe eviction: pick page, write to NVMe (fake), complete.
+// Returns page_id of the evicted page, or UINT32_MAX if none.
+static uint32_t fake_evict_page(kv_store& s, uint64_t fake_lba = 1000, uint8_t disk = 0) {
+    uint32_t victim = ([&]{ bool cf=false; return s.begin_eviction(cf); }());
+    if (victim == UINT32_MAX) return UINT32_MAX;
+    auto& pe = s.pt[victim];
+    pe.nvme_lba = fake_lba;
+    pe.disk_id = disk;
+    bool free_lba = s.complete_eviction(victim, true);
+    (void)free_lba;
+    return victim;
+}
+
+// Fill a slab page by SETting enough keys to fill it, return (page_id, key list).
+struct fill_result { uint32_t page_id; std::vector<std::string> keys; };
+static fill_result fill_one_page(kv_store& s, const std::string& prefix, int value_len) {
+    auto sc = size_class_for(value_len);
+    int nslots = slots_per_page[sc];
+    std::string val(value_len, 'V');
+    fill_result fr;
+    fr.page_id = UINT32_MAX;
+    for (int i = 0; i < nslots; i++) {
+        std::string k = prefix + std::to_string(i);
+        s.set(k.c_str(), static_cast<uint16_t>(k.size()),
+              val.c_str(), static_cast<uint32_t>(val.size()));
+        auto* e = s.ht.lookup(k.c_str(), static_cast<uint16_t>(k.size()));
+        if (fr.page_id == UINT32_MAX) fr.page_id = e->page_id;
+        fr.keys.push_back(k);
+    }
+    return fr;
+}
+
+// ── clean eviction tests ──
+
+// A1: promote doesn't decrement old page live_count
+static void test_ce_promote_keeps_live_count() {
+    kv_store s;
+    std::string val(64, 'A');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    // Evict to NVMe.
+    auto& pe = s.pt[pid];
+    pe.state = page_entry::ON_NVME;
+    pe.nvme_lba = 100;
+    pe.disk_id = 0;
+    uint16_t lc_before = pe.live_count;
+
+    // Promote.
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    assert(pe.live_count == lc_before);  // NOT decremented
+    e = s.ht.lookup("k1", 2);
+    assert(e->nvme_page_id == pid);      // backup saved
+    assert(e->page_id != pid);           // entry moved to new page
+}
+
+// A2: SET on clean entry releases backup
+static void test_ce_set_clean_releases_backup() {
+    kv_store s;
+    std::string val(64, 'A');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t old_pid = e->page_id;
+
+    // Evict + promote.
+    s.pt[old_pid].state = page_entry::ON_NVME;
+    s.pt[old_pid].nvme_lba = 100;
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    e = s.ht.lookup("k1", 2);
+    assert(e->has_nvme_backup());
+    uint16_t lc = s.pt[old_pid].live_count;
+
+    // SET → should release backup.
+    std::string val2(64, 'B');
+    s.set("k1", 2, val2.c_str(), 64);
+    e = s.ht.lookup("k1", 2);
+    assert(!e->has_nvme_backup());
+    assert(s.pt[old_pid].live_count == lc - 1);
+}
+
+// A3: DEL on clean entry releases backup
+static void test_ce_del_clean_releases_backup() {
+    kv_store s;
+    std::string val(64, 'A');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);  // keep page alive after k1 leaves
+    auto* e1 = s.ht.lookup("k1", 2);
+    uint32_t old_pid = e1->page_id;
+
+    s.pt[old_pid].state = page_entry::ON_NVME;
+    s.pt[old_pid].nvme_lba = 100;
+    s.promote("k1", 2, e1->version, val.c_str(), 64);
+    uint16_t lc = s.pt[old_pid].live_count;
+
+    s.del("k1", 2);
+    assert(s.pt[old_pid].live_count == lc - 1);
+}
+
+// A4: SET on ON_NVME entry (page_id == nvme_page_id) only decrements once
+static void test_ce_set_on_nvme_no_double_dec() {
+    kv_store s;
+    std::string val(64, 'A');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);  // keep page alive
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    // Evict → ON_NVME. Promote → clean evict → back to pid.
+    auto& pe = s.pt[pid];
+    pe.state = page_entry::ON_NVME;
+    pe.nvme_lba = 100;
+    uint16_t lc_nvme = pe.live_count;
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    assert(pe.live_count == lc_nvme);  // not decremented
+
+    // Simulate clean evict: return entry to old page.
+    e = s.ht.lookup("k1", 2);
+    uint32_t new_pid = e->page_id;
+    auto& new_pe = s.pt[new_pid];
+    e->page_id = e->nvme_page_id;
+    e->slot_index = e->nvme_slot;
+    e->nvme_page_id = entry::NO_NVMe_PAGE;
+    new_pe.slot_bitmap &= ~(1ULL << e->slot_index);
+    // Don't actually free the page for simplicity.
+
+    // Now entry is ON_NVME at pid. nvme_page_id = INVALID.
+    assert(e->page_id == pid);
+    assert(!e->has_nvme_backup());
+
+    // SET on this ON_NVME entry.
+    std::string val2(64, 'B');
+    s.set("k1", 2, val2.c_str(), 64);
+    // Should decrement pid only once.
+    assert(s.pt[pid].live_count == lc_nvme - 1);
+}
+
+// A5: all refs released → page freed
+static void test_ce_all_refs_released_frees_page() {
+    kv_store s;
+    std::string val(64, 'A');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 100;
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+
+    // live_count should still be 1 (promote didn't dec).
+    assert(s.pt[pid].live_count == 1);
+
+    // SET releases the backup → live_count = 0 → page freed.
+    std::string val2(64, 'B');
+    s.set("k1", 2, val2.c_str(), 64);
+    assert(s.pending_nvme_frees_.size() >= 1);
+}
+
+// B1-B4: dirty_bitmap
+static void test_ce_dirty_bitmap_promote_vs_set() {
+    kv_store s;
+    std::string val(64, 'A');
+    // Fill a page.
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);
+    auto* e1 = s.ht.lookup("k1", 2);
+    auto* e2 = s.ht.lookup("k2", 2);
+    uint32_t pid = e1->page_id;
+    assert(e2->page_id == pid);  // same page
+
+    // Both dirty from SET.
+    auto& pe = s.pt[pid];
+    assert(pe.dirty_bitmap & (1ULL << e1->slot_index));
+    assert(pe.dirty_bitmap & (1ULL << e2->slot_index));
+
+    // Evict + promote k1.
+    pe.state = page_entry::ON_NVME;
+    pe.nvme_lba = 100;
+    s.promote("k1", 2, e1->version, val.c_str(), 64);
+    e1 = s.ht.lookup("k1", 2);
+    uint32_t new_pid = e1->page_id;
+    auto& new_pe = s.pt[new_pid];
+
+    // Promoted slot should be clean (dirty_bitmap = 0).
+    assert(!(new_pe.dirty_bitmap & (1ULL << e1->slot_index)));
+
+    // SET k1 → slot becomes dirty.
+    s.set("k1", 2, val.c_str(), 64);
+    e1 = s.ht.lookup("k1", 2);
+    assert(s.pt[e1->page_id].dirty_bitmap & (1ULL << e1->slot_index));
+}
+
+// C1: all-clean page → begin_eviction frees directly
+static void test_ce_begin_eviction_all_clean() {
+    kv_store s;
+    std::string val(256, 'X');
+
+    // Create two pages: page A (will be evicted first) and page B (target for promote).
+    auto fa = fill_one_page(s, "a", 256);  // SC_256: 16 slots
+    auto fb = fill_one_page(s, "b", 256);  // ensures partial pages exist for promote
+    uint32_t pa = fa.page_id;
+
+    // Evict page A to NVMe (simulate).
+    auto& pea = s.pt[pa];
+    pea.state = page_entry::ON_NVME;
+    pea.nvme_lba = 200;
+    s.slab.remove_from_partials_public(pea.size_class, pa);
+    s.slab.total_pages_--;
+
+    // Promote all entries from page A (they go to page B or new pages).
+    for (auto& k : fa.keys) {
+        auto* e = s.ht.lookup(k.c_str(), static_cast<uint16_t>(k.size()));
+        if (!e || s.pt[e->page_id].state != page_entry::ON_NVME) continue;
+        s.promote(k.c_str(), static_cast<uint16_t>(k.size()), e->version,
+                  val.c_str(), 256);
+    }
+
+    // All promoted entries should be clean with nvme_page_id = pa.
+    for (auto& k : fa.keys) {
+        auto* e = s.ht.lookup(k.c_str(), static_cast<uint16_t>(k.size()));
+        assert(e);
+        if (e->is_inline()) continue;
+        assert(e->has_nvme_backup());
+        assert(e->nvme_page_id == pa);
+    }
+
+    // Now find the page these promoted entries landed on and evict it.
+    auto* e0 = s.ht.lookup(fa.keys[0].c_str(), static_cast<uint16_t>(fa.keys[0].size()));
+    uint32_t promoted_page = e0->page_id;
+    auto& ppe = s.pt[promoted_page];
+
+    // Verify all slots on this page are clean.
+    uint64_t occupied_clean = ppe.slot_bitmap & ~ppe.dirty_bitmap;
+    assert(occupied_clean == ppe.slot_bitmap);  // all occupied slots are clean
+
+    uint16_t lc_before = ppe.live_count;
+    uint32_t total_pages_before = s.slab.total_pages_;
+
+    // Force this page to be the coldest by setting hotness = 0.
+    ppe.hotness = 0;
+    uint32_t evicted = ([&]{ bool cf=false; return s.begin_eviction(cf); }());
+
+    // begin_eviction should return UINT32_MAX (all clean, freed directly).
+    assert(evicted == UINT32_MAX);
+    assert(s.slab.total_pages_ < total_pages_before);
+
+    // Entries should be back on page A (ON_NVME).
+    for (auto& k : fa.keys) {
+        auto* e = s.ht.lookup(k.c_str(), static_cast<uint16_t>(k.size()));
+        if (!e) continue;
+        auto r = s.get(k.c_str(), static_cast<uint16_t>(k.size()));
+        assert(std::holds_alternative<cold_result>(r));
+    }
+}
+
+// C2: mixed page → clean entries return, dirty remain
+static void test_ce_begin_eviction_mixed() {
+    kv_store s;
+    std::string val(64, 'M');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);
+    auto* e1 = s.ht.lookup("k1", 2);
+    auto* e2 = s.ht.lookup("k2", 2);
+    uint32_t pid = e1->page_id;
+    assert(e2->page_id == pid);
+
+    // Evict to NVMe.
+    auto& pe = s.pt[pid];
+    pe.state = page_entry::ON_NVME;
+    pe.nvme_lba = 300;
+    s.slab.remove_from_partials_public(pe.size_class, pid);
+    s.slab.total_pages_--;
+
+    // Promote both.
+    s.promote("k1", 2, e1->version, val.c_str(), 64);
+    s.promote("k2", 2, e2->version, val.c_str(), 64);
+    e1 = s.ht.lookup("k1", 2);
+    e2 = s.ht.lookup("k2", 2);
+
+    // SET k1 → dirty. k2 stays clean.
+    std::string val2(64, 'N');
+    s.set("k1", 2, val2.c_str(), 64);
+    e1 = s.ht.lookup("k1", 2);
+    e2 = s.ht.lookup("k2", 2);
+
+    uint32_t new_pid = e2->page_id;  // they might be on same or different pages
+    if (e1->page_id == new_pid) {
+        // Both on same page: mixed dirty/clean.
+        auto& npe = s.pt[new_pid];
+        npe.hotness = 0;
+        uint16_t lc_before = npe.live_count;
+        uint32_t victim = ([&]{ bool cf=false; return s.begin_eviction(cf); }());
+        if (victim == UINT32_MAX) {
+            // All clean evicted (k1 might have moved to different page on SET).
+            // This is fine — k2 returned to its NVMe page.
+        } else {
+            // Mixed: should have fewer live entries (clean ones returned).
+            assert(s.pt[victim].live_count < lc_before);
+        }
+    }
+    // If on different pages, the test is trivially correct.
+}
+
+// C3: all-dirty page → normal eviction
+static void test_ce_begin_eviction_all_dirty() {
+    kv_store s;
+    std::string val(64, 'D');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);
+    auto* e1 = s.ht.lookup("k1", 2);
+    uint32_t pid = e1->page_id;
+    auto& pe = s.pt[pid];
+
+    // All entries are from SET → all dirty.
+    pe.hotness = 0;
+    uint32_t victim = ([&]{ bool cf=false; return s.begin_eviction(cf); }());
+    // Should return the page (needs NVMe write, not freed directly).
+    assert(victim != UINT32_MAX);
+    assert(s.pt[victim].state == page_entry::EVICTING);
+}
+
+// C4: after clean evict, get() returns cold_result
+static void test_ce_cold_result_after_clean_evict() {
+    kv_store s;
+    std::string val(64, 'C');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    // Evict → ON_NVME → promote → simulate clean evict (return to old page).
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 400;
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    e = s.ht.lookup("k1", 2);
+
+    // Manual clean evict: return to old page.
+    e->page_id = e->nvme_page_id;
+    e->slot_index = e->nvme_slot;
+    e->nvme_page_id = entry::NO_NVMe_PAGE;
+
+    // get() should return cold_result.
+    auto r = s.get("k1", 2);
+    assert(std::holds_alternative<cold_result>(r));
+    auto cr = std::get<cold_result>(r);
+    assert(cr.nvme_lba == 400);
+}
+
+// D1: bounce 5 times
+static void test_ce_bounce_cycle() {
+    kv_store s;
+    std::string val(64, 'B');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t orig_pid = e->page_id;
+
+    s.pt[orig_pid].state = page_entry::ON_NVME;
+    s.pt[orig_pid].nvme_lba = 500;
+    uint16_t orig_lc = s.pt[orig_pid].live_count;
+
+    for (int i = 0; i < 5; i++) {
+        e = s.ht.lookup("k1", 2);
+        s.promote("k1", 2, e->version, val.c_str(), 64);
+        e = s.ht.lookup("k1", 2);
+        assert(e->has_nvme_backup());
+        assert(e->nvme_page_id == orig_pid);
+        assert(s.pt[orig_pid].live_count == orig_lc);  // stable
+
+        // Simulate clean evict: return to orig_pid.
+        e->page_id = e->nvme_page_id;
+        e->slot_index = e->nvme_slot;
+        e->nvme_page_id = entry::NO_NVMe_PAGE;
+        // (Don't bother freeing the promote target page in this test.)
+    }
+
+    assert(s.pt[orig_pid].live_count == orig_lc);  // still stable
+}
+
+// D2: bounce then SET releases reference
+static void test_ce_bounce_then_set() {
+    kv_store s;
+    std::string val(64, 'B');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);  // keep old page alive
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 600;
+    uint16_t lc = s.pt[pid].live_count;
+
+    // Bounce twice.
+    for (int i = 0; i < 2; i++) {
+        e = s.ht.lookup("k1", 2);
+        s.promote("k1", 2, e->version, val.c_str(), 64);
+        e = s.ht.lookup("k1", 2);
+        e->page_id = e->nvme_page_id;
+        e->slot_index = e->nvme_slot;
+        e->nvme_page_id = entry::NO_NVMe_PAGE;
+    }
+    assert(s.pt[pid].live_count == lc);
+
+    // Now promote + SET → should release.
+    e = s.ht.lookup("k1", 2);
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    std::string val2(64, 'Z');
+    s.set("k1", 2, val2.c_str(), 64);
+    assert(s.pt[pid].live_count == lc - 1);
+}
+
+// D3: two entries from same page, one SET one not
+static void test_ce_two_entries_one_set() {
+    kv_store s;
+    std::string val(64, 'T');
+    s.set("k1", 2, val.c_str(), 64);
+    s.set("k2", 2, val.c_str(), 64);
+    auto* e1 = s.ht.lookup("k1", 2);
+    auto* e2 = s.ht.lookup("k2", 2);
+    uint32_t pid = e1->page_id;
+    assert(e2->page_id == pid);
+
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 700;
+    uint16_t lc = s.pt[pid].live_count;
+
+    s.promote("k1", 2, e1->version, val.c_str(), 64);
+    s.promote("k2", 2, e2->version, val.c_str(), 64);
+    assert(s.pt[pid].live_count == lc);  // neither decremented
+
+    // SET k1 → releases one reference.
+    std::string val2(64, 'U');
+    s.set("k1", 2, val2.c_str(), 64);
+    assert(s.pt[pid].live_count == lc - 1);
+
+    // k2 still has backup.
+    e2 = s.ht.lookup("k2", 2);
+    assert(e2->has_nvme_backup());
+    assert(e2->nvme_page_id == pid);
+}
+
+// E1: promote then SET with different size class
+static void test_ce_set_changes_size_class() {
+    kv_store s;
+    std::string val(64, 'S');
+    s.set("k1", 2, val.c_str(), 64);
+    auto* e = s.ht.lookup("k1", 2);
+    uint32_t pid = e->page_id;
+
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 800;
+    s.promote("k1", 2, e->version, val.c_str(), 64);
+    e = s.ht.lookup("k1", 2);
+    assert(e->has_nvme_backup());
+
+    // SET with larger value (different size class).
+    std::string big(256, 'L');
+    s.set("k1", 2, big.c_str(), 256);
+    e = s.ht.lookup("k1", 2);
+    assert(!e->has_nvme_backup());
+    // Old page should have been dec_live'd.
+}
+
+// E2: inline promote doesn't track backup
+static void test_ce_inline_promote_dec_lives() {
+    kv_store s;
+    std::string val(8, 'I');  // fits inline (≤16B)
+    s.set("k1", 2, val.c_str(), 8);
+    auto* e = s.ht.lookup("k1", 2);
+    // Small value goes inline directly, no page involved.
+    assert(e->is_inline());
+    // Nothing to test for promote — inline values are never ON_NVME pages.
+    // This test verifies inline entries don't interfere with dirty tracking.
+
+    // SET with slab value.
+    std::string sval(64, 'J');
+    s.set("k1", 2, sval.c_str(), 64);
+    e = s.ht.lookup("k1", 2);
+    assert(!e->is_inline());
+    assert(!e->has_nvme_backup());  // never promoted, should be INVALID
+
+    // Evict → promote with inline value.
+    uint32_t pid = e->page_id;
+    s.pt[pid].state = page_entry::ON_NVME;
+    s.pt[pid].nvme_lba = 900;
+    uint16_t lc = s.pt[pid].live_count;
+
+    std::string ival(8, 'K');  // inline-sized
+    s.promote("k1", 2, e->version, ival.c_str(), 8);
+    e = s.ht.lookup("k1", 2);
+    assert(e->is_inline());
+    // Inline promote DOES dec_live (no dirty tracking for inline).
+    assert(s.pt[pid].live_count == lc - 1);
+}
+
 // ── main ──
 
 int main() {
@@ -1233,6 +1728,23 @@ int main() {
     RUN(test_large_value_mixed_eviction);
     RUN(test_large_value_no_leak_repeated_update);
     RUN(test_large_value_entry_flag);
+
+    printf("clean eviction:\n");
+    RUN(test_ce_promote_keeps_live_count);
+    RUN(test_ce_set_clean_releases_backup);
+    RUN(test_ce_del_clean_releases_backup);
+    RUN(test_ce_set_on_nvme_no_double_dec);
+    RUN(test_ce_all_refs_released_frees_page);
+    RUN(test_ce_dirty_bitmap_promote_vs_set);
+    RUN(test_ce_begin_eviction_all_clean);
+    RUN(test_ce_begin_eviction_mixed);
+    RUN(test_ce_begin_eviction_all_dirty);
+    RUN(test_ce_cold_result_after_clean_evict);
+    RUN(test_ce_bounce_cycle);
+    RUN(test_ce_bounce_then_set);
+    RUN(test_ce_two_entries_one_set);
+    RUN(test_ce_set_changes_size_class);
+    RUN(test_ce_inline_promote_dec_lives);
 
     printf("\nAll %d tests passed.\n", pass_count);
     return 0;

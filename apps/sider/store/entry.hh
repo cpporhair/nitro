@@ -18,10 +18,10 @@ namespace sider::store {
     // 28      key_len            2
     // 30      type               1   (bit 7: large, bit 6: inline)
     // 31      _reserved          1
-    // 32      union              16  ({page_id,slot_index,last_access} or inline_value[16])
+    // 32      union              16  ({page_id,slot_index,nvme_slot,nvme_page_id} or inline_value[16])
     // Total: 48 bytes, alignment: 8
-
     struct entry {
+        static constexpr uint32_t NO_NVMe_PAGE = UINT32_MAX;
         char*    key_data    = nullptr;  // heap-allocated key bytes
         int64_t  expire_at   = -1;       // -1 = no expiry
         uint32_t key_hash    = 0;
@@ -35,12 +35,15 @@ namespace sider::store {
             struct {
                 uint32_t page_id;        // slab/large value page id
                 uint8_t  slot_index;     // 0 for large values
-                uint8_t  _pad1[3];
-                uint32_t last_access;    // per-key LRU for large values
+                uint8_t  nvme_slot;      // NVMe backup slot (clean eviction)
+                uint8_t  _pad1[2];
+                uint32_t nvme_page_id;   // NVMe backup page (NO_NVMe_PAGE = invalid)
                 uint32_t _pad2;
             };
             char inline_value[16];       // for values <= INLINE_VALUE_MAX
         };
+
+        bool has_nvme_backup() const { return nvme_page_id != NO_NVMe_PAGE; }
 
         bool is_large()  const { return type & 0x80; }
         void set_large(bool v) { if (v) type |= 0x80; else type &= ~0x80; }
@@ -48,7 +51,10 @@ namespace sider::store {
         bool is_inline()  const { return type & 0x40; }
         void set_inline(bool v) { if (v) type |= 0x40; else type &= ~0x40; }
 
-        entry() { std::memset(inline_value, 0, sizeof(inline_value)); }
+        entry() {
+            std::memset(inline_value, 0, sizeof(inline_value));
+            nvme_page_id = NO_NVMe_PAGE;
+        }
 
         ~entry() { delete[] key_data; }
 

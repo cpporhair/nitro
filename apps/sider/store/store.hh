@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <variant>
@@ -115,14 +116,15 @@ namespace sider::store {
             if (pe.state != page_entry::ON_NVME) return;
 
             uint32_t old_page_id = e->page_id;
+            uint8_t  old_slot    = e->slot_index;
 
             if (is_inline_value(value_len)) {
-                // Promote to inline — no slab allocation needed.
+                // Promote to inline — no slab, no dirty tracking.
                 std::memcpy(e->inline_value, value, value_len);
                 e->value_len = value_len;
                 e->set_inline(true);
                 e->set_large(false);
-                nvme_page_dec_live(old_page_id);
+                nvme_page_dec_live(old_page_id, old_slot);
                 return;
             }
 
@@ -132,7 +134,11 @@ namespace sider::store {
             if (!ok) return;  // alloc failed, keep on NVMe
             record_slot_key_hash(e);
             pt[e->page_id].hotness = ++access_clock_;
-            nvme_page_dec_live(old_page_id);
+
+            // Save NVMe backup location. Don't dec_live old page — keep it alive.
+            e->nvme_page_id = old_page_id;
+            e->nvme_slot    = old_slot;
+            pt[e->page_id].dirty_bitmap &= ~(1ULL << e->slot_index);  // clean
         }
 
         // Test helper: extract hot/nil/inline as legacy get_result.
@@ -190,6 +196,7 @@ namespace sider::store {
 
                 if (old_pe.state == page_entry::ON_NVME) {
                     uint32_t old_page_id = e->page_id;
+                    uint8_t  old_slot    = e->slot_index;
                     if (new_inline) {
                         std::memcpy(e->inline_value, value, value_len);
                         e->set_inline(true);
@@ -206,13 +213,21 @@ namespace sider::store {
                     if (!e->is_inline()) {
                         record_slot_key_hash(e);
                         pt[e->page_id].hotness = ++access_clock_;
+                        pt[e->page_id].dirty_bitmap |= (1ULL << e->slot_index);
                     }
-                    nvme_page_dec_live(old_page_id);
+                    nvme_page_dec_live(old_page_id, old_slot);
+                    e->nvme_page_id = entry::NO_NVMe_PAGE;  // don't double dec
                     return true;
                 }
 
                 // IN_MEMORY or EVICTING: page is in RAM.
                 bool old_large = e->is_large();
+
+                // Release NVMe backup if clean (before any slot changes).
+                if (e->has_nvme_backup()) {
+                    nvme_page_dec_live(e->nvme_page_id, e->nvme_slot);
+                    e->nvme_page_id = entry::NO_NVMe_PAGE;
+                }
 
                 if (new_inline) {
                     // slab/large → inline: free old storage.
@@ -230,6 +245,7 @@ namespace sider::store {
 
                     if (old_sc == new_sc && old_pe.state == page_entry::IN_MEMORY) {
                         std::memcpy(slab.slot_ptr(e->page_id, e->slot_index), value, value_len);
+                        old_pe.dirty_bitmap |= (1ULL << e->slot_index);
                     } else {
                         slab.free_slot(e->page_id, e->slot_index);
                         if (!try_alloc_slab(e, value, value_len)) return true;
@@ -239,6 +255,7 @@ namespace sider::store {
                     uint32_t new_pc = pages_for(value_len);
                     if (new_pc == old_pe.page_count && old_pe.state == page_entry::IN_MEMORY) {
                         std::memcpy(old_pe.mem_ptr, value, value_len);
+                        old_pe.dirty_bitmap |= (1ULL << e->slot_index);
                     } else {
                         free_large_entry_mem(e);
                         if (!try_alloc_large(e, value, value_len)) return true;
@@ -275,6 +292,7 @@ namespace sider::store {
                     if (!ar.slot_ptr) return true;  // DMA alloc failed, drop key
 
                     std::memcpy(ar.slot_ptr, value, value_len);
+                    pt[ar.page_id].dirty_bitmap |= (1ULL << ar.slot_index);
                     e = ht.insert(key, key_len);
                     e->page_id    = ar.page_id;
                     e->slot_index = ar.slot_index;
@@ -409,25 +427,72 @@ namespace sider::store {
         }
 
         // Mark a slab page for async NVMe eviction.
-        uint32_t begin_eviction() {
+        // Returns UINT32_MAX if no victim or all-clean freed, page_id otherwise.
+        // clean_freed is set to true if a page was freed without NVMe write.
+        uint32_t begin_eviction(bool& clean_freed) {
+            clean_freed = false;
             uint32_t victim = sample_coldest_page();
             if (victim == UINT32_MAX) return UINT32_MAX;
 
             auto& pe = pt[victim];
+
+            // Return clean entries to their old NVMe pages.
+            auto sc = static_cast<size_class_t>(pe.size_class);
+            uint64_t clean_bits = pe.slot_bitmap & ~pe.dirty_bitmap;
+            while (clean_bits) {
+                uint8_t si = static_cast<uint8_t>(std::countr_zero(clean_bits));
+                clean_bits &= clean_bits - 1;  // clear lowest bit
+                if (!pe.slot_key_hashes) continue;
+
+                auto* e = ht.lookup_by_page(pe.slot_key_hashes[si], victim, si);
+                if (!e) continue;  // shouldn't happen
+
+                // Return entry to its old ON_NVME page.
+                e->page_id    = e->nvme_page_id;
+                e->slot_index = e->nvme_slot;
+                e->nvme_page_id = entry::NO_NVMe_PAGE;
+                pe.slot_bitmap &= ~(1ULL << si);
+                pe.live_count--;
+            }
+
+            if (pe.live_count == 0) {
+                // All entries were clean — free page without NVMe write.
+                clean_freed = true;
+                slab.evict_page(victim);
+                return UINT32_MAX;
+            }
+
+            // Remaining entries are all dirty — proceed with NVMe write.
             pe.state = page_entry::EVICTING;
-
-            // Remove from slab partials — no new allocations on this page.
             slab.remove_from_partials_public(pe.size_class, victim);
-
             return victim;
         }
 
         // Mark a large value for async NVMe eviction.
-        uint32_t begin_large_eviction() {
+        uint32_t begin_large_eviction(bool& clean_freed) {
+            clean_freed = false;
             uint32_t victim = sample_coldest_large();
             if (victim == UINT32_MAX) return UINT32_MAX;
 
             auto& pe = pt[victim];
+
+            // Large value: 1 entry. If clean, return to old NVMe page.
+            if (pe.slot_key_hashes && !(pe.dirty_bitmap & 1)) {
+                auto* e = ht.lookup_by_page(pe.slot_key_hashes[0], victim, 0);
+                if (e && e->has_nvme_backup()) {
+                    e->page_id    = e->nvme_page_id;
+                    e->slot_index = e->nvme_slot;
+                    e->nvme_page_id = entry::NO_NVMe_PAGE;
+                    // Free large memory.
+                    free_large(pe.mem_ptr);
+                    large_memory_bytes_ -= static_cast<uint64_t>(pe.page_count) * PAGE_SIZE;
+                    remove_from_large_ids(victim);
+                    pt.free_page_id(victim);
+                    clean_freed = true;
+                    return UINT32_MAX;
+                }
+            }
+
             pe.state = page_entry::EVICTING;
             remove_from_large_ids(victim);
             return victim;
@@ -488,10 +553,12 @@ namespace sider::store {
             auto ar = slab.allocate(new_sc);
             if (!ar.slot_ptr) [[unlikely]] return false;
             std::memcpy(ar.slot_ptr, value, value_len);
-            e->page_id    = ar.page_id;
-            e->slot_index = ar.slot_index;
+            e->page_id      = ar.page_id;
+            e->slot_index   = ar.slot_index;
+            e->nvme_page_id = entry::NO_NVMe_PAGE;
             e->set_large(false);
             e->set_inline(false);
+            pt[ar.page_id].dirty_bitmap |= (1ULL << ar.slot_index);
             return true;
         }
 
@@ -511,10 +578,12 @@ namespace sider::store {
             pe.hotness    = 0;
             pe.mem_ptr    = mem;
             pe.slot_bitmap = 1ULL;
+            pe.dirty_bitmap = 1ULL;
             pe.slot_key_hashes = new uint32_t[1]{};
 
-            e->page_id    = pid;
-            e->slot_index = 0;
+            e->page_id      = pid;
+            e->slot_index   = 0;
+            e->nvme_page_id = entry::NO_NVMe_PAGE;
             e->set_large(true);
             e->set_inline(false);
 
@@ -529,10 +598,15 @@ namespace sider::store {
 
             auto& pe = pt[e->page_id];
             if (pe.state == page_entry::ON_NVME) {
-                nvme_page_dec_live(e->page_id);
+                nvme_page_dec_live(e->page_id, e->slot_index);
+                e->nvme_page_id = entry::NO_NVMe_PAGE;
             } else if (e->is_large()) {
+                if (e->has_nvme_backup())
+                    nvme_page_dec_live(e->nvme_page_id, e->nvme_slot);
                 free_large_entry_mem(e);
             } else {
+                if (e->has_nvme_backup())
+                    nvme_page_dec_live(e->nvme_page_id, e->nvme_slot);
                 slab.free_slot(e->page_id, e->slot_index);
             }
         }
@@ -544,10 +618,11 @@ namespace sider::store {
                 pe.slot_key_hashes[e->slot_index] = e->key_hash;
         }
 
-        // Decrement live_count on an ON_NVME page.
+        // Decrement live_count on an ON_NVME page, clearing the slot bitmap bit.
         // If zero, queue NVMe LBA(s) for freeing and release page_id.
-        void nvme_page_dec_live(uint32_t page_id) {
+        void nvme_page_dec_live(uint32_t page_id, uint8_t slot_index) {
             auto& pe = pt[page_id];
+            pe.slot_bitmap &= ~(1ULL << slot_index);
             pe.live_count--;
             if (pe.live_count == 0) {
                 for (uint32_t i = 0; i < pe.page_count; i++)

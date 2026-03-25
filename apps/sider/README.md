@@ -4,7 +4,7 @@
 
 Redis 的数据必须全部放在内存中——内存不够，数据就放不下。Sider 把冷数据透明地淘汰到 NVMe SSD，热数据留在内存直接访问，冷数据按需从 NVMe 异步读回。对客户端完全透明，协议兼容 RESP2。
 
-基于 PUMP 异步管道框架，share-nothing 多核架构，SPDK 用户态 NVMe 驱动。4 核热读 6.37M ops/s，冷读 3.55M ops/s。
+基于 PUMP 异步管道框架，share-nothing 多核架构，SPDK 用户态 NVMe 驱动。4 核热读 6.38M ops/s，冷读 2.46M ops/s。纯读稳态下 NVMe 写为零（clean eviction）。
 
 ## 开发方式
 
@@ -44,7 +44,7 @@ NVMe scheduler (SPDK, per-core qpair) ── 冷数据落盘 / 冷读回填
 |----|------|------|
 | inline | value ≤ 16B | 直接在 hash entry 中 |
 | slab (hot) | value ≤ 4KB, 内存充足 | DMA 页内 slot 寻址 |
-| NVMe (cold) | 被淘汰到盘 | async read + promote |
+| NVMe (cold) | 被淘汰到盘 | async read + promote (clean eviction 零写) |
 | large | value > 4KB | 连续 DMA 页 |
 
 ### 背压与淘汰
@@ -54,7 +54,12 @@ NVMe scheduler (SPDK, per-core qpair) ── 冷数据落盘 / 冷读回填
 - **100% (max)**: 有 NVMe 返回 `-BACKPRESSURE retry N`（客户端等待后重试），无 NVMe 返回 `-ERR OOM`
 - 32 次 aggressive async 淘汰
 
-设计文档: `ai_context/sider/backpressure.md`
+### Clean eviction
+
+entry 级 NVMe 备份追踪：promote 时保留旧 ON_NVME 页引用，淘汰时 clean entry 直接退回旧页，不写 NVMe。纯读稳态下 NVMe 写降为零。
+
+设计文档: `ai_context/sider/clean_eviction_plan.md`
+背压设计: `ai_context/sider/backpressure.md`
 
 ## 构建
 
@@ -115,28 +120,30 @@ sudo ./build/sider --config apps/sider/sider.json
 ## 性能
 
 测试环境: Intel i9-12900HX, 128GB DDR5, 3x Samsung 980 PRO NVMe, GCC 15.2.1
-测试工具: [sider_bench](bench/)（基于 Valkey redis-benchmark，BSD-3-Clause）
+测试执行: `sudo ./apps/sider/scripts/bench.sh <hot|cold> <1|2|4>`
 
 ### 纯内存 (--memory 512M, 无 NVMe)
 
-| 场景 | Redis | Sider 1C | Sider 2C | Sider 4C |
-|------|-------|----------|----------|----------|
-| P32 GET | 1.23M | 1.79M | 4.00M | 6.37M |
-| P1 GET | 245K | 241K | 444K | 666K |
-| P32 SET | 1.12M | 1.78M | — | — |
+| 场景 | Redis (Valkey 8.1) | Sider 1C | Sider 2C | Sider 4C |
+|------|-------------------|----------|----------|----------|
+| P32 GET | 1.24M | 1.80M | 3.99M | 6.38M |
+| P1 GET | 252K | 251K | 444K | 666K |
+| P32 SET | 1.10M | — | — | — |
 
-### 冷读 (--memory 512M + NVMe, 3 倍 key, ~2/3 冷读比例)
+### 冷读 (--memory 512M + 3 NVMe, -r 5400000, ~2/3 冷读比例)
 
 | 场景 | Redis（纯内存） | Sider 1C | Sider 2C | Sider 4C |
-|------|----------------|----------|----------|----------|
-| P32 GET | 1.23M | 995K | 2.00M | 3.55M |
-| P1 GET | 245K | 249K | 400K | 615K |
+|------|---------------|----------|----------|----------|
+| P32 GET | 1.24M | 963K | 1.60M | 2.46M |
+| P1 GET | 252K | 220K | 363K | 571K |
 
-Sider 用 1/3 的内存承载 3 倍数据量，2/3 请求走 NVMe 冷读。即使在这种条件下，**单核冷读 P1 GET 已与 Redis 纯内存持平，2 核起即超越 Redis**。
+Sider 用 1/3 的内存承载 3 倍数据量，2/3 请求走 NVMe 冷读。**2 核起 P1 冷读超越 Redis 纯内存，4 核 P32 冷读达 Redis 2 倍**。
+
+纯读稳态下 NVMe 写为零（clean eviction，5 分钟预热后验证）。
 
 测试标准: [benchmark.md](../../ai_context/sider/benchmark.md)
 测试报告: [stage2_report.md](../../ai_context/sider/stage2_report.md)
-背压设计: [backpressure.md](../../ai_context/sider/backpressure.md)
+Clean eviction 设计: [clean_eviction_plan.md](../../ai_context/sider/clean_eviction_plan.md)
 
 ## 目录结构
 

@@ -128,7 +128,7 @@ PUMP 在这里不是“只是一个异步框架”，而是系统并发模型的
 
 1. **scheduler ownership**
    - 每类状态有明确 owner scheduler。
-   - per-front-scheduler front state、tree reclaim、NVMe qpair 都可以天然 share-nothing。
+   - per-front-scheduler front state、tree reclaim、per-core NVMe qpair 都可以天然 share-nothing。
 
 2. **fan-out / reduce 编排**
    - 一个 batch 可以自然地 fan-out 到多个 front schedulers 执行 `value object durable + canonical WAL(ref) + canonical memtable insert`，再 reduce 回来发布。
@@ -153,20 +153,29 @@ PUMP 在这里不是“只是一个异步框架”，而是系统并发模型的
                        client requests
                               |
                      +-----------------+
-                     | batch scheduler |
+                     | coord_sched     |
                      | assign lsn      |
+                     | canonicalize    |
                      | publish         |
                      +--------+--------+
                               |
+                   +----------v-----------+
+                   | value_alloc_sched    |
+                   | leader-follower      |
+                   | value alloc + write  |
+                   | FUA on local nvme    |
+                   +----------+-----------+
+                              | value_ref
+                  route by hash, fan-out
              +----------------+----------------+
              |                |                |
      +--------v-------+ +--------v-------+ +--------v-------+
      | front sched 0  | | front sched 1  | | front sched N  |
-     | WAL stream     | | WAL stream     | | WAL stream     |
-     | active/imms    | | active/imms    | | active/imms    |
+     | WAL FUA        | | WAL FUA        | | WAL FUA        |
+     | memtable insert| | memtable insert| | memtable insert|
      +--------+-------+ +--------+-------+ +--------+-------+
              |                |                |
-             +----------------+----------------+
+             +-------reduce---+----------------+
                               |
                      +--------v--------+
                      | tree scheduler  |
@@ -175,28 +184,29 @@ PUMP 在这里不是“只是一个异步框架”，而是系统并发模型的
                      | reclaim         |
                      +--------+--------+
                               |
-                   +----------+-----------+
-                   |                      |
-            +------v------+        +------v------+
-            | logical B+  |        | value area  |
-            | tree        |        | blobs       |
-            +------+------|        +------+------+
-                   |                      |
-                   +----------+-----------+
-                              |
-                     +--------v--------+
-                     | nvme schedulers |
-                     +--------+--------+
-                              |
-                           SSD / FTL
+               +----------+-----------+
+               |                      |
+        +------v------+        +------v------+
+        | logical B+  |        | value area  |
+        | tree        |        | blobs       |
+        +------+------|        +------+------+
+               |                      |
+               +----------+-----------+
+                          |
+                 +--------v--------+
+                 | nvme schedulers |
+                 +--------+--------+
+                          |
+                       SSD / FTL
 ```
 
 这张图里最重要的结构关系是：
 
-1. 前台 ingest 是按当前运行期的 front scheduler 分片的。
-2. 后台物化是一棵逻辑树。
-3. WAL 提交和 tree flush 是两条不同时间尺度的路径。
-4. NVMe I/O 是单独 owner 的执行域，不和上层状态混在一起。
+1. 前台写先经 `value_alloc_sched` 统一持久化 value（leader-follower 合并并发 batch），拿到 `value_ref` 后再按 key hash fan-out 到各 `front_sched` 写 WAL + memtable。
+2. `front_sched` 只负责 WAL 追加、memtable 维护和 point read。
+3. 后台物化是一棵逻辑树。
+4. WAL 提交和 tree flush 是两条不同时间尺度的路径。
+5. NVMe I/O 是单独 owner 的执行域，不和上层状态混在一起。
 
 KV 层当前只提供以下保证：
 
@@ -229,34 +239,41 @@ same key -> same front scheduler (within one runtime)
 
 ### 1.7 系统组件总览
 
-从系统分层看，Inconel 可以先理解成 5 个部件：
+从系统分层看，Inconel 由 6 类 scheduler 组成：
 
-1. **batch scheduler**
+1. **batch scheduler**（`coord_sched`，单实例）
    - 按当前运行期的 gap-free 顺序分配 `batch_lsn`
    - 接收或生成 canonical batch image
    - 计算 canonical `entry_count`
    - 协调 fan-out / reduce
    - 推进 `publish_catalog.durable_lsn`
 
-2. **front scheduler**
-   - 为 PUT 分配并持久化前台 value object
+2. **front scheduler**（`front_sched`，N 实例，`key_hash % N` 路由）
+   - 追加 canonical WAL entry（FUA）并插入 canonical memtable entry
    - 维护本 owner 的 `active + sealed memtable gens`
    - 处理 point read 访问本 owner 的 memtable
    - 执行 `seal_active`
 
-3. **wal space scheduler**
+3. **wal space scheduler**（`wal_space_sched`，单实例）
    - 管理 WAL segment `free -> active -> sealed -> free`
    - 只在换段和回收时参与
 
-4. **tree scheduler**
+4. **tree scheduler**（`tree_sched`，单实例）
    - 选择可 flush 的 sealed gens
    - fold 前台状态，生成新的 tree frontier 与 value reclaim 决策
    - 构造新的 `checkpoint_guard`
    - 执行 frontier switch 和 tree-side reclaim
 
-5. **nvme scheduler(s)**
+5. **value alloc scheduler**（`value_alloc_sched`，单实例）
+   - 集中管理 value page 分配与前台 value 持久化
+   - 持有分配元数据：bump head、per-class `whole_page_pool` / `hole_page_list` / `extent_free_pool`
+   - 前台 PUT 的 value 写入采用 leader-follower 模式：advance() 合并当前并发 batch 的 PUT entries，leader 统一分配 slot、填充 DMA frame、提交 FUA 写到本核 nvme_sched；FUA 完成后所有 batch 拿到 `value_ref`，再 fan-out 到各 `front_sched` 写 WAL + memtable
+   - `tree_sched` 完成 TRIM 后通过 `freed_slots` / `recycle_whole` 投递回收
+
+6. **nvme scheduler(s)**（`nvme_sched`，每核心 × 每设备各一个实例）
    - 执行具体的 NVMe read / write / FLUSH / TRIM
-   - 是设备 owner；其他对象只能 enqueue 给它，不能越权发命令
+   - 每个 `nvme_sched` 拥有独立的 SPDK qpair
+   - 各 scheduler 使用本核心的 `nvme_sched`：`value_alloc_sched` 用其核心的 qpair 做 value FUA；`front_sched` 用其核心的 qpair 做 WAL FUA；`tree_sched` 用其核心的 qpair 做 flush write / FLUSH / TRIM；tree_lookup 在调用方核心就地读 page
 
 ### 1.8 端到端数据流
 
@@ -265,11 +282,11 @@ same key -> same front scheduler (within one runtime)
 ```text
 write:
 client
-  -> batch scheduler(assign lsn, prepare canonical image, route)
-  -> front schedulers
-       -> persist value object(for PUT)
+  -> coord_sched(assign lsn, canonicalize)
+  -> value_alloc_sched(leader-follower: alloc slots, fill DMA, FUA write → value_ref)
+  -> route by hash, fan-out to front schedulers
        -> canonical WAL append(FUA, carries value_ref)
-       -> canonical active memtable insert(ValueHandle / tombstone)
+       -> canonical active memtable insert(value_handle / tombstone)
   -> reduce
   -> publish durable_lsn on current CAT
   -> ACK
@@ -281,6 +298,7 @@ sealed memtable gens
   -> NVMe FLUSH
   -> publish new tree_guard / new CAT
   -> reclaim old memtable / old tree data / old front-only values / old WAL segments
+       -> tree_sched TRIM -> value_alloc_sched recycle
 
 read:
 client
@@ -428,16 +446,16 @@ tree 负责后台有序物化
 
 盘上恢复输入是：
 
-1. `superblock A/B` 里的格式常量与区域边界
-2. Data Area 中所有仍可解析的 leaf records，以及被 leaf/WAL 记录通过 `value_ref` 引用、且在 recovery 期间尚未被提前复用的 value objects
+1. `superblock A/B` 里的格式常量与区域边界、`root_base_paddr`
+2. 从 `root_base_paddr` 遍历 tree 得到的 CRC-valid leaf records（recovery 不读任何 value body）
 3. WAL area 中仍然存活的 segments
 
-恢复不依赖一条盘上的 tree 结构前沿；它直接从 leaf records、surviving WAL refs 与它们携带的 stable `value_ref` 重建逻辑 KV 状态。
+恢复从 superblock root 出发遍历 tree 收集 leaf records，再与 surviving WAL 合并重建逻辑 KV 状态。superblock root 可能是旧的（flush 改了 root 但 superblock 未更新），此时 WAL 中仍保留对应 entries（因为 recovery_safe_lsn 未推进，WAL 未回收）。
 
 恢复不尝试复原崩溃前的 `active/imm/CAT` 拓扑，而是：
 
 ```text
-scan tree leaf records
+traverse tree from superblock root → collect leaf records
 -> replay surviving WAL refs
 -> rebuild logical winners
 -> rebuild clean tree(reuse winner value_ref)
@@ -546,6 +564,7 @@ struct range_ref {
 
 struct value_ref {
     paddr base;
+    uint16_t byte_offset;
     uint32_t len;
     uint16_t flags;
 };
@@ -557,7 +576,9 @@ struct value_ref {
 2. leaf 的 value record 保存 `value_ref`；leaf 的 tombstone record 不指向 value object。
 3. superblock root 保存的是 `paddr root_base_paddr`。
 4. v1 单盘时，所有地址都落在 `device_id = 0`。
-5. `value_ref` 在语义上指向一个稳定的 durable value object；只要 live WAL / memtable / tree / recovery 仍可能需要它，这个对象就不能被复用成别的 value。
+5. `value_ref` 的物理起点是 `base.lba * lba_size + byte_offset`；`base` 表示该 value object 起始所在的 LBA。
+6. 当 value class 本身按 LBA 对齐时，`byte_offset == 0`；只有 `class_size < lba_size` 的 sub-LBA 布局才需要它。
+7. `value_ref` 在语义上指向一个稳定的 durable value object；只要 live WAL / memtable / tree / recovery 仍可能需要它，这个对象就不能被复用成别的 value。
 
 ### 3.3 运行时部署参数
 
@@ -861,19 +882,22 @@ struct wal_segment_runtime {
 前台写的唯一规范流程是：
 
 ```text
-1. batch scheduler 按当前运行期的 gap-free 顺序分配 batch_lsn
+1. coord_sched 按当前运行期的 gap-free 顺序分配 batch_lsn
 2. 在进入 Inconel durable path 之前，按客户端 batch 内顺序把同 key 操作折叠成 canonical batch image
 3. 计算该 canonical batch image 的全局 entry_count
-4. 各 canonical entries 按 key hash 路由到目标 front scheduler
-5. 各目标 front schedulers 并行：
-   - PUT: 先分配并持久化 value object，得到 durable `value_ref`
+4. value_alloc_sched（leader-follower）：
+   - advance() 合并当前并发 batch 的 PUT entries
+   - leader 统一分配 value slots、填充 DMA frame、FUA 写到本核 nvme_sched
+   - FUA 完成后所有 batch 拿到 durable `value_ref`
+5. 各 canonical entries 按 key hash 路由到目标 front scheduler
+6. 各目标 front schedulers 并行：
    - append canonical WAL entry (FUA, PUT 记录 `value_ref`)
    - insert canonical active memtable entry
        * PUT    -> `value_handle { durable = value_ref, hot = hot_blob }`
        * DELETE -> tombstone
-6. reduce()
-7. publish(batch_lsn)
-8. ACK
+7. reduce()
+8. publish(batch_lsn)
+9. ACK
 ```
 
 这里的 `canonical batch image` 不是实现优化，而是持久化语义本身。冻结规则如下：
@@ -967,6 +991,19 @@ entry 对该 reader 可见，当且仅当 entry.lsn <= read_lsn
 
 ## 8. 读路径与可见性模型
 
+### 8.0 最高准则
+
+**`read_handle` 是一个完整的、自洽的拓扑 snapshot。读路径的每个步骤都使用 `read_handle` 内部的引用，不使用任何 scheduler 的当前可变状态。**
+
+如果你的实现需要以下任何一项，说明理解错了：
+
+1. ❌ 在读路径中访问 `front_sched.active` / `front_sched.imms`（应使用 `read_handle.cat->prs->fronts[owner]`）
+2. ❌ 在读路径中访问 `tree_sched` 当前 manifest（应使用 `read_handle.cat->prs->tree_guard->manifest`）
+3. ❌ 把 `tree_lookup` 串行到 `tree_sched` 上执行（应就地在调用方 scheduler 上执行，CoW tree 的核心就是读写分离）
+4. ❌ 需要额外机制保证"读操作期间不发生 seal / flush / frontier switch"（`read_handle` 的 `shared_ptr` pin 已经保证拓扑不变）
+
+原因：seal / frontier switch / release_gens 会修改 scheduler 的当前可变状态，但 `read_handle` pin 住的 PRS snapshot 不受影响。两者在正常路径重合，在 frontier switch 后分裂——用 scheduler 当前状态的实现在分裂时丢数据。
+
 ### 8.1 Point GET
 
 这里的 `batch cache` 指当前请求上下文中的临时写集合，只用于同一逻辑 batch 内的 read-your-own-writes；它不持久化，也不参与恢复。
@@ -993,6 +1030,16 @@ Point GET 的规范顺序如下：
 4. memtable 命中 value 时，必须直接从 `value_handle.hot_blob` 返回；它绝不能退化成一次 SSD 读。
 5. value cache 若存在，只能淘汰自己的索引或附加引用；只要 memtable entry 还持有 `hot_blob`，这块热值就不能被真正驱逐。
 6. tree 侧可以有 per-core node cache，但它只是性能优化，不改变 `read_handle`、`tree_guard` 或可见性规则。
+
+读路径 handle 数据源断言（详细设计展开 handle 签名时必须对照）：
+
+| handle | 数据输入 | 来源 | ❌ 不是 |
+|--------|---------|------|--------|
+| `lookup_memtable` | active, imms | 调用方 `read_handle.cat->prs->fronts[owner]`（snapshot） | `front_sched` 当前 active/imms |
+| `scan_memtable` | active, imms | 同上 | 同上 |
+| `tree_lookup` | manifest | 调用方 `read_handle.cat->prs->tree_guard->manifest`（snapshot） | `tree_sched` 当前 manifest |
+
+原因：`release_gens` / frontier switch 后，scheduler 自有状态已更新，但旧 reader pin 的 PRS snapshot 仍指向旧 gens/旧 guard。用 self.state 会导致旧 reader 丢数据。
 
 ### 8.2 MultiGet / range scan
 
@@ -1161,6 +1208,18 @@ statement-start stable Read Committed
 
 ## 10. Tree 与 Value Area 规范
 
+### 10.0 最高准则
+
+**运行时 tree 结构一致性来自 `checkpoint_guard` 持有的 immutable `tree_manifest`，不来自盘上的 slot 扫描。`manifest` 精确告诉每个 range 应该读哪个 slot。**
+
+如果你的实现需要以下任何一项，说明理解错了：
+
+1. ❌ 运行时 cache miss 时扫描 shadow range 的多个 slot 选最新（应由 `manifest.resolve(range_base)` 直接给出精确 slot 地址）
+2. ❌ 需要"每个 range 只剩一个 slot"才能正常读服务（多个 slot 共存是常态，`manifest` 指定当前 snapshot 该读哪个）
+3. ❌ 把 flush / recovery 的目标理解为"重写回 slot 0"（flush 是 CoW 写 next slot；recovery 是一次与 steady-state 同构的增量 flush）
+
+只有 boot recovery 没有旧 manifest 时才扫描 shadow range 找最新 CRC-valid slot（从高 index 向低 index），这是 recovery 特有的 bootstrap 步骤，不是运行时常态。
+
 ### 10.1 Shadow CoW B+ Tree
 
 单棵逻辑树的基本规则：
@@ -1229,13 +1288,14 @@ tree allocator -> [shadow ranges ... free space ... value slabs] <- value alloca
 1. Data Area 不预先切出固定的 tree/value 比例；两端共享同一连续空间。
 2. tree allocator 从低地址向高地址分配，单位是整个 shadow range；`range_size = tree_page_size * shadow_slots_per_range`，并按该粒度天然对齐。
 3. value allocator 从高地址向低地址分配，单位是 `value_size_classes` 定义的 size class / slab。
-4. 两端在中间相遇就表示 Data Area 已满。
+4. 两端在中间相遇就表示 Data Area 已满。碰撞检测通过 per-device 的 `std::atomic<uint64_t>` 实现：`tree_sched` 分配新 range 后 relaxed store 更新 `tree_alloc_head`，`value_alloc_sched` bump 分配时 relaxed store 更新 `value_alloc_head`；两侧分配前各自 relaxed load 对方的 head 做本地检查。两个 head 都是单调的（tree 只增，value 只减），读到略旧的值只会导致少分配一点后重试，不破坏正确性。
 5. tree 和 value 都有各自的 free pool；真正回收到可重用状态，要等各自对应的读/恢复屏障满足后再由 owner scheduler 处理。
 6. tree free pool 和 value free pool 不混用；tree 侧回收的是整个 shadow range，value 侧回收的是按 size class 组织的 value extent/slab。
 7. value free pool 的来源有两类：
    - old tree-visible value，经由 old `checkpoint_guard`
    - `memtable-only loser durable_ref`，经由 owning `memtable_gen`
-8. allocator head 与 free pool 都不持久化；它们是运行时状态，不是恢复入口。
+8. 当 `class_size < lba_size` 时，value allocator 可以在一个 LBA 内放多个 sub-LBA slots；对上层暴露的稳定定位符仍统一是 `value_ref { base, byte_offset, len, flags }`。
+9. allocator head 与 free pool 都不持久化；它们是运行时状态，不是恢复入口。
 
 这样做的目的不是“布局好看”，而是：
 
@@ -1268,6 +1328,12 @@ persist value object
 2. WAL PUT record 只记录 `value_ref`，不再内联原始 value bytes。
 3. memtable PUT entry 持有 `value_handle { durable_ref, hot_blob }`。
 4. steady-state flush 只把 winner 的 `value_ref` 物化进 tree；它不再重复写 value body。
+
+这里在概要层再冻结一条抽象边界：
+
+1. `value_ref` 的稳定定位格式是 `{ base, byte_offset, len, flags }`。
+2. 当 `class_size < lba_size` 时，一个 LBA 内可以承载多个 value slots，由 `byte_offset` 区分。
+3. WAL / memtable / tree / recovery 只传播 `value_ref` 抽象，不依赖 value allocator 在盘上的具体 slot 组织方式。
 
 tree 叶子保存的是：
 
@@ -1328,7 +1394,7 @@ v1 只实现“一个逻辑 value -> 一个 `value_ref`”。
 
 但为了不给后续 large-value / 多盘 value 条带化挖坑，详细设计应当：
 
-1. 把 leaf payload 的 value 分支定义成 `value_ref` 抽象，而不是裸 `lba + len` 局部散落；
+1. 把 leaf payload 的 value 分支定义成 `value_ref` 抽象，而不是裸 `lba/byte_offset/len` 组合在各层局部散落；
 2. 允许未来把 `value_ref.flags` 扩展成外部 blob / extent list 的解释方式；
 3. 不让 publish、flush、recovery 语义依赖“value 一定内联为单 extent”。
 
@@ -1532,6 +1598,22 @@ WAL 快路径不允许碰全局共享 tail。共享状态只包括：
 
 ## 12. Recovery 规范
 
+### 12.0 最高准则
+
+**Recovery 就是一次在 boot 时执行的 flush。** 如果你的理解需要以下任何一项才能成立，说明理解错了：
+
+1. ❌ 扫描或读取 Value Area（哪怕一个 value body / value header）
+2. ❌ 把 tree 重写回 slot 0 或从 scratch 重建
+3. ❌ 需要 `dead_value_refs` 才能保证 allocator 不泄漏（`live_value_refs` 是占用状态的唯一真相；不在 live 中的 slot 就是 free，无论是已知 dead、orphan、还是从未写入）
+4. ❌ 引入盘面白名单之外的持久化元数据才能完成恢复
+
+Recovery 的全部工作：
+1. 确定 logical winners = merge(tree leaf records, complete WAL batches)
+2. 做一次与 steady-state 同构的增量 flush（CoW 写新 slot，直接复用 winner 的 `value_ref`，不碰 value body）
+3. TRIM 旧 slots / 旧 ranges / dead values，重建 allocator runtime state（这些是清理和优化，不是正确性前提）
+
+`dead_value_refs`（从 all_referenced - live 以及 incomplete batches 中得到）只是辅助信息，用于加速 class 识别和 TRIM 判定。即使完全丢弃 `dead_value_refs`，allocator 仍可以仅从 `live_value_refs` 反推出完整的占用/空闲状态。
+
 ### 12.1 恢复目标
 
 恢复完成后的系统状态必须是：
@@ -1547,23 +1629,26 @@ WAL 快路径不允许碰全局共享 tail。共享状态只包括：
 恢复流程固定为：
 
 ```text
-1. 读取 superblock A/B，取出格式常量与区域边界；`root_base_paddr` 只作为最新 clean root 信息或扫描 hint，不作为 recovery correctness 前沿
-2. 扫描 Data Area，收集所有 CRC 通过的 leaf records；internal nodes 不是 recovery source of truth
+1. 读取 superblock A/B，取出格式常量与区域边界
+2. 从 `superblock.root_base_paddr` 出发递归遍历 tree，收集所有 CRC-valid leaf records；root 为 null 则 leaf record pool 为空。遍历只读 tree pages，不读任何 value body
 3. 扫描全部 WAL segments，收集所有完整 canonicalized batches（PUT 记录 `value_ref`）
 4. 将 leaf records 与 surviving complete canonicalized batches 按逻辑 key / `data_ver` fold，先重建 crash 后应存活的最新逻辑 KV winner 集合
-5. 基于这份逻辑 KV 状态，从空白 clean frontier 重新构建一棵新 tree：
-   - winner 为 value -> 直接复用 winner `value_ref`；v1 boot recovery 不读取、不校验、也不重写旧 value body
-   - winner 为 tombstone -> boot recovery 一律保守保留 tombstone，不在此阶段直接变成 absent
-   - 写引用这些 winner `value_ref` 或 tombstone 的新 tree slots
-   - 在内存中构造新的 clean `tree_manifest`
-   - NVMe FLUSH
+5. 在已遍历的 tree 基础上增量合并 WAL winners（本质上与 steady-state flush 同构）：
+   - 不变的 leaf page → 保留现有 slot，零写入
+   - 有变化的 leaf page → CoW 写入同一 range 的 next slot
+   - 结构变化（split/新 key）→ 正常分配新 range
+   - winner 为 value → 直接复用 winner `value_ref`；不读取、不校验、也不重写旧 value body
+   - winner 为 tombstone → boot recovery 一律保守保留 tombstone，不在此阶段直接变成 absent
+   - 如果 WAL 为空（无变化），零 tree page 写入
+   - 在内存中构造新的 clean `tree_manifest`（每个 range 记录当前有效 slot_index）
+   - 有写入时才 NVMe FLUSH
 6. 必要时更新 superblock A/B 中的 clean root 信息
 7. 生成新的 clean checkpoint_guard = G_clean
-8. TRIM old tree slot / old tree range，并依据 live `value_ref` 集合回收 definitively-dead value extents
-9. 从 rebuilt clean tree 与 live `value_ref` 集合重建 allocator runtime state：
+8. TRIM old tree slot / old tree range，并依据 live 与 dead `value_ref` 集合回收 definitively-dead value extents（sub-LBA dead slot 不逐个 TRIM，只在整页全 dead 时才 TRIM）
+9. 从 rebuilt clean tree、live `value_ref` 集合与 dead `value_ref` 集合重建 allocator runtime state：
    - tree allocator = 最大 live range 之后的第一个可分配位置
    - value allocator = 最低地址 live value 之前的第一个可分配位置；若无 live value，则回到 `data_area_end_paddr`
-   - value free pools = 由 live `value_ref` 集合反推出的空洞 extents
+   - value free pools = 由 live `value_ref` 集合反推出的空洞 extents，加上由 dead `value_ref` 集合识别出的 `value_head` 之上的 definitively-dead extents
    - allocator free pools 全部在内存重建，不持久化
 10. 重置 WAL segment pool，安装新的空 active memtables
 11. 设置 recovered_max_lsn = max( surviving complete WAL batches 的最大 batch_lsn,
@@ -1580,8 +1665,8 @@ WAL 快路径不允许碰全局共享 tail。共享状态只包括：
 
 1. recovery 不尝试恢复旧 runtime frontier，只恢复成新的 clean runtime；这里的 clean 指 tree frontier 与 runtime ownership 收敛，不要求 boot 时全量重写 live values。
 2. crash 后旧 `checkpoint_guard/tree_manifest` 全部消失，因此 recovery correctness 不依赖持久化 `slot_seq`，也不依赖 root-slot-derived frontier。
-3. recovery 的 source of truth 是“所有 CRC-valid leaf records + ALL surviving complete WAL batches + stable winner `value_ref` 集合”，而不是旧 internal-tree 拓扑。
-4. internal nodes 和旧 runtime manifest 在 recovery 中只可能作为扫描 hint 或诊断信息，不是 correctness source of truth。
+3. recovery 的 source of truth 是”从 superblock root 遍历 tree 得到的 CRC-valid leaf records + ALL surviving complete WAL batches + stable winner `value_ref` 集合”。recovery 全程不读任何 value body。
+4. internal nodes 在 recovery 中用于遍历导航（从 root 下降到 leaf），不是独立的 correctness source。旧 runtime manifest 不参与 recovery。
 5. surviving WAL 中的每个完整 batch 保存的都是 canonical batch image，而不是原始 batch 内中间步骤；因此 recovery replay 不需要再解释 batch 内顺序，只需要按 `batch_lsn` 比较这些 canonical records。
 6. `recovered_max_lsn` 不能只看 surviving WAL；它还必须覆盖 rebuilt clean logical state 中的最大 `data_ver`。否则当 WAL 已被清空而 tree 中仍保留更老但仍 live 的记录时，恢复后的 `durable_lsn/next_lsn` 会倒退。
 7. rebuild clean tree 在逻辑 key 维度上按 `data_ver` 幂等；`data_ver` 在语义上等价于该记录对应的 `batch_lsn`，因此某个 batch 即使已经体现在旧 leaf records 中，再次 replay 也不能改变最终可见状态。
@@ -1651,9 +1736,10 @@ WAL 快路径不允许碰全局共享 tail。共享状态只包括：
 write_batch(req)
   = on(coord_sched, assign_batch_lsn_and_prepare_canonical_entries(req))
  >> on(coord_sched, route_canonical_entries())
- >> when_all(
-      on(front(f0), persist_value_objects_if_put(frag0) >> wal_append_ref_fua(frag0) >> memtable_insert_handle(frag0)),
-      on(front(f1), persist_value_objects_if_put(frag1) >> wal_append_ref_fua(frag1) >> memtable_insert_handle(frag1)),
+ >> on(value_alloc_sched, persist_put_values())          // leader-follower: alloc + fill DMA + FUA
+ >> when_all(                                             // value durable 后 fan-out 到 front_scheds
+      on(front(f0), wal_append_ref_fua(frag0) >> memtable_insert_handle(frag0)),
+      on(front(f1), wal_append_ref_fua(frag1) >> memtable_insert_handle(frag1)),
       ...
     )
  >> on(coord_sched, await_publish_gate_if_needed(batch_lsn))
@@ -1683,7 +1769,7 @@ ensure_active_segment()
 ```text
 point_get(key)
   = on(coord_sched, acquire_read_handle())
- >> on(front(owner_front(key)), lookup_active_and_imms(key, read_lsn) >> if_memtable_value_then_return_hot_blob())
+ >> on(front(owner_front(key)), lookup_memtable(key, read_lsn, prs.fronts[owner]) >> if_memtable_value_then_return_hot_blob())
  >> if_miss(
       tree_lookup(tree_guard, key)
       >> decode_leaf_record()
@@ -1698,8 +1784,8 @@ multi_get(keys)
   = on(coord_sched, acquire_read_handle())
  >> on(coord_sched, group_by_owner_front(keys))
  >> when_all(
-      on(front(f0), lookup_memtables(keys_on_f0, read_lsn)),
-      on(front(f1), lookup_memtables(keys_on_f1, read_lsn)),
+      on(front(f0), lookup_memtables(keys_on_f0, read_lsn, prs.fronts[f0])),
+      on(front(f1), lookup_memtables(keys_on_f1, read_lsn, prs.fronts[f1])),
       ...
     )
  >> tree_fill_misses(tree_guard)
@@ -1712,8 +1798,8 @@ multi_get(keys)
 range_scan(begin, end)
   = on(coord_sched, acquire_read_handle())
  >> when_all(
-      on(front(f0), scan_memtables(begin, end, read_lsn)),
-      on(front(f1), scan_memtables(begin, end, read_lsn)),
+      on(front(f0), scan_memtable(begin, end, read_lsn, prs.fronts[f0])),
+      on(front(f1), scan_memtable(begin, end, read_lsn, prs.fronts[f1])),
       ...,
       tree_scan(tree_guard, begin, end)
     )
@@ -1763,8 +1849,8 @@ flush_round()
 ```text
 recover()
   = read_superblock_a_b()
- >> scan_data_area_leaf_records()
  >> when_all(
+      traverse_tree_collect_leaf_records(root_base_paddr),
       on(nvme(d0), scan_wal_segments())
     )
  >> on(coord_sched, assemble_complete_batches())

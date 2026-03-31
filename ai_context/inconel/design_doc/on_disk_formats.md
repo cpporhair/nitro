@@ -232,9 +232,8 @@ WAL entry 可以跨 `lba_size` 页边界（概要 §11.2 额外约束 2），但
   → 只需 FUA 写该 page（tail_buf）
 
 如果 entry 跨越 N 个 LBA pages：
-  → 先非 FUA 写前 N-1 个完整 page
-  → 最后一个 page 用 FUA 写
-  → FUA 完成保证所有先提交的写也已 durable
+  → v1 当前方案：每个相关 page write command 都带 FUA
+  → 不使用“前 N-1 页普通写，最后一页 FUA”的混合模式
 ```
 
 ### 3.6 Segment Size 约束

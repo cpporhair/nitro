@@ -12,15 +12,23 @@
 |--------|---------|--------|
 | `assign_lsn` | `(raw_batch)` → `(batch_lsn, canonical_entries, entry_count, route_table)` | RSM §2.3, WP §2.1 |
 | `publish_batch` | `(batch_lsn)` → `void` | RSM §2.3, WP §2.1 |
+| `release_batch` | `(batch_lsn)` → `void` | RSM §2.3, WP §10.7, OV §7.4 |
 | `acquire_read_handle` | `()` → `read_handle { cat, read_lsn }` | RSM §2.3, RAP §2.1, RAP §4.2 |
+| `capture_flush_frontier` | `()` → `flush_frontier { durable_lsn, old_guard }` | RSM §2.3, FF §2.2/8.1 |
+| `frontier_switch` | `(old_guard, new_manifest, retired, flushed_gens_by_front)` → `void` | RSM §2.3, FF §4.2/8.1 |
 | `install_cat` | `(new_publish_catalog)` → `void` | RSM §2.3, FF §4.2 |
-| `write_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §6 |
+| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
+| `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
+| `batch_lookup` | `(keys[], read_lsn, front_read_set)` → `batch_lookup_results[]` | RSM §3.4/3.7, RAP §5.1-5.3 |
 | **`lookup_memtable`** | **`(key, read_lsn, front_read_set)`** → `variant<vh, tombstone, miss>` | **RSM §3.4/3.7, RAP §4.2/4.3/5.3, OV §8.1/14.2** |
 | **`scan_memtable`** | **`(begin, end, read_lsn, front_read_set)`** → `scan_result_set` | **RSM §3.4, RAP §6.2/6.3, OV §14.4** |
+| `collect_eligible_gens` | `(durable_lsn)` → `eligible_gens[]` | RSM §3.4/3.8, FF §2.2/8.1 |
 | `seal_active` | `()` → `front_read_set` | RSM §3.6, OV §9.2 |
 | `release_gens` | `(gen_id_list)` → `void` | RSM §3.8, FF §4.3 |
 | `persist_put_values` | `(batch PUT entries)` → `durable value_refs` | RSM §6.2, WP §2.1/5.4 |
-| `freed_slots` | `(page_base, class_idx, freed_mask)` → `void` | RSM §6.6, FF §7.2 |
+| `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
+| `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
+| `freed_slots` | `(page_base, class_idx, freed_mask)` → `void` | RSM §6.7, FF §7.2 |
 | `recycle_whole` | `(class_idx, page_base)` → `void` | RSM §6.2 |
 | `alloc_segment` | `(stream_id, sealed_info?)` → `segment_runtime*` | RSM §5.3, WP §7.2 |
 | `reclaim_check` | `(recovery_safe_lsn)` → `void` | RSM §5.4, RW §12.4 |
@@ -53,7 +61,7 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `page_frame` | `id, st, dma_buf, byte_len, pin_count, crc_valid` | RMC §5.4 | — |
 | `value_page_frame` | `class_idx, slots_per_page, free_bitmap, free_count, mode` | RMC §5.5 | RSM §6.3 (open_frames) |
 | `frame_id` | `base, span_lbas, dom` | RMC §5.2 | — |
-| `hole_page_descriptor` | `page_base, class_idx, free_mask` | RMC §6.4 | RSM §6.6 |
+| `hole_page_descriptor` | `page_base, class_idx, free_mask` | RMC §6.4 | RSM §6.7 |
 
 ## 3. Owner 归属
 
@@ -62,10 +70,13 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | 状态 | Owner | 声明点 | 违反检测 |
 |------|-------|--------|---------|
 | value open frames (dirty_append / dirty_hole_fill) | `value_alloc_sched` | RMC §7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
-| value placement metadata (pools, hole_page_list) | `value_alloc_sched` | RMC §6.4/7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
+| value placement metadata (pools, hole_page_list, generic_free_spans) | `value_alloc_sched` | RMC §6.4/7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
+| **value_page readonly_frame_cache（读写共享）** | **`value_alloc_sched`** | RMC §7.1, RSM §6.1/6.5 | 如果 front_sched 或 tree_lookup_sched 持有 value_page cache → 错 |
 | WAL tail frame | `front_sched` | RMC §7.1, RSM §3.9 | — |
+| tree node read-only frame cache（普通读路径） | `tree_lookup_sched` | RMC §7.1/9.1, RSM §4.7 | 如果 front_sched 持有 tree_node cache → 错 |
 | tree flush write buffers | `tree_sched` | RMC §7.1 | — |
 | active/sealed memtable gens | `front_sched` | RSM §3.1 | — |
+| flush frontier snapshot (`durable_lsn` + `tree_guard`) | `coord_sched` | RSM §2.3, FF §2.2 | 如果 tree_sched 自行拼装当前 frontier → 错 |
 | tree allocator + retire queues | `tree_sched` | RSM §4.1 | — |
 | WAL segment pool | `wal_space_sched` | RSM §5.1 | — |
 | publish_catalog / publish_gate | `coord_sched` | RSM §2.1 | — |
@@ -76,9 +87,11 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 
 | Handle | 数据输入 | 来源 | ❌ 不是 |
 |--------|---------|------|--------|
-| `lookup_memtable` | active, imms | 调用方 `read_handle.cat->prs->fronts[owner]` (snapshot) | `front_sched` 当前 active/imms |
+| `lookup_memtable` | active, imms | 请求携带的 `read_handle.cat->prs->fronts[owner]` (snapshot) | `front_sched` 当前 active/imms |
 | `scan_memtable` | active, imms | 同上 | 同上 |
-| `tree_lookup` | manifest | 调用方 `read_handle.cat->prs->tree_guard->manifest` (snapshot) | `tree_sched` 当前 manifest |
+| `tree_lookup` | manifest | 请求携带的 `read_handle.cat->prs->tree_guard->manifest` (snapshot) | `tree_sched` 当前 manifest |
+| `read_value` | value_ref | `tree_lookup` 返回的 `leaf_value_record.vr` | 不是 front_sched / tree_lookup_sched 本地读取 |
+| `read_page_values` | value_read_group | 调用方对 tree-sourced `value_ref`s 做 request-local page grouping 后得到 | 不是逐条 `read_value()` fan-out |
 
 ## 5. Pipeline 跳转路径
 
@@ -86,15 +99,15 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 
 ### 写路径
 ```
-coord_sched(assign_lsn) → value_alloc_sched(persist_put_values) → fan-out front_scheds(write_fragment) → reduce → coord_sched(publish_batch)
+coord_sched(assign_lsn) → value_alloc_sched(persist_put_values) → fan-out front_scheds(write_wal_fragment) → reduce → fan-out front_scheds(write_memtable_fragment) → reduce → coord_sched(publish_batch/release_batch)
 ```
 出现点：OV §1.8/7.1/14.1, WP §1/2.1
 
 ### 读路径 (Point GET)
 ```
-coord_sched(acquire_read_handle) → front_sched(lookup_memtable with PRS snapshot) → [miss] → tree_lookup 就地执行(不经 tree_sched)
+coord_sched(acquire_read_handle) → front_sched(lookup_memtable with PRS snapshot) → [miss] → tree_lookup_sched(tree_lookup with read_handle manifest) → [hit value] → value_alloc_sched(read_value)
 ```
-出现点：OV §8.1/14.2, RAP §4.1/4.2
+出现点：OV §8.1/14.2, RAP §4.1/4.2/4.5
 
 ### Seal
 ```
@@ -104,7 +117,7 @@ coord_sched(close_gate) → fan-out front_scheds(seal_active) → reduce → coo
 
 ### Flush
 ```
-tree_sched(select gens) → fan-out front_scheds(collect_eligible_gens) → reduce → tree_sched(fold, write_tree_slots, build_manifest) → nvme_flush → tree_sched(update_flush_max_lsn) → coord_sched(frontier_switch, install_cat2) → fan-out front_scheds(release_gens)
+tree_sched(check_trigger_conditions) → coord_sched(capture_flush_frontier) → fan-out front_scheds(collect_eligible_gens) → reduce → tree_sched(fold, write_tree_slots, build_manifest) → nvme_flush → tree_sched(update_flush_max_lsn) → coord_sched(frontier_switch) → fan-out front_scheds(release_gens)
 ```
 出现点：OV §9.4/14.6, FF §1.1/8.1
 
@@ -150,12 +163,13 @@ read_superblock → traverse_tree(leaf_records) + scan_wal(entries) → merge(lo
 
 | 被引用章节 | 引用方 |
 |-----------|--------|
-| RSM §4.7 (tree_lookup 就地执行) | RAP §4.2 "见 runtime_state_machine.md §4.7" |
+| RSM §4.7 (`tree_lookup_sched` 与 tree lookup) | RAP §4.2 "见 runtime_state_machine.md §4.7" |
 | RSM §4.8 (recovery_safe_lsn) | FF §6.2 "见 runtime_state_machine.md §4.8" |
-| RSM §6 (value_alloc_sched) | WP §5.3, RMC §6.2 |
+| RSM §6 (value_alloc_sched) | WP §5.3, RMC §6.2, RAP §4.5/9.3 |
+| RSM §6.5 (`handle_read_value` / `handle_read_page_values`) | RAP §4.2/4.5/5.2/6.2 |
 | RSM §5.3-5.4 (wal_space_sched) | RW §12.4 |
 | WP §5 (value 分配流程) | RMC §6.2 |
-| WP §6 (write_fragment) | RSM §3.5 |
+| WP §2.3 / §10.7 (`write_wal_fragment`, `write_memtable_fragment`) | RSM §3.5 |
 | RMC §5.4 (frame_pin) | RAP §9.2-9.3 |
 | FF §3 (fold 算法) | RW §7.2 "与 flush_and_frontier_switch.md §3 同构" |
 | OV §8.1 (Point GET 规则 + 数据源断言) | RSM §3.7, RAP §4 |

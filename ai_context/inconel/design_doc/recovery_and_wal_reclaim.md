@@ -373,10 +373,11 @@ for each old_range_base not in clean_manifest.slot_map:
 ### 8.3 回收 Dead Value Extents
 
 ```text
-// 在 Step 2 扫描期间，也记录了所有 leaf record 中出现的 value_ref
+// 在 Step 2/4 扫描期间，也记录所有在 leaf/WAL 中出现过的 value_ref。
+// 这是“已知旧引用”集合，不是占用真相；占用真相只有 live_value_refs。
 all_referenced_value_refs = 所有 leaf record + WAL entry 中出现的 value_ref 的并集
 
-// dead value = 在 all_referenced 中但不在 live_value_refs 中的
+// dead value = 在 surviving refs 中出现过、但不属于当前 logical winners 的 value_ref
 dead_value_refs = all_referenced_value_refs - live_value_refs
 
 // 加上 incomplete batch 中 PUT 的 value_ref（orphan）
@@ -385,9 +386,13 @@ for lsn in incomplete_batch_lsns:
         if entry.op_type == PUT:
             dead_value_refs.insert(entry.vr)
 
-// 回收分 class 粒度处理：
+// dead_value_refs 只承担两类“快路径清理”职责：
+//   1. 对 >= LBA 的 definitively-dead extent 直接 TRIM
+//   2. 给 Step 9.2 的 whole-free page/extent 提供 class hint
+// 它不是 allocator correctness 的前提。
 for vr in dead_value_refs:
-    class_size = find_class_size(vr.len + sizeof(value_object_header))
+    class_idx = find_min_class_idx(vr.len + sizeof(value_object_header))
+    class_size = value_size_classes[class_idx]
 
     if class_size >= lba_size:
         // LBA-aligned / multi-LBA：整个 extent 可安全 TRIM
@@ -396,10 +401,14 @@ for vr in dead_value_refs:
 
     else:
         // sub-LBA：不能逐 slot TRIM（会破坏同页 live siblings）
-        // dead sub-LBA slot 不在此处 TRIM，而是参与 Step 9.2 的 free-pool 重建
-        // 只有当同一 LBA 的所有 slot 都 dead 时，才在 Step 9.2 中整页 TRIM
+        // 是否能整页 TRIM 由 Step 9.2 按 "free = whole value area - live" 判定
         pass
 ```
+
+关键点：
+
+1. `dead_value_refs` 不是 correctness source。某个 page/extent 即使完全没出现在 `dead_value_refs` 中，只要它不在 `live_value_refs` 中，recovery 结束后它仍必须回到 allocatable 状态。
+2. Step 8.3 只是“已知 definitively-dead extents 的快路径清理”；完整的 value free-state 由 Step 9.2 从 live set 的语义补集重建。
 
 ## 9. Step 9：重建 Allocator Runtime State
 
@@ -431,19 +440,33 @@ tree_allocator = {
 
 ### 9.2 Value Allocator
 
-**核心原则（§1 不变量重申）**：`live_value_refs` 是 Value Area 占用状态的唯一真相。不在 `live_value_refs` 中的 slot 就是 free。`dead_value_refs` 只是辅助信息（帮助识别 dead 页的 class、加速 TRIM 判定）。
+**核心原则（§1 不变量重申）**：`live_value_refs` 是 Value Area 占用状态的唯一真相。`occupied = expand(live_value_refs)`；`free = 整个 Value Area 地址空间 - occupied`。`dead_value_refs` 只是辅助信息（帮助识别 class、加速 TRIM），不是 correctness source。
+
+Recovery 与 allocator 的职责边界固定如下：
+
+1. recovery 只负责求出 `occupied` 真相（归一化后的 `live_extents`）和 `global_value_head`；
+2. `value_alloc_sched` 是 value free-space metadata 的唯一 owner；它必须把 `occupied` 反推出自己的 runtime free-state；
+3. `hole_page_list` / `whole_page_pool` / `extent_free_pool` / `generic_free_spans` 都是 `value_alloc_sched` 的内部状态，不是 recovery 的跨组件输出。
+
+Recovery 后的 free 空间分成两段：
+
+1. `[tree_alloc_head, global_value_head)`：fresh/bump 区域。这里不需要显式枚举 free page，后续正常 bump 分配即可触达。
+2. `[global_value_head, data_area_end_paddr)` 中除 `occupied` 外的全部地址：这是“历史上可能写过、但现在不 live”的上半区，必须在 boot 时由 `value_alloc_sched` 重建成 runtime 可分配状态。
+
+第 2 段的 free-state 是对**整个上半区**做 `occupied` 的语义补集，不是对 `live ∪ dead` 这类“被 surviving refs 看见的页面集合”做补集。
 
 ```text
-// ── Step 0: bump head ──
+// ── Step 0: bump head 只看 live ──
 // value allocator 从 data_area_end_paddr 向低地址分配（bump 单调递减）
-// head = min(live ∪ dead)，保证 dead refs 的页不会和 bump 双重分配
-all_known_value_refs = live_value_refs ∪ dead_value_refs
-if all_known_value_refs 非空:
-    global_value_head = min(vr.base.lba for vr in all_known_value_refs)
+// recovery 后，fresh bump frontier 可以直接推进到最低地址 live value 之前；
+// 不 live 的旧页/旧 extent 会由 value_alloc_sched.install_recovered_state()
+// 重建成 runtime free metadata。
+if live_value_refs 非空:
+    global_value_head = min(vr.base.lba for vr in live_value_refs)
 else:
     global_value_head = data_area_end_paddr.lba
 
-// ── Step 1: 从 live_value_refs 构建占用图（唯一真相）──
+// ── Step 1: 从 live_value_refs 构建归一化 occupied truth（唯一真相）──
 
 struct value_extent {
     uint64_t base_lba;
@@ -453,87 +476,51 @@ struct value_extent {
 };
 
 live_extents: vector<value_extent>
-// 按页聚合：lba → { class_idx, live_offsets }
-page_live: map<uint64_t, { class_idx, set<uint16_t> }>
-
 for vr in live_value_refs:
     class_idx = find_min_class_idx(vr.len + sizeof(value_object_header))
     class_size = value_size_classes[class_idx]
     span_lbas = max(1, class_size / lba_size)
     live_extents.push({ vr.base.lba, vr.byte_offset, class_idx, span_lbas })
-    page_live[vr.base.lba] = { class_idx, ... }  // 记录该页的 class 和 live slots
 
-// ── Step 2: 从 dead_value_refs 获取辅助信息 ──
-// dead refs 提供两件事：(a) 对无 live ref 的页提供 class 信息；(b) 帮助 Step 8.3 做 TRIM
-// 如果 dead refs 完全丢弃，allocator 仍正确（只是无法立即回收那些无 live ref 的页）
-page_dead: map<uint64_t, { class_idx, set<uint16_t> }>
+sort live_extents by (base_lba, span_lbas, byte_offset)
+
+// ── Step 2: dead refs 只作为可选 class / TRIM hint ──
+struct dead_class_hint {
+    uint64_t base_lba;
+    uint16_t byte_offset;
+    uint32_t class_idx;
+    uint32_t span_lbas;
+};
+
+dead_class_hints: vector<dead_class_hint>
 for vr in dead_value_refs:
     class_idx = find_min_class_idx(vr.len + sizeof(value_object_header))
-    page_dead[vr.base.lba] = { class_idx, ... }
+    class_size = value_size_classes[class_idx]
+    dead_class_hints.push({
+        vr.base.lba,
+        vr.byte_offset,
+        class_idx,
+        max(1, class_size / lba_size),
+    })
 
-// ── Step 3: 按页产出 free pools ──
-
-all_known_pages = keys(page_live) ∪ keys(page_dead)
-
-for page in all_known_pages:
-    has_live = page in page_live
-    has_dead = page in page_dead
-
-    if has_live:
-        // ── 页有 live slots → class 从 live ref 确定 ──
-        class_idx = page_live[page].class_idx
-        class_size = value_size_classes[class_idx]
-
-        if class_size >= lba_size:
-            // LBA-aligned / multi-LBA：整个 extent 被 live 占用 → 跳过
-            pass
-        else:
-            // sub-LBA：live slots 占用，其余全部是 free（无论 dead、orphan、还是从未写入）
-            slots_per_page = lba_size / class_size
-            live_offsets = page_live[page].offsets
-            free_mask = bitset(slots_per_page, all_zero)
-            for slot_idx in 0 .. slots_per_page - 1:
-                if slot_idx * class_size not in live_offsets:
-                    free_mask.set(slot_idx)
-            if free_mask.any():
-                hole_page_list[class_idx].push({ page, class_idx, free_mask })
-
-    else:
-        // ── 整页无 live → 页上所有 slot 都是 free ──
-        if has_dead:
-            // class 从 dead ref 确定
-            class_idx = page_dead[page].class_idx
-        else:
-            // 无 live 也无 dead（orphan-only 页）→ 边界情况
-            // 这类页的数量上界 = per-class 各 1 页（crash 瞬间的 open frame）
-            // 处理方式：TRIM 后不加入 per-class pool（class 无法确定）
-            // 空间在设备层被回收；allocator 层视为未分配，bump 不会撞到它（它在 head 之上）
-            trim({ 0, page }, 1)
-            continue
-
-        class_size = value_size_classes[class_idx]
-        span_lbas = max(1, class_size / lba_size)
-
-        if class_size >= lba_size:
-            // LBA-aligned / multi-LBA：已在 Step 8.3 被 TRIM → 加入 per-class pool
-            if class_size == lba_size:
-                whole_page_pools[class_idx].push({ 0, page })
-            else:
-                extent_free_pools[class_idx].push({ 0, page })
-        else:
-            // sub-LBA：整页无 live → TRIM + whole_page_pool
-            trim({ 0, page }, 1)
-            whole_page_pools[class_idx].push({ 0, page })
+// ── Step 3: 把 occupied truth 交给唯一 owner ──
+// recovery 不直接拼 hole_page_list / per-class pools；这些都是 value_alloc_sched 的内部状态。
+value_alloc_sched.install_recovered_state(
+    live_extents,               // 唯一 correctness source：occupied truth
+    global_value_head,          // fresh bump frontier
+    data_area_end_paddr.lba,    // Value Area 上界
+    dead_class_hints,           // 可为空；仅用于 class 归桶/TRIM 优化
+)
 ```
 
 **回收总结**：
 
-| 页状态 | class 来源 | 处理 |
+| 区域状态 | 真相来源 | 处理 |
 |--------|-----------|------|
-| 有 live slot（sub-LBA） | live ref | `free_mask = ~live_slots` → hole_page_list |
-| 有 live slot（≥ LBA） | live ref | 整 extent 占用，跳过 |
-| 无 live，有 dead ref | dead ref | TRIM（Step 8.3 或此处）+ per-class pool |
-| 无 live，无 dead（orphan-only） | 无法确定 | TRIM，不入 pool（上界 per-class 1 页） |
+| sub-LBA 页内有 live slots | `live_value_refs` | `value_alloc_sched` 从 `live_slots` 反推 `free_mask`，写入 `hole_page_list` |
+| ≥ LBA 的 live extent | `live_value_refs` | 视为占用，跳过 |
+| whole-free region，class 可推断 | `occupied` 的补集 + 可选 dead hint | `value_alloc_sched` 负责 TRIM（必要时）+ per-class pool |
+| whole-free region，无 surviving ref | `occupied` 的补集 | `value_alloc_sched` 必须保存为 owner-local `generic_free_spans` 或等价状态；不能泄漏 |
 
 ### 9.3 数据区域空间检查
 
@@ -565,20 +552,21 @@ recovered_max_lsn = max(
     0  // 如果两者都为空
 )
 
-// Step 12: 安装新 active memtables + 分发 value free pools
+// Step 12: 安装新 active memtables + 初始化 value allocator 输入
 for each front_sched (0 .. front_sched_count-1):
     front.active = new memtable_gen { gen_id = next_gen_id++, st = active }
     front.imms = []
     front.wal = 新的空 wal_stream_state
 
-// Step 12a: 将 value free pools 灌入 value_alloc_sched
-// recovery 重建出的 whole_page_pools / hole_page_list / extent_free_pools
-// 一次性灌入 value_alloc_sched 的 per-class state（单一 owner，不按 hash 分发）
+// Step 12a: 将 recovered occupied truth 交给 value_alloc_sched
+// recovery 只提供 live/occupied truth 与 bump head；
+// value_alloc_sched 作为单一 owner，自行重建 hole_page_list / per-class pools /
+// generic_free_spans 等 runtime free state（不按 hash 分发）
 value_alloc_sched.install_recovered_state(
-    whole_page_pools,
-    hole_page_list,       // flat_hash_map<paddr, hole_page_descriptor>
-    extent_free_pools,
-    global_value_head,    // bump head
+    live_extents,            // normalized occupied truth
+    global_value_head,       // bump head
+    data_area_end_paddr.lba, // Value Area 上界
+    dead_class_hints,        // 可为空；只做 class 归桶/TRIM hint
 )
 
 // Step 13: PRS_clean
@@ -598,6 +586,7 @@ current_publish_catalog = CAT_clean
 
 // Step 15: 开始服务
 next_lsn = recovered_max_lsn + 1
+superblock_safe_lsn = recovered_max_lsn  // clean runtime 的当前 superblock root 已覆盖整棵 clean tree
 recovery_safe_lsn = recovered_max_lsn  // 所有旧版本都已收敛到 clean tree
 ```
 
@@ -607,7 +596,7 @@ recovery_safe_lsn = recovered_max_lsn  // 所有旧版本都已收敛到 clean t
 
 概要 §12.3 第 9 点：boot recovery 一律保守保留 tombstone。
 
-原因：boot recovery 没有旧 runtime 的 `recovery_safe_lsn`，无法判断 tombstone 的 `data_ver` 是否足够老。但因为 recovery 从 scratch 重建 clean tree，所有 tombstone 都对应真实的"该 key 曾有 value 后被 DELETE"的状态。
+原因：boot recovery 没有旧 runtime 的 `recovery_safe_lsn`，无法判断 tombstone 的 `data_ver` 是否足够老。但因为 recovery 最终会收敛成唯一的 clean tree，所有 tombstone 都对应真实的"该 key 曾有 value 后被 DELETE"的状态。
 
 ### 11.2 Steady-State 中
 
@@ -619,18 +608,34 @@ tombstone.data_ver <= recovery_safe_lsn
 
 含义：即使在此刻崩溃并 recovery，该 tombstone 覆盖的所有更老版本都不可能从 WAL 或旧 leaf records 中出现。因此安全删除。
 
+v1 的 steady-state tombstone GC 是**page-local opportunistic compaction**：
+
+1. flush 仍只用 memtable-touched keys 来定位 `affected_leaves`
+2. 只要某个 leaf 因本轮 flush 被重写，就会顺带检查该页上的 tombstone records
+3. 满足 `data_ver <= recovery_safe_lsn` 的 tombstone 可以在新 leaf image 中直接省略（变成 absent）
+4. v1 不为旧 tombstone 维护单独的全局 revisit / sweep 队列；未被触达的 leaf 继续保守保留 tombstone
+
 ### 11.3 实现
 
-在 flush fold 算法中（`flush_and_frontier_switch.md` §3.2）：
+在 leaf rewrite 阶段（`flush_and_frontier_switch.md` §3.4）：
 
 ```text
-if old_tree_record.kind == tombstone
-   && 无更新的 memtable winner
-   && old_tree_record.data_ver <= recovery_safe_lsn:
-    // 可以物理删除（变成 absent）
-    // 不写入新 leaf record
-    remove_from_leaf = true
+candidate_records = merge(old_leaf.records, point_mutations_for_this_leaf)
+
+for record in candidate_records:
+    if record.kind == tombstone
+       && record.data_ver <= recovery_safe_lsn:
+        // 可以物理删除（变成 absent）
+        // 不把该 tombstone 拷入新的 leaf image
+        continue
+
+    new_leaf_image.push(record)
 ```
+
+关键点：
+
+1. 这里处理的是**整页 compact**，不是“逐 key 主动 revisit 旧 tombstone”。
+2. 因此，即使某个 tombstone 对应的 key 本轮没有新 memtable 更新，只要它所在 leaf 因其他 key 更新而被重写，也可以顺手物理删除。
 
 ## 12. Recovery-Safe LSN 与 WAL Reclaim
 
@@ -651,7 +656,7 @@ if old_tree_record.kind == tombstone
 ```text
 recovery_safe_lsn = min(
     flush_frontier,         // tree 已 flush 到这里
-    superblock_frontier,    // superblock 已记录到这里
+    superblock_safe_frontier, // 当前 on-disk superblock root 已能覆盖到这里
     wal_reclaim_frontier,   // 对应的 WAL segments 已回收或仍可安全解释
 )
 ```
@@ -660,9 +665,17 @@ recovery_safe_lsn = min(
 
 **flush_frontier** = 最近一次成功 flush 的 `flush_max_lsn`。即 tree 已经物化了这些 batch 对应的 winner records。
 
-**superblock_frontier**：如果 flush 改变了 `root_base_paddr` 且 superblock 已更新，则 = flush_max_lsn。如果 superblock 尚未更新，则 = 上一次 superblock 更新时的 flush_max_lsn。
+**superblock_safe_frontier**：当前 on-disk superblock root 已经能够覆盖到的最大 flushed frontier。它不是“superblock 里存了一个 flush_lsn”，而是 runtime 对恢复可达性的判断量：
 
-直觉：如果此时崩溃，recovery 读到的 superblock root hint 对应的是哪一轮 flush。recovery 需要扫描 WAL 来补上 superblock 之后的变更。所以 superblock 之后的 WAL 不能回收。
+1. **root-stable flush**
+   - `root_base_paddr` 不变，只是该 root range 中的 slot 前进了。
+   - recovery 从 superblock 中的 `root_base_paddr` 出发，扫描这个 shadow range 时仍能找到最新 root slot。
+   - 因此本轮 `nvme_flush` 完成后，`superblock_safe_frontier` 可以直接推进到该轮 `flush_max_lsn`，不需要更新 superblock。
+
+2. **root-change flush**
+   - `root_base_paddr` 改变。
+   - 在异步 superblock 更新完成前，recovery 仍只能从旧 root base 出发；这轮及其之后的变更必须依赖 WAL 补齐。
+   - 因此在 update completion 前，`superblock_safe_frontier` 不能推进；完成后再推进到该次更新覆盖的 `flush_max_lsn`。
 
 **wal_reclaim_frontier** = 所有已回收 WAL segments 的 max_lsn 的最大值。即这些 WAL 信息已经在 tree 中体现，不再需要。
 
@@ -675,7 +688,8 @@ else:
     wal_frontier = min(seg.min_lsn for seg in sealed_segments_not_yet_reclaimed) - 1
 
 recovery_safe_lsn = min(
-    latest_superblock_flush_max_lsn,
+    flush_max_lsn,
+    superblock_safe_lsn,
     wal_frontier,
 )
 ```
@@ -690,15 +704,9 @@ recovery_safe_lsn = min(
 条件 1: seg.max_lsn <= flush_max_lsn
     // 该 segment 中所有 batch 都已被 flush 进 tree
 
-条件 2: 对应的 flush 后 superblock 已更新（如果那轮 flush 改变了 root）
-    // 如果 root 没变，只要条件 1 满足就够了
-    // 如果 root 变了但 superblock 未更新 → 不能回收
-    //   因为崩溃后 recovery 会从旧 root hint 出发，需要 WAL 补上差异
-
-条件 3: 无 live reader 还可能通过旧 guard 引用到该 segment 中的 value_ref
-    // v1 中这个条件可以简化为：无旧 guard 仍然存活
-    // 但实际上 WAL 回收只看 recovery safety，不看 reader safety
-    // reader 安全由 checkpoint_guard 保证
+条件 2: seg.max_lsn <= superblock_safe_lsn
+    // root-stable flush 可在无 metadata IO 的情况下推进这条边界
+    // root-change flush 则必须等对应 superblock update completion
 ```
 
 简化表达：
@@ -746,11 +754,18 @@ wal_reclaim_round()
 
 ### 13.2 Boot Recovery 的 Value 回收
 
-Recovery 通过 `live_value_refs` 集合反推 dead values（§8.3），直接 TRIM。
+Recovery 不是“枚举所有曾经分配过的 slot”，而是直接重建下面这个语义：
 
-Recovery 后的 value free pool 包含两部分：
-1. 扫描出的已分配但未被 live_value_refs 引用的 slots
-2. 未分配的空间（value_alloc_head 以上）
+1. `occupied = clean tree / logical winners` 中的 `live_value_refs`
+2. `free = 整个 Value Area - occupied`
+
+其中：
+
+1. `[tree_alloc_head, global_value_head)` 这段 fresh 空间由 bump head 覆盖；
+2. `[global_value_head, data_area_end_paddr)` 中除 `occupied` 外的全部地址，由 `value_alloc_sched` 依据 `occupied` 的语义补集，重建为 `hole_page_list` / `whole_page_pool` / `extent_free_pool` / `generic_free_spans` 等 owner-local metadata；
+3. `dead_value_refs` 只是帮助某些 whole-free region 更快确定 class 并 TRIM；不是“free 能否找全”的前提。
+
+因此，即使某个 crash-open page / orphan-only extent 从未出现在 leaf/WAL refs 中，只要它不在 `live_value_refs` 里，recovery 结束后它也必须重新回到 allocatable 状态，而不是悬空在 `global_value_head` 之上。
 
 ### 13.3 不泄漏论证
 
@@ -796,14 +811,12 @@ recover()
   >> flat()
   >> on(coord_sched, assemble_complete_batches(wal_entries))
   >> on(tree_sched, merge_and_rebuild_logical_winners(leaf_records, complete_batches))
-  >> on(tree_sched, rebuild_clean_tree(winners))
-     // 内部：顺序构建 leaf/internal pages → 并发 NVMe write → reduce
-  >> flat_map([](auto&& build_result) {
-         return nvme_flush();
-     })
+  >> on(tree_sched, merge_winners_into_existing_tree_and_build_clean_manifest(winners))
+     // 内部：只写受 WAL winners 影响的 tree pages；不读 Value Area，不重写 live values
+  >> maybe_if_tree_pages_written(nvme_flush())
   >> on(tree_sched, update_superblock_if_needed(new_root))
-  >> on(tree_sched, trim_old_tree_and_dead_values(old_slots, dead_vrs))
-  >> on(tree_sched, rebuild_allocator_state(live_vrs, clean_manifest))
+  >> on(tree_sched, trim_old_tree_and_reclaim_known_dead_values(old_slots, dead_vrs))
+  >> on(tree_sched, rebuild_allocator_state_from_live_set(live_vrs, dead_vrs, clean_manifest))
   >> on(wal_space_sched, reset_wal_pool())
   >> on(coord_sched, install_clean_runtime(clean_manifest, recovered_max_lsn))
 ```
@@ -827,7 +840,7 @@ recover()
 - Data Area 无（或有旧的）leaf records
 - WAL 有 surviving entries
 - → complete batches 从 WAL 恢复
-- → rebuild tree 包含这些 batch 的 winners
+- → 在空/旧 tree 上执行一次 recovery flush，得到包含这些 winners 的 clean tree
 
 ### 15.3 Flush 后崩溃（superblock 已更新）
 
@@ -836,7 +849,7 @@ recover()
 - WAL 可能有 flush 之后的新 entries
 - → leaf scan 覆盖已 flush 数据
 - → WAL scan 覆盖 flush 后的新数据
-- → merge 后 rebuild clean tree
+- → merge 后只对受影响的 tree 节点做 CoW，收敛到新的 clean tree
 
 ### 15.4 Flush 后崩溃（superblock 未更新）
 
@@ -846,4 +859,4 @@ recover()
 - → leaf scan 收集新旧所有 records
 - → WAL scan 收集所有 surviving entries
 - → merge 时按 data_ver 幂等 → 结果正确
-- → rebuild clean tree（包含新旧合并后的 winners）
+- → 在旧 tree 基础上增量 flush WAL winners，收敛到唯一 clean tree

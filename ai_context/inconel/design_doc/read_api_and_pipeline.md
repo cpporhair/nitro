@@ -154,14 +154,17 @@ point_get(key)
            // memtable miss → 继续查 tree
            goto step 6
 
-6. 查 tree（使用 cat->prs->tree_guard.manifest）
+6. 路由到 owner front 的 home `tree_lookup_sched`
+   tree_owner = route_tree_lookup(owner)
+
+7. 查 tree（on tree_lookup_sched[tree_owner]，使用 cat->prs->tree_guard.manifest）
    tree_result = tree_lookup(key, cat->prs->tree_guard->manifest)
 
-7. 处理 tree 结果：
+8. 处理 tree 结果：
    match tree_result:
        leaf_value_record(data_ver, vr):
-           // tree hit value → 从 NVMe 读 value body
-           value_data = nvme_read_value(vr)
+           // tree hit value → 路由到 value_alloc_sched 读 value body
+           value_data = value_alloc_sched->read_value(vr)
            return value_data
        leaf_tombstone(data_ver):
            // tree hit tombstone → not found
@@ -170,7 +173,7 @@ point_get(key)
            // tree miss → key 不存在
            return not_found
 
-8. 释放 read_handle
+9. 释放 read_handle
 ```
 
 ### 4.2 PUMP Pipeline
@@ -195,22 +198,31 @@ point_get(key)
          } else if constexpr (std::is_same_v<T, tombstone_tag>) {
              return just(not_found_result{});
          } else {
-             // miss → tree lookup（就地执行，不经过 tree_sched）
+             // miss → tree_lookup_sched 查 tree → value_alloc_sched 读 value
              return get_context<read_handle>()
                  >> then([key](read_handle& rh) {
-                        return tree_lookup(key, rh.cat->prs->tree_guard->manifest);
+                        uint32_t owner = key_hash(key) % front_sched_count;
+                        uint32_t tree_owner = route_tree_lookup(owner);
+                        return tree_lookup_sched[tree_owner]->tree_lookup(
+                            key, rh.cat->prs->tree_guard->manifest);
                     })
                  >> flat()
+                 >> visit()         // variant<leaf_value, leaf_tombstone, absent>
                  >> then([](auto&& tree_result) {
-                        return process_tree_result(tree_result);
-                    });
+                        using T = std::decay_t<decltype(tree_result)>;
+                        if constexpr (std::is_same_v<T, leaf_value_record>)
+                            return value_alloc_sched->read_value(tree_result.vr);
+                        else
+                            return just(not_found_result{});
+                    })
+                 >> flat();
          }
      })
   >> flat()
   >> pop_context()              // 释放 read_handle
 ```
 
-**tree_lookup 就地执行**：tree_lookup 不经过 tree_sched，而是在当前 scheduler 上就地执行（见 `runtime_state_machine.md` §4.7）。它只依赖 immutable manifest 和 readonly_frame_cache，不需要 tree_sched 的可变状态。CoW tree 的核心就是读写隔离——读路径不应被 flush/reclaim 阻塞。
+**tree traversal 与 value read 分离**：memtable miss 后，读路径分两步：(1) 把 `(key, manifest)` 路由到 owner front 的 home `tree_lookup_sched`（见 `runtime_state_machine.md` §4.7）执行 tree traversal；(2) tree hit value 后，路由到 `value_alloc_sched` 读 value body（见 `runtime_state_machine.md` §6.5）。Point GET 走 `read_value(vr)`；MultiGet / Scan 先在调用方按 value page 分组，再走 `read_page_values(group)`。`value_alloc_sched` 集中持有 value_page cache（含 dirty open frames）。这样 tree-node cache 与 tree traversal 共置在 `tree_lookup_sched`，value cache 与 value allocator 共置在 `value_alloc_sched`，两者都不依赖 tree_sched 的可变状态。
 
 ### 4.3 Memtable Lookup 实现
 
@@ -225,19 +237,22 @@ lookup_memtable(key, read_lsn, frs):
    收集所有 data_ver <= read_lsn 的 entries
    winner_active = 其中 data_ver 最大的
 
-2. 如果 winner_active 存在 → 返回（最新在 active，不需要查 imms）
-
-3. 查 frs.imms（从新到旧）：
+2. 查 frs.imms（从新到旧）：
    for gen in frs.imms:
        在 gen.table 中查找 key
        收集所有 data_ver <= read_lsn 的 entries
        winner_gen = 其中 data_ver 最大的
-       if winner_gen 存在 → 返回
 
-4. 全部 miss → 返回 miss
+3. winner = winner_active 与所有 winner_gen 中 data_ver 最大的那条
+
+4. 如果 winner 不存在 → 返回 miss
+
+5. 如果 winner.kind == value → 返回 value_handle
+
+6. 否则 winner.kind == tombstone → 返回 tombstone
 ```
 
-**优化**：因为 `same key → same front_sched`，同一 gen 中同一 key 的 entries 来自不同 batch（不同 batch_lsn）。按 data_ver 降序扫描，找到第一条 `data_ver <= read_lsn` 的即为 winner。
+这里不能因为 active 命中就提前返回。gen 的拓扑顺序（active / imms）不等价于同一 key 的 `data_ver` 新旧顺序；正确性标准始终是“在 `active + imms` 中取 `data_ver <= read_lsn` 的最大版本”。
 
 ### 4.4 hot_blob 返回路径
 
@@ -264,19 +279,24 @@ read_handle pin cat → cat.prs pin memtable_gen → gen 持有 memtable_entry
 
 memtable miss 后查 tree，如果命中 value record：
 
+- Point GET：直接路由到 `value_alloc_sched` 执行 `read_value(vr)`
+- MultiGet / Scan：先把 tree-sourced `value_ref` 按 value page 分组，再调用 `read_page_values(group)`
+
+Point GET 的单值路径如下（见 `runtime_state_machine.md` §6.5）：
+
 ```text
-read_value(value_ref vr):
-    1. 通过 readonly_frame_cache 获取 value page frame（见 §9.3）
-       cache hit → 直接使用 DMA frame（零 NVMe read）
-       cache miss → NVMe read 整个 LBA → 回填 cache
-    2. 在 frame->dma_buf + vr.byte_offset 处定位 value_object_header
-    3. 校验 magic == 0x56414C55
-    4. 校验 body_len == vr.len
-    5. 校验 body_crc
-    6. 返回 value_view { frame, vr.byte_offset, vr.len }（零拷贝）
+value_alloc_sched.read_value(value_ref vr):
+    1. 先查 dirty open frames（当前正在填充的页）→ 命中则直接从 DMA buffer 读
+    2. 查本地 readonly_frame_cache（value_page domain）→ cache hit 零 NVMe
+    3. cache miss → 通过本核 nvme_sched 读整个 LBA → 回填 cache
+    4. 在 frame->dma_buf + vr.byte_offset 处定位 value_object_header
+    5. 校验 magic + body_len + body_crc（数据在 L1/L2 中是热的）
+    6. copy body bytes → 返回 owning bytes 给调用方
 ```
 
-sub-LBA value 和同页其他 value 共享一个 frame。读一个 LBA 可能同时使多个 value 变成 cache resident。
+sub-LBA value 和同页其他 value 共享一个 frame。读一个 LBA 同时使同页所有 value 变成 cache resident。
+
+**返回 copy 而非 zero-copy view**：`value_alloc_sched` 返回 owning bytes，DMA frame 生命周期完全封闭在 `value_alloc_sched` 内部。copy 发生在 CRC 校验后数据 cache line 热的时刻，成本最低；上层（如网络发送）最终也需要一次 copy，在这里做等价于在那里做。
 
 ## 5. MultiGet
 
@@ -296,20 +316,29 @@ multi_get(keys[])
 
 4. 收集 memtable miss 的 keys → tree_miss_keys
 
-5. Tree batch lookup（对 tree_miss_keys）
-   tree_results = tree_batch_lookup(tree_miss_keys, manifest)
+5. 按 `route_tree_lookup(owner_front(key))` 对 tree_miss_keys 分组
 
-6. 合并结果
+6. Fan-out 到各 `tree_lookup_scheds` 做 tree batch lookup
+   tree_results = parallel tree_batch_lookup(group.keys, manifest, group.tree_owner)
+
+7. 从 tree results 中提取 value refs，按 value page 分组
+   value_groups = group_value_refs_by_page(tree_results)
+
+8. Fan-out 到 `value_alloc_sched` 做批量 value read
+   for each group in value_groups:
+       page_values[group.page_fid] = value_alloc_sched->read_page_values(group)
+
+9. 合并结果
    for each key in keys:
        if memtable_results has value: use memtable result（hot_blob）
-       else if tree_results has value: use tree result（NVMe read value）
+       else if tree_results has value: use grouped page values
        else if memtable_results has tombstone: not found
        else if tree_results has tombstone: not found
        else: not found
 
-7. 过滤 tombstone → 只返回 live values
+10. 过滤 tombstone → 只返回 live values
 
-8. 释放 read_handle
+11. 释放 read_handle
 ```
 
 ### 5.2 PUMP Pipeline
@@ -337,10 +366,39 @@ multi_get(keys)
          auto miss_keys = extract_miss_keys(memtable_results);
          if (miss_keys.empty())
              return just(std::move(memtable_results));
-         return tree_batch_lookup(miss_keys, manifest)
-             >> then([mr = std::move(memtable_results)](auto&& tree_results) mutable {
-                    return merge_results(std::move(mr), std::move(tree_results));
-                });
+         auto groups = group_keys_by_tree_lookup_owner(miss_keys);
+         return get_context<read_handle>()
+             >> then([groups = std::move(groups), mr = std::move(memtable_results)]
+                     (read_handle& rh) mutable {
+                    auto manifest = rh.cat->prs->tree_guard->manifest;
+                    return for_each(groups)
+                        >> concurrent(tree_lookup_sched_count)
+                        >> flat_map([manifest](auto&& group) {
+                               return tree_lookup_sched[group.tree_owner]->tree_batch_lookup(
+                                   group.keys, manifest);
+                           })
+                        >> reduce(merged_tree_results, merge)
+                        // ── Phase 2b: value read for tree hit values ──
+                        >> then([](auto&& tree_results) {
+                               auto value_groups = group_value_refs_by_page(tree_results);
+                               if (value_groups.empty())
+                                   return just(std::move(tree_results));
+                               return for_each(value_groups)
+                                   >> concurrent()
+                                   >> flat_map([](auto&& group) {
+                                          return value_alloc_sched->read_page_values(group);
+                                      })
+                                   >> reduce()
+                                   >> then([tr = std::move(tree_results)](auto&& values) mutable {
+                                          return fill_tree_results_with_values(std::move(tr), std::move(values));
+                                      });
+                           })
+                        >> flat()
+                        >> then([mr = std::move(mr)](auto&& tree_results) mutable {
+                               return merge_results(std::move(mr), std::move(tree_results));
+                           });
+                })
+             >> flat();
      })
   >> flat()
   // ── Phase 3: 合并与过滤 ──
@@ -369,13 +427,13 @@ batch_lookup(keys[], read_lsn, front_read_set):
 ### 5.4 Tree Batch Lookup
 
 ```text
-tree_batch_lookup(keys[], manifest):
+tree_batch_lookup(keys[], manifest, tree_owner):
     // 按 key 排序（利用 B+ tree 的顺序访问局部性）
     sorted_keys = sort(keys)
 
     results = []
     for key in sorted_keys:
-        result = tree_lookup(key, manifest)
+        result = tree_lookup(key, manifest)         // 在同一个 tree_lookup_sched 上顺序执行
         results.push({ key, result })
     return results
 ```
@@ -408,7 +466,7 @@ range_scan(begin, end)
 
 2. 并发执行：
    a. 各 front_sched 的 memtable scan
-   b. tree range scan
+   b. on one `tree_lookup_sched` 执行 tree range scan
 
 3. Merge：memtable results overlay on tree results
 
@@ -434,10 +492,12 @@ range_scan(begin, end)
                   return item.fs->scan_memtable(begin, end, read_lsn, item.frs);
               })
            >> reduce(merged_memtable_scan, merge_sorted),
-         // tree scan（就地执行，不经过 tree_sched）
+         // tree scan（在选定的 tree_lookup_sched 上执行，不经过 tree_sched）
          get_context<read_handle>()
            >> then([begin, end](read_handle& rh) {
-                  return tree_scan(begin, end, rh.cat->prs->tree_guard->manifest);
+                  uint32_t tree_owner = route_tree_scan(begin, end);
+                  return tree_lookup_sched[tree_owner]->tree_scan(
+                      begin, end, rh.cat->prs->tree_guard->manifest);
               })
            >> flat()
      )
@@ -447,10 +507,28 @@ range_scan(begin, end)
          auto& tree_scan = std::get<2>(std::get<1>(when_all_res));
          return merge_memtable_over_tree(memtable_scan, tree_scan);
      })
-  // ── 过滤 tombstone + stream out ──
+  // ── 过滤 tombstone ──
   >> then([](auto&& merged) {
          return filter_tombstones(merged);
      })
+  // ── value read for tree-sourced value records ──
+  // memtable-sourced records 已有 hot_blob（直接输出）
+  // tree-sourced value records 先按 value page 分组，再通过 value_alloc_sched 批量读 value body
+  >> then([](auto&& filtered) {
+         auto tree_value_groups = group_value_refs_by_page(filtered);
+         if (tree_value_groups.empty())
+             return just(std::move(filtered));
+         return for_each(tree_value_groups)
+             >> concurrent()
+             >> flat_map([](auto&& group) {
+                    return value_alloc_sched->read_page_values(group);
+                })
+             >> reduce()
+             >> then([f = std::move(filtered)](auto&& values) mutable {
+                    return fill_with_values(std::move(f), std::move(values));
+                });
+     })
+  >> flat()
   >> pop_context()
 ```
 
@@ -625,12 +703,12 @@ v1 先实现策略 3（内存反压）和策略 2（作为观测/告警手段）
 | 旧术语 | 统一模型 |
 |--------|---------|
 | `node_cache` | `readonly_frame_cache` 在 `tree_node` domain 的逻辑视图 |
-| `value_cache` | value frame residency + `value_view` 零拷贝引用 |
+| `value_cache` | value page frame residency + `read_value()` / `read_page_values()` copy-out 服务 |
 | `hot_blob` | 不变。correctness-carried hot data，不属于 page cache |
 
 ### 9.2 Tree Node Frame Cache
 
-tree lookup 使用 `readonly_frame_cache` 获取 tree page frame：
+`tree_lookup_sched` 使用自己持有的 `readonly_frame_cache` 获取 tree page frame：
 
 ```cpp
 // 概念接口（返回 frame_pin，RAII 自动 pin/unpin）
@@ -647,37 +725,33 @@ frame_pin get_or_read_tree_node(paddr slot_paddr, uint16_t span_lbas) {
 }
 ```
 
+这里仍然用裸 `frame_id` 命中 tree page cache。v1 的正确性前提不是“地址永不复用”，而是 tree old range 在进入 `tree_allocator.free_ranges` 前已经完成 `tree_node` invalidate barrier（见 `runtime_memory_and_cache.md` §10.2）。`front_sched` 本身不拥有 tree-node cache；它只把 memtable miss 路由到 home `tree_lookup_sched`。
+
 **pin 语义**：tree 遍历是多步异步操作（root → internal → leaf）。每步获取 `frame_pin`（RAII），pin 析构时自动 `pin_count--`。pin_count > 0 的 frame 不可驱逐。frame 由 cache 持有，消费者不持有 ownership（见 `runtime_memory_and_cache.md` §5.4）。
 
 **驱逐安全**：pin_count == 0 的 frame 可按 LRU 淘汰。manifest 由 checkpoint_guard pin 住，保证结构信息不丢失；frame 只是 page image 的可重建载体。
 
-### 9.3 Value Frame 与 `value_view`
+### 9.3 Value Read（`value_alloc_sched` 集中服务）
 
-tree-path 命中 value record 后，通过 `value_ref` 读取 value body：
-
-```cpp
-struct value_view {
-    frame_pin pin;                       // RAII 保活 DMA page（见 runtime_memory_and_cache.md §5.4）
-    uint16_t byte_offset;                // value_object_header 起始位置
-    uint32_t len;                        // value body 长度
-    // value body 指针 = pin.frame->dma_buf + byte_offset + sizeof(value_object_header)
-};
-```
-
-获取流程：
+tree-path 命中 value record 后，读路径路由到 `value_alloc_sched` 读 value body（见 `runtime_state_machine.md` §6.5）。`value_alloc_sched` 是 value_page cache 的唯一 owner，同时持有 dirty open frames 和 `readonly_frame_cache`。
 
 ```text
-read_value(value_ref vr):
-    frame_id fid = { vr.base, span_lbas_for_class(vr), domain::value_page };
-    frame = readonly_frame_cache.get_or_read(fid)
-    // 校验 magic + body_crc（在 frame->dma_buf + vr.byte_offset 处）
-    return value_view { frame, vr.byte_offset, vr.len }
-    // 上层直接从 value_view 读 bytes → 零拷贝
+Point GET:
+    read_value(vr)                  // 单值包装
+
+MultiGet / Scan:
+    group_value_refs_by_page(...)   // 调用方先按 frame_id 分组
+    read_page_values(group)         // 同页多个 refs 一次处理
 ```
 
-**sub-LBA 共享**：同一 LBA 中的多个 value objects 共享一个 frame。不同 `value_view` 指向同一 frame 的不同 byte_offset。
+**设计要点**：
 
-**上层需要 owning bytes 时**：显式 materialize（memcpy 到 heap buffer）。但大多数读路径只需要 `value_view` 的生命周期内引用。
+1. **集中 cache，无 coherence 开销**：value_page cache 只在 `value_alloc_sched` 上，不存在跨 shard stale hit，hole-fill writeback 后直接更新本地 cache，无需 invalidate barrier。
+2. **请求内按页分组**：MultiGet / Scan 不应把同页多个 `value_ref` 变成多次独立 `read_value()` 调用。
+3. **dirty frame 可读**：sub-LBA page 停留在 `open_frames` 期间，tree-path read 可直接从 DMA buffer 读取已 durable 的 slot，零 NVMe。
+4. **copy 返回**：返回 owning bytes 而非 `value_view` + `frame_pin`。DMA frame生命周期封闭在 `value_alloc_sched` 内部，`pin_count` 保持 `uint32_t`。copy 发生在 CRC 校验后数据 cache line 热的时刻；上层（如网络发送）最终也需要 copy，在这里做等价于在那里做。
+5. **sub-LBA 共享**：同一 LBA 的多个 value objects 共享一个 frame。按页分组后，同页多个 value 只做一次 page lookup / page miss 判定。
+6. **部署建议**：最佳实践是把 `value_alloc_sched` 放在独占核心上，读写共享同一份大 cache；但这属于部署优化，不是语义前提。
 
 ### 9.4 hot_blob 不变
 
@@ -694,9 +768,10 @@ memtable hit 的语义不受 frame cache 影响：
 point_get(key):
   memtable hit value → hot_blob（零拷贝，不经 frame cache）
   memtable hit tombstone → not found
-  memtable miss → tree lookup:
-    tree traversal: get_or_read_tree_node() × depth 次（frame pin/unpin）
-    leaf hit value → read_value(vr) → value_view（零拷贝 DMA frame 引用）
+  memtable miss → route to home tree_lookup_sched:
+    tree traversal: get_or_read_tree_node() × depth 次（在 tree_lookup_sched 上执行）
+    leaf hit value → route to value_alloc_sched:
+      read_value(vr) → owning bytes（cache hit 含 dirty frame / miss 时 NVMe read）
     leaf hit tombstone → not found
     leaf miss → not found
 ```

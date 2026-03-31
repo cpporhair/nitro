@@ -16,7 +16,7 @@ client batch
       ▼
  ┌────────────────────────────────────────────────────────────────┐
  │  coord_sched                                                   │
- │  ① assign_lsn → ② canonicalize                                 │
+ │  ① canonicalize → ② assign_lsn                                 │
  └────────────────────────┬───────────────────────────────────────┘
                           │
                           ▼
@@ -33,10 +33,17 @@ client batch
   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
   │ front_sched 0│ │ front_sched 1│ │ front_sched N│
   │ ⑦ wal append │ │ ⑦ wal append │ │ ⑦ wal append │
+  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+         │                │                │
+         └────── reduce(all WAL ok) ───────┘
+                    │
+                    ▼
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+  │ front_sched 0│ │ front_sched 1│ │ front_sched N│
   │ ⑧ mem insert │ │ ⑧ mem insert │ │ ⑧ mem insert │
   └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
          │                │                │
-         └────── reduce ──┴────────────────┘
+         └────── reduce(all mem ok) ───────┘
                     │
                     ▼
  ┌────────────────────────────────────────────────────────────────┐
@@ -52,14 +59,14 @@ client batch
 ```text
 write_batch(client_req)
   = on(coord_sched.as_task(),
-        assign_lsn_and_canonicalize(client_req))
+        canonicalize_and_assign_lsn(client_req))
                                             // → (batch_ctx)
   >> push_result_to_context()               // batch_ctx 入 context 栈
   // ── Phase A: value durable（value_alloc_sched leader-follower）──
   >> on(value_alloc_sched.as_task(),
         persist_put_values(batch_ctx))      // 合并 → 分配 → 填充 DMA → FUA
                                             // FUA 完成后返回 value_refs
-  // ── Phase B: route + WAL + memtable（fan-out 到 front_scheds）──
+  // ── Phase B: route + all-WAL barrier（fan-out 到 front_scheds）──
   >> get_context<batch_ctx>()
   >> then([](batch_ctx& bc) {
          return route_and_build_fragments(bc);  // 按 owner 分组，entries 已携带 value_ref
@@ -68,10 +75,19 @@ write_batch(client_req)
      >> concurrent(front_sched_count)
      >> flat_map([](fragment&& frag) {
             auto* fs = front_sched_list[frag.owner];
-            return fs->write_fragment(std::move(frag));
+            return fs->write_wal_fragment(std::move(frag));
         })
      >> reduce()
-  // ── Phase C: publish + ACK ──
+  // ── Phase C: all-memtable barrier ──
+  >> get_context<batch_ctx>()
+  >> for_each(fragments)
+     >> concurrent(front_sched_count)
+     >> flat_map([](fragment&& frag) {
+            auto* fs = front_sched_list[frag.owner];
+            return fs->write_memtable_fragment(std::move(frag));
+        })
+     >> reduce()
+  // ── Phase D: publish + ACK ──
   >> get_context<batch_ctx>()
   >> then([](batch_ctx& bc) {
          return coord_sched->publish_batch(bc.batch_lsn);
@@ -106,18 +122,25 @@ struct batch_ctx {
 };
 ```
 
-### 2.3 `write_fragment` — Front Sched 内部 Pipeline
+### 2.3 Front Sched 内部 Pipeline
 
-value 已在 Phase A 中 durable。front_sched 只做 WAL append + memtable insert：
+value 已在 Phase A 中 durable。front_sched 的工作被拆成两个独立 sender：
 
 ```text
-write_fragment(frag)
+write_wal_fragment(frag)
   = on(front_sched.as_task(),
         append_wal_entries_fua(frag))       // WAL 编码 + FUA（WAL durable point）
-  >> insert_memtable_entries(frag)          // CPU，memtable insert
+
+write_memtable_fragment(frag)
+  = on(front_sched.as_task(),
+        insert_memtable_entries(frag))      // CPU，memtable insert
 ```
 
-两步在同一个 front_sched 上顺序执行。跨 front_sched 的并发由顶层 `for_each >> concurrent` 提供。
+冻结约束：
+
+1. `write_memtable_fragment` 只能在该 batch 的 all-WAL reduce 成功后才启动。
+2. 因此 `value` / `WAL` 失败都仍然发生在 memtable phase 之前，可以走 `release_batch(batch_lsn)`。
+3. 一旦进入 `write_memtable_fragment`，该 batch 的失败语义就不再是 release，而是 fatal。
 
 ## 3. Canonicalization 算法
 
@@ -127,6 +150,8 @@ write_fragment(frag)
 输入：client_batch = [(op, key, value?), ...] 按客户端提交顺序
 输出：canonical_entries = [(op, key, value?), ...] 每个 key 最多一条
 ```
+
+canonicalization 在 `coord_sched` 内先执行，且先于 `batch_lsn` 分配。只有 canonicalization / 参数校验成功的 batch，才会继续消耗 gap-free `batch_lsn` 并进入 durable path。
 
 ### 3.2 折叠规则
 
@@ -213,7 +238,7 @@ route(canonical_entries, front_sched_count):
 
 Value Area 从 `data_area_end_paddr` 向低地址分配（概要 §10.4）。Value 分配与持久化通过单个 `value_alloc_sched` 集中管理（leader-follower 模式）。`value_alloc_sched` 持有分配元数据（bump head、per-class pools）、DMA open frames，并通过本核 `nvme_sched` 提交 value FUA 写入。
 
-**leader-follower 模式**：`value_alloc_sched` 的 `advance()` 合并当前并发到达的多个 batch 的 PUT entries。leader 统一执行：分配 slots → 填充 DMA frame → FUA 写到本核 nvme_sched。FUA 完成后所有 batch 拿到 durable `value_ref`，再各自 fan-out 到 front_scheds 写 WAL + memtable。
+**leader-follower 模式**：`value_alloc_sched` 的 `advance()` 合并当前并发到达的多个 batch 的 PUT entries。leader 统一执行：分配 slots → 填充 DMA frame → FUA 写到本核 nvme_sched。FUA 完成后所有 batch 拿到 durable `value_ref`，再各自 fan-out 到 front_scheds 先写 WAL、all-WAL reduce 成功后再进入 memtable phase。
 
 **分层原则**：分配器分为两层——**placement policy**（决定"值放在哪"）和 **write method**（决定"怎么写进去"）。两层独立：placement policy 不依赖具体设备能力；write method 根据设备能力选择最优路径。v1 的 page-based NVMe I/O 只是 write method 的一种 realization。
 
@@ -304,23 +329,22 @@ write_value_object(vr, header, body, open_frame):
 在 `value_alloc_sched` 的 `persist_put_values()` 末尾统一提交：
 
 1. 收集本轮所有写入过的 dirty value frames
-2. 提交到本核 nvme_sched（普通写 + 末尾 FUA）
-3. FUA 完成后：
-   - `free_count == 0` 的 frame → `clean_readonly`
+2. 提交到本核 nvme_sched（v1 当前方案：每个相关 write command 都带 FUA）
+3. 所有 FUA 完成后：
+   - `free_count == 0` 的 frame → `clean_readonly`，直接留在 readonly cache；**不**回 free pool，也**不**调用 `return_page`
    - 仍有空 slot 的 frame → 保留为 open frame，下一轮继续填充
-   - frame 满后归还到 per-class pools（`return_page` 是 value_alloc_sched 内部操作）
 
-value FUA 完成是整个写路径的**第一个 durable point**。之后各 batch 才 fan-out 到 front_scheds 写 WAL。
+value page 的 FUA completion 是整个写路径的**第一个 durable point**。之后各 batch 才 fan-out 到 front_scheds 写 WAL。
 
 ### 5.8 未来扩展说明
 
-v1 的 write method 层只有 page-based NVMe I/O（通过 `nvme_sched`）。
+v1 的 write method 层只有 page-based NVMe I/O（通过 `nvme_sched`），并采用**每条相关 write command 都带 FUA**的保守实现。
 
-**非 v1 future capability**：未来若底层 I/O 层支持更细粒度 durable write，可在不改 placement policy、frame 状态机、`value_ref` 语义或 recovery 规则的前提下扩展 write method。具体适配方式（sender 粒度、submit 路径等）留待未来 lower I/O 设计确定。
+**非 v1 future capability**：未来若 PUMP / lower I/O 层支持把一批普通写和最终 `NVMe FLUSH` 组合成明确的 durable barrier，可在不改 placement policy、frame 状态机、`value_ref` 语义或 recovery 规则的前提下，把当前“每页 FUA”演进为“write + flush”模式。具体 sender 粒度和 submit 路径留待未来接口设计确定。
 
 ## 6. Fragment 内两阶段处理
 
-value 已在 §5.4 中由 `value_alloc_sched` 完成 durable。fragment 到达 front_sched 时，每条 PUT entry 的 `allocated_vr` 已填入。front_sched 只做 WAL + memtable。
+value 已在 §5.4 中由 `value_alloc_sched` 完成 durable。fragment 到达 front_sched 时，每条 PUT entry 的 `allocated_vr` 已填入。front-side 剩余工作被拆成 batch-global barrier 约束下的两步：先 WAL，后 memtable。
 
 ### 6.1 Phase 1：WAL 批量追加 + FUA
 
@@ -350,15 +374,12 @@ append_wal_entries_fua(frag):
         append_to_wal_frames(encoded, wal_pages_to_write)
 
     // ── 1c. 提交 WAL pages 到本核 nvme_sched ──
-    for (i, page) in wal_pages_to_write:
-        if i == wal_pages_to_write.size() - 1:
-            // 最后一页 FUA
-            nvme_sched->submit_write(page.paddr, page.buf, lba_size,
-                                     io_flags = SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)
-        else:
-            nvme_sched->submit_write(page.paddr, page.buf, lba_size, io_flags = 0)
+    // v1 当前方案：每个页写 command 都带 FUA；不使用“前几页普通写、最后一页 FUA”。
+    for page in wal_pages_to_write:
+        nvme_sched->submit_write(page.paddr, page.buf, lba_size,
+                                 io_flags = SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)
 
-    // FUA 完成 → WAL durable
+    // 所有页写的 FUA 完成 → WAL durable
 ```
 
 PUMP pipeline 形态：
@@ -367,7 +388,7 @@ PUMP pipeline 形态：
 append_wal_entries_fua(frag)
   = on(front_sched.as_task(),
         encode_wal_entries(frag))            // CPU: WAL 编码
-  >> submit_wal_pages_fua(...)               // NVMe: WAL pages + 末页 FUA
+  >> submit_wal_pages_fua(...)               // NVMe: WAL pages（每页 FUA）
 ```
 
 ### 6.2 Phase 2：Memtable 批量插入（CPU only）
@@ -428,8 +449,8 @@ switch_segment()
 
 ```text
 wal_space_sched 将 alloc 请求放入 pending_alloc_queue
-→ front_sched 的 write_fragment pipeline 挂起（sender 未完成）
-→ coord_sched 的整个 write_batch pipeline 在 reduce() 处等待该 front
+→ front_sched 的 write_wal_fragment pipeline 挂起（sender 未完成）
+→ coord_sched 的整个 write_batch pipeline 在 WAL reduce() 处等待该 front
 → 该 batch 不会 publish（因为 reduce 未完成）
 → 后续 batch 的 assign_lsn 不受影响（coord_sched 可以继续分配）
 → 但后续 batch 如果也路由到同一个 front_sched，会排在队列里等待
@@ -449,31 +470,37 @@ wal_space_sched 将 alloc 请求放入 pending_alloc_queue
 ```text
 时间线（coord_sched 视角）：
 
-  t0: assign_lsn(batch_A) → lsn=1, dispatch fan-out
-  t1: assign_lsn(batch_B) → lsn=2, dispatch fan-out
-  t2: assign_lsn(batch_C) → lsn=3, dispatch fan-out
+  t0: canonicalize_and_assign_lsn(batch_A) → lsn=1, dispatch fan-out
+  t1: canonicalize_and_assign_lsn(batch_B) → lsn=2, dispatch fan-out
+  t2: canonicalize_and_assign_lsn(batch_C) → lsn=3, dispatch fan-out
   ...
-  t5: batch_A reduce 完成 → publish_batch(1)
-  t6: batch_C reduce 完成 → publish_batch(3)  // C 先于 B 完成
-  t7: batch_B reduce 完成 → publish_batch(2)
+  t5: batch_A 的 all-WAL reduce 完成 → dispatch memtable phase
+  t6: batch_C 的 all-WAL reduce 完成 → dispatch memtable phase
+  t7: batch_A 的 all-memtable reduce 完成 → publish_batch(1)
+  t8: batch_C 的 all-memtable reduce 完成 → publish_batch(3)  // C 先于 B 完成
+  t9: batch_B 的 all-memtable reduce 完成 → publish_batch(2)
 ```
 
-`coord_sched` 是单线程的，因此 `assign_lsn` 是严格顺序的。但 fan-out 之后，各 batch 在 front_scheds 上的执行可以交错。
+`coord_sched` 是单线程的，因此成功进入 durable path 的 batch 的 `assign_lsn` 是严格顺序的。但 fan-out 之后，各 batch 在 front_scheds 上的执行可以交错。
 
 ### 8.2 Front Sched 队列内交错
 
-同一个 front_sched 可能同时收到 batch_A 和 batch_B 的 fragment。但因为 front_sched 是单线程的：
+同一个 front_sched 可能同时收到 batch_A 和 batch_B 的 `write_wal_fragment` / `write_memtable_fragment`。但因为 front_sched 是单线程的：
 
 ```text
 front_sched[0] 队列：
-  [write_fragment(batch_A, frag_0)] → [write_fragment(batch_B, frag_0)] → ...
+  [write_wal_fragment(batch_A, frag_0)]
+  → [write_wal_fragment(batch_B, frag_0)]
+  → [write_memtable_fragment(batch_A, frag_0)]
+  → ...
 
 执行顺序：
-  先完整执行 batch_A 的 frag_0（value write + WAL + memtable）
-  再完整执行 batch_B 的 frag_0
+  每个消息都是原子的：
+  - `write_wal_fragment` 内部只做 WAL
+  - `write_memtable_fragment` 内部只做 memtable
 ```
 
-**不变量**：同一 front_sched 上，一个 fragment 的四阶段处理是原子的（在单线程意义上）。batch_B 的 fragment 不会插入到 batch_A 的 fragment 中间。
+**不变量**：同一 front_sched 上，单个 sender（`write_wal_fragment` 或 `write_memtable_fragment`）不会被另一条消息插入中间。
 
 ### 8.3 WAL 交错
 
@@ -483,7 +510,7 @@ front_sched[0] 队列：
 
 ### 8.4 durable_lsn 推进
 
-publish_batch 到达 coord_sched 的顺序可能乱序（batch_C 先于 batch_B 完成）。ready_bitmap 处理这种乱序：
+publish_batch / release_batch 到达 coord_sched 的顺序可能乱序（batch_C 先于 batch_B 完成）。ready_bitmap 处理这种乱序：
 
 ```text
 state: durable_lsn = 0
@@ -492,7 +519,7 @@ state: durable_lsn = 0
   publish(2) → ready[2]=1, advance: durable_lsn = 3 (1,2,3 连续)
 ```
 
-一次推进可以跨过多个已 ready 的 batch（概要 §7.4）。
+如果中间某个 batch 在 value/WAL phase 失败，则它走 `release_batch(X)`，同样会把 `ready[X]` 置 1，从而填平前缀而不是留下永久 hole。
 
 ### 8.5 最大 In-Flight 限制
 
@@ -520,24 +547,24 @@ if next_lsn - durable_lsn >= WINDOW_SIZE:
 
 ```text
 coord_sched 队列中的操作：
-  ... write_batch(A).fan-out ... write_batch(B).fan-out ... seal_round ...
+  ... write_batch(A).WAL fan-out ... write_batch(A).memtable fan-out ... write_batch(B)... seal_round ...
 
-场景 1: batch_X 的 fan-out 在 seal_round 之前入队
-  → 各 front_sched 先收到 write_fragment(X)，再收到 seal_active
+场景 1: batch_X 的 WAL / memtable 两轮 fan-out 都在 seal_round 之前入队
+  → 各 front_sched 先收到 `write_wal_fragment(X)` 与 `write_memtable_fragment(X)`，再收到 seal_active
   → X 的所有 entries 写入 pre-seal 的 A*
 
-场景 2: batch_Y 的 fan-out 在 seal_round 之后入队
-  → 各 front_sched 先收到 seal_active，再收到 write_fragment(Y)
+场景 2: batch_Y 的 WAL / memtable 两轮 fan-out 都在 seal_round 之后入队
+  → 各 front_sched 先收到 seal_active，再收到该 batch 的两轮 fragment
   → Y 的所有 entries 写入 post-seal 的 N*
 ```
 
 **层 2：每个 front_sched 的队列顺序**
 
-同一 front_sched 上，消息按入队顺序执行。所以如果 batch_X 的 write_fragment 在 seal_active 之前入队到某个 front_sched，那么 batch_X 的 write_fragment 一定在该 front_sched 执行 seal_active 之前完成。
+同一 front_sched 上，消息按入队顺序执行。所以如果 batch_X 的 `write_memtable_fragment` 在 seal_active 之前入队到某个 front_sched，那么它一定在该 front_sched 执行 seal_active 之前完成。
 
 ### 9.3 Seal 发起约束
 
-Seal 发起必须由 `coord_sched` 发起（不能由 front_sched 自行决定），因为只有 coord_sched 能保证"所有正在进行的 write batch fan-out 都已投递到 front_scheds 之后，再投递 seal_active"。
+Seal 发起必须由 `coord_sched` 发起（不能由 front_sched 自行决定），因为只有 coord_sched 能保证"不会把 seal_active 插到同一 batch 的 WAL phase 和 memtable phase 之间"。
 
 ```text
 seal_round()
@@ -587,7 +614,7 @@ seal_round()
     → X 正常 publish 到旧 CAT0
 
   或者 publish_batch(X) 在 close_gate 之后到达：
-    → gate 关闭，pending_advance 记录 X
+    → gate 关闭，gate.pending_advance 记录 X
     → seal 完成后 open_gate → CAT1 安装
     → X 的 lsn 在 CAT1 上继续 publish
 ```
@@ -606,82 +633,101 @@ seal_round()
 | Value DMA 填充 / FUA 写失败 | Phase A | `value_alloc_sched` | 该 batch（fan-out 之前） |
 | WAL append 失败 | Phase B | `front_sched` | 该 fragment → 该 batch |
 | WAL 换段失败（backpressure） | Phase B | `front_sched` | 该 fragment（暂停） |
-| Memtable insert 失败 | Phase B | `front_sched` | 不应发生（纯内存） |
+| Memtable insert 失败 | Phase C | `front_sched` | 该 batch（fatal） |
 | Data Area 空间不足 | Phase A | `value_alloc_sched` | 该 batch + 后续 batch |
 
-### 10.2 Phase A 失败 → 整 Batch 立即失败
+### 10.2 Phase A 失败 → `release_batch(batch_lsn)` + 返回错误
 
 `value_alloc_sched` 的 `persist_put_values` 失败时，fan-out 尚未发生：
 
 ```text
 1. persist_put_values sender 产生异常
-2. 整个 write_batch pipeline 异常终止（不进入 Phase B fan-out）
-3. batch 不会 publish
-4. ready_bitmap 中该 lsn 永远不 ready
+2. coord_sched 调用 release_batch(batch_lsn)
+3. 客户端收到错误
+4. 后续 batch 可以继续推进
 ```
 
-此时不产生 orphan value——value FUA 要么未提交，要么未成功。DMA frame 中的 slot 可重用。
+此时可能出现 **pre-WAL orphan values**：如果某些 value page 已先 durable、后续 value write 失败，它们没有对应 WAL/memtable 引用，留给 recovery 按 orphan 清理。DMA frame 中未 durable 的 slot 仍可重用。
 
-### 10.3 Phase B 失败 → 整 Batch 失败 + 可能 Orphan
+### 10.3 Phase B 失败 → `release_batch(batch_lsn)` + 返回错误 + 可能 Orphan
 
 value 已在 Phase A durable。某个 `front_sched` 的 WAL FUA 失败：
 
 ```text
 1. 该 fragment 的 sender 产生异常
-2. 顶层 reduce() 收到异常
-3. 整个 write_batch pipeline 异常终止
-4. batch 不会 publish
-5. ready_bitmap 中该 lsn 永远不 ready
+2. 顶层 all-WAL reduce() 收到异常
+3. coord_sched 调用 release_batch(batch_lsn)
+4. memtable phase 根本不会启动
+5. 客户端收到错误
 ```
 
-此时 Phase A 已为整个 batch 的所有 PUT entries 写入了 durable value objects。这些 value objects 没有对应的 WAL/memtable 引用 → **orphan values**。
+此时 Phase A 已为整个 batch 的所有 PUT entries 写入了 durable value objects；同时可能已有部分 WAL fragment durable，但因为 all-WAL barrier 失败，整个 batch 仍视为未完成。对应的 value objects / partial WAL 都交给 recovery 清理。
 
-### 10.4 异常对 durable_lsn 的影响
+### 10.4 Phase C 失败 → 运行时终止
 
-如果 `batch_lsn = X` 永远不 ready：
+只有进入 memtable phase 后失败，运行时才必须主动崩溃：
 
 ```text
-durable_lsn 永远无法推进到 >= X
-→ 所有后续 batch (X+1, X+2, ...) 即使 ready 也无法 publish
-→ 系统实际上停止服务
+1. all-WAL barrier 已成功
+2. 某个 front_sched 的 insert_memtable_entries 失败
+3. batch 不再允许 release
+4. 运行时终止，交给 recovery 收敛
 ```
 
-这是概要 §7.1 规则 7（v1 不定义永久 hole 语义）的体现。运行时应当在 batch 失败后立即终止并进入 recovery。
+原因：此时一整批 WAL 已 durable，但 runtime memtable 状态不完整；继续服务会让 live runtime 与 recovery 结果分叉。
 
-### 10.5 Orphan Value 处理
+### 10.5 `release_batch` 对 durable_lsn 的影响
 
-Orphan 只在 Phase B 失败时产生（Phase A 成功 → value durable，Phase B 失败 → 无 WAL 引用）。
+`release_batch(X)` 与 `publish_batch(X)` 一样，都会把 `ready_bitmap[X]` 置 1，用来补齐连续前缀；区别只是：
 
-Orphan 的 scope 是 `value_alloc_sched` 本轮 leader-follower 合并写入的**整个 batch 的所有 PUT value objects**，不是单个 fragment 的 value。
+1. `publish_batch`：该 batch 的数据变为可见，客户端 ACK
+2. `release_batch`：该 batch 不产生任何可见数据，客户端收到错误
+
+例子：
+
+```text
+state: durable_lsn = 9
+  release(10) → ready[10]=1, durable_lsn = 10
+  publish(11) → ready[11]=1, durable_lsn = 11
+```
+
+因此 v1 仍保持“连续前缀推进”，只是前缀中的某些 batch_lsn 槽位可以是 released-empty slot，而不是 committed batch。
+
+### 10.6 Orphan Value 处理
+
+Orphan 可能出现在两类场景：
+
+1. **Phase A 失败**：partial durable value，但还没进入 WAL
+2. **Phase B 失败**：value 已 durable，all-WAL barrier 没通过
 
 处理方式（概要 §7.1 规则 9）：
 
 ```text
 运行时路径：
-  Phase B 失败触发运行时终止
-  orphan value 交给 recovery 处理（v1 推荐，最简单）
+  value/WAL 失败 → release_batch(batch_lsn) → 返回错误
+  orphan value 留给 recovery 处理（v1 推荐，最简单）
 
 recovery 路径：
-  recovery 扫描 WAL → 该 batch 不完整 → entries 丢弃
-  orphan value_ref 进入 dead_value_refs 集合
-  → LBA-aligned/multi-LBA class: Step 8.3 整段 TRIM
-  → sub-LBA class: 不逐 slot TRIM，Step 9.2 按整页判断
-    整页全 dead → TRIM + value_alloc_sched whole_page_pool
-    部分 dead → dead slots 进 hole_page_descriptor
+  recovery 扫描 WAL → 未完成 batch 丢弃
+  orphan value_ref 进入 dead_value_refs / occupied 补集清理路径
 ```
 
-### 10.6 Pipeline 异常处理编排
+### 10.7 Pipeline 异常处理编排
 
 ```text
-write_fragment(frag)
-  // value 已由 value_alloc_sched 在 Phase A 中 durable（见 §2.1/§5.4）
-  // write_fragment 只做 WAL + memtable
+write_wal_fragment(frag)
   = on(front_sched.as_task(),
         append_wal_entries_fua(frag))       // WAL 编码 + FUA（WAL durable point）
-  >> insert_memtable_entries(frag)          // CPU，memtable insert
   >> any_exception([&frag](auto e) {
-         // v1 推荐：不在运行时回收 orphan，交给 recovery 处理
-         // post-LSN 失败会触发运行时终止，recovery 自然清理
+         // 交给顶层 all-WAL reduce；顶层会 release_batch(batch_lsn)
+         return just_exception(e);  // 重新抛出
+     })
+
+write_memtable_fragment(frag)
+  = on(front_sched.as_task(),
+        insert_memtable_entries(frag))
+  >> any_exception([&frag](auto e) {
+         // 一旦进入 memtable phase，失败语义就是 fatal
          return just_exception(e);  // 重新抛出
      })
 ```
@@ -690,19 +736,22 @@ write_fragment(frag)
 
 ```text
 write_batch(client_req)
-  = on(coord_sched, assign_lsn_and_canonicalize(client_req))
+  = on(coord_sched, canonicalize_and_assign_lsn(client_req))
   >> push_result_to_context()
   // ── Phase A: value durable ──
   >> on(value_alloc_sched, persist_put_values(batch_ctx))
-  // ── Phase B: fan-out WAL + memtable ──
-  >> ...for_each(fragments) >> concurrent >> flat_map(write_fragment) >> reduce()
-  // ���─ Phase C: publish ──
+  // ── Phase B: all-WAL barrier ──
+  >> ...for_each(fragments) >> concurrent >> flat_map(write_wal_fragment) >> reduce()
+  // ── Phase C: all-memtable barrier ──
+  >> ...for_each(fragments) >> concurrent >> flat_map(write_memtable_fragment) >> reduce()
+  // ── Phase D: publish ──
   >> on(coord_sched, publish_batch(batch_lsn))
   >> pop_context()
   >> any_exception([batch_lsn](auto e) {
-         // batch 失败，不 publish
-         // 日志记录
-         // 触发运行时终止或上层 abort 逻辑
+         if current_phase in {value_phase, wal_phase}:
+             return on(coord_sched, release_batch(batch_lsn))
+                    >> then(return_error_to_client(e))
+         // memtable phase 失败：fatal
          return just_exception(e);
      })
 ```
@@ -717,8 +766,8 @@ write_batch(client_req)
 
 ```text
 value_alloc_sched（leader-follower）:
-  合并 PUT entries → 分配 slots → 填充 DMA frame → FUA 写到本核 nvme_sched
-  → FUA 完成 → value 已 durable → 返回 value_ref 给各 batch
+  合并 PUT entries → 分配 slots → 填充 DMA frame → 按页 FUA 写到本核 nvme_sched
+  → 所有相关页的 FUA 完成 → value 已 durable → 返回 value_ref 给各 batch
 
 各 front_sched:
   收到 value_ref 后才开始 WAL append + FUA
@@ -730,14 +779,14 @@ value FUA 完成是 front_sched 开始写 WAL 的**前置条件**（因果依赖
 
 ### 11.2 WAL Entry 之间的顺序
 
-同一 fragment 的多条 WAL entries 在 segment 中按写入顺序排列。FUA 只在最后一页发出，覆盖所有 entries。
+同一 fragment 的多条 WAL entries 在 segment 中按写入顺序排列。v1 当前实现对该 fragment 涉及的**每个 WAL page write command** 都设置 FUA。
 
-如果 FUA 之前崩溃：
+如果崩溃发生在所有相关页的 FUA 完成之前：
 - 部分 entries 可能写入，部分未写入
 - Recovery 通过 CRC 逐条检查，只接受完整 entry
 - 该 batch 的 `actual_count < entry_count` → 不完整 → 整个 batch 丢弃
 
-这是安全的：要么全部 WAL entries durable（FUA 后），要么 batch 在 recovery 中被判定为不完整。
+这是安全的：只有已经完成 FUA 的页才算 durable；若整 batch 的 WAL image 未收齐，recovery 仍会把它判成不完整并丢弃。
 
 ### 11.3 跨 Front Sched 的 Ordering
 
@@ -770,37 +819,42 @@ batch_lsn = X，有 3 个 fragments：
 ```text
 单 batch 端到端延迟（最坏情况）：
 
-  coord_sched assign_lsn:     ~1μs（CPU only）
+  coord_sched canonicalize+assign_lsn: ~1μs（CPU only）
   coord_sched route:           ~1μs（CPU only）
   fan-out dispatch:            ~1μs（per_core queue）
   front_sched alloc values:    ~1μs（CPU only）
-  NVMe value writes:           ~10-30μs（取决于 value size 和并发度）
-  NVMe WAL FUA:                ~10-30μs（单页 FUA）
+  NVMe value page writes:      ~10-30μs / page（当前每页 FUA）
+  NVMe WAL page writes:        ~10-30μs / page（当前每页 FUA）
   memtable insert:             ~1μs（CPU only）
   reduce + publish:            ~2μs（CPU + per_core queue）
 
-  总计：~30-70μs（value + WAL FUA 主导）
+  总计：取决于该 batch 触达的 value/WAL 页数；小 batch 常由 1-2 次 value page FUA 和 1-2 次 WAL page FUA 主导
 ```
 
 ### 12.2 吞吐量
 
 ```text
-瓶颈在 NVMe FUA 延迟。
+瓶颈在按页 FUA 的次数和 NVMe FUA 延迟。
 
-单 front_sched 吞吐 ≈ 1 / WAL_FUA_latency ≈ 30K-100K batches/s
-N 个 front_scheds 并行 → N × 单 front 吞吐
+对当前 v1 实现，单 front_sched 的上限更接近：
+
+  1 / (avg_wal_pages_per_batch × FUA_latency)
+
+value 路径同理也会受 `avg_value_pages_per_batch × FUA_latency` 影响。
+
+N 个 front_scheds 并行后，整体吞吐仍可线性扩展，但会更早打到设备侧 FUA IOPS 上限。
 
 但实际瓶颈可能在 NVMe IOPS（value writes + WAL writes）
-或 coord_sched 的 assign_lsn 序列化点。
+或 coord_sched 的 canonicalize+assign_lsn 序列化点。
 ```
 
 ### 12.3 优化方向
 
-1. **Group commit**：多个 batch 的 WAL entries 合并到同一次 FUA。
-   - 需要在 front_sched 上引入 batch 窗口或 timer
+1. **Write + Flush 模式**：多个 page write 不带 FUA，最后用一次 `NVMe FLUSH` 固定 durable 点。
+   - 需要 PUMP / lower I/O 层支持“写批次 + flush barrier”的明确编排
    - 显著减少 FUA 次数
-   - 增加单 batch 延迟（等待窗口）
-   - v1 可暂不实现
+   - durable 点从“每页 write completion”变成“flush completion”
+   - v1 先不实现，当前保守方案仍是每页 FUA
 
 2. **Value write pipelining**：下一个 batch 的 value writes 和上一个 batch 的 WAL FUA 重叠。
    - 需要 front_sched 级别的异步 pipeline

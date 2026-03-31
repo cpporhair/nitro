@@ -2,7 +2,7 @@
 
 > 依据：`ai_context/inconel/design_overview.md`（唯一概要规范）
 >
-> 本文细化六类 scheduler 的内部状态、请求类型、handle 逻辑和交互协议。不重复概要中的系统语义，只在需要时引用章节编号。
+> 本文细化七类 scheduler 的内部状态、请求类型、handle 逻辑和交互协议。不重复概要中的系统语义，只在需要时引用章节编号。
 
 ## 1. Scheduler 总览
 
@@ -10,6 +10,7 @@
 |-----------|--------|-----------|---------|
 | `coord_sched` | 1 | `next_lsn`、`publish_gate`、`current_publish_catalog` | 固定单点 |
 | `front_sched` | N（运行时参数） | WAL stream、active/sealed memtable gens | `key_hash % N` |
+| `tree_lookup_sched` | K（运行时参数，通常 `< front_sched_count`） | `tree_node` `readonly_frame_cache`、可选 miss-coalescing 表 | `front_owner -> stable home lookup shard` |
 | `tree_sched` | 1 | tree allocator、flush 状态、retire 队列 | 固定单点 |
 | `wal_space_sched` | 1 | segment free pool、alloc head | 固定单点 |
 | `value_alloc_sched` | 1 | bump head、per-class pools、per-class open_frames、dirty_pages、deferred_freed、本地 readonly_frame_cache | 固定单点 |
@@ -29,7 +30,7 @@ struct coord_state {
     // ── 发布 ──
     publish_gate gate;                               // open / closed
     std::shared_ptr<publish_catalog> current_cat;    // 当前活跃 catalog（atomic store/load）
-    ready_bitmap ready_set;                          // 跟踪哪些 batch_lsn 已完成 front-side fan-out
+    ready_bitmap ready_set;                          // 跟踪哪些 batch_lsn 已达到终态（publish 或 release）
 
     // ── Seal 重入保护 ──
     bool seal_in_progress = false;                   // seal_round 异步执行期间为 true
@@ -45,7 +46,10 @@ struct coord_state {
 |------|------|------|--------|
 | `assign_lsn` | 原始 batch | `batch_lsn` + canonical entries + 路由表 | 前台写入 pipeline |
 | `publish_batch` | `batch_lsn` | void（推进 `durable_lsn`） | front fan-out reduce 后 |
+| `release_batch` | `batch_lsn` | void（推进 `durable_lsn`，但该 batch 不产生可见数据） | value/WAL 阶段失败后的异常路径 |
 | `acquire_read_handle` | — | `read_handle { cat, read_lsn }` | 读路径入口 |
+| `capture_flush_frontier` | — | `flush_frontier { durable_lsn, old_guard }` | flush Phase 1 发起 |
+| `frontier_switch` | `(old_guard, new_manifest, retired, flushed_gens_by_front)` | void | flush Phase 3 安装 CAT2 |
 | `install_cat` | 新 `publish_catalog` | void | seal / frontier switch |
 | `close_gate` | — | void | seal 发起 |
 | `open_gate` | — | void | seal 完成 |
@@ -55,10 +59,10 @@ struct coord_state {
 #### `handle_assign_lsn`
 
 ```text
-1. batch_lsn = next_lsn++
-2. canonical_image = canonicalize(raw_batch)
+1. canonical_image = canonicalize(raw_batch)
    - 同 key 多步操作 → last-op-wins → 最多一条 PUT(value) 或 DELETE
    - MERGE/INCREMENT → 折叠成等价 PUT/DELETE（不读 DB 状态）
+2. batch_lsn = next_lsn++
 3. entry_count = |canonical_image|
 4. route_table = { key_hash % front_sched_count → [entries] }
 5. cb(batch_lsn, canonical_image, entry_count, route_table)
@@ -66,7 +70,7 @@ struct coord_state {
 
 关于 canonicalization 的归属：概要冻结的是 "durable boundary 之后只允许看到 canonical image"。本设计把 canonicalization 放在 `coord_sched` 的 `handle_assign_lsn` 内部完成，而非要求调用方预先折叠。原因：
 
-1. `coord_sched` 是单线程入口，canonicalization 在此完成可以保证和 `batch_lsn` 分配在同一原子步骤。
+1. `coord_sched` 是单线程入口；先 canonicalize、再分配 `batch_lsn`，可以保证只有成功进入 durable path 的 batch 才消耗 gap-free LSN。
 2. 调用方不需要了解 canonical 规则。
 
 #### `handle_publish_batch`
@@ -80,12 +84,33 @@ struct coord_state {
    if gate.is_open():
        current_cat->durable_lsn.store(new_prefix, release)
    else:
-       // gate 关闭中（seal 进行中），将 new_prefix 暂存到 pending_advance
-       pending_advance = max(pending_advance, new_prefix)
+       // gate 关闭中（seal 进行中），将 new_prefix 暂存到 gate.pending_advance
+       gate.pending_advance = max(gate.pending_advance, new_prefix)
 4. cb()
 ```
 
-`publish_gate` 的职责（概要 §9.2）：阻止 "旧 topology 上的 publish 越过 seal 边界"。在 gate 关闭期间，`durable_lsn` 不前进，但 `ready_set` 继续累积。gate 重新打开时，`pending_advance` 被应用到新 CAT 上（见 `open_gate`），后续 publish 恢复推进。
+`publish_gate` 的职责（概要 §9.2）：阻止 "旧 topology 上的 front-side terminal action（publish / release）越过 seal 边界"。在 gate 关闭期间，`durable_lsn` 不前进，但 `ready_set` 继续累积。gate 重新打开时，`gate.pending_advance` 被应用到新 CAT 上（见 `open_gate`），后续 publish / release 恢复推进。
+
+#### `handle_release_batch`
+
+`release_batch(batch_lsn)` 表示：该 batch 已拿到 `batch_lsn`，但在 memtable phase 之前失败；`coord_sched` 需要把这个 LSN 槽位标记为“已终态解决”，允许连续前缀继续前进，但该 batch 不产生任何可见数据、客户端收到错误而不是 ACK。
+
+```text
+1. ready_set.mark(batch_lsn)
+2. new_prefix = ready_set.advance_contiguous_prefix(current_durable_lsn)
+3. if new_prefix > current_durable_lsn:
+   if gate.is_open():
+       current_cat->durable_lsn.store(new_prefix, release)
+   else:
+       gate.pending_advance = max(gate.pending_advance, new_prefix)
+4. cb()
+```
+
+成立前提：
+
+1. `release_batch` 只允许发生在 memtable phase 之前；
+2. 因而 runtime 中不会留下 `data_ver = batch_lsn` 的 memtable entry；
+3. 盘上即使留下 partial value / partial WAL 残影，recovery 也会把它们当作未完成 batch 或 orphan 清理。
 
 #### `handle_acquire_read_handle`
 
@@ -106,18 +131,69 @@ struct coord_state {
 4. cb()
 ```
 
+#### `handle_capture_flush_frontier`
+
+```text
+1. cat = atomic_load(current_cat)
+2. frontier = flush_frontier {
+       durable_lsn = cat->durable_lsn.load(acquire),
+       old_guard   = cat->prs->tree_guard,
+   }
+3. cb(frontier)
+```
+
+`old_guard` 用 shared_ptr pin 住当前 tree snapshot，使 flush round 后续拿到的 `frontier.old_guard->manifest`
+在整轮 fold / write tree / frontier switch 期间都不会被提前释放。
+
+#### `handle_frontier_switch`
+
+```text
+输入：
+  old_guard            // 本轮 flush 基于的旧 G0
+  new_manifest         // 本轮 flush 产出的 immutable manifest
+  retired              // 本轮覆盖掉的 old_slots / old_ranges / old_tree_values
+  flushed_gens_by_front
+
+1. G0 = old_guard
+2. G0.retired.old_slots.append(retired.old_slots)
+   G0.retired.old_ranges.append(retired.old_ranges)
+   G0.retired.old_tree_values.append(retired.old_tree_values)
+3. G1 = checkpoint_guard {
+       manifest = new_manifest,
+       retired = {},
+   }
+4. cat = atomic_load(current_cat)
+5. D1 = cat->durable_lsn.load(acquire)
+6. new_epoch = cat_epoch + 1
+7. PRS2 = {
+       tree_guard = G1,
+       fronts = subtract_flushed_gens(cat->prs->fronts, flushed_gens_by_front),
+       epoch = new_epoch,
+   }
+8. CAT2 = {
+       prs = PRS2,
+       durable_lsn = D1,
+       epoch = new_epoch,
+   }
+9. install_cat(CAT2)
+10. cb()
+```
+
+`frontier_switch` 只负责 reader 可见拓扑切换：把本轮 retired 挂到旧 G0，构造新 G1/PRS2/CAT2 并安装。它**不**直接修改各
+`front_sched` 的本地 `imms` 链表；本地移除仍由后续 fan-out 的 `release_gens` 完成。
+
 #### `handle_open_gate`
 
 ```text
 1. gate.open()
-2. if pending_advance > current_cat->durable_lsn.load(acquire):
-       // 把 seal 期间累积的已 ready 前缀应用到新 CAT
-       current_cat->durable_lsn.store(pending_advance, release)
-3. pending_advance = 0
+2. if gate.pending_advance > current_cat->durable_lsn.load(acquire):
+       // 把 seal 期间累积的已 resolved 前缀应用到新 CAT
+       current_cat->durable_lsn.store(gate.pending_advance, release)
+3. gate.pending_advance = 0
 4. cb()
 ```
 
-**关键**：`pending_advance` 必须在 gate 打开时被消费。如果只写不读，seal 期间完成 fan-out 的 batch 会永久丢失发布机会，因为对应的 `ready_bitmap` bits 已经在 `advance_contiguous_prefix()` 中被消费了。
+**关键**：`gate.pending_advance` 必须在 gate 打开时被消费。如果只写不读，seal 期间完成 fan-out 的 batch 会永久丢失发布机会，因为对应的 `ready_bitmap` bits 已经在 `advance_contiguous_prefix()` 中被消费了。
 
 ### 2.4 `ready_bitmap` 实现
 
@@ -161,7 +237,7 @@ struct publish_gate {
 };
 ```
 
-gate 不是 mutex，不涉及线程阻塞。它只是 `coord_sched` 单线程内部的一个状态位，用于控制 `handle_publish_batch` 是否推进 `durable_lsn`。如果 publish_batch 请求在 gate 关闭时到达，它仍然正常完成（更新 ready_set、cb()），只是 `durable_lsn` 暂不前进。
+gate 不是 mutex，不涉及线程阻塞。它只是 `coord_sched` 单线程内部的一个状态位，用于控制 `handle_publish_batch` / `handle_release_batch` 是否推进 `durable_lsn`。如果请求在 gate 关闭时到达，它仍然正常完成（更新 ready_set、cb()），只是 `durable_lsn` 暂不前进。
 
 ### 2.6 Seal 触发策略
 
@@ -207,7 +283,7 @@ handle_assign_lsn(raw_batch):
         enqueue_to_pending(raw_batch)
         return
 
-    // 正常分配 lsn ...
+    // 正常执行 canonicalize + 分配 lsn ...
 ```
 
 为什么不挡在 post-lsn：batch 一旦拿到 `batch_lsn`，如果某个 front 卡住而其他 front 完成了，reduce 等不到 → durable_lsn 永远推不过该 batch → 等同于永久 hole（概要 §7.1 rule 7）。
@@ -288,25 +364,36 @@ struct retired_value_ref {
 
 | 请求 | 输入 | 输出 | 说明 |
 |------|------|------|------|
-| `write_entries` | `(batch_lsn, entry_count, entries[])` | void | WAL FUA + memtable insert（value 已由 value_alloc_sched durable） |
+| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` | void | WAL FUA；value 已由 value_alloc_sched durable |
+| `insert_memtable_entries` | `(batch_lsn, entries[])` | void | all-WAL barrier 成功后的 memtable insert |
 | `seal_active` | — | `front_read_set` | seal 时由 coord_sched 投递 |
+| `batch_lookup` | `(keys[], read_lsn, front_read_set)` | `batch_lookup_results[]` | MultiGet 的 front-local 批量 memtable 查找；只是 `lookup_memtable` 的顺序包装 |
 | `lookup_memtable` | `(key, read_lsn, front_read_set)` | `variant<value_handle, tombstone, miss>` | point read（搜索 PRS snapshot 的 active/imms，概要 §8.1 step 3） |
 | `scan_memtable` | `(begin, end, read_lsn, front_read_set)` | `scan_result_set` | range scan（同上） |
+| `collect_eligible_gens` | `durable_lsn` | `eligible_gens[]` | flush Phase 1：收集 `max_lsn <= durable_lsn` 的 sealed gens |
 | `release_gens` | `gen_id_list` | void | frontier switch 后移除 imms |
 
-### 3.5 `handle_write_entries`（前台写两阶段）
+### 3.5 前台写入 Handles
 
 > 完整的 pipeline 编排见 `write_path_and_pipeline.md` §6。本节只给出 scheduler handle 级的高层摘要。
 
-value 已由 `value_alloc_sched` 完成 durable（leader-follower FUA）。fragment 到达 front_sched 时，每条 PUT entry 的 `allocated_vr` 已填入。front_sched 只做 WAL + memtable：
+#### `handle_write_wal_entries`
+
+value 已由 `value_alloc_sched` 完成 durable（leader-follower FUA）。`coord_sched` 先对所有目标 `front_sched` 并发投递 `write_wal_entries`，并等待 all-WAL reduce 成功；在这一步完成之前，任何 `front_sched` 都**不**允许执行该 batch 的 memtable insert。
 
 ```text
-// ── Phase 1: WAL 编码 + FUA（WAL durable point）──
 // 编码 WAL entries 到 tail_frame->dma_buf
-// 提交 WAL pages 到本核 nvme_sched，最后一页 FUA
-// FUA 完成 → WAL durable
+// 提交 WAL pages 到本核 nvme_sched，v1 当前方案为每页 write command 都带 FUA
+// 所有相关页的 FUA 完成 → WAL durable
+```
 
-// ── Phase 2: memtable insert（CPU only）──
+**Value-before-WAL 保证**：value FUA 在 `value_alloc_sched` 上已完成，是 front_sched 开始写 WAL 的因果前置条件。不需要 value 和 WAL 在同一 qpair 上。
+
+#### `handle_insert_memtable_entries`
+
+只有当同一 batch 的所有 `write_wal_entries` 都成功后，`coord_sched` 才会启动第二轮 fan-out，并发投递 `insert_memtable_entries`：
+
+```text
 for each canonical entry in entries[]:
     if entry.op == PUT:
         hot = make_hot_blob(entry.value_bytes, entry.value_len)
@@ -322,7 +409,11 @@ for each canonical entry in entries[]:
     active->min_lsn = min(active->min_lsn, batch_lsn)
 ```
 
-**Value-before-WAL 保证**：value FUA 在 `value_alloc_sched` 上已完成，是 front_sched 开始写 WAL 的因果前置条件。不需要 value 和 WAL 在同一 qpair 上。
+关键约束：
+
+1. `insert_memtable_entries` 之前必须已有 all-WAL barrier 成功；
+2. 一旦开始 memtable phase，该 batch 的失败语义不再是 `release_batch`，而是运行时终止；
+3. `coord_sched` 不得让 `seal_active` 插在同一 batch 的 `write_wal_entries` 和 `insert_memtable_entries` 两轮 fan-out 之间。
 
 ### 3.6 `handle_seal_active`
 
@@ -335,7 +426,7 @@ for each canonical entry in entries[]:
 6. cb(front_read_set { active = N, imms = [F] ++ old_imms })
 ```
 
-**不变量**（概要 §7.1 补充）：同一 batch 不会跨这次 seal 边界裂成两代。这由 `coord_sched` 的单线程顺序保证：seal_active 请求和 write_entries 请求在同一个 `front_sched` 队列中按顺序执行。
+**不变量**（概要 §7.1 补充）：同一 batch 不会跨这次 seal 边界裂成两代。这由 `coord_sched` 的单线程顺序保证：seal_active 请求不会插入到同一 batch 的 `write_wal_entries` fan-out 与 `insert_memtable_entries` fan-out 之间；在单个 `front_sched` 上，这两类请求与 `seal_active` 也都按入队顺序执行。
 
 ### 3.7 `handle_lookup_memtable`
 
@@ -357,11 +448,39 @@ handle_lookup_memtable(key, read_lsn, frs):
        cb(tombstone)          // 上层返回 not found
 ```
 
-**线程安全**：dispatch 到 front_sched 执行是为了保证 btree_map 读操作的线程安全。sealed gen 是 immutable 的；PRS 中的 active gen 可能仍在被 front_sched 写入，但 lookup 在 front_sched 单线程上执行，与 write_entries 串行，不存在竞争。
+**线程安全**：dispatch 到 front_sched 执行是为了保证 btree_map 读操作的线程安全。sealed gen 是 immutable 的；PRS 中的 active gen 可能仍在被 front_sched 写入，但 lookup 在 front_sched 单线程上执行，与 `insert_memtable_entries` 串行，不存在竞争。
 
-**优化**：因为 data_ver 在同一 gen 内不重复（概要 §1.6 `same key → same front scheduler`），可以从 frs.active → frs.imms[0] → frs.imms[1] → ... 依次查找，找到第一条 `data_ver <= read_lsn` 的即为 winner，无需遍历所有 gens。
+**约束**：不能因为在 `frs.active` 中命中 key 就提前返回。`front_read_set` 中各 gen 的拓扑顺序不保证同一 key 的 `data_ver` 单调递减；`lookup_memtable` 的唯一正确 winner 规则仍然是“在 `active + imms` 的所有命中中取最大 `data_ver`”。
 
-### 3.8 `handle_release_gens`
+#### `handle_batch_lookup`
+
+`batch_lookup(keys[], read_lsn, front_read_set)` 是 front-side 的正式 handle，用于 MultiGet；它不引入新的可见性语义，只是把同一个 `front_read_set` 上的多个 `lookup_memtable()` 串行打包：
+
+```text
+results = []
+for key in keys[]:
+    results.push({ key, lookup_memtable(key, read_lsn, front_read_set) })
+cb(results)
+```
+
+它存在的意义只是：
+
+1. 明确这是一个跨文档可引用的 scheduler handle，而不是 RAP 里的临时 helper 名字；
+2. 让 MultiGet 可以按 owner 做一次 front-local fan-out，而不是对每个 key 单独发消息。
+
+### 3.8 Flush 辅助 Handles
+
+#### `handle_collect_eligible_gens`
+
+```text
+1. eligible_gens = [ gen in imms where gen.max_lsn <= durable_lsn ]
+2. cb(eligible_gens)
+```
+
+返回的是 `intrusive_ptr<memtable_gen>` snapshot。flush round 在 reduce 后持有这些引用，因此即使后续有新的
+seal/frontier switch，本轮选中的 gens 也不会在 fold 结束前被提前释放。
+
+#### `handle_release_gens`
 
 ```text
 for gen_id in gen_id_list:
@@ -399,9 +518,10 @@ struct wal_stream_state {
        memset(tail_frame->dma_buf, 0, LBA_SIZE)
 3. memcpy(tail_frame->dma_buf + (write_offset % LBA_SIZE), encoded.data, encoded.len)
 4. write_offset += encoded.len
-5. // FUA 写当前 tail page（可能包含本次 entry 和同页的旧 entries）
+5. // v1 当前方案：本次触达的每个 WAL page write command 都带 FUA
+   // 当前 tail page（可能包含本次 entry 和同页的旧 entries）写回时使用 FUA
    fua_write(active_seg.base_paddr + floor(write_offset - 1, LBA_SIZE), tail_frame->dma_buf)
-   // 如果 entry 跨页，先非 FUA 写前面的完整页，最后一页 FUA
+   // 如果 entry 跨页，则每个被写回的页都各自带 FUA
 6. seg_max_lsn = max(seg_max_lsn, entry.lsn)
 ```
 
@@ -437,6 +557,7 @@ struct tree_state {
 
     // ── Flush 状态 ──
     uint64_t flush_max_lsn;                          // 已 flush 进 tree 的最大 batch_lsn
+    uint64_t superblock_safe_lsn;                    // 当前 on-disk superblock root 已能覆盖到的最大 flush frontier
     uint64_t recovery_safe_lsn;                      // 对 WAL/value 回收安全的下界
 
     // ── Retire 队列 ──
@@ -451,9 +572,9 @@ struct tree_state {
 |------|------|------|------|
 | `flush` | eligible sealed gens | `checkpoint_guard` + new manifest | 详见 flush_and_frontier_switch.md |
 | `reclaim` | `reclaim_task` | void | TRIM old slots/ranges, recycle value extents |
-| `update_superblock` | `root_base_paddr` | void | root 变化时异步更新 |
+| `update_superblock` | `(root_base_paddr, covered_lsn)` | void | root-change flush 后异步更新；完成后推进 `superblock_safe_lsn` |
 
-注：`tree_lookup` 和 `tree_scan` 不是 tree_sched 的请求。它们就地在调用方 scheduler 上执行（见 §4.7）。
+注：`tree_lookup` 和 `tree_scan` 不是 tree_sched 的请求。它们由少量 `tree_lookup_sched` 执行（见 §4.7）；读路径绝不访问 tree_sched 的当前可变状态。
 
 ### 4.3 Data Area 碰撞检测
 
@@ -476,7 +597,7 @@ struct tree_allocator {
     paddr head;                                      // 下一个可分配的 range base
     // head 从 data_area_base_paddr 开始，向高地址增长
     // 分配单位 = tree_page_size * shadow_slots_per_range
-    local::queue<range_ref, 4096> free_ranges;       // 已回收可重用的 range
+    local::queue<range_ref, 4096> free_ranges;       // 已回收可重用的 range（入队前必须完成 tree_node invalidate barrier）
     data_area_heads* shared_heads;                   // 碰撞检测共享结构
 
     range_ref allocate() {
@@ -493,6 +614,7 @@ struct tree_allocator {
     }
 
     void recycle(range_ref r) {
+        invalidate_tree_node_range_on_all_shards(r); // wait-all-acks；发现 pinned frame = 生命周期 bug
         free_ranges.try_enqueue(r);
     }
 };
@@ -544,26 +666,49 @@ struct checkpoint_guard {
 };
 ```
 
-### 4.7 Tree Lookup（就地执行，不经过 tree_sched）
+### 4.7 `tree_lookup_sched` 与 Tree Lookup
 
-tree_lookup **不在 tree_sched 上执行**。它就地在调用方所在的 scheduler（如 front_sched）上执行，通过 nvme_sched 异步读 page。
+为避免把 `tree_node` read cache 在每个 `front_sched` 上重复一份，同时又不把共享锁带进 front hot path，读侧引入少量 `tree_lookup_sched`。它们是 tree read-only cache 的 owner，也是 tree traversal 的执行者。
 
-原因：tree_lookup 的依赖（immutable manifest、NVMe read、readonly_frame_cache）全部不需要 tree_sched 的可变状态。CoW tree 的核心设计就是读写分离——reader 拿着旧 manifest 走旧结构，writer 在 tree_sched 上写新 slot。把 tree_lookup 放到 tree_sched 上会破坏这一核心属性，使读路径被 flush/reclaim 阻塞。
+```cpp
+struct tree_lookup_state {
+    uint32_t lookup_id;
+    readonly_frame_cache node_cache;                // 仅收纳 tree_node domain 的 clean frames
+
+    // 可选：对同一 slot 的并发 miss 做 single-flight 合并
+    flat_hash_map<frame_id, pending_read*> inflight_reads;
+};
+```
+
+路由规则：
+
+1. 启动期建立稳定映射 `home_tree_lookup(front_owner)`。
+2. point GET / MultiGet 的 tree miss 路由到 owner `front_sched` 对应的 home `tree_lookup_sched`。
+3. `same key -> same front_sched` 因而也推出 `same key -> same tree_lookup_sched`（在同一次运行期间）。
+4. `tree_lookup_sched` 的实例数 `K` 通常小于 `front_sched_count`，并优先按 NUMA 分组放置；默认优先选择与 owner `front_sched` 同 NUMA 的 shard。
+5. range scan 的 tree-side 遍历整体路由到一个选定的 `tree_lookup_sched` shard；默认选择调用方 NUMA 上的本地 shard，而不是把 leaf frames 借回多个 `front_sched`。
+
+tree_lookup **不在 tree_sched 上执行**。它在路由得到的 `tree_lookup_sched` 上执行，通过该 scheduler 本核的 `nvme_sched` 异步读 page。
+
+原因：tree_lookup 的依赖（immutable manifest、NVMe read、tree_node `readonly_frame_cache`）全部不需要 tree_sched 的可变状态；但如果仍把 tree traversal 留在 `front_sched`，又会引入跨 scheduler 借 frame / 归还 frame 的生命周期问题。把 tree traversal 与 tree-node cache 一起放进 `tree_lookup_sched`，可以保持 owner-local、无锁、无借页。
 
 ```text
-// 在调用方 scheduler 上就地执行（如 front_sched、coord_sched）
+// 在 home tree_lookup_sched 上执行
 tree_lookup(key, manifest):
-1. slot_paddr = manifest->resolve(root_range_base)
-2. root_page = readonly_frame_cache.get_or_read(slot_paddr)
-   // cache miss → nvme_sched->read → 回填 cache
-3. 从 root 开始 B+ tree 下降：
+1. if manifest->root_slot == null:
+       return absent
+2. slot_paddr = manifest->root_slot
+3. root_page = node_cache.get_or_read(slot_paddr)
+   // cache miss → 本核 nvme_sched->read → 回填 cache
+4. page = root_page
+5. 从 root 开始 B+ tree 下降：
    for each internal level:
        child_range_base = find_child(page, key)
        child_slot_paddr = manifest->resolve(child_range_base)
-       child_page = readonly_frame_cache.get_or_read(child_slot_paddr)
-4. leaf_page = 最终叶子
-5. record = leaf_page.find(key)
-6. if record 不存在:
+       page = node_cache.get_or_read(child_slot_paddr)
+6. leaf_page = page
+7. record = leaf_page.find(key)
+8. if record 不存在:
        return absent
    else if record.kind == value:
        return leaf_value_record { data_ver, value_ref }
@@ -571,9 +716,11 @@ tree_lookup(key, manifest):
        return leaf_tombstone { data_ver }
 ```
 
-**node frame cache**：每个可能执行 tree_lookup 的 scheduler 拥有自己的 `readonly_frame_cache` shard（tree_node domain）。tree page 以 `page_frame { dom = tree_node, st = clean_readonly }` 形式驻留在 DMA 内存中。遍历期间通过 `pin_count` 防止驱逐；pin 释放后按 LRU 可淘汰。cache 驱逐不影响正确性，因为 manifest 持有结构信息，page 可以随时从 NVMe 重新读取。同一个 tree page 可以在多个 shard 中各自驻留（`runtime_memory_and_cache.md` §7.3）。
+**node frame cache**：每个 `tree_lookup_sched` 拥有自己的 `readonly_frame_cache` shard（tree_node domain）。tree page 以 `page_frame { dom = tree_node, st = clean_readonly }` 形式驻留在 DMA 内存中。遍历期间通过 `pin_count` 防止驱逐；pin 释放后按 LRU / clock 可淘汰。cache 驱逐不影响正确性，因为 manifest 持有结构信息，page 可以随时从 NVMe 重新读取。
 
-**tree_sched 只保留写侧操作**：flush、reclaim、allocator、superblock 更新。flush 期间读取旧 leaf pages 也在 tree_sched 上执行（这是写侧 fold 的一部分），不影响其他 scheduler 上的读路径 tree_lookup。
+v1 的 tree cache key 仍是裸 `frame_id { slot_paddr, span_lbas, domain::tree_node }`。它之所以安全，不是因为 slot 地址永不复用，而是因为 old range 在进入 `tree_allocator.free_ranges` 前必须先完成跨 shards 的 `tree_node` invalidate barrier（见 `runtime_memory_and_cache.md` §10.2）。
+
+**tree_sched 只保留写侧操作**：flush、reclaim、allocator、superblock 更新。flush 期间读取旧 leaf pages 仍在 tree_sched 上执行（这是写侧 fold 的一部分）；普通读路径的 tree_lookup 则在 `tree_lookup_sched` 上执行。
 
 ### 4.8 `recovery_safe_lsn` 推进
 
@@ -589,13 +736,28 @@ else:
 
 recovery_safe_lsn = min(
     flush_max_lsn,               // tree 已经物化到这里
-    superblock.generation 对应的那次 flush 的 flush_max_lsn,
-                                  // superblock 已经更新到这里
+    superblock_safe_lsn,         // 当前 on-disk superblock root 已能覆盖到这里
     wal_frontier,                // 即使崩溃，比这更早的 WAL 已不会出现
 )
 ```
 
-简化理解：只有当 tree flush 完成 + superblock 更新 + 对应 WAL segments 回收完毕后，`recovery_safe_lsn` 才能安全推进。
+`superblock_safe_lsn` 的语义是：
+
+1. **root-stable flush**
+   - 当前 on-disk superblock 记录的 `root_base_paddr` 与本轮 flush 后的 root range base 相同。
+   - recovery 即使不更新 superblock，也能从该 root range 扫描到最新 root slot。
+   - 因此在 `nvme_flush` 完成后，`superblock_safe_lsn` 可以直接推进到本轮 `flush_max_lsn`，不需要额外 metadata IO。
+
+2. **root-change flush**
+   - 本轮 flush 改变了 `root_base_paddr`。
+   - 在异步 superblock 更新完成前，recovery 仍只会从旧 root base 出发，因此必须依赖 WAL 补齐这轮及其后的变更。
+   - 因此在 superblock update completion 之前，`superblock_safe_lsn` 保持旧值；完成后再推进到该次更新覆盖的 `covered_lsn`。
+
+简化理解：`recovery_safe_lsn` 取决于三条边界同时满足：
+
+1. tree 已 durable（`flush_max_lsn`）
+2. 当前 on-disk superblock root 已经“看得到”这些 flushed 结果（`superblock_safe_lsn`）
+3. 比它更老的 WAL 已经不再需要作为 recovery 输入（`wal_frontier`）
 
 ## 5. `wal_space_sched`（WAL 空间 Scheduler）
 
@@ -696,13 +858,15 @@ handle_reclaim_check(recovery_safe_lsn):
 
 ### 6.1 定位
 
-集中管理 value page 的分配、DMA frame 填充与 NVMe FUA 写入（leader-follower 模式）。通过本核 `nvme_sched` 提交 value FUA。
+集中管理 value page 的分配、DMA frame 填充、NVMe FUA 写入（leader-follower 模式），以及 **value read 服务**（tree-path value 读取的唯一执行域）。通过本核 `nvme_sched` 提交 value FUA 写入和 value page 读取。
+
+最佳实践是把它部署在独占核心上；但语义上只要求它保持单实例 owner。读写共享同一份 `readonly_frame_cache`（value_page domain），避免跨 shard 缓存重复和 invalidate 开销。
 
 | 属性 | 值 |
 |------|---|
 | 实例数 | 1（全局唯一） |
-| Owner 状态 | bump head（per-device）、per-class pools（whole_page_pool / hole_page_list / extent_free_pool）、dirty_pages、deferred_freed、per-class open frames |
-| NVMe I/O | 通过本核 nvme_sched 提交 value FUA 写入 |
+| Owner 状态 | bump head（per-device）、per-class pools（whole_page_pool / hole_page_list / extent_free_pool）、owner-local `generic_free_spans`、dirty_pages、deferred_freed、per-class open frames、本地 `readonly_frame_cache`（value_page domain，读写共享） |
+| NVMe I/O | 通过本核 nvme_sched 提交 value FUA 写入和 value page 读取 |
 | 路由 | 固定单点 |
 
 ### 6.2 请求类型
@@ -710,10 +874,17 @@ handle_reclaim_check(recovery_safe_lsn):
 | 请求 | 输入 | 输出 | 调用者 |
 |------|------|------|--------|
 | `persist_put_values` | batch PUT entries | durable value_refs | coord_sched（leader-follower：多 batch 合并） |
+| `read_value` | `value_ref` | owning value bytes | 读路径（tree hit value 后） |
+| `read_page_values` | `value_read_group { page_fid, refs[] }` | owning value bytes[] | 读路径（MultiGet / Scan 的 tree hit values） |
 | `freed_slots` | page_base, class_idx, freed_mask | void | tree_sched（sub-LBA value 回收） |
 | `recycle_whole` | class_idx, page_base | void | tree_sched（LBA-aligned value 回收，TRIM 由 tree_sched 先完成） |
+| `install_recovered_state` | `live_extents`, `global_value_head`, `data_area_end_lba`, optional `dead_class_hints` | void | boot recovery（一次性初始化） |
 
-注：`alloc_page` 和 `return_page` 不再是跨 scheduler 请求——它们是 `persist_put_values` 内部的本地操作（value_alloc_sched 自己持有 open frames 和 per-class pools）。
+注：
+
+1. `alloc_page` 和 `return_page` 不再是跨 scheduler 请求——它们是 `persist_put_values` 内部的本地操作（value_alloc_sched 自己持有 open frames 和 per-class pools）。
+2. `read_value` 是 Point GET 使用的单值包装；`read_page_values` 是 MultiGet / Scan 使用的页级批量原语。两者都由 `value_alloc_sched` 服务：先查 dirty open frames，再查 value_page `readonly_frame_cache`，miss 时通过本核 `nvme_sched` 读取并回填 cache。返回 copy 后的 owning bytes，调用方无需管理 DMA frame 生命周期。
+3. `install_recovered_state` 是 boot-only 初始化接口；steady-state 下不走这条路径。recovery 只交出 occupied truth，allocator 内部自行重建 `hole_pages` / pools / `generic_free_spans`。
 
 ### 6.3 Owner 状态
 
@@ -737,6 +908,12 @@ struct value_alloc_state {
     // ── 分配 ──
     per_device_value_state dev_state;                // bump head（per-device，v1 单设备）
 
+    struct free_span_descriptor {
+        paddr base;
+        uint32_t span_lbas;
+        uint16_t class_idx_or_invalid;               // UINT16_MAX = 暂无可用 class hint
+    };
+
     // ── Per-class pools ──
     struct per_class_state {
         flat_hash_map<paddr, hole_page_descriptor> hole_pages;  // 带空洞页
@@ -744,6 +921,11 @@ struct value_alloc_state {
         local::queue<paddr, 64>  extent_free_pool;              // multi-LBA extent
     };
     small_vector<per_class_state, 16> classes;
+
+    // ── Whole-free region，但暂时无法归入某个 class pool ──
+    // 典型来源：boot recovery 后，某些 region 语义上确定 free，
+    // 但没有足够 surviving refs 可立即唯一推断 class。
+    intrusive_list<free_span_descriptor> generic_free_spans;
 
     // ── Per-class open frames（当前正在填充的 DMA page）──
     // persist_put_values 中 leader 统一分配 slot、memcpy 到 open_frame，
@@ -761,6 +943,15 @@ struct value_alloc_state {
     value_placement_config config;                   // hole_reuse_watermark 等
 };
 ```
+
+`install_recovered_state()` 的职责边界固定为：
+
+1. recovery 提供 `live_extents`（occupied truth）和 `global_value_head`；
+2. `value_alloc_sched` 先清空旧的 free metadata / open frame 残留，再从 `live_extents` 反推出：
+   - sub-LBA partially-free 页的 `hole_pages`
+   - class 可判定的 `whole_page_pool` / `extent_free_pool`
+   - class 暂不可判定的 `generic_free_spans`
+3. `dead_class_hints` 只用于 class 归桶或 TRIM 优化；没有它也不能泄漏 free 空间。
 
 不变量：`dirty_pages` 中的 page 不会同时出现在 `hole_pages` 中。`deferred_freed` 只在 dirty 期间累积，`return_page` 时一次性合并清空。
 
@@ -810,7 +1001,63 @@ try_alloc_bump(class_idx):
 - `fresh` / `whole_page` → 分配 DMA frame，清零
 - `non_resident_hole` → 先查本地 `readonly_frame_cache`；cache hit 则零 NVMe read，cache miss 则通过本核 nvme_sched 读整页
 
-### 6.5 `handle_return_page`
+其中 `whole_page` source 只会来自已经完成过 `value_page` invalidate barrier 的 free pool；因此这里允许继续用裸 `frame_id` 命中本地 cache，而不会把旧页像误认成新对象。
+
+### 6.5 `handle_read_value` / `handle_read_page_values`
+
+Tree-path value 读取统一在 `value_alloc_sched` 上完成。Point GET 使用 `handle_read_value(value_ref)`；MultiGet / Scan 先在调用方按 value page 分组，再调用 `handle_read_page_values(value_read_group)`。
+
+```cpp
+struct value_read_group {
+    frame_id page_fid;                               // 同一 value page
+    small_vector<value_ref, 8> refs;                 // 全部属于 page_fid
+};
+```
+
+```text
+handle_read_value(value_ref vr):
+    group = build_single_value_group(vr)
+    values = handle_read_page_values(group)
+    cb(values[0])
+
+handle_read_page_values(value_read_group group):
+    fid = group.page_fid
+
+    // ── 1. 先查 dirty open frames（当前正在填充的页）──
+    if hit_open_frame(fid) → frame:
+        goto serve_from_frame
+
+    // ── 2. 查 readonly_frame_cache ──
+    if frame = readonly_frame_cache.get(fid):
+        goto serve_from_frame
+
+    // ── 3. Cache miss → NVMe read ──
+    frame = alloc_dma_frame(fid)
+    nvme_sched->read(fid.base, frame->dma_buf, fid.span_lbas * lba_size)
+    // NVMe read 完成后：
+    frame->st = clean_readonly
+    readonly_frame_cache.put(fid, frame)
+    goto serve_from_frame
+
+serve_from_frame:
+    result = []
+    for vr in group.refs:
+        header = reinterpret_cast<value_object_header*>(frame->dma_buf + vr.byte_offset)
+        assert(header->magic == VALUE_MAGIC)
+        assert(header->body_len == vr.len)
+        verify_crc32c(frame->dma_buf + vr.byte_offset + sizeof(header), vr.len, header->body_crc)
+        result.push(copy_bytes(frame->dma_buf + vr.byte_offset + sizeof(header), vr.len))
+    cb(result)
+```
+
+**设计要点**：
+
+1. **请求内按页分组**：MultiGet / Scan 先在调用方按 `frame_id` 分组，避免把同页多个 `value_ref` 变成多条独立消息。
+2. **dirty frame 命中**：sub-LBA page 停留在 `open_frames` 的时间窗口内，tree-path read 可直接从 DMA buffer 读取，零 NVMe。这对频繁 flush + 小 value 的工作负载有意义。
+3. **copy 返回**：返回 owning bytes 而非 `value_view` + `frame_pin`。DMA frame 生命周期完全封闭在 `value_alloc_sched` 内部，`pin_count` 保持 `uint32_t` 不需要 atomic。copy 发生在 CRC 校验后，数据在 L1/L2 中是热的，成本最低。上层（如网络发送）最终也需要 copy，在这里做等价于在那里做。
+4. **无 coherence 开销**：value_alloc_sched 既是 writer 又是唯一的 cache owner。hole-fill writeback 后直接更新本地 cache，不需要跨 shard invalidate barrier。
+
+### 6.6 `handle_return_page`
 
 ```text
 handle_return_page(page_base, class_idx, free_bitmap):
@@ -833,7 +1080,9 @@ handle_return_page(page_base, class_idx, free_bitmap):
             hole_page_descriptor { page_base, class_idx, free_bitmap })
 ```
 
-### 6.6 `handle_freed_slots`（sub-LBA 回收核心）
+`handle_return_page()` 只更新 allocator metadata。writeback completion 后，`value_alloc_sched` 直接把 updated frame 转为 `clean_readonly` 放回本地 cache。无需跨 shard invalidate（`value_alloc_sched` 是 value_page cache 唯一 owner）。
+
+### 6.7 `handle_freed_slots`（sub-LBA 回收核心）
 
 ```text
 handle_freed_slots(page_base, class_idx, freed_mask):
@@ -862,18 +1111,19 @@ handle_freed_slots(page_base, class_idx, freed_mask):
 
 **幂等性**：全部用 `|=` + `bitmap.count()`，不用 `++`。
 
-### 6.7 `recycle_whole_page` 统一路径
+### 6.8 `recycle_whole_page` 统一路径
 
 ```text
 recycle_whole_page(class_idx, page_base):
-    1. stale cache invalidation
+    1. 从本地 readonly_frame_cache 删除该 page 的 frame（如有）
     2. 放回 classes[class_idx].whole_page_pool
     // TRIM 由调用方（tree_sched）在投递 recycle 之前完成（等待 TRIM 回调后再投递）
+    // 无需跨 shard invalidate（value_alloc_sched 是 value_page cache 唯一 owner）
 ```
 
-multi-LBA extent 的 `handle_recycle_whole` 同理：放回 `classes[class_idx].extent_free_pool`。
+multi-LBA extent 的 `handle_recycle_whole` 同理：从本地 cache 删除覆盖该 extent 的 frames，再放回 `classes[class_idx].extent_free_pool`。
 
-### 6.8 TRIM 顺序协议
+### 6.9 TRIM 顺序协议
 
 `recycle_whole_page` 路径中，TRIM 必须在回收之前完成。因为 per-core 模型下 TRIM（tree_sched 核心的 qpair）和后续写入（value_alloc_sched 核心的 qpair）在不同 qpair 上，没有隐式顺序保证：
 
@@ -886,7 +1136,7 @@ tree_sched: freed_slots / recycle_whole → value_alloc_sched
 
 TRIM 在回收路径上（非写关键路径），等待完成不影响前台延迟。
 
-### 6.9 `dirty_pages` / `deferred_freed` 生命周期
+### 6.10 `dirty_pages` / `deferred_freed` 生命周期
 
 | 事件 | 动作 |
 |------|------|
@@ -976,7 +1226,7 @@ struct published_read_set {
 存活期间：
   - memtable entry live → hot_blob 有 ref → 不可释放
   - hot_blob 独立于 page/frame cache（见 runtime_memory_and_cache.md §9.3）
-  - tree-path value read 使用 value_view（frame_pin 引用 DMA page），不复用 hot_blob
+  - tree-path value read 使用 `read_value(value_ref)` copy 返回 owning bytes，不复用 hot_blob
 
 释放触发：
   - memtable_gen 从所有 published_read_set 中摘除
@@ -1019,13 +1269,22 @@ client
 coord_sched ── assign_lsn(raw_batch) ──────────────────────┐
   │  cb: (batch_lsn, canonical_entries, route_table)        │
   │                                                         │
-  ├── fan-out ──────────────────────────────────────────────┤
+  ├── fan-out WAL ──────────────────────────────────────────┤
   │                                                         │
   │  ┌─────────────────┐  ┌─────────────────┐              │
   │  │ front_sched[0]  │  │ front_sched[1]  │  ...         │
-  │  │ write_entries() │  │ write_entries() │              │
+  │  │ write_wal_entries() │ │ write_wal_entries() │        │
   │  │  (value 已durable)│ │  (value 已durable)│            │
   │  │  1. WAL FUA     │  │  1. WAL FUA     │              │
+  │  └────────┬────────┘  └────────┬────────┘              │
+  │           │                    │                        │
+  │           └────── reduce ──────┘                        │
+  │                                                         │
+  ├── fan-out memtable ─────────────────────────────────────┤
+  │                                                         │
+  │  ┌─────────────────┐  ┌─────────────────┐              │
+  │  │ front_sched[0]  │  │ front_sched[1]  │  ...         │
+  │  │ insert_memtable_entries() │ │ insert_memtable_entries() │
   │  │  2. memtable ins│  │  2. memtable ins│              │
   │  └────────┬────────┘  └────────┬────────┘              │
   │           │                    │                        │
@@ -1115,11 +1374,12 @@ tree_sched ── enqueue reclaim ─── maybe update superblock
 2. seal 发起和 write batch fan-out 有确定的先后关系。
 3. `publish_gate` 的开/关和 `durable_lsn` 推进不会并发。
 
-### 10.3 `tree_sched` 单线程
+### 10.3 tree-domain schedulers 单线程
 
-1. tree allocator 不需要锁。
-2. `tree_manifest` 构造不需要并发保护。
-3. `recovery_safe_lsn` 推进不会并发。
+1. `tree_sched` 上的 tree allocator 不需要锁。
+2. `tree_sched` 上的 `tree_manifest` 构造不需要并发保护。
+3. `tree_sched` 上的 `recovery_safe_lsn` 推进不会并发。
+4. 每个 `tree_lookup_sched` 的 node cache / miss-coalescing 状态也都是 owner-local，不需要锁。
 
 ### 10.4 跨 scheduler 的 read_handle 安全
 
@@ -1130,15 +1390,28 @@ reader pin `publish_catalog` 后：
 
 ## 11. 异常与错误处理
 
-### 11.1 NVMe 写失败（post-LSN）
+### 11.1 post-LSN 失败矩阵
 
-batch 已拿到 `batch_lsn` 后的任何写入失败都必须触发运行时终止，交给 recovery 收敛（概要 §7.1 规则 7：不允许留下永久 LSN hole 后继续服务）。
+batch 已拿到 `batch_lsn` 后，失败语义按 batch 当前所处阶段区分：
 
-1. value object 写失败 → 该 entry 的 WAL 和 memtable insert 不执行 → batch 在 reduce 时观察到异常 → 不 publish → **运行时终止**。
-2. WAL FUA 写失败 → 同上。
-3. 概要 §7.1 规则 9：如果 value object 已 durable 但 WAL 最终没 durable，该 value object 可立即回收或留给 recovery 当垃圾清理。
+1. **value phase 失败**
+   - `coord_sched.release_batch(batch_lsn)`
+   - 客户端收到错误
+   - 若已有 partial durable value，则按 orphan 路径处理
 
-注：pre-LSN 阶段（如 canonicalization 失败、参数校验错误）可以安全返回错误给客户端，因为此时尚未分配 `batch_lsn`。
+2. **all-WAL barrier 之前的 WAL 失败**
+   - 该 batch 还未进入 memtable phase
+   - `coord_sched.release_batch(batch_lsn)`
+   - 客户端收到错误
+   - 若已有 partial durable WAL/value，recovery 会按未完成 batch / orphan 清理
+
+3. **memtable phase 失败**
+   - 此时 all-WAL barrier 已经成功，batch 不再允许 clean release
+   - 必须触发运行时终止，交给 recovery 收敛
+
+概要 §7.1 规则 9 仍成立：如果 value object 已 durable 但 WAL 最终没 durable，该 value object 可立即回收或留给 recovery 当垃圾清理。
+
+注：pre-LSN 阶段（如 `coord_sched.handle_assign_lsn` 内的 canonicalization 失败、参数校验错误）可以安全返回错误给客户端，因为此时尚未分配 `batch_lsn`。
 
 ### 11.2 WAL backpressure
 

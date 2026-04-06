@@ -72,7 +72,7 @@ namespace apps::inconel::tree {
 
         struct req {
             lookup_state* state;
-            std::move_only_function<void(bool)> cb;
+            std::move_only_function<void(batch_decision&&)> cb;
         };
 
         template<typename sched_t>
@@ -85,9 +85,9 @@ namespace apps::inconel::tree {
             void start(ctx_t& ctx, scope_t& scope) {
                 sched->schedule(new req{
                     state,
-                    [ctx = ctx, scope = scope](bool ok) mutable {
+                    [ctx = ctx, scope = scope](batch_decision&& d) mutable {
                         pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                            ctx, scope, ok);
+                            ctx, scope, std::move(d));
                     }
                 });
             }
@@ -141,11 +141,11 @@ namespace apps::inconel::tree {
                 s.first_call = false;
                 if (!s.manifest->has_root()) {
                     s.all_done = true;
-                    s.read_descs.clear();
+                    r->cb(decision_done{});
                 } else {
                     prepare_reads(s);
+                    r->cb(decision_need_read{});
                 }
-                r->cb(true);
                 delete r;
                 return;
             }
@@ -191,12 +191,12 @@ namespace apps::inconel::tree {
             for (auto& e : s.entries)
                 if (!e.resolved) { s.all_done = false; break; }
 
-            if (s.all_done)
-                s.read_descs.clear();
-            else
+            if (s.all_done) {
+                r->cb(decision_done{});
+            } else {
                 prepare_reads(s);
-
-            r->cb(true);
+                r->cb(decision_need_read{});
+            }
             delete r;
         }
 
@@ -243,7 +243,7 @@ namespace pump::core {
     compute_sender_type<ctx_t, apps::inconel::tree::_tree_lookup::sender<sched_t>> {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
-            return std::type_identity<bool>{};
+            return std::type_identity<apps::inconel::tree::batch_decision>{};
         }
     };
 }

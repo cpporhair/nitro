@@ -20,6 +20,14 @@ namespace apps::inconel::tree {
 
     using lookup_result = std::variant<lookup_value, lookup_tombstone, lookup_absent>;
 
+    // ── Scheduler decision per round ──
+
+    struct decision_done {};
+
+    struct decision_need_read {};
+
+    using batch_decision = std::variant<decision_done, decision_need_read>;
+
 }
 
 #endif //APPS_INCONEL_TREE_LOOKUP_HH

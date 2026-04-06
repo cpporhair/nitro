@@ -10,25 +10,9 @@
 
 namespace apps::inconel::mock_nvme {
 
-    // ── I/O descriptor for batch operations ──
-
-    struct write_desc {
-        uint64_t lba;
-        const void* data;
-        uint32_t num_lbas;
-        uint32_t flags;
-    };
-
-    struct read_desc {
-        uint64_t lba;
-        void* buf;
-        uint32_t num_lbas;
-    };
-
-    struct trim_desc {
-        uint64_t lba;
-        uint32_t num_lbas;
-    };
+    using format::write_desc;
+    using format::read_desc;
+    using format::trim_desc;
 
     // ── Single-item senders (scheduler → bool) ──
 

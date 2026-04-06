@@ -34,6 +34,26 @@ namespace apps::inconel::format {
     };
     static_assert(sizeof(value_ref) == 18);
 
+    // ── I/O descriptors for batch operations ──
+
+    struct write_desc {
+        uint64_t lba;
+        const void* data;
+        uint32_t num_lbas;
+        uint32_t flags;
+    };
+
+    struct read_desc {
+        uint64_t lba;
+        void* buf;
+        uint32_t num_lbas;
+    };
+
+    struct trim_desc {
+        uint64_t lba;
+        uint32_t num_lbas;
+    };
+
 }
 
 template<>

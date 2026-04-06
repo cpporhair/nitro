@@ -50,10 +50,10 @@ static void write_leaf(mock_device& dev, uint64_t lba,
     for (auto& [key, ver] : records) {
         value_ref vr = {.base = {0, ver}, .byte_offset = 0,
                         .len = static_cast<uint32_t>(ver), .flags = 0};
-        assert(b.add_value(key, ver, vr));
+        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); assert(ok);
     }
     b.finalize();
-    assert(dev.do_write(lba, page, 1));
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
 }
 
 static void write_internal(mock_device& dev, uint64_t lba,
@@ -62,10 +62,10 @@ static void write_internal(mock_device& dev, uint64_t lba,
     alignas(64) char page[PS];
     internal_page_builder b;
     b.init(page, PS);
-    for (auto& [sep, child] : children) assert(b.add_child(sep, child));
+    for (auto& [sep, child] : children) { [[maybe_unused]] bool ok = b.add_child(sep, child); assert(ok); }
     b.set_rightmost_child(rightmost);
     b.finalize();
-    assert(dev.do_write(lba, page, 1));
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
 }
 
 struct tree_data {

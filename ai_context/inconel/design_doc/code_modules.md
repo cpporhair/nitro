@@ -39,6 +39,10 @@ apps/inconel/
 
 **关键约束：L2 的 5 个 scheduler 模块之间互不依赖。** 跨 scheduler 协作完全通过 L3 pipeline 层的 sender 编排完成，不通过直接调用。
 
+**Scheduler 模块接口约束：每个 scheduler 模块对外只暴露 `sender.hh` 一个接口。** 其他模块使用该 scheduler 的功能时，只允许 `#include "模块/sender.hh"`。模块内部的 `scheduler.hh`、`device.hh` 等属于实现细节，不直接对外暴露。例外：`runtime/` 需要访问 scheduler 构造函数和 `advance()` 来完成初始化和主循环，这不受此约束限制。
+
+此约束适用于所有含 scheduler 的模块：L1（nvme、mock_nvme）和 L2（coord、front、tree、wal、value）。
+
 ---
 
 ## L0 — 基础定义

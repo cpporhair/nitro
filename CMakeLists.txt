@@ -89,6 +89,9 @@ add_executable(inconel_test_tree_lookup_multicore apps/inconel/test/test_tree_lo
 target_include_directories(inconel_test_tree_lookup_multicore PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_lookup_multicore PRIVATE pthread)
 
+add_executable(inconel_test_page_cache apps/inconel/test/test_page_cache.cc)
+target_include_directories(inconel_test_page_cache PRIVATE ${CMAKE_SOURCE_DIR})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

@@ -112,8 +112,9 @@ private:
 
 struct core_schedulers {
     scheduler nvme_sched;
-    lookup_scheduler tree_sched;
-    core_schedulers(mock_device* dev) : nvme_sched(dev) {}
+    lookup_scheduler<clock_cache> tree_sched;
+    core_schedulers(mock_device* dev)
+        : nvme_sched(dev), tree_sched(clock_cache(32)) {}
     void advance() { tree_sched.advance(); nvme_sched.advance(); }
 };
 

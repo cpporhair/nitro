@@ -5,9 +5,11 @@
 // Verifies: all hits, misses, mixed, single-key batch
 //
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -78,13 +80,14 @@ static void write_internal(mock_device& dev, uint64_t lba,
 struct test_env {
     mock_device dev;
     scheduler nvme_sched;
-    lookup_scheduler tree_sched;
+    lookup_scheduler<clock_cache> tree_sched;
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
     test_env()
         : dev(PS * 8192, LBS)
-        , nvme_sched(&dev) {
+        , nvme_sched(&dev)
+        , tree_sched(clock_cache(32)) {
         build();
     }
 
@@ -201,10 +204,115 @@ static void test_single_key(test_env& env) {
     printf("  single key: OK\n");
 }
 
+// ── Cache eviction regression ──
+//
+// Tree has 13 unique pages (1 root + 4 internal + 8 leaves). With cache
+// capacity = 4, the cache cannot hold all pages, so traversal must evict
+// and re-read pages from NVMe. We verify:
+//   1. all 400 keys still resolve to the correct value (functional correctness
+//      after eviction)
+//   2. NVMe read count is significantly larger than 13 — confirming that
+//      pages were evicted and re-read, not just loaded once
+//   3. Clock policy specifically: the root page is hit on every traversal,
+//      so it should never be evicted; non-root reads dominate the count.
+
+template <typename Cache>
+static void test_cache_eviction(Cache cache, const char* label) {
+    // Build a fresh tree env (isolated from other tests' global env).
+    mock_device dev(PS * 8192, LBS);
+    scheduler nvme_sched(&dev);
+    lookup_scheduler<Cache> tree_sched(std::move(cache));
+    tree_manifest manifest;
+    std::vector<std::pair<std::string, uint64_t>> all_records;
+
+    struct leaf_spec { uint64_t lba; const char* prefix; uint64_t ver_base; };
+    leaf_spec leaves[] = {
+        {3000, "a", 100}, {3004, "c", 200},
+        {3012, "e", 300}, {3016, "g", 400},
+        {3020, "j", 500}, {3024, "m", 600},
+        {3028, "p", 700}, {3032, "s", 800},
+    };
+    for (auto& [lba, prefix, ver_base] : leaves) {
+        std::vector<std::pair<std::string, uint64_t>> records;
+        for (int i = 1; i <= 50; ++i) {
+            auto key = make_key(prefix, i);
+            uint64_t ver = ver_base + i;
+            records.emplace_back(key, ver);
+            all_records.emplace_back(key, ver);
+        }
+        write_leaf(dev, lba, records);
+    }
+    write_internal(dev, 2000, {{"c", {0, 3000}}}, {0, 3004});
+    write_internal(dev, 2004, {{"g", {0, 3012}}}, {0, 3016});
+    write_internal(dev, 2008, {{"m", {0, 3020}}}, {0, 3024});
+    write_internal(dev, 2012, {{"s", {0, 3028}}}, {0, 3032});
+    write_internal(dev, 1000,
+        {{"e", {0, 2000}}, {"j", {0, 2004}}, {"p", {0, 2008}}}, {0, 2012});
+
+    manifest.tree_page_size = PS;
+    manifest.lba_size = LBS;
+    manifest.root_slot = {0, 1000};
+    for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
+                          3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
+        manifest.slot_map[{0, lba}] = 0;
+
+    // Shuffle the access order so consecutive lookups touch DIFFERENT leaves —
+    // this is what actually forces eviction with a small cache. Without
+    // shuffling, the natural batch-by-leaf order keeps the same 3 pages hot
+    // and never triggers eviction.
+    std::vector<size_t> order(all_records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::mt19937 rng(0xBEEF);
+    std::shuffle(order.begin(), order.end(), rng);
+
+    // Reset counter — only count reads from the lookup phase, not the writes
+    // we just did to set up the tree.
+    dev.reset_io_counters();
+
+    // Run lookups one key at a time, with the small cache forcing eviction
+    // between independent lookups.
+    int correct = 0;
+    for (size_t idx : order) {
+        auto& [key, expected_ver] = all_records[idx];
+        auto ctx = pump::core::make_root_context();
+        std::vector<lookup_result> out;
+        bool done = false;
+        std::vector<std::string_view> single = { key };
+        pump::sender::just()
+            >> lookup(&tree_sched, &nvme_sched, single, &manifest)
+            >> pump::sender::then([&](std::vector<lookup_result>&& r) {
+                out = std::move(r); done = true;
+            })
+            >> pump::sender::submit(ctx);
+        for (int i = 0; i < 200 && !done; ++i) {
+            tree_sched.advance();
+            nvme_sched.advance();
+        }
+        assert(done);
+        assert(std::holds_alternative<lookup_value>(out[0]));
+        if (std::get<lookup_value>(out[0]).data_ver == expected_ver)
+            correct++;
+    }
+
+    uint64_t total_unique_pages = 13;
+    uint64_t reads = dev.get_read_count();
+
+    assert(correct == static_cast<int>(all_records.size()));
+    // With only 4 cache slots holding 13 unique pages, lookups must trigger
+    // many re-reads. Each lookup that misses needs at least 1 NVMe read for
+    // the leaf (root and intermediate may stay in cache thanks to clock).
+    // Reads must be much greater than the unique page count.
+    assert(reads > total_unique_pages * 5);
+
+    printf("  [%s] eviction stress: %d/%zu correct, %lu NVMe reads "
+           "(13 unique pages, cache cap=4)\n",
+           label, correct, all_records.size(), (unsigned long)reads);
+}
+
 static void test_empty_tree() {
     mock_device dev(PS * 1024, LBS);
     scheduler ns(&dev);
-    lookup_scheduler ts;
+    lookup_scheduler<clock_cache> ts(clock_cache(8));
     auto m = tree_manifest::empty(PS, LBS);
 
     auto ctx = pump::core::make_root_context();
@@ -231,6 +339,8 @@ int main() {
     test_mixed_hit_miss(env);
     test_single_key(env);
     test_empty_tree();
+    test_cache_eviction(clock_cache(4), "clock");
+    test_cache_eviction(slru_cache(4),  "slru ");
     printf("all passed\n");
     return 0;
 }

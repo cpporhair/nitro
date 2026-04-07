@@ -1,6 +1,7 @@
 #ifndef APPS_INCONEL_MOCK_NVME_DEVICE_HH
 #define APPS_INCONEL_MOCK_NVME_DEVICE_HH
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -15,6 +16,8 @@ namespace apps::inconel::mock_nvme {
         uint64_t total_lbas;
         std::vector<bool> trimmed;
         std::mutex* shared_mtx = nullptr;  // optional, for multi-threaded testing
+        std::atomic<uint64_t> read_count_{0};
+        std::atomic<uint64_t> write_count_{0};
 
         mock_device(uint64_t ns_size, uint32_t lba_sz)
             : namespace_size(ns_size)
@@ -61,11 +64,13 @@ namespace apps::inconel::mock_nvme {
             if (lba + num_lbas > total_lbas) return false;
             std::memcpy(storage + lba * lba_size, data, static_cast<uint64_t>(num_lbas) * lba_size);
             for (uint64_t i = lba; i < lba + num_lbas; ++i) trimmed[i] = false;
+            write_count_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         bool do_read_impl(uint64_t lba, void* buf, uint32_t num_lbas) {
             if (lba + num_lbas > total_lbas) return false;
             std::memcpy(buf, storage + lba * lba_size, static_cast<uint64_t>(num_lbas) * lba_size);
+            read_count_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         bool do_trim_impl(uint64_t lba, uint32_t num_lbas) {
@@ -101,6 +106,13 @@ namespace apps::inconel::mock_nvme {
         uint64_t get_total_lbas() const { return total_lbas; }
         uint32_t get_lba_size() const { return lba_size; }
         uint64_t get_namespace_size() const { return namespace_size; }
+
+        uint64_t get_read_count() const  { return read_count_.load(std::memory_order_relaxed); }
+        uint64_t get_write_count() const { return write_count_.load(std::memory_order_relaxed); }
+        void reset_io_counters() {
+            read_count_.store(0, std::memory_order_relaxed);
+            write_count_.store(0, std::memory_order_relaxed);
+        }
     };
 
 }

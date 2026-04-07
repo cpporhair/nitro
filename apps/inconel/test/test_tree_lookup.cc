@@ -6,7 +6,7 @@
 //
 
 #include <algorithm>
-#include <cassert>
+#include "apps/inconel/test/check.hh"
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -44,10 +44,10 @@ static void write_leaf(mock_device& dev, uint64_t lba,
     for (auto& [key, ver] : records) {
         value_ref vr = {.base = {0, ver}, .byte_offset = 0,
                         .len = static_cast<uint32_t>(ver), .flags = 0};
-        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); assert(ok);
+        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); CHECK(ok);
     }
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 static void write_internal(mock_device& dev, uint64_t lba,
@@ -57,11 +57,11 @@ static void write_internal(mock_device& dev, uint64_t lba,
     internal_page_builder b;
     b.init(page, PS);
     for (auto& [sep, child] : children) {
-        [[maybe_unused]] bool added = b.add_child(sep, child); assert(added);
+        [[maybe_unused]] bool added = b.add_child(sep, child); CHECK(added);
     }
     b.set_rightmost_child(rightmost);
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 // ── Test environment ──
@@ -158,7 +158,7 @@ do_lookup(test_env& env, std::vector<std::string_view> keys) {
         env.tree_sched.advance();
         env.nvme_sched.advance();
     }
-    assert(done);
+    CHECK(done);
     return out;
 }
 
@@ -170,14 +170,14 @@ static void test_all_existing_keys(test_env& env) {
         keys.push_back(k);
 
     auto results = do_lookup(env, keys);
-    assert(results.size() == env.all_records.size());
+    CHECK(results.size() == env.all_records.size());
 
     for (size_t i = 0; i < results.size(); ++i) {
         auto& [key, expected_ver] = env.all_records[i];
-        assert(std::holds_alternative<lookup_value>(results[i]));
+        CHECK(std::holds_alternative<lookup_value>(results[i]));
         auto& val = std::get<lookup_value>(results[i]);
-        assert(val.data_ver == expected_ver);
-        assert(val.vr.len == static_cast<uint32_t>(expected_ver));
+        CHECK(val.data_ver == expected_ver);
+        CHECK(val.vr.len == static_cast<uint32_t>(expected_ver));
     }
     printf("  all %zu existing keys: OK\n", results.size());
 }
@@ -188,7 +188,7 @@ static void test_missing_keys(test_env& env) {
     };
     auto results = do_lookup(env, keys);
     for (size_t i = 0; i < results.size(); ++i)
-        assert(std::holds_alternative<lookup_absent>(results[i]));
+        CHECK(std::holds_alternative<lookup_absent>(results[i]));
     printf("  %zu missing keys: OK\n", results.size());
 }
 
@@ -197,23 +197,23 @@ static void test_mixed_hit_miss(test_env& env) {
         "a001", "nope", "s050", "aaaa", "m025",
     };
     auto results = do_lookup(env, keys);
-    assert(results.size() == 5);
-    assert(std::holds_alternative<lookup_value>(results[0]));
-    assert(std::holds_alternative<lookup_absent>(results[1]));
-    assert(std::holds_alternative<lookup_value>(results[2]));
-    assert(std::holds_alternative<lookup_absent>(results[3]));
-    assert(std::holds_alternative<lookup_value>(results[4]));
-    assert(std::get<lookup_value>(results[0]).data_ver == 101);
-    assert(std::get<lookup_value>(results[2]).data_ver == 850);
-    assert(std::get<lookup_value>(results[4]).data_ver == 625);
+    CHECK(results.size() == 5);
+    CHECK(std::holds_alternative<lookup_value>(results[0]));
+    CHECK(std::holds_alternative<lookup_absent>(results[1]));
+    CHECK(std::holds_alternative<lookup_value>(results[2]));
+    CHECK(std::holds_alternative<lookup_absent>(results[3]));
+    CHECK(std::holds_alternative<lookup_value>(results[4]));
+    CHECK(std::get<lookup_value>(results[0]).data_ver == 101);
+    CHECK(std::get<lookup_value>(results[2]).data_ver == 850);
+    CHECK(std::get<lookup_value>(results[4]).data_ver == 625);
     printf("  mixed hit/miss: OK\n");
 }
 
 static void test_single_key(test_env& env) {
     auto results = do_lookup(env, {"g033"});
-    assert(results.size() == 1);
-    assert(std::holds_alternative<lookup_value>(results[0]));
-    assert(std::get<lookup_value>(results[0]).data_ver == 433);
+    CHECK(results.size() == 1);
+    CHECK(std::holds_alternative<lookup_value>(results[0]));
+    CHECK(std::get<lookup_value>(results[0]).data_ver == 433);
     printf("  single key: OK\n");
 }
 
@@ -309,8 +309,8 @@ static void test_cache_eviction(Cache cache, const char* label) {
             tree_sched.advance();
             nvme_sched.advance();
         }
-        assert(done);
-        assert(std::holds_alternative<lookup_value>(out[0]));
+        CHECK(done);
+        CHECK(std::holds_alternative<lookup_value>(out[0]));
         if (std::get<lookup_value>(out[0]).data_ver == expected_ver)
             correct++;
     }
@@ -318,12 +318,12 @@ static void test_cache_eviction(Cache cache, const char* label) {
     uint64_t total_unique_pages = 13;
     uint64_t reads = dev.get_read_count();
 
-    assert(correct == static_cast<int>(all_records.size()));
+    CHECK(correct == static_cast<int>(all_records.size()));
     // With only 4 cache slots holding 13 unique pages, lookups must trigger
     // many re-reads. Each lookup that misses needs at least 1 NVMe read for
     // the leaf (root and intermediate may stay in cache thanks to clock).
     // Reads must be much greater than the unique page count.
-    assert(reads > total_unique_pages * 5);
+    CHECK(reads > total_unique_pages * 5);
 
     printf("  [%s] eviction stress: %d/%zu correct, %lu NVMe reads "
            "(13 unique pages, cache cap=4)\n",
@@ -356,8 +356,8 @@ static void test_empty_tree() {
         })
         >> pump::sender::submit(ctx);
     for (int i = 0; i < 50 && !done; ++i) { ts.advance(); ns.advance(); }
-    assert(done && out.size() == 3);
-    for (auto& r : out) assert(std::holds_alternative<lookup_absent>(r));
+    CHECK(done && out.size() == 3);
+    for (auto& r : out) CHECK(std::holds_alternative<lookup_absent>(r));
     printf("  empty tree: OK\n");
 }
 

@@ -14,7 +14,7 @@
 //
 
 #include <atomic>
-#include <cassert>
+#include "apps/inconel/test/check.hh"
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -56,10 +56,10 @@ static void write_leaf(mock_device& dev, uint64_t lba,
     for (auto& [key, ver] : records) {
         value_ref vr = {.base = {0, ver}, .byte_offset = 0,
                         .len = static_cast<uint32_t>(ver), .flags = 0};
-        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); assert(ok);
+        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); CHECK(ok);
     }
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 static void write_internal(mock_device& dev, uint64_t lba,
@@ -68,10 +68,10 @@ static void write_internal(mock_device& dev, uint64_t lba,
     alignas(64) char page[PS];
     internal_page_builder b;
     b.init(page, PS);
-    for (auto& [sep, child] : children) { [[maybe_unused]] bool ok = b.add_child(sep, child); assert(ok); }
+    for (auto& [sep, child] : children) { [[maybe_unused]] bool ok = b.add_child(sep, child); CHECK(ok); }
     b.set_rightmost_child(rightmost);
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 struct tree_data {
@@ -131,26 +131,26 @@ static void test_registry_population(const char* label) {
     auto* rt = runtime::build_runtime<Cache>(opts);
 
     // 1. List counts match the number of populated cores.
-    assert(core::registry::nvme_count() == cores.size());
-    assert(core::registry::tree_lookup_count() == cores.size());
+    CHECK(core::registry::nvme_count() == cores.size());
+    CHECK(core::registry::tree_lookup_count() == cores.size());
 
     // 2. by_core is filled exactly for the listed cores, nullptr elsewhere.
     for (uint32_t c = 0; c < std::thread::hardware_concurrency(); ++c) {
         bool expected = std::find(cores.begin(), cores.end(), c) != cores.end();
         bool got_nvme = core::registry::nvme_for_core(c) != nullptr;
         bool got_tlookup = core::registry::tree_lookup_for_core(c) != nullptr;
-        assert(got_nvme == expected);
-        assert(got_tlookup == expected);
+        CHECK(got_nvme == expected);
+        CHECK(got_tlookup == expected);
     }
 
     // 3. PUMP runtime tuple has the same instances we registered.
     for (uint32_t c : cores) {
         auto* nvme_p = rt->template get_by_core<mock_nvme::scheduler>(c);
         auto* tlookup_p = rt->template get_by_core<lookup_scheduler<Cache>>(c);
-        assert(nvme_p == core::registry::nvme_for_core(c));
+        CHECK(nvme_p == core::registry::nvme_for_core(c));
         // tree_lookup is registered as base in the application registry,
         // but PUMP holds the full derived type. Compare via base upcast.
-        assert(static_cast<lookup_scheduler_base*>(tlookup_p) ==
+        CHECK(static_cast<lookup_scheduler_base*>(tlookup_p) ==
                core::registry::tree_lookup_for_core(c));
     }
 
@@ -177,7 +177,7 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     auto* rt = runtime::build_runtime<Cache>(opts);
 
     const uint32_t shards = core::registry::tree_lookup_count();
-    assert(shards == cores.size());
+    CHECK(shards == cores.size());
 
     // Spawn worker threads using PUMP's run() — each thread sets its own
     // this_core_id and drives the per-core advance loop. Stop them later by
@@ -230,10 +230,10 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     int ok = 0;
     for (size_t i = 0; i < N; ++i) {
         auto& [key, expected_ver] = td.all_records[i];
-        assert(std::holds_alternative<lookup_value>(results[i]));
+        CHECK(std::holds_alternative<lookup_value>(results[i]));
         if (std::get<lookup_value>(results[i]).data_ver == expected_ver) ok++;
     }
-    assert(ok == static_cast<int>(N));
+    CHECK(ok == static_cast<int>(N));
 
     runtime::destroy_runtime<Cache>(rt);
     printf("  [%s] e2e multi-core via runtime: %d/%zu OK\n", label, ok, N);

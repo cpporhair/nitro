@@ -5,7 +5,7 @@
 // behavior, hot-page protection, and SLRU scan resistance.
 //
 
-#include <cassert>
+#include "apps/inconel/test/check.hh"
 #include <cstdio>
 #include <vector>
 
@@ -30,43 +30,76 @@ static char* B(uint64_t i) { return &g_bufs[i]; }
 
 template <cache_concept Cache>
 static void test_basic(const char* label) {
-    Cache c(4);
+    // Capacity 20: leaves SLRU prob_cap = 20*0.2 = 4, enough to hold 4 fresh
+    // entries before any of them is promoted to protected. Both clock_cache
+    // and slru_cache use the same single-arg constructor, so the test stays
+    // template-uniform without needing per-cache helpers.
+    Cache c(20);
 
-    assert(!c.contains(P(1)));
-    assert(c.get(P(1)) == nullptr);
-    assert(c.size() == 0);
+    CHECK(!c.contains(P(1)));
+    CHECK(c.get(P(1)) == nullptr);
+    CHECK(c.size() == 0);
 
     auto e = c.put(P(1), B(1));
-    assert(!e.has_value());
-    assert(c.size() == 1);
-    assert(c.contains(P(1)));
-    assert(c.get(P(1)) == B(1));
+    CHECK(!e.has_value());
+    CHECK(c.size() == 1);
+    CHECK(c.contains(P(1)));
+    CHECK(c.get(P(1)) == B(1));
 
+    // For SLRU, the get() above promotes P1 to protected. P2..P4 then go to
+    // probation; with prob_cap=4 there is exactly enough room for the three
+    // fresh entries, so total size = 1 (protected) + 3 (probation) = 4.
     c.put(P(2), B(2));
     c.put(P(3), B(3));
     c.put(P(4), B(4));
-    assert(c.size() == 4);
-    assert(c.get(P(2)) == B(2));
-    assert(c.get(P(3)) == B(3));
-    assert(c.get(P(4)) == B(4));
+    CHECK(c.size() == 4);
+    CHECK(c.get(P(2)) == B(2));
+    CHECK(c.get(P(3)) == B(3));
+    CHECK(c.get(P(4)) == B(4));
 
     printf("  [%s] basic: OK\n", label);
 }
 
-template <cache_concept Cache>
-static void test_capacity_eviction(const char* label) {
-    Cache c(3);
+// Capacity eviction tests are split per cache type because LRU (clock) and
+// SLRU have fundamentally different "what counts as full" semantics:
+//
+//   clock(N): fills all N slots equally; (N+1)-th fresh put evicts the
+//             clock victim.
+//   slru(N) :  fresh entries only enter probation, whose capacity is roughly
+//             20% of N. The (prob_cap + 1)-th fresh put evicts probation tail.
+//
+// A single template can't capture both correctly without per-cache constants.
+
+static void test_clock_capacity_eviction() {
+    clock_cache c(3);
     c.put(P(1), B(1));
     c.put(P(2), B(2));
     c.put(P(3), B(3));
-    assert(c.size() == 3);
+    CHECK(c.size() == 3);
 
     auto e = c.put(P(4), B(4));
-    assert(e.has_value());
-    assert(c.size() == 3);
-    assert(c.contains(P(4)));
+    CHECK(e.has_value());
+    CHECK(c.size() == 3);
+    CHECK(c.contains(P(4)));
 
-    printf("  [%s] capacity eviction: OK\n", label);
+    printf("  [clock] capacity eviction: OK\n");
+}
+
+static void test_slru_capacity_eviction() {
+    // capacity 10 → prot_cap=8, prob_cap=2.
+    // Two fresh puts fill probation; the third evicts probation tail.
+    slru_cache c(10);
+    c.put(P(1), B(1));
+    c.put(P(2), B(2));
+    CHECK(c.size() == 2);
+
+    auto e = c.put(P(3), B(3));
+    CHECK(e.has_value());
+    CHECK(c.size() == 2);            // prob still saturated
+    CHECK(c.contains(P(3)));         // newest entry stays
+    CHECK(!c.contains(P(1)));        // oldest probation entry evicted
+
+    printf("  [slru ] capacity eviction: OK\n");
 }
 
 template <cache_concept Cache>
@@ -74,21 +107,32 @@ static void test_update_existing(const char* label) {
     Cache c(3);
     c.put(P(1), B(1));
     auto e = c.put(P(1), B(11));   // update — no eviction
-    assert(!e.has_value());
-    assert(c.size() == 1);
-    assert(c.get(P(1)) == B(11));
+    CHECK(!e.has_value());
+    CHECK(c.size() == 1);
+    CHECK(c.get(P(1)) == B(11));
     printf("  [%s] update existing: OK\n", label);
 }
 
-template <cache_concept Cache>
-static void test_eviction_returns_buf(const char* label) {
-    Cache c(2);
+static void test_clock_eviction_returns_buf() {
+    clock_cache c(2);
     c.put(P(1), B(1));
     c.put(P(2), B(2));
     auto e = c.put(P(3), B(3));
-    assert(e.has_value());
-    assert(e->buf == B(1) || e->buf == B(2));
-    printf("  [%s] eviction returns buf: OK\n", label);
+    CHECK(e.has_value());
+    CHECK(e->buf == B(1) || e->buf == B(2));
+    printf("  [clock] eviction returns buf: OK\n");
+}
+
+static void test_slru_eviction_returns_buf() {
+    // capacity 10 → prot_cap=8, prob_cap=2.
+    // Probation evicts in LRU order, so the third fresh put returns P1's buf.
+    slru_cache c(10);
+    c.put(P(1), B(1));
+    c.put(P(2), B(2));
+    auto e = c.put(P(3), B(3));
+    CHECK(e.has_value());
+    CHECK(e->buf == B(1));
+    printf("  [slru ] eviction returns buf: OK\n");
 }
 
 // ── Clock-specific: hot page survives sweeps ──
@@ -104,8 +148,8 @@ static void test_clock_hot_page() {
         c.put(P(100 + round), B(100 + round));  // cold insert
     }
 
-    assert(c.contains(P(1)));
-    assert(c.get(P(1)) == B(1));
+    CHECK(c.contains(P(1)));
+    CHECK(c.get(P(1)) == B(1));
     printf("  [clock] hot page survives sweeps: OK\n");
 }
 
@@ -122,8 +166,8 @@ static void test_slru_promotion() {
     // Scan to evict probation entries
     for (int i = 0; i < 50; ++i) c.put(P(1000 + i), B(1000 + i));
 
-    assert(!c.contains(P(1)));   // probation-only → evicted
-    assert(c.contains(P(2)));    // promoted → still present
+    CHECK(!c.contains(P(1)));   // probation-only → evicted
+    CHECK(c.contains(P(2)));    // promoted → still present
 
     printf("  [slru] promotion to protected: OK\n");
 }
@@ -147,9 +191,9 @@ static void test_slru_scan_resistance() {
         if (e.has_value() && e->key.lba < 8) evicted_hot++;
     }
 
-    assert(evicted_hot == 0);
+    CHECK(evicted_hot == 0);
     for (int i = 0; i < 8; ++i)
-        assert(c.contains(P(i)));
+        CHECK(c.contains(P(i)));
 
     printf("  [slru] scan resistance (0 hot pages evicted by 100 scans): OK\n");
 }
@@ -157,15 +201,19 @@ static void test_slru_scan_resistance() {
 int main() {
     printf("page cache tests:\n");
 
+    // ── Generic interface tests (both cache types) ──
     test_basic<clock_cache>("clock");
     test_basic<slru_cache>("slru ");
-    test_capacity_eviction<clock_cache>("clock");
-    test_capacity_eviction<slru_cache>("slru ");
     test_update_existing<clock_cache>("clock");
     test_update_existing<slru_cache>("slru ");
-    test_eviction_returns_buf<clock_cache>("clock");
-    test_eviction_returns_buf<slru_cache>("slru ");
 
+    // ── Capacity-eviction tests (per-cache because LRU/SLRU differ) ──
+    test_clock_capacity_eviction();
+    test_slru_capacity_eviction();
+    test_clock_eviction_returns_buf();
+    test_slru_eviction_returns_buf();
+
+    // ── Algorithm-specific behavior tests ──
     test_clock_hot_page();
     test_slru_promotion();
     test_slru_scan_resistance();

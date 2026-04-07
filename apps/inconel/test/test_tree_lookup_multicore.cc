@@ -10,7 +10,7 @@
 // interleaving on cores 2 and 4.
 //
 
-#include <cassert>
+#include "apps/inconel/test/check.hh"
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -51,10 +51,10 @@ static void write_leaf(mock_device& dev, uint64_t lba,
     for (auto& [key, ver] : records) {
         value_ref vr = {.base = {0, ver}, .byte_offset = 0,
                         .len = static_cast<uint32_t>(ver), .flags = 0};
-        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); assert(ok);
+        [[maybe_unused]] bool ok = b.add_value(key, ver, vr); CHECK(ok);
     }
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 static void write_internal(mock_device& dev, uint64_t lba,
@@ -63,10 +63,10 @@ static void write_internal(mock_device& dev, uint64_t lba,
     alignas(64) char page[PS];
     internal_page_builder b;
     b.init(page, PS);
-    for (auto& [sep, child] : children) { [[maybe_unused]] bool ok = b.add_child(sep, child); assert(ok); }
+    for (auto& [sep, child] : children) { [[maybe_unused]] bool ok = b.add_child(sep, child); CHECK(ok); }
     b.set_rightmost_child(rightmost);
     b.finalize();
-    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); assert(wrote);
+    [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
 struct tree_data {
@@ -200,10 +200,10 @@ int main() {
     int hits = 0, misses = 0;
     for (size_t i = 0; i < N; ++i) {
         auto& [key, expected_ver] = td.all_records[i];
-        assert(std::holds_alternative<lookup_value>(results[i]));
+        CHECK(std::holds_alternative<lookup_value>(results[i]));
         auto& v = std::get<lookup_value>(results[i]);
-        assert(v.data_ver == expected_ver);
-        assert(v.vr.len == static_cast<uint32_t>(expected_ver));
+        CHECK(v.data_ver == expected_ver);
+        CHECK(v.vr.len == static_cast<uint32_t>(expected_ver));
         hits++;
     }
     printf("  verified: %d hits, all correct\n", hits);
@@ -250,7 +250,7 @@ int main() {
         t4b.join();
 
         for (int i = 0; i < M; ++i)
-            assert(std::holds_alternative<lookup_absent>(miss_results[i]));
+            CHECK(std::holds_alternative<lookup_absent>(miss_results[i]));
         printf("  verified: %d concurrent misses, all absent\n", M);
     }
 

@@ -62,7 +62,6 @@ namespace apps::inconel::tree {
 
     // ── Forward declare scheduler ──
 
-    template<typename nvme_sched_t>
     struct lookup_scheduler;
 
     // ── process sender (lookup request) ──
@@ -75,31 +74,21 @@ namespace apps::inconel::tree {
             req* next = nullptr;  // intrusive waiter list
         };
 
-        template<typename sched_t>
         struct op {
             constexpr static bool tree_lookup_op = true;
-            sched_t* sched;
+            lookup_scheduler* sched;
             lookup_state* state;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
-            void start(ctx_t& ctx, scope_t& scope) {
-                sched->schedule_lookup(new req{
-                    state,
-                    [ctx = ctx, scope = scope](batch_decision&& d) mutable {
-                        pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                            ctx, scope, std::move(d));
-                    }
-                });
-            }
+            void start(ctx_t& ctx, scope_t& scope);
         };
 
-        template<typename sched_t>
         struct sender {
-            sched_t* sched;
+            lookup_scheduler* sched;
             lookup_state* state;
 
             auto make_op() {
-                return op<sched_t>{.sched = sched, .state = state};
+                return op{.sched = sched, .state = state};
             }
 
             template<typename ctx_t>
@@ -118,31 +107,21 @@ namespace apps::inconel::tree {
             std::move_only_function<void(bool)> cb;
         };
 
-        template<typename sched_t>
         struct op {
             constexpr static bool cache_pages_op = true;
-            sched_t* sched;
+            lookup_scheduler* sched;
             std::vector<std::pair<paddr, char*>> page_map;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
-            void start(ctx_t& ctx, scope_t& scope) {
-                sched->schedule_cache(new req{
-                    std::move(page_map),
-                    [ctx = ctx, scope = scope](bool ok) mutable {
-                        pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                            ctx, scope, ok);
-                    }
-                });
-            }
+            void start(ctx_t& ctx, scope_t& scope);
         };
 
-        template<typename sched_t>
         struct sender {
-            sched_t* sched;
+            lookup_scheduler* sched;
             std::vector<std::pair<paddr, char*>> page_map;
 
             auto make_op() {
-                return op<sched_t>{.sched = sched, .page_map = std::move(page_map)};
+                return op{.sched = sched, .page_map = std::move(page_map)};
             }
 
             template<typename ctx_t>
@@ -154,9 +133,7 @@ namespace apps::inconel::tree {
 
     // ── Scheduler ──
 
-    template<typename nvme_sched_t>
     struct lookup_scheduler {
-        nvme_sched_t* nvme;
         pump::core::per_core::queue<_tree_lookup::req*> lookup_queue_;
         pump::core::per_core::queue<_cache_pages::req*> cache_queue_;
 
@@ -166,8 +143,8 @@ namespace apps::inconel::tree {
         _tree_lookup::req* waiters_head_ = nullptr;             // intrusive waiter list
 
         explicit
-        lookup_scheduler(nvme_sched_t* nvme_s, size_t depth = 2048)
-            : nvme(nvme_s), lookup_queue_(depth), cache_queue_(depth) {}
+        lookup_scheduler(size_t depth = 2048)
+            : lookup_queue_(depth), cache_queue_(depth) {}
 
         void schedule_lookup(_tree_lookup::req* r) { lookup_queue_.try_enqueue(r); }
         void schedule_cache(_cache_pages::req* r) { cache_queue_.try_enqueue(r); }
@@ -214,11 +191,11 @@ namespace apps::inconel::tree {
         bool advance(runtime_t&) { return advance(); }
 
         auto process(lookup_state& state) {
-            return _tree_lookup::sender<lookup_scheduler>{this, &state};
+            return _tree_lookup::sender{this, &state};
         }
 
         auto submit_cache(std::vector<std::pair<paddr, char*>> page_map) {
-            return _cache_pages::sender<lookup_scheduler>{this, std::move(page_map)};
+            return _cache_pages::sender{this, std::move(page_map)};
         }
 
     private:
@@ -314,6 +291,30 @@ namespace apps::inconel::tree {
             }
         }
     };
+
+    // ── Deferred op::start() definitions (need complete lookup_scheduler) ──
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _tree_lookup::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_lookup(new _tree_lookup::req{
+            state,
+            [ctx = ctx, scope = scope](batch_decision&& d) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(d));
+            }
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _cache_pages::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_cache(new _cache_pages::req{
+            std::move(page_map),
+            [ctx = ctx, scope = scope](bool ok) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, ok);
+            }
+        });
+    }
 }
 
 // ── PUMP specializations ──
@@ -332,9 +333,9 @@ namespace pump::core {
         }
     };
 
-    template<typename ctx_t, typename sched_t>
+    template<typename ctx_t>
     struct
-    compute_sender_type<ctx_t, apps::inconel::tree::_tree_lookup::sender<sched_t>> {
+    compute_sender_type<ctx_t, apps::inconel::tree::_tree_lookup::sender> {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
             return std::type_identity<apps::inconel::tree::batch_decision>{};
@@ -353,9 +354,9 @@ namespace pump::core {
         }
     };
 
-    template<typename ctx_t, typename sched_t>
+    template<typename ctx_t>
     struct
-    compute_sender_type<ctx_t, apps::inconel::tree::_cache_pages::sender<sched_t>> {
+    compute_sender_type<ctx_t, apps::inconel::tree::_cache_pages::sender> {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
             return std::type_identity<bool>{};

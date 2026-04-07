@@ -78,14 +78,13 @@ static void write_internal(mock_device& dev, uint64_t lba,
 struct test_env {
     mock_device dev;
     scheduler nvme_sched;
-    lookup_scheduler<scheduler> tree_sched;
+    lookup_scheduler tree_sched;
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
     test_env()
         : dev(PS * 8192, LBS)
-        , nvme_sched(&dev)
-        , tree_sched(&nvme_sched) {
+        , nvme_sched(&dev) {
         build();
     }
 
@@ -205,7 +204,7 @@ static void test_single_key(test_env& env) {
 static void test_empty_tree() {
     mock_device dev(PS * 1024, LBS);
     scheduler ns(&dev);
-    lookup_scheduler ts(&ns);
+    lookup_scheduler ts;
     auto m = tree_manifest::empty(PS, LBS);
 
     auto ctx = pump::core::make_root_context();

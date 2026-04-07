@@ -27,7 +27,7 @@ namespace apps::inconel::tree {
 
     template<typename nvme_sched_t>
     inline auto
-    on_decision_need_read(nvme_sched_t* nvme_sched, lookup_scheduler<nvme_sched_t>* tree_sched, decision_need_read&& dec) {
+    on_decision_need_read(nvme_sched_t* nvme_sched, lookup_scheduler* tree_sched, decision_need_read&& dec) {
         auto n = dec.read_descs.size();
         return just()
             >> with_context(__fwd__(dec))([nvme_sched, tree_sched, n]() {
@@ -47,7 +47,7 @@ namespace apps::inconel::tree {
 
     template<typename nvme_sched_t, typename key_range_t>
     inline auto
-    lookup(lookup_scheduler<nvme_sched_t>* tree_sched,
+    lookup(lookup_scheduler* tree_sched,
            nvme_sched_t* nvme,
            key_range_t&& keys,
            const core::tree_manifest* manifest) {

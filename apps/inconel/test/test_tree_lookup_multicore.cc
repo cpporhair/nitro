@@ -112,8 +112,8 @@ private:
 
 struct core_schedulers {
     scheduler nvme_sched;
-    lookup_scheduler<scheduler> tree_sched;
-    core_schedulers(mock_device* dev) : nvme_sched(dev), tree_sched(&nvme_sched) {}
+    lookup_scheduler tree_sched;
+    core_schedulers(mock_device* dev) : nvme_sched(dev) {}
     void advance() { tree_sched.advance(); nvme_sched.advance(); }
 };
 

@@ -10,8 +10,10 @@
 
 #include "../core/page_cache.hh"
 #include "../core/registry.hh"
+#include "../format/types.hh"
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"
+#include "../value/scheduler.hh"
 
 namespace apps::inconel::runtime {
 
@@ -28,7 +30,8 @@ namespace apps::inconel::runtime {
     template <core::cache_concept Cache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
-        tree::lookup_scheduler<Cache>
+        tree::lookup_scheduler<Cache>,
+        value::scheduler
     >;
 
     // ── Build context ──
@@ -39,9 +42,20 @@ namespace apps::inconel::runtime {
     // for it will land when more schedulers exist.
 
     struct build_options {
-        std::span<const uint32_t> cores;     // which cores to populate
-        mock_nvme::mock_device*   device;    // nvme backing device
+        std::span<const uint32_t> cores;             // which cores to populate
+        mock_nvme::mock_device*   device;            // nvme backing device
         uint32_t                  cache_capacity = 32;
+
+        // value scheduler configuration. The class sizes must be sorted
+        // ascending and each must satisfy the value_object alignment rules
+        // (lba_size divisible by class_size for sub-LBA, or class_size
+        // divisible by lba_size for LBA-aligned / multi-LBA). The value
+        // scheduler is pinned to cores[0] and bumps from data_area_end
+        // downward toward data_area_base.
+        std::span<const uint32_t> value_class_sizes;
+        uint32_t                  lba_size = 4096;
+        format::paddr             value_data_area_base = {0, 0};
+        format::paddr             value_data_area_end  = {0, 0};
     };
 
     // ── build_runtime: construct schedulers + double-register ──
@@ -65,6 +79,7 @@ namespace apps::inconel::runtime {
 
         auto* rt = new inconel_runtime_t<Cache>();
 
+        bool first = true;
         for (uint32_t core : opts.cores) {
             // PUMP per_core::queue routes by this_core_id, so it must be set
             // before constructing schedulers that hold such queues.
@@ -73,14 +88,30 @@ namespace apps::inconel::runtime {
             auto* nvme = new mock_nvme::scheduler(opts.device);
             auto* tlookup = new tree::lookup_scheduler<Cache>(Cache(opts.cache_capacity));
 
+            // value::scheduler is a singleton, pinned to cores[0]. Other
+            // cores get a nullptr placeholder so the PUMP per-core tuple
+            // shape stays uniform — share_nothing's advance loop skips
+            // nullptr slots automatically.
+            value::scheduler* value_sched = nullptr;
+            if (first && !opts.value_class_sizes.empty()) {
+                value_sched = new value::scheduler(
+                    opts.value_class_sizes,
+                    opts.lba_size,
+                    opts.value_data_area_base,
+                    opts.value_data_area_end);
+                core::registry::value_alloc_sched = value_sched;
+            }
+
             // PUMP runtime (typed)
-            rt->add_core_schedulers(core, nvme, tlookup);
+            rt->add_core_schedulers(core, nvme, tlookup, value_sched);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme);
             core::registry::nvme_scheds.by_core[core] = nvme;
             core::registry::tree_lookup_scheds.list.push_back(tlookup);
             core::registry::tree_lookup_scheds.by_core[core] = tlookup;
+
+            first = false;
         }
 
         return rt;
@@ -94,6 +125,9 @@ namespace apps::inconel::runtime {
         for (auto* s : core::registry::nvme_scheds.list)         delete s;
         for (auto* s : core::registry::tree_lookup_scheds.list) {
             delete static_cast<tree::lookup_scheduler<Cache>*>(s);
+        }
+        if (core::registry::value_alloc_sched) {
+            delete core::registry::value_alloc_sched;
         }
         core::registry::clear();
         delete rt;

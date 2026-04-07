@@ -1,0 +1,481 @@
+//
+// value scheduler regression test
+//
+// Step 6 verification. Six cases:
+//
+//   case_1_write_path        sender writes a batch of mixed-class values,
+//                            verifies on-device bytes via test_read_raw
+//   case_2_read_miss         test_write_raw seeds a value page; sender
+//                            read_value pulls it via NVMe; check counter
+//                            advanced
+//   case_3_cache_hit         second read of same vr — counter unchanged
+//   case_4_write_then_read   sender write then immediately read same vr —
+//                            should hit open_pages_ / readonly_cache_
+//   case_5_sub_lba_same_page two sub-LBA values of the same class share a
+//                            page (vr.base equal, byte_offset different)
+//   case_6_cross_class       multiple classes including multi-LBA — each
+//                            writes to its own page
+//
+// Sync model: shared_ptr<atomic<int>> counter + sleep_for + check.
+// Stage-only test; will be replaced with promise/future once the writeback
+// pipeline lands and we can drive things end-to-end synchronously.
+//
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "apps/inconel/test/check.hh"
+
+#include "env/runtime/share_nothing.hh"
+#include "pump/sender/just.hh"
+#include "pump/sender/then.hh"
+#include "pump/sender/submit.hh"
+
+#include "apps/inconel/core/registry.hh"
+#include "apps/inconel/format/value_object.hh"
+#include "apps/inconel/runtime/builder.hh"
+#include "apps/inconel/value/sender.hh"
+
+using namespace apps::inconel;
+using apps::inconel::format::paddr;
+using apps::inconel::format::value_ref;
+using apps::inconel::format::value_object_header;
+using apps::inconel::format::VALUE_MAGIC;
+
+namespace {
+
+constexpr uint32_t LBA_SIZE = 4096;
+constexpr uint64_t TOTAL_LBAS = 8192;          // 32 MiB device
+constexpr uint64_t DATA_AREA_BASE_LBA = 4000;  // value Data Area lower bound
+constexpr uint64_t DATA_AREA_END_LBA  = 8000;  // bumps from here downward
+constexpr uint64_t SEED_AREA_LBA = 1000;       // test_write_raw seed area
+
+const std::vector<uint32_t> CLASS_SIZES = {
+    64,     // class 0: sub-LBA, 64 slots/LBA, body <= 52
+    256,    // class 1: sub-LBA, 16 slots/LBA, body <= 244
+    1024,   // class 2: sub-LBA, 4 slots/LBA,  body <= 1012
+    4096,   // class 3: LBA-equal, 1 slot,     body <= 4084
+    16384,  // class 4: multi-LBA, span=4,     body <= 16372
+};
+
+// ── Helpers ──
+
+std::string make_body(const char* tag, size_t len) {
+    std::string s;
+    s.reserve(len);
+    for (size_t i = 0; i < len; ++i)
+        s.push_back(tag[i % std::strlen(tag)]);
+    return s;
+}
+
+void wait_for(std::shared_ptr<std::atomic<int>> counter, int target) {
+    using namespace std::chrono_literals;
+    for (int i = 0; i < 200 && counter->load() < target; ++i)
+        std::this_thread::sleep_for(10ms);
+    CHECK(counter->load() >= target && "sender pipeline did not complete in time");
+}
+
+// Decode an on-device page slot at (lba, byte_offset) into the body bytes,
+// using mock_device.test_read_raw. Used by case_1 to verify the writer
+// actually placed the right bytes on NVMe.
+std::string decode_on_device(mock_nvme::mock_device& dev, value_ref vr) {
+    // Determine span_lbas via class size
+    size_t span_lbas = 1;
+    for (uint32_t cs : CLASS_SIZES) {
+        if (sizeof(value_object_header) + vr.len <= cs) {
+            span_lbas = (cs >= LBA_SIZE) ? cs / LBA_SIZE : 1;
+            break;
+        }
+    }
+    const char* page = static_cast<const char*>(
+        dev.test_read_raw(vr.base.lba, static_cast<uint32_t>(span_lbas)));
+    if (!page) return std::string{};
+
+    std::span<const char> slot(page + vr.byte_offset,
+                               span_lbas * LBA_SIZE - vr.byte_offset);
+    auto d = format::decode_value_object(slot, vr.len);
+    if (!d.ok()) return std::string{};
+    return std::string(d.body.data(), d.body.size());
+}
+
+// Build a 1-LBA page image with N sub-LBA value objects of class_size.
+// Used by case_2 to seed the device directly with mock_device.test_write_raw.
+void build_subLba_page_image(std::vector<char>& page,
+                              uint32_t class_size,
+                              const std::vector<std::string>& bodies) {
+    page.assign(LBA_SIZE, char{0});
+    uint32_t slots = LBA_SIZE / class_size;
+    CHECK(bodies.size() <= slots);
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        std::span<char> slot(page.data() + i * class_size, class_size);
+        std::span<const char> body(bodies[i].data(), bodies[i].size());
+        bool ok = format::encode_value_object(slot, body);
+        CHECK(ok);
+    }
+}
+
+// ── Test environment ──
+
+struct test_env {
+    mock_nvme::mock_device                                       dev;
+    runtime::inconel_runtime_t<core::clock_cache>*               rt = nullptr;
+    std::vector<std::jthread>                                    workers;
+    std::vector<uint32_t>                                        cores;
+
+    test_env() : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE) {
+        cores = {2, 4, 6};
+        runtime::build_options opts{
+            .cores                = cores,
+            .device               = &dev,
+            .cache_capacity       = 32,
+            .value_class_sizes    = CLASS_SIZES,
+            .lba_size             = LBA_SIZE,
+            .value_data_area_base = paddr{0, DATA_AREA_BASE_LBA},
+            .value_data_area_end  = paddr{0, DATA_AREA_END_LBA},
+        };
+        rt = runtime::build_runtime<core::clock_cache>(opts);
+
+        for (uint32_t core : cores) {
+            workers.emplace_back([this, core]() {
+                pump::env::runtime::run(rt, core, [](auto*, uint32_t){});
+            });
+        }
+
+        // Submitter thread (this thread) needs a non-conflicting this_core_id
+        // so per_core::queue routes its enqueues into a free SPSC bucket.
+        pump::core::this_core_id = 0;
+    }
+
+    ~test_env() {
+        for (uint32_t core : cores)
+            rt->is_running_by_core[core].store(false);
+        workers.clear();   // jthread joins on dtor
+        runtime::destroy_runtime<core::clock_cache>(rt);
+    }
+};
+
+// ════════════════════════════════════════════════════════════════
+//  case_1: write path — sender writes, verify on-device bytes
+// ════════════════════════════════════════════════════════════════
+
+void case_1_write_path() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    // Mix of classes: sub-LBA (class 1, 200B body), LBA-equal (class 3, 4000B),
+    // multi-LBA (class 4, 16000B), sub-LBA tiny (class 0, 40B).
+    std::string b1 = make_body("alpha", 200);
+    std::string b2 = make_body("beta",  4000);
+    std::string b3 = make_body("gamma", 16000);
+    std::string b4 = make_body("delta", 40);
+
+    value_ref vr1{}, vr2{}, vr3{}, vr4{};
+    std::vector<value::put_entry> entries = {
+        {.body = b1, .out_vr = &vr1},
+        {.body = b2, .out_vr = &vr2},
+        {.body = b3, .out_vr = &vr3},
+        {.body = b4, .out_vr = &vr4},
+    };
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+
+    value::persist_values(sched, std::span<value::put_entry>(entries))
+        >> pump::sender::then([counter](bool ok) {
+            CHECK(ok);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+
+    wait_for(counter, 1);
+
+    // Verify on-device bytes via test_read_raw + decode.
+    auto decoded1 = decode_on_device(env.dev, vr1);
+    auto decoded2 = decode_on_device(env.dev, vr2);
+    auto decoded3 = decode_on_device(env.dev, vr3);
+    auto decoded4 = decode_on_device(env.dev, vr4);
+    CHECK(decoded1 == b1);
+    CHECK(decoded2 == b2);
+    CHECK(decoded3 == b3);
+    CHECK(decoded4 == b4);
+
+    printf("  case_1_write_path: OK (4 values, mixed class)\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_2: read miss — seed device, sender reads via NVMe
+// ════════════════════════════════════════════════════════════════
+
+void case_2_read_miss() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    // Seed two sub-LBA class-1 values into a known LBA.
+    std::string b1 = make_body("xyz", 200);
+    std::string b2 = make_body("uvw", 100);
+    std::vector<char> page;
+    build_subLba_page_image(page, /*class_size*/ 256, {b1, b2});
+
+    void* dst = env.dev.test_write_raw(SEED_AREA_LBA);
+    std::memcpy(dst, page.data(), LBA_SIZE);
+
+    value_ref vr1{
+        .base = paddr{0, SEED_AREA_LBA}, .byte_offset = 0,
+        .len = static_cast<uint32_t>(b1.size()), .flags = 0
+    };
+    value_ref vr2{
+        .base = paddr{0, SEED_AREA_LBA}, .byte_offset = 256,  // slot 1
+        .len = static_cast<uint32_t>(b2.size()), .flags = 0
+    };
+
+    env.dev.reset_io_counters();
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+    std::string got1, got2;
+
+    value::read_value(sched, vr1)
+        >> pump::sender::then([&got1, counter](std::string s) {
+            got1 = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+
+    value::read_value(sched, vr2)
+        >> pump::sender::then([&got2, counter](std::string s) {
+            got2 = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+
+    wait_for(counter, 2);
+
+    CHECK(got1 == b1);
+    CHECK(got2 == b2);
+
+    // Both reads target the same page, so the first miss fills the cache
+    // and the second hits — exactly one NVMe read either way (the order is
+    // serialized through the value sched advance loop).
+    auto reads = env.dev.get_read_count();
+    CHECK(reads >= 1 && reads <= 2);
+
+    printf("  case_2_read_miss: OK (decoded %zu+%zu bytes, %lu device reads)\n",
+           got1.size(), got2.size(), reads);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_3: cache hit — second read of same vr after case_2
+// ════════════════════════════════════════════════════════════════
+
+void case_3_cache_hit() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    // Seed
+    std::string b = make_body("hit", 50);
+    std::vector<char> page;
+    build_subLba_page_image(page, /*class_size*/ 64, {b});
+    void* dst = env.dev.test_write_raw(SEED_AREA_LBA);
+    std::memcpy(dst, page.data(), LBA_SIZE);
+
+    value_ref vr{
+        .base = paddr{0, SEED_AREA_LBA}, .byte_offset = 0,
+        .len = static_cast<uint32_t>(b.size()), .flags = 0
+    };
+
+    env.dev.reset_io_counters();
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+    std::string got1, got2;
+
+    // First read: miss → fills cache
+    value::read_value(sched, vr)
+        >> pump::sender::then([&got1, counter](std::string s) {
+            got1 = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+    auto reads_after_first = env.dev.get_read_count();
+    CHECK(reads_after_first == 1);
+
+    // Second read: cache hit → no NVMe activity
+    value::read_value(sched, vr)
+        >> pump::sender::then([&got2, counter](std::string s) {
+            got2 = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 2);
+    auto reads_after_second = env.dev.get_read_count();
+    CHECK(reads_after_second == reads_after_first);
+
+    CHECK(got1 == b);
+    CHECK(got2 == b);
+
+    printf("  case_3_cache_hit: OK (1 device read across 2 reads)\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_4: write then read — should hit open_pages_ / cache, no NVMe
+// ════════════════════════════════════════════════════════════════
+
+void case_4_write_then_read() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string body = make_body("wtr", 30);  // tiny → class 0 sub-LBA
+    value_ref vr{};
+    std::vector<value::put_entry> entries = {{body, &vr}};
+
+    env.dev.reset_io_counters();
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+
+    value::persist_values(sched, std::span<value::put_entry>(entries))
+        >> pump::sender::then([counter](bool ok) {
+            CHECK(ok);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+
+    // Now read it back. This page is still in open_pages_ (sub-LBA, only 1
+    // slot used out of 64 → free_mask != 0). The read should not touch NVMe.
+    std::string got;
+    value::read_value(sched, vr)
+        >> pump::sender::then([&got, counter](std::string s) {
+            got = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 2);
+
+    CHECK(got == body);
+    auto reads = env.dev.get_read_count();
+    CHECK(reads == 0 && "write_then_read should hit open_pages_, no NVMe read");
+
+    printf("  case_4_write_then_read: OK (0 device reads)\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_5: sub-LBA same page — two values of same class share a page
+// ════════════════════════════════════════════════════════════════
+
+void case_5_sub_lba_same_page() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string b1 = make_body("aa", 30);
+    std::string b2 = make_body("bb", 40);
+    value_ref vr1{}, vr2{};
+    std::vector<value::put_entry> entries = {
+        {b1, &vr1},
+        {b2, &vr2},
+    };
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+
+    value::persist_values(sched, std::span<value::put_entry>(entries))
+        >> pump::sender::then([counter](bool ok) {
+            CHECK(ok);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+
+    // Both should be in the same LBA, different byte_offset
+    CHECK(vr1.base == vr2.base);
+    CHECK(vr1.byte_offset != vr2.byte_offset);
+    CHECK(vr1.byte_offset == 0);
+    CHECK(vr2.byte_offset == 64);  // class 0 = 64-byte slots
+
+    // Verify both via on-device bytes
+    auto d1 = decode_on_device(env.dev, vr1);
+    auto d2 = decode_on_device(env.dev, vr2);
+    CHECK(d1 == b1);
+    CHECK(d2 == b2);
+
+    printf("  case_5_sub_lba_same_page: OK (vr1.lba=%lu off=%u, vr2.off=%u)\n",
+           vr1.base.lba, vr1.byte_offset, vr2.byte_offset);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_6: cross-class — different classes go to different pages
+// ════════════════════════════════════════════════════════════════
+
+void case_6_cross_class() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string b_tiny  = make_body("t", 30);     // class 0
+    std::string b_small = make_body("s", 200);    // class 1
+    std::string b_med   = make_body("m", 1000);   // class 2
+    std::string b_lba   = make_body("l", 4000);   // class 3 (LBA-equal)
+    std::string b_multi = make_body("M", 16000);  // class 4 (multi-LBA)
+
+    value_ref vr_t{}, vr_s{}, vr_m{}, vr_l{}, vr_M{};
+    std::vector<value::put_entry> entries = {
+        {b_tiny,  &vr_t},
+        {b_small, &vr_s},
+        {b_med,   &vr_m},
+        {b_lba,   &vr_l},
+        {b_multi, &vr_M},
+    };
+
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto* sched = core::registry::value_sched();
+
+    value::persist_values(sched, std::span<value::put_entry>(entries))
+        >> pump::sender::then([counter](bool ok) {
+            CHECK(ok);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+
+    // Each different class lives on a distinct page.
+    CHECK(vr_t.base != vr_s.base);
+    CHECK(vr_s.base != vr_m.base);
+    CHECK(vr_m.base != vr_l.base);
+    CHECK(vr_l.base != vr_M.base);
+
+    // multi-LBA value: byte_offset is 0, len fits within span
+    CHECK(vr_M.byte_offset == 0);
+
+    // Verify all decoded
+    CHECK(decode_on_device(env.dev, vr_t) == b_tiny);
+    CHECK(decode_on_device(env.dev, vr_s) == b_small);
+    CHECK(decode_on_device(env.dev, vr_m) == b_med);
+    CHECK(decode_on_device(env.dev, vr_l) == b_lba);
+    CHECK(decode_on_device(env.dev, vr_M) == b_multi);
+
+    printf("  case_6_cross_class: OK (5 distinct pages, 5 classes)\n");
+}
+
+}  // namespace
+
+int main() {
+    printf("inconel value scheduler test:\n");
+
+    case_1_write_path();
+    case_2_read_miss();
+    case_3_cache_hit();
+    case_4_write_then_read();
+    case_5_sub_lba_same_page();
+    case_6_cross_class();
+
+    printf("all passed\n");
+    return 0;
+}

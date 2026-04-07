@@ -9,6 +9,7 @@
 
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::lookup_scheduler_base
+#include "../value/scheduler.hh" // for value::scheduler
 
 namespace apps::inconel::core::registry {
 
@@ -40,13 +41,17 @@ namespace apps::inconel::core::registry {
     };
     inline tree_lookup_list tree_lookup_scheds;
 
+    // value::scheduler is a global singleton — only one instance exists,
+    // pinned to a specific core (cores[0] in the v6 builder). All access
+    // goes through value_sched().
+    inline value::scheduler* value_alloc_sched = nullptr;
+
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
     // Singletons:
     //   inline coord::scheduler*       coord_sched       = nullptr;
     //   inline tree::scheduler*        tree_sched        = nullptr;
     //   inline wal::scheduler*         wal_space_sched   = nullptr;
-    //   inline value::scheduler*       value_alloc_sched = nullptr;
     //
     // Per-shard:
     //   struct front_list {
@@ -76,6 +81,19 @@ namespace apps::inconel::core::registry {
         nvme_scheds.by_core.clear();
         tree_lookup_scheds.list.clear();
         tree_lookup_scheds.by_core.clear();
+        value_alloc_sched = nullptr;
+    }
+
+    // ── Singleton access ──
+    //
+    // value_sched() asserts non-null; the builder is responsible for
+    // installing the instance at startup. Application code uses this
+    // helper rather than reading the variable directly.
+
+    inline value::scheduler*
+    value_sched() {
+        assert(value_alloc_sched && "value::scheduler not registered");
+        return value_alloc_sched;
     }
 
     // ── Per-core fast access (current core) ──

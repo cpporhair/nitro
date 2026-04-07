@@ -96,6 +96,14 @@ add_executable(inconel_test_runtime apps/inconel/test/test_runtime.cc)
 target_include_directories(inconel_test_runtime PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_runtime PRIVATE pthread)
 
+add_executable(inconel_test_value apps/inconel/test/test_value.cc)
+target_include_directories(inconel_test_value PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_value PRIVATE pthread)
+
+add_executable(inconel_test_tree_value apps/inconel/test/test_tree_value.cc)
+target_include_directories(inconel_test_tree_value PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_tree_value PRIVATE pthread)
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

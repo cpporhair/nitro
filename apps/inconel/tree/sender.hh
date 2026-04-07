@@ -12,6 +12,7 @@
 #include "pump/sender/pop_context.hh"
 
 #include "./scheduler.hh"
+#include "../core/registry.hh"
 #include "../mock_nvme/sender.hh"
 
 namespace apps::inconel::tree {
@@ -25,17 +26,25 @@ namespace apps::inconel::tree {
         co_return false;
     }
 
-    template<typename nvme_sched_t>
+    // The NVMe scheduler is resolved via core::registry::local_nvme() at the
+    // moment the read is issued — that runs on the tree_sched home core after
+    // its callback fires, so this_core_id reflects the worker core, not the
+    // submitter. Each tree lookup naturally uses its own core's nvme,
+    // preserving share-nothing.
+
     inline auto
-    on_decision_need_read(nvme_sched_t* nvme_sched, lookup_scheduler_base* tree_sched, decision_need_read&& dec) {
+    on_decision_need_read(lookup_scheduler_base* tree_sched, decision_need_read&& dec) {
         auto n = dec.read_descs.size();
         return just()
-            >> with_context(__fwd__(dec))([nvme_sched, tree_sched, n]() {
+            >> with_context(__fwd__(dec))([tree_sched, n]() {
                 return loop(n)
                     >> concurrent()
                     >> get_context<decision_need_read>()
-                    >> flat_map([nvme_sched](decision_need_read& ctx, size_t i) {
-                        return nvme_sched->read(ctx.read_descs[i].lba, ctx.read_descs[i].buf, ctx.read_descs[i].num_lbas);
+                    >> flat_map([](decision_need_read& ctx, size_t i) {
+                        auto* nvme = core::registry::local_nvme();
+                        return nvme->read(ctx.read_descs[i].lba,
+                                          ctx.read_descs[i].buf,
+                                          ctx.read_descs[i].num_lbas);
                     })
                     >> all()
                     >> get_context<decision_need_read>()
@@ -45,27 +54,25 @@ namespace apps::inconel::tree {
             });
     }
 
-    template<typename nvme_sched_t, typename key_range_t>
+    template<typename key_range_t>
     inline auto
     lookup(lookup_scheduler_base* tree_sched,
-           nvme_sched_t* nvme,
            key_range_t&& keys,
            const core::tree_manifest* manifest) {
-
         return with_context(
             make_lookup_state(std::forward<key_range_t>(keys), manifest))(
-            [tree_sched, nvme]() {
+            [tree_sched]() {
                 return get_context<lookup_state>()
-                    >> flat_map([tree_sched, nvme](lookup_state& state) {
+                    >> flat_map([tree_sched](lookup_state& state) {
                         return just()
                             >> for_each(pump::coro::make_view_able(check_not_done(state)))
                             >> flat_map([tree_sched, &state](bool) {
                                 return tree_sched->process(state);
                             })
                             >> visit()
-                            >> flat_map([tree_sched, nvme]<typename D>(D&& decision) mutable {
+                            >> flat_map([tree_sched]<typename D>(D&& decision) mutable {
                                 if constexpr (std::is_same_v<std::decay_t<D>, decision_need_read>) {
-                                    return on_decision_need_read(nvme, tree_sched, __fwd__(decision));
+                                    return on_decision_need_read(tree_sched, __fwd__(decision));
                                 } else {
                                     return just(true);
                                 }

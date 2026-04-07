@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "pump/core/lock_free_queue.hh"
+#include "apps/inconel/core/registry.hh"
 #include "apps/inconel/tree/sender.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "pump/sender/just.hh"
@@ -128,6 +129,19 @@ int main() {
     core_schedulers core2(&td.dev);
     core_schedulers core4(&td.dev);
 
+    // Register both core's schedulers — sender::lookup() uses
+    // registry::local_nvme() which indexes by this_core_id.
+    registry::clear();
+    registry::init_capacity(8);
+    registry::nvme_scheds.list.push_back(&core2.nvme_sched);
+    registry::nvme_scheds.list.push_back(&core4.nvme_sched);
+    registry::nvme_scheds.by_core[2] = &core2.nvme_sched;
+    registry::nvme_scheds.by_core[4] = &core4.nvme_sched;
+    registry::tree_lookup_scheds.list.push_back(&core2.tree_sched);
+    registry::tree_lookup_scheds.list.push_back(&core4.tree_sched);
+    registry::tree_lookup_scheds.by_core[2] = &core2.tree_sched;
+    registry::tree_lookup_scheds.by_core[4] = &core4.tree_sched;
+
     std::atomic<bool> running{true};
 
     // ── Per-key result slots ──
@@ -159,13 +173,12 @@ int main() {
     for (size_t i = 0; i < N; ++i) {
         // Route: even → core 2, odd → core 4
         auto* ts = (i % 2 == 0) ? &core2.tree_sched : &core4.tree_sched;
-        auto* ns = (i % 2 == 0) ? &core2.nvme_sched : &core4.nvme_sched;
 
         std::vector<std::string_view> single_key = { keys_owned[i] };
         auto ctx = pump::core::make_root_context();
 
         pump::sender::just()
-            >> lookup(ts, ns, single_key, &td.manifest)
+            >> lookup(ts, single_key, &td.manifest)
             >> pump::sender::then([&results, &completed, i](std::vector<lookup_result>&& r) {
                 results[i] = std::move(r[0]);
                 completed.fetch_add(1, std::memory_order_release);
@@ -218,11 +231,10 @@ int main() {
         pump::core::this_core_id = 0;
         for (int i = 0; i < M; ++i) {
             auto* ts = (i % 2 == 0) ? &core2.tree_sched : &core4.tree_sched;
-            auto* ns = (i % 2 == 0) ? &core2.nvme_sched : &core4.nvme_sched;
             std::vector<std::string_view> k = { miss_keys_owned[i] };
             auto ctx = pump::core::make_root_context();
             pump::sender::just()
-                >> lookup(ts, ns, k, &td.manifest)
+                >> lookup(ts, k, &td.manifest)
                 >> pump::sender::then([&miss_results, &miss_completed, i](std::vector<lookup_result>&& r) {
                     miss_results[i] = std::move(r[0]);
                     miss_completed.fetch_add(1, std::memory_order_release);

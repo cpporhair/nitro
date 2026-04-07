@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "apps/inconel/core/registry.hh"
 #include "apps/inconel/tree/sender.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "pump/sender/just.hh"
@@ -89,6 +90,18 @@ struct test_env {
         , nvme_sched(&dev)
         , tree_sched(clock_cache(32)) {
         build();
+        // Single-thread test runs everything on this_core_id == 0; register
+        // both schedulers there so the sender's local_nvme() lookup works.
+        registry::clear();
+        registry::init_capacity(8);
+        registry::nvme_scheds.list.push_back(&nvme_sched);
+        registry::nvme_scheds.by_core[0] = &nvme_sched;
+        registry::tree_lookup_scheds.list.push_back(&tree_sched);
+        registry::tree_lookup_scheds.by_core[0] = &tree_sched;
+    }
+
+    ~test_env() {
+        registry::clear();
     }
 
 private:
@@ -136,7 +149,7 @@ do_lookup(test_env& env, std::vector<std::string_view> keys) {
     std::vector<lookup_result> out;
     bool done = false;
     pump::sender::just()
-        >> lookup(&env.tree_sched, &env.nvme_sched, keys, &env.manifest)
+        >> lookup(&env.tree_sched, keys, &env.manifest)
         >> pump::sender::then([&](std::vector<lookup_result>&& r) {
             out = std::move(r); done = true;
         })
@@ -265,6 +278,14 @@ static void test_cache_eviction(Cache cache, const char* label) {
     std::mt19937 rng(0xBEEF);
     std::shuffle(order.begin(), order.end(), rng);
 
+    // Register schedulers for the sender's local_nvme() resolution.
+    registry::clear();
+    registry::init_capacity(8);
+    registry::nvme_scheds.list.push_back(&nvme_sched);
+    registry::nvme_scheds.by_core[0] = &nvme_sched;
+    registry::tree_lookup_scheds.list.push_back(&tree_sched);
+    registry::tree_lookup_scheds.by_core[0] = &tree_sched;
+
     // Reset counter — only count reads from the lookup phase, not the writes
     // we just did to set up the tree.
     dev.reset_io_counters();
@@ -279,7 +300,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
         bool done = false;
         std::vector<std::string_view> single = { key };
         pump::sender::just()
-            >> lookup(&tree_sched, &nvme_sched, single, &manifest)
+            >> lookup(&tree_sched, single, &manifest)
             >> pump::sender::then([&](std::vector<lookup_result>&& r) {
                 out = std::move(r); done = true;
             })
@@ -307,6 +328,8 @@ static void test_cache_eviction(Cache cache, const char* label) {
     printf("  [%s] eviction stress: %d/%zu correct, %lu NVMe reads "
            "(13 unique pages, cache cap=4)\n",
            label, correct, all_records.size(), (unsigned long)reads);
+
+    registry::clear();
 }
 
 static void test_empty_tree() {
@@ -315,12 +338,19 @@ static void test_empty_tree() {
     lookup_scheduler<clock_cache> ts(clock_cache(8));
     auto m = tree_manifest::empty(PS, LBS);
 
+    registry::clear();
+    registry::init_capacity(8);
+    registry::nvme_scheds.list.push_back(&ns);
+    registry::nvme_scheds.by_core[0] = &ns;
+    registry::tree_lookup_scheds.list.push_back(&ts);
+    registry::tree_lookup_scheds.by_core[0] = &ts;
+
     auto ctx = pump::core::make_root_context();
     std::vector<lookup_result> out;
     bool done = false;
     std::vector<std::string_view> keys = {"a", "b", "c"};
     pump::sender::just()
-        >> lookup(&ts, &ns, keys, &m)
+        >> lookup(&ts, keys, &m)
         >> pump::sender::then([&](std::vector<lookup_result>&& r) {
             out = std::move(r); done = true;
         })

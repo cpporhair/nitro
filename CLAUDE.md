@@ -1,5 +1,23 @@
 # Nitro — 基于 PUMP 框架的高性能应用
 
+## 最高优先级规则 — 实现时禁止读测试
+
+**实现任何功能时禁止打开或搜索测试文件**：`test_*.cc`、`*_test.cc`、`tests/` 下任何文件、测试 fixture、benchmark 文件。
+
+**所有结构决策必须对应设计文档或已有生产代码**，不能对应"能通过现有测试的最简结构"。
+
+**背景**：把测试数据反推成 spec 是我的 fatal failure mode——inconel B+ tree 曾被我硬编码两层骗过所有测试，debt 累积到分支不可推进。规则防不住"我以为 spec 就是 tests"——只能从物理上切断测试文件对实现阶段的可见性。
+
+**例外**：用户明确让我修失败测试或读测试时，必须先声明"我要读测试文件"获得确认。
+
+**新增约束 A — 收窄实现必须显式声明并 fail-fast**：如果当前实现只覆盖特定 tree 形态、固定深度、特定 scheduler 拓扑、单一 batch 形态或其他受限前提，必须在命名、注释、类型或返回状态中显式写出限制；一旦输入超出覆盖范围，必须 fail-fast（返回 `unsupported_*`、抛错或断言失败，按模块层级选择），禁止 silent fallback，禁止"先按最常见 case 跑通"。
+
+**新增约束 B — 通用命名必须对应通用语义**：只有满足设计文档定义的完整语义，才能使用 `tree_lookup`、`flush_phase2`、`write_restructured`、`range_scan`、`frontier_switch` 这类通用命名；如果只是阶段 seam、owner-local helper 或 shape-specific implementation，名字里必须带限制词，例如 `*_single_leaf_only`、`*_direct_leaf_root_only`、`*_root_stable_only`。
+
+**新增约束 C — 设计缺口时禁止自行补最简 spec**：如果设计文档和已有生产代码不足以唯一决定结构，必须停下来说明缺口并请求确认；禁止用"最容易实现"、"最像当前 fixture"、"先满足当前输入形态"的结构自行补 spec。
+
+---
+
 ## 框架规范（通过 submodule 加载）
 - @pump/CLAUDE.md
 - @pump/ai_spec/RUNTIME_MODEL.md

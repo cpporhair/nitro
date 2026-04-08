@@ -1,0 +1,57 @@
+# Inconel — Known Issues
+
+> 已确认存在 + 已确认延后的问题登记。一行一条，方向一句话。
+> 真正动手修时回 audit / spec / 代码再研究；本文不是实施手册。
+
+## Priority
+
+- `urgent`  不被 dependency 阻塞，尽快处理
+- `blocked` dependency 锁住，等解封条件
+- `normal`  标准 backlog
+- `low`     改善向
+
+## Open
+
+| ID | Issue | 来源 | Priority | 方向 |
+|----|-------|------|----------|------|
+| INC-001 | tree multi-level descent 在 production 0 验证 | audit/tree.md F3 | `blocked` (tree_sched 写侧 + property test) | tree_sched 写侧落地后补 property test 强制 ≥3 层；mitigation 期加 depth assert + 模块 scope 注释 |
+| INC-002 | mock_nvme 路径上的硬耦合：(a) tree::lookup_scheduler 用 `std::make_unique` 非 DMA 内存 buffer；(b) runtime `start_options.device` 类型是 `mock_nvme::mock_device*` | audit/tree.md F5 + audit/runtime.md R3 | `blocked` (apps/inconel/nvme/) | nvme/ 落地时同时引入 device + buffer 双抽象（virtual base 或 template），lookup_scheduler 迁到 BufferPool，runtime 接 device 抽象不接 mock_nvme 类型 |
+| INC-003 | `home_tree_lookup_for_front` 路由缺失，sender 让 caller 自由传 sched | audit/tree.md F7 | `blocked` (apps/inconel/front/) | sender API 改成接收 `(keys, manifest, front_owner)`，内部用 stub routing `front_owner % count` |
+| INC-004 | tree + value 检测到 corruption 时走 silent fallback 或 throw 而不是 panic：tree::process_entries 把 CRC/magic/zero 失败映射成 `lookup_absent`；value::scheduler `handle_fill` / `serve_hit_or_fail` 走 cb/fail dual callback 抛异常进 PUMP exception path | audit/tree.md F1 + audit/value.md V1 + V7 | `urgent` | `core/panic.hh::panic_inconsistency` helper（参考 `value::handle_finalize` 已有的 fprintf+abort 范本），tree 和 value 的 corruption 路径全调 panic helper 并传入具体 reason（`tree_page_status` / `value_decode_status` 4 种错误分别枚举，不要折叠成笼统 "corrupt" 消息）；cb/fail pattern 整体保留不动 |
+| INC-005 | `tree_manifest::resolve` 用 assert，Release 退化 UB | audit/tree.md F2 | `urgent` | `resolve` 找不到 range_base 时调 INC-004 的 panic helper |
+| INC-007 | `tree_manifest` 模块归属 core/ vs tree/ 不明，spec 没明说 | audit/tree.md F6 | `low` | 拍板归属（core/ 多 sched 共享 vs tree/ owner）后做迁移或在当前位置加注释说明选择理由 |
+| INC-008 | spec ODF §4.2 的 `internal_record` 没有 import 到 `format/tree_page.hh`，layout 散在 page_builder/reader 4 处散文 memcpy（leaf record 是正确范本） | audit/tree.md F8 | `urgent` | `format/tree_page.hh` 加 `internal_record` packed struct + `static_assert(sizeof == 2)` + `internal_record_size(key_len)` helper；4 处 site 收敛到 struct 和 helper |
+| INC-009 | `loading_pages_` / `slot_map` 用 std::unordered_*，spec 用 flat_hash_map | audit/tree.md F9 | `urgent` | 引入 abseil，改用 absl::flat_hash_set/map |
+| INC-010 | spec 用 abseil 容器词汇（flat_hash_map/set、btree_map、small_vector），代码用 std::* | spec 全文 | `urgent` | 用 absl 等价物全面替换：unordered_* → flat_hash_*，small_vector → InlinedVector，memtable 落地时用 btree_map |
+| INC-011 | `tree_manifest::has_root()` 用 `lba == 0` 当 sentinel，依赖隐式不变量 | audit/tree.md F10 | `blocked` (tree_sched 写侧 / page allocator) | 等 allocator 落地知道哪些 lba 合法后定方案（optional<paddr> 或显式 bool 字段） |
+| INC-012 | leaf/internal page reader 全 linear scan，热路径每页 ~134/185 次比较 | audit/tree.md F11 | `normal` (flush 落地前完成) | spec 加 full slot directory（紧跟 tree_slot_header 的 uint16_t offsets[record_count]），page_builder finalize 写 directory，reader 用 binary search；CoW 上下文 InnoDB 稀疏方案不适用 |
+| INC-013 | `lookup_scheduler::handle` 的 `if (s.first_call)` 分支 + `lookup_state::first_call` 字段是 dead code（make_lookup_state 已处理空 manifest，coroutine 短路掉了 handle 入口） | audit/tree.md F12 | `low` | 删 `first_call` 字段 + 删 handle 里整个 if 块 |
+| INC-014 | tree (`lookup_scheduler` / `lookup_scheduler_base`) 和 value (`scheduler` / `scheduler_base`) 都用裸命名，跟 spec 名字 `tree_lookup_sched` / `value_alloc_sched` 不一致；user 报告 context 大时 AI 曾混淆这类裸命名 | audit/tree.md F13 + audit/value.md V4 | `urgent` | 两个模块同时 rename 到 spec 名字：`tree::lookup_scheduler` → `tree::tree_lookup_sched`、`value::scheduler` → `value::value_alloc_sched`，更新所有引用点 |
+| INC-015 | `tree/lookup.hh::decision_need_cache` variant 分支永不产生永不专门处理（fall-through 等同 done），暴露在 sender 类型上易被新 scheduler 抄成"预留 variant" pattern | audit/tree.md F14 | `urgent` | 去掉 `decision_need_cache`，`batch_decision` 收敛为 `variant<decision_done, decision_need_read>`，sender visit 简化 |
+| INC-016 | tree + value 两侧 cache buffer ownership 都是 workaround：tree 用 free_bufs_ + owned_bufs_ 析构隐式释放；value `~scheduler()` 手动 evict_one drain | audit/tree.md F15 + audit/value.md V9 | `blocked` (与 INC-002 共生命周期) | nvme/ + BufferPool 抽象落地时一起重做 cache_concept 的 buffer ownership 模型，覆盖 tree + value 两边 |
+| INC-017 | `value::handle_persist` rollback 时 fresh_bump / whole_page source 的 LBA 永久泄漏（silent state degradation），且 out-of-space 走 fail() 给 caller 而不是 panic（v1 没 reclaim 撞底不可恢复） | audit/value.md V2 | `urgent` | rollback 真归还 LBA（fresh_bump → `push_back_bump`，whole_page → `recycle_whole_page`，allocator 加 push_back_bump 接口）；`acquire_round_page` 返回 nullptr 时直接调 INC-004 panic helper |
+| INC-018 | value 模块缺 `freed_slots` handle（sub-LBA slot 回收，spec RSM §6.7） | audit/value.md V3 | `urgent` | 实现 `handle_freed_slots`（dirty / in-hole / not-tracked 三 case），同步加 `hole_pages` + `dirty_pages` + `deferred_freed` 状态机 |
+| INC-019 | value 模块缺 `recycle_whole` handle（整页回收，spec RSM §6.8） | audit/value.md V3 | `urgent` | 实现 `handle_recycle_whole`，把 paddr 注入 `whole_pool`；调用方约定 TRIM 已完成（spec §6.9） |
+| INC-020 | value 模块缺 `install_recovered_state` handle（boot recovery 入口，spec RSM §6.2） | audit/value.md V3 | `low` (Phase 1 dev 不重启从 0 init) | 等 recovery 路径整体落地时实现 |
+| INC-021 | value 模块缺 `read_page_values` handle（MultiGet/Scan 批量读，spec RSM §6.5） | audit/value.md V3 | `low` (Phase 2 用) | 等 read pipeline + Scan/MultiGet 落地时实现 |
+| INC-022 | tree 模块缺 `flush` handle 整套（spec RSM §4 + FF §3：tree_allocator / checkpoint_guard / fold / consolidation / frontier_switch / new manifest） | audit/tree.md F4（扩展） | `urgent` | 实现 tree_sched 写侧基础设施（allocator + checkpoint_guard + retire queues）+ flush handle；这是 INC-001 的真正解封路径 |
+| INC-023 | tree 模块缺 `reclaim` handle（spec RSM §4.2：TRIM 旧 slot/range + 调用 value 的 freed_slots / recycle_whole） | audit/tree.md F4（扩展） | `urgent` | 实现 reclaim handle，dispatch 到 INC-018 / INC-019 的 value 接收方；TRIM 顺序遵循 spec §6.9 |
+| INC-024 | tree 模块缺 `update_superblock` handle（spec RSM §4.2：root-change flush 后异步更新 superblock + 推进 superblock_safe_lsn） | audit/tree.md F4（扩展） | `low` (Phase 1 不重启) | 等 superblock 持久化路径整体落地时实现 |
+| INC-025 | value `writable_pages_` 是对 spec `hole_pages` + `open_frames` 双概念的简化（合成单一 per-class queue），但 spec ↔ 代码对应关系没文档化 | audit/value.md V6 | `normal` | 修 spec 加补充说明这层简化，或在 `value/scheduler.hh::writable_pages_` 字段处加注释解释跟 spec 概念的对应关系 |
+| INC-026 | `value::handle_persist` 用 `goto round_failed` + 嵌套循环 + 复杂错误传播，user 报告读不懂、无法有效 review 正确性 | audit/value.md V8 | `urgent` | 重构 handle_persist：拆小函数、消除 goto、用早 return / lambda / RAII 让 happy path 和 error path 分别清晰可读 |
+| INC-027 | `value::scheduler` 的 `class_sizes_storage_` + `class_sizes_view_` 双字段冗余（vector 可直接 decay 到 span，view 字段没必要） | audit/value.md V10 | `low` | 删 `class_sizes_view_` 字段，find_min_class 直接接 vector |
+| INC-028 | `value::handle_persist` 的 leader-follower 合并把整个 persist_q_ 吃光，单 round 无上限 → leader latency 不可控（特别影响 perf tuning 的 tail latency） | audit/value.md V14 | `urgent` | `handle_persist` 加 max followers per round 上限，超过的留给下一轮 advance |
+| INC-029 | tree + value 的 `advance()` 用 `.drain()` 把单 queue 吃光，多 queue 之间无 fairness 保证，单次 advance 延迟不可控（一个 queue 满了会饿死其他 queue 的处理） | audit/value.md V14 + tree 同源 | `urgent` | `advance()` 改成 bounded per-queue 处理：每 queue 每次 advance 最多处理 N 个 item，剩余等下一轮；用 bounded for + try_dequeue 替代 drain() |
+| INC-030 | format/ 缺 WAL 三个 POD type：`wal_segment_header` (ODF §3.2, 26B) / `wal_entry_header` (ODF §3.3, 25B + 编解码) / `wal_sealed_trailer` (ODF §3.4, 33B)，front_sched / batch PUT 路径需要 | audit/format.md F2-F4 | `urgent` | 新建 `format/wal.hh`，加 3 个 packed struct + static_assert + entry 编解码 helper |
+| INC-031 | format/ 缺 `superblock` POD（ODF §2.2 定义 ~120B 的 packed struct） | audit/format.md F1 | `low` (Phase 2 boot/recovery 用) | 新建 `format/superblock.hh`，加 packed struct + static_assert |
+| INC-032 | `format/crc.hh::crc32c` 用 raw SSE4.2 intrinsics，缺标准 CRC-32C 的 init/xor conditioning，跟外部工具（btrfs/ext4/iSCSI 等）不匹配；spec ODF §1.3 含糊 | audit/format.md F5 | `urgent` | 删 `format/crc.hh`，所有调用点（`tree_page_compute_crc`、`encode_value_object`、`decode_value_object` 共 3 处）改用 `absl::ComputeCrc32c`；spec ODF §1.3 加一行 "由 absl::ComputeCrc32c 实现，含标准 init/xor conditioning"。INC-009/010 已经 link absl 所以无新依赖 |
+| INC-033 | `build_runtime` + `start.hh::run_with` 一连串 raw `new` 没 RAII，`start()` 抛或某个 scheduler 构造抛 → 已分配的 rt + scheduler 全 leak | audit/runtime.md R1 | `normal` | init 失败直接 panic（std::abort + 诊断 fprintf），跟 `value::handle_finalize` / INC-004 panic helper 同形态——process 死了 OS 回收所有资源，不需要 RAII |
+| INC-034 | `build_options` 把 4 个 disk format 字段（`value_class_sizes` / `lba_size` / `value_data_area_base` / `value_data_area_end`）暴露为 runtime config，但它们是 disk format 决定，一旦写数据就锁死不能改；当前还有"传空 → silent disable" 等 fail 路径 | audit/runtime.md R2 | `normal` | 4 个字段全 hardcode 为代码常量（放 core/ 或 format/），从 build_options 移除；将来 INC-031 (superblock POD) + recovery 落地后从 superblock 读，hardcoded 值退化为"format 新盘的默认值" |
+| INC-035 | runtime/ 缺 `format_disk()` 路径，spec ODF §7 定义的格式化流程（计算区域边界 + TRIM 整盘 + 写 superblock A/B）完全缺失；mock_nvme zero buffer 当"已格式化"使蒙混过去，真 nvme 上线必需 | audit/runtime.md R7 | `blocked` (依赖 INC-031 superblock POD + nvme/ 落地) | 按 ODF §7 实现 `format_disk()`：算 region 边界、TRIM 整盘、写 superblock A/B；与 INC-020 install_recovered_state 是同组（format/recovery 配套） |
+| INC-036 | `cache_concept`（page_cache.hh）value 类型是 raw `char*`，缺 `pin_count` 概念、缺 frame state machine（dirty_append/dirty_hole_fill/writeback_inflight/clean_readonly），跟 spec RMC §6.1 + §11 期望的 `lru_or_clock<frame_id, page_frame*>` + frame state 不符；与 INC-016 (buffer ownership / DMA 替换) 是正交两层 | audit/core.md C1 | `urgent` | 按 RMC §6.1 + §11 重做 cache_concept：value 类型从 `char*` 改成 `page_frame*`（含 buffer + pin_count + state），加 pin/unpin 操作，evict 跳过 pin_count > 0 / 非 clean_readonly 的 frame；clock_cache + slru_cache 同步迁移；概念重做完成前不允许新增 cache 实现 |
+| INC-037 | `slru_cache::evict_one` 从 protected 段 evict 时不重置 `in_protected`，`free_node` 也不重置；recycled node 带 stale `in_protected==true` 进 free list，下一次 alloc_node + link_probation_head 后 get() 会走错 `if (n.in_protected)` 分支调 `unlink_protected` 操作 probation 列表的节点 → 破坏 protected 列表指针 + 错误递减 prot_size_；当前不可达（evict_one 仅 teardown 用），但 latent + AI 抄走会扩散 | audit/core.md C2 | `urgent` | `slru_cache::free_node` 加 `nodes_[idx].in_protected = false;` 统一覆盖所有 free path；`alloc_node` 加 `assert(!nodes_[idx].in_protected)` 让不变量显式 |
+| INC-038 | `cache_concept::evict_one` 命名跟语义漂移：clock_cache 走 `index_.begin()` 非确定性（不按 clock policy），slru_cache 走 probation tail 后 protected tail（LRU 序），page_cache.hh 注释说 "teardown drain" 但名字像 "按 policy evict 一个"；concept 没规范，AI 给新 cache 实现 evict_one 时会两边各自漂 | audit/core.md C3 | `normal` | rename `evict_one` → `drain_one`（cache_concept + clock_cache + slru_cache + 所有 use site），page_cache.hh 文档明确 "drain_one is teardown-only, not policy eviction"；INC-036 重做 cache_concept 时顺手做掉 |
+
+## Resolved
+
+（暂无）

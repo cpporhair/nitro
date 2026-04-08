@@ -21,6 +21,7 @@
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
 
+#include "../core/page_cache.hh"
 #include "../format/types.hh"
 #include "../format/value_object.hh"
 #include "./allocator.hh"
@@ -69,20 +70,48 @@ namespace apps::inconel::value {
     // is responsible for issuing nvme->read into buf, then calling
     // fill_and_decode(vr, buf) to insert into cache + decode + return.
 
-    struct read_hit  { std::string body; };
-    struct read_miss { paddr base; uint32_t span_lbas; std::shared_ptr<std::vector<char>> buf; };
+    struct read_hit { std::string body; };
+
+    // read miss → pipeline issues the NVMe read into rm.buf, then hands the
+    // buffer back via fill_and_decode for cache admission + decode. The buf
+    // is unique_ptr so ownership flows linearly: handle_read alloc → pipeline
+    // hold (via context) → fill req → cache (release) or auto-free.
+    //
+    // admit_to_cache encodes decision D1 (only 1-LBA pages enter the cache):
+    //   admit=true   1-LBA / sub-LBA → handle_fill releases buf into cache
+    //   admit=false  multi-LBA       → handle_fill drops buf after decode
+    // The flag is computed in handle_read and carried through the pipeline
+    // because handle_fill no longer has class-size context to recompute it.
+
+    struct read_miss {
+        paddr                   base;
+        uint32_t                span_lbas;
+        std::unique_ptr<char[]> buf;
+        uint32_t                buf_size;
+        bool                    admit_to_cache;
+    };
+
     using read_prepare_result = std::variant<read_hit, read_miss>;
 
     // ── Internal page_data ──
     //
-    // A page that's currently held by the scheduler in writable state
-    // (open / ready) — i.e. still has free slots and the in-memory image is
-    // already durable on NVMe.
+    // A page held by the scheduler in writable state — i.e. its NVMe image is
+    // already durable but it still has free slots, so the next persist round
+    // for the same class will reuse this page in-memory rather than allocate
+    // a fresh one. v7 keeps a flat per-class queue (writable_pages_[ci]) and
+    // pops the most recently installed page first (LIFO) so the hottest
+    // partial page is always picked up next.
+    //
+    // image is unique_ptr<char[]> rather than vector<char> so the same buffer
+    // representation flows through writable_pages_, the cache, and (later) a
+    // DMA pool — there is no vector→buffer→vector copy at any boundary.
+    // image_size is required because char[] does not carry its own length.
 
     struct page_data {
-        paddr             base;
-        uint64_t          free_mask;
-        std::vector<char> image;
+        paddr                   base;
+        uint64_t                free_mask;
+        std::unique_ptr<char[]> image;
+        uint32_t                image_size;
     };
 
     // ── Forward declarations of req types (used by sender layer) ──
@@ -92,7 +121,7 @@ namespace apps::inconel::value {
     namespace _value_read     { struct req; }
     namespace _value_fill     { struct req; }
 
-    struct scheduler;
+    struct scheduler_base;
 
     // ── PUMP op/sender wrappers ──
     //
@@ -110,7 +139,7 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_persist_op = true;
-            scheduler*           sched;
+            scheduler_base*      sched;
             std::span<put_entry> entries;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -118,7 +147,7 @@ namespace apps::inconel::value {
         };
 
         struct sender {
-            scheduler*           sched;
+            scheduler_base*      sched;
             std::span<put_entry> entries;
 
             auto make_op() { return op{.sched = sched, .entries = entries}; }
@@ -141,18 +170,18 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_finalize_op = true;
-            scheduler* sched;
-            uint64_t   round_id;
-            bool       ok;
+            scheduler_base* sched;
+            uint64_t        round_id;
+            bool            ok;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            scheduler* sched;
-            uint64_t   round_id;
-            bool       ok;
+            scheduler_base* sched;
+            uint64_t        round_id;
+            bool            ok;
 
             auto make_op() { return op{.sched = sched, .round_id = round_id, .ok = ok}; }
 
@@ -173,16 +202,16 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_read_op = true;
-            scheduler* sched;
-            value_ref  vr;
+            scheduler_base* sched;
+            value_ref       vr;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            scheduler* sched;
-            value_ref  vr;
+            scheduler_base* sched;
+            value_ref       vr;
 
             auto make_op() { return op{.sched = sched, .vr = vr}; }
 
@@ -197,27 +226,41 @@ namespace apps::inconel::value {
 
         struct req {
             value_ref                                          vr;
-            std::shared_ptr<std::vector<char>>                 buf;
+            std::unique_ptr<char[]>                            buf;
+            uint32_t                                           buf_size;
+            bool                                               admit_to_cache;
             std::move_only_function<void(std::string&&)>       cb;
             std::move_only_function<void(std::exception_ptr)>  fail;
         };
 
         struct op {
             constexpr static bool value_fill_op = true;
-            scheduler*                         sched;
-            value_ref                          vr;
-            std::shared_ptr<std::vector<char>> buf;
+            scheduler_base*         sched;
+            value_ref               vr;
+            std::unique_ptr<char[]> buf;
+            uint32_t                buf_size;
+            bool                    admit_to_cache;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            scheduler*                         sched;
-            value_ref                          vr;
-            std::shared_ptr<std::vector<char>> buf;
+            scheduler_base*         sched;
+            value_ref               vr;
+            std::unique_ptr<char[]> buf;
+            uint32_t                buf_size;
+            bool                    admit_to_cache;
 
-            auto make_op() { return op{.sched = sched, .vr = vr, .buf = std::move(buf)}; }
+            auto make_op() {
+                return op{
+                    .sched          = sched,
+                    .vr             = vr,
+                    .buf            = std::move(buf),
+                    .buf_size       = buf_size,
+                    .admit_to_cache = admit_to_cache,
+                };
+            }
 
             template<typename ctx_t>
             auto connect() {
@@ -226,22 +269,69 @@ namespace apps::inconel::value {
         };
     }
 
-    // ── Scheduler ──
+    // ── scheduler_base ──
+    //
+    // Non-templated layer holding the four PUMP queues, the schedule_*
+    // enqueue helpers, and the sender factory entry points. Senders/ops only
+    // need this base — they never see the templated derived class — so the
+    // PUMP pipeline machinery (op_pusher / compute_sender_type) doesn't have
+    // to know what Cache the scheduler uses.
+    //
+    // The templated scheduler<Cache> publicly derives from this base; pointer
+    // implicit upcasting lets the runtime/registry/sender layers all work in
+    // terms of scheduler_base*.
 
-    struct scheduler {
+    struct scheduler_base {
+        pump::core::per_core::queue<_value_persist::req*>  persist_q_;
+        pump::core::per_core::queue<_value_finalize::req*> finalize_q_;
+        pump::core::per_core::queue<_value_read::req*>     read_q_;
+        pump::core::per_core::queue<_value_fill::req*>     fill_q_;
+
+        explicit
+        scheduler_base(size_t queue_depth = 2048)
+            : persist_q_(queue_depth)
+            , finalize_q_(queue_depth)
+            , read_q_(queue_depth)
+            , fill_q_(queue_depth) {}
+
+        // ── enqueue helpers (called by op::start) ──
+
+        void schedule_persist (_value_persist::req*  r) { persist_q_ .try_enqueue(r); }
+        void schedule_finalize(_value_finalize::req* r) { finalize_q_.try_enqueue(r); }
+        void schedule_read    (_value_read::req*     r) { read_q_    .try_enqueue(r); }
+        void schedule_fill    (_value_fill::req*     r) { fill_q_    .try_enqueue(r); }
+
+        // ── Sender factories ──
+        //
+        // Declared here, defined inline at the bottom of this header (after
+        // the sender struct types are complete). This is the same pattern
+        // tree::lookup_scheduler_base uses for process() / submit_cache().
+
+        auto prepare_persist(std::span<put_entry> entries);
+        auto finalize_persist(uint64_t round_id, bool ok);
+        auto prepare_read(value_ref vr);
+        auto fill_and_decode(value_ref vr, std::unique_ptr<char[]> buf,
+                             uint32_t buf_size, bool admit_to_cache);
+    };
+
+    // ── scheduler<Cache> ──
+
+    template <core::cache_concept Cache>
+    struct scheduler : scheduler_base {
         // ── Per-round state (held in inflight_rounds_) ──
         //
         // Created by leader's prepare handle, consumed by finalize handle.
         // Followers wait inside this round's followers vec.
 
         struct round_page {
-            paddr             base;
-            uint16_t          class_idx;
-            uint32_t          span_lbas;
-            value_page_source source;
-            uint64_t          original_free_mask; // for rollback
-            uint64_t          free_mask;          // updated as slots are filled
-            std::vector<char> image;
+            paddr                   base;
+            uint16_t                class_idx;
+            uint32_t                span_lbas;
+            value_page_source       source;
+            uint64_t                original_free_mask; // for rollback
+            uint64_t                free_mask;          // updated as slots are filled
+            std::unique_ptr<char[]> image;
+            uint32_t                image_size;
         };
 
         struct round {
@@ -253,53 +343,69 @@ namespace apps::inconel::value {
 
         value_allocator alloc_;
 
-        // writable state — per class
-        std::vector<std::optional<page_data>> open_pages_;
-        std::vector<std::vector<page_data>>   ready_pages_;
+        // writable pages — per class. Each entry is a page that's already
+        // durable on NVMe but still has at least one free slot, so the next
+        // persist round for the same class will reuse it in-memory. LIFO
+        // (pop_back) keeps the hottest partial page in front.
+        std::vector<std::vector<page_data>> writable_pages_;
 
-        // readonly cache: paddr → page image bytes (full LBA span)
-        // v6: simple inconel-style unbounded map; future step replaces with
-        // page_cache_concept (clock/slru) + buf reuse pool.
-        std::map<paddr, std::vector<char>> readonly_cache_;
+        // readonly cache: paddr → 1-LBA page image. Holds raw char[] buffers
+        // handed off via release() + put() — the scheduler is the sole
+        // owner of the cache, and ~scheduler() below drains it via
+        // evict_one() because clock_cache / slru_cache do not free buffers
+        // in their own destructors (they only own their slot/node arrays).
+        //
+        // Decision D1 — multi-LBA bypass: only span_lbas == 1 pages enter
+        // here. commit_pages and handle_fill both gate on the span before
+        // calling put(); handle_read symmetrically only consults the cache
+        // when admit == (span == 1). Multi-LBA full pages are dropped at
+        // commit time (round_page's unique_ptr destructor frees them).
+        //
+        // Lifetime contract for put() / evict_one() (full statement in
+        // core/page_cache.hh's cache_concept doc): every "Some(...)" return
+        // is a buf the caller must free. Both put-on-existing-key (an
+        // overwritten replacement) and put-when-cap-full (an LRU eviction)
+        // use the same channel. commit_pages and handle_fill below treat
+        // the optional uniformly with `if (auto evicted = ...) delete[]`.
+        Cache readonly_cache_;
 
         // leader-follower in-flight tracking
         std::map<uint64_t, std::unique_ptr<round>> inflight_rounds_;
         uint64_t                                   next_round_id_ = 1;
 
-        // 4 PUMP queues, one per request kind
-        pump::core::per_core::queue<_value_persist::req*>  persist_q_;
-        pump::core::per_core::queue<_value_finalize::req*> finalize_q_;
-        pump::core::per_core::queue<_value_read::req*>     read_q_;
-        pump::core::per_core::queue<_value_fill::req*>     fill_q_;
-
         scheduler(std::span<const uint32_t> class_sizes,
                   uint32_t                  lba_size,
                   paddr                     data_area_base,
                   paddr                     data_area_end,
+                  Cache                     cache,
                   size_t                    queue_depth = 2048)
-            : alloc_(class_sizes, lba_size, data_area_base, data_area_end)
-            , open_pages_(class_sizes.size())
-            , ready_pages_(class_sizes.size())
-            , persist_q_(queue_depth)
-            , finalize_q_(queue_depth)
-            , read_q_(queue_depth)
-            , fill_q_(queue_depth)
+            : scheduler_base(queue_depth)
+            , alloc_(class_sizes, lba_size, data_area_base, data_area_end)
+            , writable_pages_(class_sizes.size())
+            , readonly_cache_(std::move(cache))
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
             class_sizes_view_ = std::span<const uint32_t>(class_sizes_storage_);
         }
 
-        // ── enqueue helpers (called by op::start) ──
+        // ── Destructor ──
+        //
+        // The cache holds raw char[] buffers handed off by commit_pages /
+        // handle_fill via release(). The scheduler is the sole owner of the
+        // cache, so on teardown we must drain every remaining buffer through
+        // evict_one() — neither clock_cache nor slru_cache frees buffers in
+        // their own destructor (they only own slot/node arrays).
 
-        void schedule_persist (_value_persist::req*  r) { persist_q_ .try_enqueue(r); }
-        void schedule_finalize(_value_finalize::req* r) { finalize_q_.try_enqueue(r); }
-        void schedule_read    (_value_read::req*     r) { read_q_    .try_enqueue(r); }
-        void schedule_fill    (_value_fill::req*     r) { fill_q_    .try_enqueue(r); }
+        ~scheduler() {
+            while (auto e = readonly_cache_.evict_one()) {
+                delete[] e->buf;
+            }
+        }
 
         // ── advance ──
         //
         // Order matters: finalize first (releases inflight rounds and may
-        // free pages back to open_pages_, which makes them available for
+        // return pages to writable_pages_, which makes them available for
         // subsequent persist rounds). persist next (consumes the freshly
         // freed pages). read/fill last.
 
@@ -331,24 +437,6 @@ namespace apps::inconel::value {
 
         template<typename runtime_t>
         bool advance(runtime_t&) { return advance(); }
-
-        // ── Sender factories ──
-
-        auto prepare_persist(std::span<put_entry> entries) {
-            return _value_persist::sender{.sched = this, .entries = entries};
-        }
-
-        auto finalize_persist(uint64_t round_id, bool ok) {
-            return _value_finalize::sender{.sched = this, .round_id = round_id, .ok = ok};
-        }
-
-        auto prepare_read(value_ref vr) {
-            return _value_read::sender{.sched = this, .vr = vr};
-        }
-
-        auto fill_and_decode(value_ref vr, std::shared_ptr<std::vector<char>> buf) {
-            return _value_fill::sender{.sched = this, .vr = vr, .buf = std::move(buf)};
-        }
 
     private:
         // ════════════════════════════════════════════════════════════════
@@ -391,7 +479,7 @@ namespace apps::inconel::value {
             for (auto& page : rnd->pages) {
                 rnd->writes.push_back(write_desc{
                     .lba      = page.base.lba,
-                    .data     = page.image.data(),
+                    .data     = page.image.get(),
                     .num_lbas = page.span_lbas,
                     .flags    = 0,
                 });
@@ -420,8 +508,8 @@ namespace apps::inconel::value {
 
         round_failed:
             // Roll back any pages we already touched and fail leader +
-            // followers. Pages from open_pages_ / ready_pages_ are restored
-            // by rollback_pages; fresh_bump / whole_page sources are simply
+            // followers. Pages popped from writable_pages_ are restored by
+            // rollback_pages; fresh_bump / whole_page sources are simply
             // dropped (they were never durable so this is safe — except the
             // bump head has already moved, which leaks Data Area capacity).
             // v6 accepts this leak: persist failures here only happen on
@@ -464,7 +552,7 @@ namespace apps::inconel::value {
             }
 
             // Encode value object into the slot.
-            std::span<char> slot_span(page->image.data() + off, cs);
+            std::span<char> slot_span(page->image.get() + off, cs);
             std::span<const char> body_span(entry.body.data(), entry.body.size());
             if (!format::encode_value_object(slot_span, body_span)) {
                 // restore the bit so rollback can return the page cleanly
@@ -494,45 +582,33 @@ namespace apps::inconel::value {
 
         round_page*
         acquire_round_page(round& rnd, uint16_t ci) {
-            // 1. Take from open_pages_[ci] if present
-            if (open_pages_[ci].has_value()) {
-                auto pd = std::move(*open_pages_[ci]);
-                open_pages_[ci].reset();
-                alloc_.close_open_page(ci);
+            // 1. Pop the most recent writable page for this class (LIFO).
+            //    All entries in writable_pages_[ci] have free slots and a
+            //    durable NVMe image we can mutate in-memory.
+            if (!writable_pages_[ci].empty()) {
+                auto pd = std::move(writable_pages_[ci].back());
+                writable_pages_[ci].pop_back();
                 rnd.pages.push_back(round_page{
                     .base               = pd.base,
                     .class_idx          = ci,
                     .span_lbas          = alloc_.span_lbas(ci),
-                    .source             = value_page_source::open_frame,
+                    .source             = value_page_source::writable,
                     .original_free_mask = pd.free_mask,
                     .free_mask          = pd.free_mask,
                     .image              = std::move(pd.image),
+                    .image_size         = pd.image_size,
                 });
                 return &rnd.pages.back();
             }
 
-            // 2. Take from ready_pages_[ci] back if present
-            if (!ready_pages_[ci].empty()) {
-                auto pd = std::move(ready_pages_[ci].back());
-                ready_pages_[ci].pop_back();
-                rnd.pages.push_back(round_page{
-                    .base               = pd.base,
-                    .class_idx          = ci,
-                    .span_lbas          = alloc_.span_lbas(ci),
-                    .source             = value_page_source::ready_page,
-                    .original_free_mask = pd.free_mask,
-                    .free_mask          = pd.free_mask,
-                    .image              = std::move(pd.image),
-                });
-                return &rnd.pages.back();
-            }
-
-            // 3. Ask allocator (whole_pool / bump)
+            // 2. Ask allocator (whole_pool / bump)
             auto ar = alloc_.acquire_page(ci);
             if (!ar) return nullptr;
 
             uint32_t img_bytes = ar->span_lbas * alloc_.lba_size();
-            std::vector<char> image(img_bytes, 0);   // fresh page → zero
+            // make_unique<char[]>(N) value-initializes (zero-fills) — same
+            // semantics as the previous vector<char>(N, 0).
+            auto image = std::make_unique<char[]>(img_bytes);
             rnd.pages.push_back(round_page{
                 .base               = ar->page_base,
                 .class_idx          = ci,
@@ -541,6 +617,7 @@ namespace apps::inconel::value {
                 .original_free_mask = ar->free_mask,
                 .free_mask          = ar->free_mask,
                 .image              = std::move(image),
+                .image_size         = img_bytes,
             });
             return &rnd.pages.back();
         }
@@ -595,12 +672,26 @@ namespace apps::inconel::value {
         commit_pages(round& rnd) {
             for (auto& page : rnd.pages) {
                 if (page.free_mask == 0) {
-                    // page is full → move into readonly cache
-                    readonly_cache_[page.base] = std::move(page.image);
+                    // Full page. Decision D1: only 1-LBA pages enter the
+                    // readonly cache. Multi-LBA full pages are dropped here
+                    // (the round_page's unique_ptr destructor frees the buf
+                    // when the round goes out of scope) — admitting them
+                    // would waste bounded-cache capacity since handle_read
+                    // bypasses the cache for span > 1 and the page would
+                    // never be hit again, only evict useful 1-LBA entries.
+                    if (page.span_lbas == 1) {
+                        char* raw = page.image.release();
+                        if (auto evicted = readonly_cache_.put(page.base, raw)) {
+                            delete[] evicted->buf;
+                        }
+                    }
+                    // span > 1: page.image's unique_ptr<char[]> destructor
+                    // frees the buf at end of round.
                 } else {
                     // still has free slots → put back as a writable page
                     install_writable_page(page.class_idx, page.base,
-                                          page.free_mask, std::move(page.image));
+                                          page.free_mask, std::move(page.image),
+                                          page.image_size);
                 }
             }
         }
@@ -614,27 +705,30 @@ namespace apps::inconel::value {
                     // Pages we allocated this round but never committed.
                     // Drop them; bump head leak is acceptable for v6.
                     break;
-                case value_page_source::open_frame:
-                case value_page_source::ready_page:
+                case value_page_source::writable:
                     // Restore with the original (pre-round) free_mask.
                     install_writable_page(page.class_idx, page.base,
                                           page.original_free_mask,
-                                          std::move(page.image));
+                                          std::move(page.image),
+                                          page.image_size);
                     break;
                 }
             }
         }
 
         void
-        install_writable_page(uint16_t ci, paddr base,
-                              uint64_t free_mask, std::vector<char>&& image) {
-            page_data pd{.base = base, .free_mask = free_mask, .image = std::move(image)};
-            if (!open_pages_[ci].has_value()) {
-                open_pages_[ci] = std::move(pd);
-                alloc_.install_open_page({base, ci, free_mask});
-                return;
-            }
-            ready_pages_[ci].push_back(std::move(pd));
+        install_writable_page(uint16_t ci, paddr base, uint64_t free_mask,
+                              std::unique_ptr<char[]>&& image,
+                              uint32_t image_size) {
+            // v7: single per-class queue, no special "active" slot. Newest
+            // installs land at the back so the next acquire_round_page picks
+            // them up first (hot path stays in cache).
+            writable_pages_[ci].push_back(page_data{
+                .base       = base,
+                .free_mask  = free_mask,
+                .image      = std::move(image),
+                .image_size = image_size,
+            });
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -644,7 +738,7 @@ namespace apps::inconel::value {
         void
         handle_read(_value_read::req* item) {
             // Determine the class first; we need span_lbas to allocate the
-            // miss buffer.
+            // miss buffer and to decide cache admission.
             auto ci_opt = class_for_len(item->vr.len);
             if (!ci_opt) {
                 item->fail(std::make_exception_ptr(
@@ -652,37 +746,54 @@ namespace apps::inconel::value {
                 delete item;
                 return;
             }
-            uint16_t ci = *ci_opt;
+            uint16_t ci   = *ci_opt;
+            uint32_t span = alloc_.span_lbas(ci);
 
-            // 1. open_pages_[ci]
-            if (open_pages_[ci].has_value() && open_pages_[ci]->base == item->vr.base) {
-                serve_hit_or_fail(item, open_pages_[ci]->image, "open_pages");
-                delete item;
-                return;
-            }
+            // Decision D1: only 1-LBA pages (sub-LBA + LBA-equal classes)
+            // are cache-admissible. Multi-LBA pages bypass the cache
+            // entirely — their hit rate is too low to justify burning
+            // capacity, and the buf pool stays single-sized.
+            const bool admit = (span == 1);
 
-            // 2. ready_pages_[ci]
-            for (auto& pd : ready_pages_[ci]) {
+            // 1. writable_pages_[ci] — pages held by the scheduler with free
+            //    slots remaining. Their NVMe image is durable but the
+            //    in-memory copy is the freshest source for any reader (and
+            //    every value object encoded so far this round is only here).
+            //    Linear scan: N is small (typically 0-2 per class) so this is
+            //    cheaper than maintaining a paddr index.
+            for (auto& pd : writable_pages_[ci]) {
                 if (pd.base == item->vr.base) {
-                    serve_hit_or_fail(item, pd.image, "ready_pages");
+                    serve_hit_or_fail(item,
+                                      std::span<const char>(pd.image.get(), pd.image_size),
+                                      "writable_pages");
                     delete item;
                     return;
                 }
             }
 
-            // 3. readonly_cache_
-            if (auto it = readonly_cache_.find(item->vr.base); it != readonly_cache_.end()) {
-                serve_hit_or_fail(item, it->second, "readonly_cache");
-                delete item;
-                return;
+            // 2. readonly_cache_ — only consulted when this class is
+            //    admissible (multi-LBA bypasses). The cache stores raw
+            //    char[] keyed by paddr; cached_size = lba_size since all
+            //    cache entries are 1-LBA by D1.
+            if (admit) {
+                if (const char* p = readonly_cache_.get(item->vr.base)) {
+                    serve_hit_or_fail(item,
+                                      std::span<const char>(p, alloc_.lba_size()),
+                                      "readonly_cache");
+                    delete item;
+                    return;
+                }
             }
 
-            // 4. miss → tell pipeline to issue NVMe read into a fresh buf
-            uint32_t span = alloc_.span_lbas(ci);
+            // 3. miss → tell pipeline to issue NVMe read into a fresh buf.
+            //    The unique_ptr flows through the pipeline (see read_miss
+            //    and on_read_miss in sender.hh) and ends up in handle_fill
+            //    which either releases it into the cache (admit) or drops
+            //    it after decode (bypass).
             uint32_t img_bytes = span * alloc_.lba_size();
-            auto buf = std::make_shared<std::vector<char>>(img_bytes, char{0});
+            auto buf = std::make_unique<char[]>(img_bytes);
             item->cb(read_prepare_result{
-                read_miss{item->vr.base, span, std::move(buf)}
+                read_miss{item->vr.base, span, std::move(buf), img_bytes, admit}
             });
             delete item;
         }
@@ -699,7 +810,9 @@ namespace apps::inconel::value {
             // exception via item->fail() and leave the cache untouched —
             // otherwise every subsequent reader of this paddr would be
             // served the same poisoned page.
-            auto body_opt = try_decode_value(*item->buf, item->vr);
+            auto body_opt = try_decode_value(
+                std::span<const char>(item->buf.get(), item->buf_size),
+                item->vr);
             if (!body_opt) {
                 item->fail(std::make_exception_ptr(std::runtime_error(
                     "value::read: corrupt value object on disk (post-NVMe)")));
@@ -707,10 +820,18 @@ namespace apps::inconel::value {
                 return;
             }
 
-            // Verified — safe to move the staging buffer into the cache.
-            // body_opt was copy-constructed from the buffer's bytes above,
-            // so the move-out below cannot dangle it.
-            readonly_cache_[item->vr.base] = std::move(*item->buf);
+            // Verified — admit policy was decided in handle_read and rides
+            // along on the fill req:
+            //   admit  → release the buf into the cache; the cache becomes
+            //            sole owner. If the put evicts another entry, that
+            //            buf is freed here.
+            //   bypass → unique_ptr stays in item, item->~req() frees it.
+            if (item->admit_to_cache) {
+                char* raw = item->buf.release();
+                if (auto evicted = readonly_cache_.put(item->vr.base, raw)) {
+                    delete[] evicted->buf;
+                }
+            }
 
             item->cb(std::move(*body_opt));
             delete item;
@@ -725,10 +846,15 @@ namespace apps::inconel::value {
         // from "on-disk corruption" and surface the latter as an exception.
         // Never returns an empty std::string to mean "decode failed";
         // empty body is a legitimate value.
+        //
+        // span<const char> is the uniform decode path: writable_pages_,
+        // readonly_cache_, and the fill staging buffer all reach this through
+        // a span construction at the call site, so the helper is agnostic to
+        // who owns the bytes.
         std::optional<std::string>
-        try_decode_value(const std::vector<char>& image, value_ref vr) const {
-            std::span<const char> slot(image.data() + vr.byte_offset,
-                                       image.size()  - vr.byte_offset);
+        try_decode_value(std::span<const char> image, value_ref vr) const {
+            if (vr.byte_offset >= image.size()) return std::nullopt;
+            auto slot = image.subspan(vr.byte_offset);
             auto d = format::decode_value_object(slot, vr.len);
             if (!d.ok()) return std::nullopt;
             return std::string(d.body.data(), d.body.size());
@@ -739,7 +865,7 @@ namespace apps::inconel::value {
         // Caller is responsible for `delete item` and `return` after this.
         void
         serve_hit_or_fail(_value_read::req* item,
-                          const std::vector<char>& image,
+                          std::span<const char> image,
                           const char* source_label) {
             auto body = try_decode_value(image, item->vr);
             if (!body) {
@@ -762,22 +888,48 @@ namespace apps::inconel::value {
             return class_sizes_view_;
         }
 
-        // Cached view used by find_min_class. Built once in the constructor
-        // body below — placed here to keep handle_persist inline-friendly.
+        // Cached view used by find_min_class. class_sizes_storage_ owns the
+        // bytes (initialized in the ctor's init list from the input span);
+        // class_sizes_view_ is a stable span over that storage built once
+        // in the ctor body. Owning a copy means the input span doesn't have
+        // to outlive the scheduler.
         std::vector<uint32_t> class_sizes_storage_;
         std::span<const uint32_t> class_sizes_view_;
-
-    public:
-        // Hook called by the constructor to populate the cached class sizes
-        // view. We can't initialize class_sizes_storage_ inside the
-        // initializer list cleanly because the constructor takes a span and
-        // we want to own the storage.
-        void
-        init_class_sizes_view(std::span<const uint32_t> class_sizes) noexcept {
-            class_sizes_storage_.assign(class_sizes.begin(), class_sizes.end());
-            class_sizes_view_ = std::span<const uint32_t>(class_sizes_storage_);
-        }
     };
+
+    // ── scheduler_base sender factory deferred definitions ──
+    //
+    // Defined out-of-line so the sender struct types they return are visible
+    // by this point. Same pattern as tree::lookup_scheduler_base::process().
+
+    inline auto
+    scheduler_base::prepare_persist(std::span<put_entry> entries) {
+        return _value_persist::sender{.sched = this, .entries = entries};
+    }
+
+    inline auto
+    scheduler_base::finalize_persist(uint64_t round_id, bool ok) {
+        return _value_finalize::sender{.sched = this, .round_id = round_id, .ok = ok};
+    }
+
+    inline auto
+    scheduler_base::prepare_read(value_ref vr) {
+        return _value_read::sender{.sched = this, .vr = vr};
+    }
+
+    inline auto
+    scheduler_base::fill_and_decode(value_ref vr,
+                                    std::unique_ptr<char[]> buf,
+                                    uint32_t buf_size,
+                                    bool admit_to_cache) {
+        return _value_fill::sender{
+            .sched          = this,
+            .vr             = vr,
+            .buf            = std::move(buf),
+            .buf_size       = buf_size,
+            .admit_to_cache = admit_to_cache,
+        };
+    }
 
     // ── op::start deferred definitions ──
     //
@@ -833,8 +985,10 @@ namespace apps::inconel::value {
     template<uint32_t pos, typename ctx_t, typename scope_t>
     void _value_fill::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_fill(new req{
-            .vr  = vr,
-            .buf = std::move(buf),
+            .vr             = vr,
+            .buf            = std::move(buf),
+            .buf_size       = buf_size,
+            .admit_to_cache = admit_to_cache,
             .cb = [ctx = ctx, scope = scope](std::string&& s) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(
                     ctx, scope, std::move(s));

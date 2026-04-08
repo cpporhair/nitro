@@ -31,6 +31,10 @@
 | §12 Recovery | 启动恢复 = flush-like merge | recovery 实现 |
 | §14 典型 Pipeline | 写/读/seal/flush/recovery 的 PUMP sender 链 | pipeline 编排参考 |
 
+### [code_quality_standard.md](code_quality_standard.md) — 实现与 Review 质量标准
+
+定义热路径预算、ownership / lifetime、抽象边界、PUMP sender 结构、设备访问边界的质量红线。修改 `apps/inconel/` 代码时，用本文审查“实现质量是否过关”。
+
 ### [cross_doc_contracts.md](cross_doc_contracts.md) — 跨文档一致性检查表
 
 **不是实现参考，是验证工具。** 改完代码后对照此表检查是否违反约束。

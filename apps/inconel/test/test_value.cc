@@ -10,7 +10,7 @@
 //                            advanced
 //   case_3_cache_hit         second read of same vr — counter unchanged
 //   case_4_write_then_read   sender write then immediately read same vr —
-//                            should hit open_pages_ / readonly_cache_
+//                            should hit writable_pages_ / readonly_cache_
 //   case_5_sub_lba_same_page two sub-LBA values of the same class share a
 //                            page (vr.base equal, byte_offset different)
 //   case_6_cross_class       multiple classes including multi-LBA — each
@@ -125,23 +125,31 @@ void build_subLba_page_image(std::vector<char>& page,
 // ── Test environment ──
 
 struct test_env {
-    mock_nvme::mock_device                                       dev;
-    runtime::inconel_runtime_t<core::clock_cache>*               rt = nullptr;
-    std::vector<std::jthread>                                    workers;
-    std::vector<uint32_t>                                        cores;
+    using tree_cache_t      = core::clock_cache;
+    using value_cache_t     = core::clock_cache;
+    using runtime_t         = runtime::inconel_runtime_t<tree_cache_t, value_cache_t>;
+    using value_scheduler_t = value::scheduler<value_cache_t>;
 
-    test_env() : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE) {
+    mock_nvme::mock_device    dev;
+    runtime_t*                rt = nullptr;
+    std::vector<std::jthread> workers;
+    std::vector<uint32_t>     cores;
+
+    explicit test_env(uint32_t value_cache_cap = 32)
+        : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE)
+    {
         cores = {2, 4, 6};
         runtime::build_options opts{
             .cores                = cores,
             .device               = &dev,
-            .cache_capacity       = 32,
+            .tree_cache_capacity  = 32,
             .value_class_sizes    = CLASS_SIZES,
             .lba_size             = LBA_SIZE,
             .value_data_area_base = paddr{0, DATA_AREA_BASE_LBA},
             .value_data_area_end  = paddr{0, DATA_AREA_END_LBA},
+            .value_cache_capacity = value_cache_cap,
         };
-        rt = runtime::build_runtime<core::clock_cache>(opts);
+        rt = runtime::build_runtime<tree_cache_t, value_cache_t>(opts);
 
         for (uint32_t core : cores) {
             workers.emplace_back([this, core]() {
@@ -158,7 +166,7 @@ struct test_env {
         for (uint32_t core : cores)
             rt->is_running_by_core[core].store(false);
         workers.clear();   // jthread joins on dtor
-        runtime::destroy_runtime<core::clock_cache>(rt);
+        runtime::destroy_runtime<tree_cache_t, value_cache_t>(rt);
     }
 };
 
@@ -326,7 +334,7 @@ void case_3_cache_hit() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  case_4: write then read — should hit open_pages_ / cache, no NVMe
+//  case_4: write then read — should hit writable_pages_ / cache, no NVMe
 // ════════════════════════════════════════════════════════════════
 
 void case_4_write_then_read() {
@@ -350,8 +358,9 @@ void case_4_write_then_read() {
         >> pump::sender::submit(ctx);
     wait_for(counter, 1);
 
-    // Now read it back. This page is still in open_pages_ (sub-LBA, only 1
-    // slot used out of 64 → free_mask != 0). The read should not touch NVMe.
+    // Now read it back. This page is still in writable_pages_[0] (sub-LBA,
+    // only 1 slot used out of 64 → free_mask != 0). The read should not
+    // touch NVMe.
     std::string got;
     value::read_value(sched, vr)
         >> pump::sender::then([&got, counter](std::string s) {
@@ -363,7 +372,7 @@ void case_4_write_then_read() {
 
     CHECK(got == body);
     auto reads = env.dev.get_read_count();
-    CHECK(reads == 0 && "write_then_read should hit open_pages_, no NVMe read");
+    CHECK(reads == 0 && "write_then_read should hit writable_pages_, no NVMe read");
 
     printf("  case_4_write_then_read: OK (0 device reads)\n");
 }
@@ -464,6 +473,186 @@ void case_6_cross_class() {
     printf("  case_6_cross_class: OK (5 distinct pages, 5 classes)\n");
 }
 
+// ════════════════════════════════════════════════════════════════
+//  case_7: cache eviction — bounded cache evicts oldest pages
+//
+//  Writes 5 LBA-equal values (class 3, 4096-byte slots, one slot per page)
+//  so each entry forces a fresh page allocation. With value_cache_capacity=2,
+//  only the two most recently committed pages survive eviction.
+//
+//  Reading newest-first (vrs[4], vrs[3], vrs[2], vrs[1], vrs[0]) yields:
+//    vrs[4], vrs[3] → cache hits (NVMe count unchanged)
+//    vrs[2..0]      → cache misses (NVMe read each)
+//  Total: exactly 3 NVMe reads.
+//
+//  This relies on clock_cache's LRU-ish ordering (last 2 puts survive when
+//  no gets touched the older entries). slru_cache with cap=2 has different
+//  invariants — case_7 is intentionally specific to clock since test_env
+//  hardcodes value::scheduler<core::clock_cache>.
+// ════════════════════════════════════════════════════════════════
+
+void case_7_cache_evict() {
+    test_env env(/*value_cache_cap*/ 2);
+    auto ctx = pump::core::make_root_context();
+
+    constexpr int N = 5;
+    std::vector<std::string> bodies;
+    std::vector<value_ref>   vrs(N);
+    std::vector<value::put_entry> entries;
+    bodies.reserve(N);
+    entries.reserve(N);
+    for (int i = 0; i < N; ++i)
+        bodies.push_back(make_body("evict", 4000));   // class 3, full page
+    for (int i = 0; i < N; ++i)
+        entries.push_back({bodies[i], &vrs[i]});
+
+    auto* sched = core::registry::value_sched();
+
+    auto wctr = std::make_shared<std::atomic<int>>(0);
+    value::persist_values(sched, std::span<value::put_entry>(entries))
+        >> pump::sender::then([wctr](bool ok) {
+            CHECK(ok);
+            wctr->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(wctr, 1);
+
+    // Each LBA-equal entry must land on its own page (1 slot per page).
+    for (int i = 0; i < N; ++i)
+        for (int j = i + 1; j < N; ++j)
+            CHECK(vrs[i].base != vrs[j].base);
+
+    env.dev.reset_io_counters();
+
+    auto read_one = [&](value_ref vr, std::string& got) {
+        auto c = std::make_shared<std::atomic<int>>(0);
+        value::read_value(sched, vr)
+            >> pump::sender::then([&got, c](std::string s) {
+                got = std::move(s);
+                c->fetch_add(1);
+            })
+            >> pump::sender::submit(ctx);
+        wait_for(c, 1);
+    };
+
+    // Read newest-first so the two cached entries are touched before any
+    // miss-driven put can evict them.
+    for (int i = N - 1; i >= 0; --i) {
+        std::string got;
+        read_one(vrs[i], got);
+        CHECK(got == bodies[i]);
+    }
+
+    auto reads = env.dev.get_read_count();
+    // cap=2 → vrs[4]/vrs[3] hit, vrs[2]/vrs[1]/vrs[0] miss → exactly 3 reads.
+    CHECK(reads == 3);
+
+    printf("  case_7_cache_evict: OK (cap=2, 5 reads → %lu NVMe = 2 hits + 3 misses)\n",
+           static_cast<unsigned long>(reads));
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_8: D1 multi-LBA bypass — both write and read paths
+//
+//  Decision D1 says only 1-LBA pages enter the readonly cache. Multi-LBA
+//  values bypass on:
+//    - read path: handle_read computes admit = (span == 1) and skips both
+//      cache.get() and cache.put() when admit is false.
+//    - write path: commit_pages only releases the buf into the cache when
+//      page.span_lbas == 1; multi-LBA full pages are dropped (unique_ptr
+//      destructor frees the buf).
+//
+//  Falsifying *both* paths needs more than NVMe-read count alone. Counting
+//  reads only witnesses read-path bypass: if commit_pages regressed and
+//  re-admitted the multi-LBA page, handle_read would still skip cache.get()
+//  on span > 1 and the test would still see reads_after_2 == 2. The
+//  write-path check has to look directly at readonly_cache_ via a white-box
+//  cast (allowed because test_env hardcodes value::scheduler<clock_cache>).
+//
+//  Three independent assertions:
+//    [W1] After persist_values commits the multi-LBA page, readonly_cache_
+//         must NOT contain vr.base (write-path bypass).
+//    [R1] reads_after_1 == 1 — first read miss hits NVMe (handle_read
+//         bypass + bounded read 1 LBA-equivalent op).
+//    [R2] reads_after_2 == 2 — second read miss also hits NVMe; if
+//         handle_fill regressed and admitted the multi-LBA page after the
+//         first miss, this would still bypass via [R1]'s assertion path
+//         (read side), but [W2] below catches admit-from-fill regressions.
+//    [W2] After two cache-miss reads, readonly_cache_ must STILL not
+//         contain vr.base (read-side fill bypass: admit_to_cache=false).
+// ════════════════════════════════════════════════════════════════
+
+void case_8_multi_lba_bypass() {
+    test_env env;   // default value_cache_capacity = 32
+    auto ctx = pump::core::make_root_context();
+
+    std::string body = make_body("multi", 16000);  // class 4, span_lbas=4
+    value_ref vr{};
+    std::vector<value::put_entry> entries = {{body, &vr}};
+
+    auto* sched_base = core::registry::value_sched();
+    // White-box cast: test_env publishes its concrete value scheduler type
+    // (test_env::value_scheduler_t == value::scheduler<value_cache_t>) so
+    // case_8 inspects readonly_cache_ directly — the only way to assert
+    // "commit_pages did NOT admit this page" without depending on a
+    // behavior the read path would silently mask.
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+
+    auto wctr = std::make_shared<std::atomic<int>>(0);
+    value::persist_values(sched_base, std::span<value::put_entry>(entries))
+        >> pump::sender::then([wctr](bool ok) {
+            CHECK(ok);
+            wctr->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(wctr, 1);
+
+    // [W1] Write-path bypass: commit_pages must drop the multi-LBA full
+    //      page instead of admitting it to readonly_cache_. The page is
+    //      class-4 (1 slot per page) so its only slot is consumed by the
+    //      write, free_mask == 0, commit_pages enters the full-page branch.
+    //      With D1 enforced, span_lbas != 1 → no put().
+    CHECK(!sched_typed->readonly_cache_.contains(vr.base));
+
+    env.dev.reset_io_counters();
+
+    auto read_one = [&](value_ref vr_in, std::string& got) {
+        auto c = std::make_shared<std::atomic<int>>(0);
+        value::read_value(sched_base, vr_in)
+            >> pump::sender::then([&got, c](std::string s) {
+                got = std::move(s);
+                c->fetch_add(1);
+            })
+            >> pump::sender::submit(ctx);
+        wait_for(c, 1);
+    };
+
+    // [R1] Read-path bypass: multi-LBA → admit=false → handle_read skips
+    //      cache.get() → miss → NVMe.
+    std::string got1;
+    read_one(vr, got1);
+    auto reads_after_1 = env.dev.get_read_count();
+    CHECK(got1 == body);
+    CHECK(reads_after_1 == 1);
+
+    // [R2] Second read still hits NVMe (cache holds nothing for span > 1).
+    std::string got2;
+    read_one(vr, got2);
+    auto reads_after_2 = env.dev.get_read_count();
+    CHECK(got2 == body);
+    CHECK(reads_after_2 == 2);
+
+    // [W2] Read-side fill bypass: handle_fill must observe admit=false on
+    //      multi-LBA reads and skip cache.put(). After two miss-driven
+    //      fills, readonly_cache_ still contains nothing for vr.base.
+    CHECK(!sched_typed->readonly_cache_.contains(vr.base));
+
+    printf("  case_8_multi_lba_bypass: OK "
+           "(cache.contains(vr_multi)=false before+after %lu→%lu reads)\n",
+           static_cast<unsigned long>(reads_after_1),
+           static_cast<unsigned long>(reads_after_2));
+}
+
 }  // namespace
 
 int main() {
@@ -475,6 +664,8 @@ int main() {
     case_4_write_then_read();
     case_5_sub_lba_same_page();
     case_6_cross_class();
+    case_7_cache_evict();
+    case_8_multi_lba_bypass();
 
     printf("all passed\n");
     return 0;

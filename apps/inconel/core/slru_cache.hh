@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -55,17 +56,36 @@ namespace apps::inconel::core {
         uint32_t free_head_ = NIL;  // free node list
 
         // capacity = total slots; protected segment is 80%, probation 20%.
+        //
+        // Both segments must have at least one slot, otherwise:
+        //   - put() with prob_cap_=0 dereferences prob_tail_=NIL while
+        //     evicting, crashing on the first call.
+        //   - get()'s promote-to-protected path with prot_cap_=0 hits
+        //     `prot_size_ >= prot_cap_` and demotes prot_tail_=NIL.
+        // The smallest legal capacity that gives prot_cap >= 1 ∧ prob_cap >= 1
+        // under the default 0.8 ratio is 2 (prot_cap=1, prob_cap=1). Higher
+        // ratios shift the threshold; the prot_cap_/prob_cap_ check below
+        // catches both cases uniformly.
         explicit
         slru_cache(uint32_t capacity, float prot_ratio = 0.8f)
             : nodes_(capacity)
             , prot_cap_(static_cast<uint32_t>(capacity * prot_ratio))
             , prob_cap_(capacity - static_cast<uint32_t>(capacity * prot_ratio)) {
+            if (capacity < 2) {
+                throw std::invalid_argument(
+                    "slru_cache: capacity must be >= 2");
+            }
+            if (prot_cap_ == 0 || prob_cap_ == 0) {
+                throw std::invalid_argument(
+                    "slru_cache: prot_ratio must yield "
+                    "prot_cap >= 1 and prob_cap >= 1");
+            }
             index_.reserve(capacity);
             // Build free list.
             for (uint32_t i = 0; i < capacity; ++i) {
                 nodes_[i].next = (i + 1 < capacity) ? (i + 1) : NIL;
             }
-            free_head_ = capacity > 0 ? 0 : NIL;
+            free_head_ = 0;
         }
 
         const char*
@@ -93,9 +113,11 @@ namespace apps::inconel::core {
 
         std::optional<evicted_entry>
         put(paddr key, char* buf) {
-            // Update existing entry (rare path).
+            // Update existing entry — return the displaced buf so the
+            // caller can free it (see clock_cache::put for the rationale).
             if (auto it = index_.find(key); it != index_.end()) {
                 uint32_t idx = it->second;
+                evicted_entry old{ key, nodes_[idx].buf };
                 nodes_[idx].buf = buf;
                 // Treat as a hit so it gets promoted/refreshed.
                 if (nodes_[idx].in_protected) {
@@ -104,7 +126,7 @@ namespace apps::inconel::core {
                     unlink_probation(idx);
                     promote_to_protected(idx);
                 }
-                return std::nullopt;
+                return old;
             }
 
             std::optional<evicted_entry> result;
@@ -129,6 +151,34 @@ namespace apps::inconel::core {
             link_probation_head(idx);
             index_[key] = idx;
             return result;
+        }
+
+        // Evict any one entry, returning its (key, buf) so the caller can
+        // release the underlying buffer. Used at scheduler teardown to drain
+        // the cache. Probation tail first (LRU within probation), then
+        // protected tail. Calling this repeatedly until it returns nullopt
+        // empties the cache.
+        std::optional<evicted_entry>
+        evict_one() {
+            if (prob_tail_ != NIL) {
+                uint32_t idx = prob_tail_;
+                auto& n = nodes_[idx];
+                evicted_entry victim{ n.key, n.buf };
+                unlink_probation(idx);
+                index_.erase(n.key);
+                free_node(idx);
+                return victim;
+            }
+            if (prot_tail_ != NIL) {
+                uint32_t idx = prot_tail_;
+                auto& n = nodes_[idx];
+                evicted_entry victim{ n.key, n.buf };
+                unlink_protected(idx);
+                index_.erase(n.key);
+                free_node(idx);
+                return victim;
+            }
+            return std::nullopt;
         }
 
         uint32_t size() const { return prot_size_ + prob_size_; }

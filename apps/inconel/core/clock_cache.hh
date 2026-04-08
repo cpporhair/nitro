@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +45,16 @@ namespace apps::inconel::core {
         explicit
         clock_cache(uint32_t capacity)
             : slots_(capacity), capacity_(capacity) {
+            // capacity == 0 would make put() fall straight into the
+            // "cache full" branch and indexing into an empty slots_ vector,
+            // crashing on the first call. Reject it at construction time
+            // (fail-fast) — runtime callers that propagate user-supplied
+            // capacities through build_options must clamp / validate before
+            // reaching here.
+            if (capacity == 0) {
+                throw std::invalid_argument(
+                    "clock_cache: capacity must be >= 1");
+            }
             index_.reserve(capacity);
         }
 
@@ -62,12 +73,18 @@ namespace apps::inconel::core {
 
         std::optional<evicted_entry>
         put(paddr key, char* buf) {
-            // Update existing entry (rare path).
+            // Update existing entry — return the displaced buf so the
+            // caller can free it. The cache only stores raw char*, so
+            // overwriting silently would leak the previous owner's
+            // allocation. Two concurrent misses on the same paddr (e.g.
+            // value::scheduler's read_q_ → fill_q_ pipeline draining a
+            // batch of cold reads in one advance round) hit this path.
             if (auto it = index_.find(key); it != index_.end()) {
                 auto& s = slots_[it->second];
+                evicted_entry old{ key, s.buf };
                 s.buf = buf;
                 s.ref = true;
-                return std::nullopt;
+                return old;
             }
 
             // Free slot available — fill it.
@@ -101,6 +118,25 @@ namespace apps::inconel::core {
                 s.ref = false;
                 hand_ = (hand_ + 1) % capacity_;
             }
+        }
+
+        // Evict any one entry, returning its (key, buf) so the caller can
+        // release the underlying buffer. Used at scheduler teardown to drain
+        // the cache. O(1) amortized: pick from index_ rather than scanning.
+        // Calling this repeatedly until it returns nullopt empties the cache.
+        std::optional<evicted_entry>
+        evict_one() {
+            if (index_.empty()) return std::nullopt;
+            auto it = index_.begin();
+            uint32_t idx = it->second;
+            auto& s = slots_[idx];
+            evicted_entry victim{ s.key, s.buf };
+            index_.erase(it);
+            s.occupied = false;
+            s.buf = nullptr;
+            s.ref = false;
+            --size_;
+            return victim;
         }
 
         uint32_t size() const { return size_; }

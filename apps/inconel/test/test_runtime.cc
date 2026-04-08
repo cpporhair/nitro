@@ -124,11 +124,11 @@ static void test_registry_population(const char* label) {
 
     std::vector<uint32_t> cores = {0, 2, 4};
     runtime::build_options opts{
-        .cores          = cores,
-        .device         = &dev,
-        .cache_capacity = 16,
+        .cores               = cores,
+        .device              = &dev,
+        .tree_cache_capacity = 16,
     };
-    auto* rt = runtime::build_runtime<Cache>(opts);
+    auto* rt = runtime::build_runtime<Cache, Cache>(opts);
 
     // 1. List counts match the number of populated cores.
     CHECK(core::registry::nvme_count() == cores.size());
@@ -154,7 +154,7 @@ static void test_registry_population(const char* label) {
                core::registry::tree_lookup_for_core(c));
     }
 
-    runtime::destroy_runtime<Cache>(rt);
+    runtime::destroy_runtime<Cache, Cache>(rt);
     printf("  [%s] registry population: OK\n", label);
 }
 
@@ -170,11 +170,11 @@ static void test_e2e_multicore_via_runtime(const char* label) {
 
     std::vector<uint32_t> cores = {2, 4};   // worker cores
     runtime::build_options opts{
-        .cores          = cores,
-        .device         = &td.dev,
-        .cache_capacity = 32,
+        .cores               = cores,
+        .device              = &td.dev,
+        .tree_cache_capacity = 32,
     };
-    auto* rt = runtime::build_runtime<Cache>(opts);
+    auto* rt = runtime::build_runtime<Cache, Cache>(opts);
 
     const uint32_t shards = core::registry::tree_lookup_count();
     CHECK(shards == cores.size());
@@ -235,7 +235,7 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     }
     CHECK(ok == static_cast<int>(N));
 
-    runtime::destroy_runtime<Cache>(rt);
+    runtime::destroy_runtime<Cache, Cache>(rt);
     printf("  [%s] e2e multi-core via runtime: %d/%zu OK\n", label, ok, N);
 }
 

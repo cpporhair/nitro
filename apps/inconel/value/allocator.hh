@@ -17,13 +17,17 @@ namespace apps::inconel::value {
     // ── Page source enum ──
     //
     // Records why a particular page is being used in the current persist
-    // round. Currently consumed only by allocator/scheduler internals; the
-    // distinction matters for rollback (fresh_bump pages return to
-    // whole_pool, open_frame pages return to open_pages_, etc).
+    // round. The distinction matters for rollback: writable pages must be
+    // returned to writable_pages_[ci] with the original free_mask, while
+    // fresh_bump / whole_page pages were never durable and can be dropped.
+    //
+    // value_page_source::writable is only constructed by the scheduler in
+    // acquire_round_page when it pops from writable_pages_[ci];
+    // value_allocator::acquire_page never returns it (the allocator does not
+    // know about writable pages).
 
     enum class value_page_source : uint8_t {
-        open_frame,    // taken from open_pages_[ci] (still has free slots)
-        ready_page,    // taken from ready_pages_[ci] (also has free slots)
+        writable,      // popped from writable_pages_[ci] (still has free slots)
         whole_page,    // taken from whole_pool[ci] (recycled empty page)
         fresh_bump,    // freshly bumped from per_device head
     };
@@ -34,14 +38,8 @@ namespace apps::inconel::value {
         paddr             page_base;
         uint16_t          class_idx;
         uint32_t          span_lbas;
-        value_page_source source;
-        uint64_t          free_mask;   // bitmask of free slots in this page
-    };
-
-    struct value_open_page_meta {
-        paddr    page_base;
-        uint16_t class_idx;
-        uint64_t free_mask;
+        value_page_source source;     // only whole_page or fresh_bump
+        uint64_t          free_mask;  // bitmask of free slots in this page
     };
 
     // ── Per-device bump head ──
@@ -100,8 +98,7 @@ namespace apps::inconel::value {
             uint32_t slots_per_page; // sub-LBA: lba_size/class_size; otherwise 1
             uint64_t all_free_mask;  // (1 << slots_per_page) - 1, capped at UINT64_MAX
 
-            std::optional<value_open_page_meta> open;
-            std::vector<paddr>                  whole_pool;
+            std::vector<paddr> whole_pool;
         };
 
         value_allocator(std::span<const uint32_t> class_sizes,
@@ -135,25 +132,19 @@ namespace apps::inconel::value {
 
         // ── acquire_page ──
         //
-        // Decision tree (v6, no hole reuse):
-        //   1. open_pages_[ci] still has free slots? — return open_frame
-        //   2. whole_pool[ci] non-empty?            — return whole_page
-        //   3. bump fresh from per_device head      — return fresh_bump
-        //   4. otherwise nullopt (out of space)
+        // Decision tree (v7):
+        //   1. whole_pool[ci] non-empty?       — return whole_page
+        //   2. bump fresh from per_device head — return fresh_bump
+        //   3. otherwise nullopt (out of space)
+        //
+        // The "writable" path (pages still owned by the scheduler with free
+        // slots remaining) is handled entirely by the scheduler — the
+        // allocator does not know it exists. acquire_page is only called when
+        // the scheduler has exhausted writable_pages_[ci].
 
         std::optional<value_alloc_result>
         acquire_page(uint16_t class_idx) noexcept {
             auto& cls = classes_[class_idx];
-
-            if (cls.open.has_value() && cls.open->free_mask != 0) {
-                return value_alloc_result{
-                    .page_base = cls.open->page_base,
-                    .class_idx = class_idx,
-                    .span_lbas = cls.span_lbas,
-                    .source    = value_page_source::open_frame,
-                    .free_mask = cls.open->free_mask,
-                };
-            }
 
             if (!cls.whole_pool.empty()) {
                 paddr base = cls.whole_pool.back();
@@ -178,24 +169,10 @@ namespace apps::inconel::value {
             };
         }
 
-        // ── open page state mutators ──
+        // ── reclaim ──
         //
-        // Called by the scheduler after a transaction commits / rolls back
-        // and the page is being returned to the active set.
-
-        void
-        install_open_page(value_open_page_meta meta) noexcept {
-            if (meta.free_mask == 0) {
-                classes_[meta.class_idx].open.reset();
-                return;
-            }
-            classes_[meta.class_idx].open = meta;
-        }
-
-        void
-        close_open_page(uint16_t class_idx) noexcept {
-            classes_[class_idx].open.reset();
-        }
+        // Pages whose all slots are once again free can be returned to the
+        // whole_pool for reuse without going through bump.
 
         void
         recycle_whole_page(uint16_t class_idx, paddr page_base) noexcept {

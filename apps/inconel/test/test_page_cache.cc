@@ -6,6 +6,7 @@
 //
 
 #include "apps/inconel/test/check.hh"
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -105,12 +106,179 @@ static void test_slru_capacity_eviction() {
 template <cache_concept Cache>
 static void test_update_existing(const char* label) {
     Cache c(3);
-    c.put(P(1), B(1));
-    auto e = c.put(P(1), B(11));   // update — no eviction
-    CHECK(!e.has_value());
+    auto e1 = c.put(P(1), B(1));
+    CHECK(!e1.has_value());                  // first insert: nothing displaced
+
+    // Same-key put MUST return the old buf as an "evicted_entry" so the
+    // caller can free it. Earlier the cache silently overwrote and leaked
+    // every superseded buf — this came up in inconel value::scheduler when
+    // two concurrent reads on the same paddr both reach handle_fill in one
+    // advance round, calling put(P, buf1) then put(P, buf2).
+    auto e2 = c.put(P(1), B(11));
+    CHECK(e2.has_value());
+    CHECK(e2->key == P(1));
+    CHECK(e2->buf == B(1));                  // old buf returned to caller
     CHECK(c.size() == 1);
-    CHECK(c.get(P(1)) == B(11));
-    printf("  [%s] update existing: OK\n", label);
+    CHECK(c.get(P(1)) == B(11));             // cache now holds the new buf
+
+    printf("  [%s] update existing returns old: OK\n", label);
+}
+
+// Reject obviously broken capacities at construction. The cache impls
+// previously took any uint32_t and crashed on the first put()/get() for
+// capacity 0 (clock_cache, slru_cache) and capacity 1 (slru_cache),
+// which made it possible for a runtime config typo to bring the whole
+// scheduler down. Both impls now throw std::invalid_argument from the
+// ctor — verify each rejected boundary explicitly.
+
+static void test_clock_capacity_zero_throws() {
+    bool threw = false;
+    try {
+        clock_cache c(0);
+        (void)c;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    printf("  [clock] capacity=0 throws: OK\n");
+}
+
+static void test_slru_capacity_zero_throws() {
+    bool threw = false;
+    try {
+        slru_cache c(0);
+        (void)c;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    printf("  [slru ] capacity=0 throws: OK\n");
+}
+
+static void test_slru_capacity_one_throws() {
+    // capacity=1 → prot_cap = floor(1 * 0.8) = 0, prob_cap = 1.
+    // Pre-fix the first get() would try to demote prot_tail_=NIL.
+    bool threw = false;
+    try {
+        slru_cache c(1);
+        (void)c;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    printf("  [slru ] capacity=1 throws: OK\n");
+}
+
+static void test_slru_extreme_ratio_throws() {
+    // prot_ratio=0 → prot_cap=0 → reject.
+    bool threw_low = false;
+    try {
+        slru_cache c(8, 0.0f);
+        (void)c;
+    } catch (const std::invalid_argument&) {
+        threw_low = true;
+    }
+    CHECK(threw_low);
+
+    // prot_ratio=1.0 → prob_cap=0 → reject.
+    bool threw_high = false;
+    try {
+        slru_cache c(8, 1.0f);
+        (void)c;
+    } catch (const std::invalid_argument&) {
+        threw_high = true;
+    }
+    CHECK(threw_high);
+
+    printf("  [slru ] extreme prot_ratio throws: OK\n");
+}
+
+// Smallest legal capacity for each impl must still drive a full
+// put/get/evict cycle without hitting the fixed boundaries.
+
+static void test_clock_min_capacity_works() {
+    clock_cache c(1);                         // smallest legal
+    CHECK(c.capacity() == 1);
+
+    auto e1 = c.put(P(1), B(1));
+    CHECK(!e1.has_value());
+    CHECK(c.size() == 1);
+    CHECK(c.get(P(1)) == B(1));
+
+    auto e2 = c.put(P(2), B(2));              // evicts the only slot
+    CHECK(e2.has_value());
+    CHECK(e2->buf == B(1));
+    CHECK(c.get(P(2)) == B(2));
+    CHECK(c.get(P(1)) == nullptr);
+
+    auto e3 = c.evict_one();                  // drain
+    CHECK(e3.has_value());
+    CHECK(e3->buf == B(2));
+    CHECK(c.size() == 0);
+
+    printf("  [clock] capacity=1 works: OK\n");
+}
+
+static void test_slru_min_capacity_works() {
+    slru_cache c(2);                          // prot_cap=1, prob_cap=1
+    CHECK(c.capacity() == 2);
+
+    auto e1 = c.put(P(1), B(1));
+    CHECK(!e1.has_value());
+    CHECK(c.get(P(1)) == B(1));               // promotes P1 to protected
+
+    auto e2 = c.put(P(2), B(2));
+    CHECK(!e2.has_value());                   // P2 enters probation
+    CHECK(c.size() == 2);
+
+    auto e3 = c.put(P(3), B(3));              // prob full → evicts P2
+    CHECK(e3.has_value());
+    CHECK(e3->buf == B(2));
+    CHECK(c.contains(P(1)));                  // P1 (protected) survives
+    CHECK(c.contains(P(3)));
+    CHECK(!c.contains(P(2)));
+
+    printf("  [slru ] capacity=2 works: OK\n");
+}
+
+// Reproducer for the leak the put-existing fix addresses: do N back-to-back
+// puts on the same key, then drain via evict_one(). Each put should hand
+// back the previous buf (N-1 displaced + 1 still resident), so iterating
+// every returned buf accounts for all N allocations exactly once. Pre-fix
+// the cache silently overwrote and the displaced bufs were leaked.
+template <cache_concept Cache>
+static void test_put_same_key_drain_no_leak(const char* label) {
+    Cache c(8);
+    constexpr int N = 4;
+    std::vector<char*> seen;
+
+    for (int i = 0; i < N; ++i) {
+        auto e = c.put(P(42), B(100 + i));
+        if (i == 0) {
+            CHECK(!e.has_value());           // first insert displaces nothing
+        } else {
+            CHECK(e.has_value());            // every subsequent put displaces
+            CHECK(e->key == P(42));
+            CHECK(e->buf == B(100 + i - 1)); // and returns the previous buf
+            seen.push_back(e->buf);
+        }
+    }
+
+    // Drain the resident entry via evict_one.
+    CHECK(c.size() == 1);
+    auto last = c.evict_one();
+    CHECK(last.has_value());
+    CHECK(last->buf == B(100 + N - 1));
+    seen.push_back(last->buf);
+    CHECK(!c.evict_one().has_value());
+    CHECK(c.size() == 0);
+
+    // Every B(100), B(101), B(102), B(103) accounted for exactly once.
+    CHECK(seen.size() == static_cast<size_t>(N));
+    std::sort(seen.begin(), seen.end());
+    CHECK(std::unique(seen.begin(), seen.end()) == seen.end());
+
+    printf("  [%s] put same key drain no leak: OK\n", label);
 }
 
 static void test_clock_eviction_returns_buf() {
@@ -172,6 +340,53 @@ static void test_slru_promotion() {
     printf("  [slru] promotion to protected: OK\n");
 }
 
+// ── evict_one: drain cache at teardown ──
+//
+// Used by value::scheduler::~scheduler to release buffers the cache still
+// owns. Both impls return one entry per call, exactly N times for N puts,
+// then nullopt with size()==0.
+
+template <cache_concept Cache>
+static void test_evict_one(const char* label) {
+    // N kept small enough to fit SLRU probation (prob_cap = capacity * 0.2 = 4
+    // for capacity 20). Without any get() the entries never get promoted, so
+    // they all live in probation; the test would fail at N>4 with a premature
+    // eviction. clock_cache has no such constraint, but using the same N for
+    // both keeps the test single-template.
+    Cache c(20);
+    constexpr int N = 3;
+    for (int i = 1; i <= N; ++i) c.put(P(i), B(i));
+    CHECK(c.size() == N);
+
+    std::vector<char*> seen;
+    while (auto e = c.evict_one()) {
+        seen.push_back(e->buf);
+    }
+    CHECK(seen.size() == static_cast<size_t>(N));
+    CHECK(c.size() == 0);
+    CHECK(!c.evict_one().has_value());
+
+    // Each buffer evicted exactly once.
+    std::sort(seen.begin(), seen.end());
+    CHECK(std::unique(seen.begin(), seen.end()) == seen.end());
+
+    // After full drain the cache must be reusable.
+    c.put(P(42), B(42));
+    CHECK(c.size() == 1);
+    CHECK(c.contains(P(42)));
+    CHECK(c.get(P(42)) == B(42));
+
+    printf("  [%s] evict_one: OK\n", label);
+}
+
+template <cache_concept Cache>
+static void test_evict_one_empty(const char* label) {
+    Cache c(8);
+    CHECK(!c.evict_one().has_value());
+    CHECK(c.size() == 0);
+    printf("  [%s] evict_one (empty): OK\n", label);
+}
+
 // ── SLRU-specific: scan resistance ──
 
 static void test_slru_scan_resistance() {
@@ -217,6 +432,26 @@ int main() {
     test_clock_hot_page();
     test_slru_promotion();
     test_slru_scan_resistance();
+
+    // ── evict_one (drain at teardown) ──
+    test_evict_one<clock_cache>("clock");
+    test_evict_one<slru_cache>("slru ");
+    test_evict_one_empty<clock_cache>("clock");
+    test_evict_one_empty<slru_cache>("slru ");
+
+    // ── put-existing must return old buf (regression: silent overwrite) ──
+    test_put_same_key_drain_no_leak<clock_cache>("clock");
+    test_put_same_key_drain_no_leak<slru_cache>("slru ");
+
+    // ── capacity-boundary rejection (regression: ctor crashed at use) ──
+    test_clock_capacity_zero_throws();
+    test_slru_capacity_zero_throws();
+    test_slru_capacity_one_throws();
+    test_slru_extreme_ratio_throws();
+
+    // ── smallest legal capacity must still work end-to-end ──
+    test_clock_min_capacity_works();
+    test_slru_min_capacity_works();
 
     printf("all passed\n");
     return 0;

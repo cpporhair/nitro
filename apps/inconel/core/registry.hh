@@ -9,7 +9,7 @@
 
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::lookup_scheduler_base
-#include "../value/scheduler.hh" // for value::scheduler
+#include "../value/scheduler.hh" // for value::scheduler_base
 
 namespace apps::inconel::core::registry {
 
@@ -43,8 +43,9 @@ namespace apps::inconel::core::registry {
 
     // value::scheduler is a global singleton — only one instance exists,
     // pinned to a specific core (cores[0] in the v6 builder). All access
-    // goes through value_sched().
-    inline value::scheduler* value_alloc_sched = nullptr;
+    // goes through value_sched(). The registry stores only the non-templated
+    // base pointer; the Cache template parameter stays inside the builder.
+    inline value::scheduler_base* value_alloc_sched = nullptr;
 
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
@@ -90,7 +91,7 @@ namespace apps::inconel::core::registry {
     // installing the instance at startup. Application code uses this
     // helper rather than reading the variable directly.
 
-    inline value::scheduler*
+    inline value::scheduler_base*
     value_sched() {
         assert(value_alloc_sched && "value::scheduler not registered");
         return value_alloc_sched;

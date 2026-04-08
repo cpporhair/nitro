@@ -87,21 +87,22 @@ struct test_env {
     mock_device                          dev;
     scheduler                            nvme_sched;
     lookup_scheduler<clock_cache>        tree_sched;
-    value::scheduler                     value_sched;
+    value::scheduler<clock_cache>        value_sched;
     tree_manifest                        manifest;
 
     std::vector<std::string> keys;
     std::vector<std::string> bodies;
     std::vector<value_ref>   refs;
 
-    test_env()
+    explicit test_env(uint32_t value_cache_cap = 32)
         : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE)
         , nvme_sched(&dev)
         , tree_sched(clock_cache(32))
         , value_sched(std::span<const uint32_t>(CLASS_SIZES),
                       LBA_SIZE,
                       paddr{0, DATA_AREA_BASE_LBA},
-                      paddr{0, DATA_AREA_END_LBA})
+                      paddr{0, DATA_AREA_END_LBA},
+                      clock_cache(value_cache_cap))
     {
         pump::core::this_core_id = 0;
 
@@ -435,6 +436,107 @@ void case_4_nvme_read_failure() {
            static_cast<unsigned long>(reads_after_1));
 }
 
+// ════════════════════════════════════════════════════════════════
+//  case_5: cache eviction isolation
+//
+//  Builds a fresh test_env with value_cache_capacity=2, then seeds 5
+//  distinct 1-LBA value pages directly via test_write_raw and reads them
+//  twice through value::read_value:
+//
+//    Round 1 (cold cache): all 5 reads must miss → exactly 5 NVMe reads.
+//    Round 2 (after fill): with cap=2 the cache holds at most 2 of the 5
+//                          entries, so re-reading all 5 must miss at least
+//                          N - cap = 3 of them. An unbounded cache would
+//                          add 0 reads in round 2, so this lower bound is
+//                          a falsifier for "cache is unbounded".
+//
+//  Round 2 also exercises the cache.put → evict → delete[] path repeatedly,
+//  giving step 9's manual valgrind run something to check. The test_env
+//  destructor at the end of the function then drives
+//  value::scheduler<Cache>::~scheduler → readonly_cache_.evict_one() drain,
+//  freeing the two surviving cached buffers. ASAN is not run on this test
+//  binary (share_nothing teardown bug, see feedback_share_nothing_no_drain),
+//  so leak verification is left to that valgrind pass.
+//
+//  case_5 deliberately bypasses the tree lookup path: cache behavior is
+//  independent of how the value_ref was obtained, and the case_2/case_3
+//  flow already covers tree → value handoff. Keeping this test focused
+//  on cache eviction makes the failure mode (round-2 read count) easy to
+//  attribute.
+// ════════════════════════════════════════════════════════════════
+
+void case_5_cache_eviction_isolation() {
+    test_env env(/*value_cache_cap*/ 2);
+
+    constexpr int      N         = 5;
+    constexpr uint64_t SEED_BASE = 5000;
+
+    std::vector<std::string> body_strs;
+    std::vector<value_ref>   vrs;
+    body_strs.reserve(N);
+    vrs.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        std::string body = "evict-isolation-" + std::to_string(i);
+        std::vector<char> page;
+        build_subLba_page_image(page, VALUE_CLASS_SIZE, {body});
+        void* dst = env.dev.test_write_raw(SEED_BASE + i);
+        std::memcpy(dst, page.data(), LBA_SIZE);
+
+        body_strs.push_back(std::move(body));
+        vrs.push_back(value_ref{
+            .base        = paddr{0, SEED_BASE + i},
+            .byte_offset = 0,
+            .len         = static_cast<uint32_t>(body_strs.back().size()),
+            .flags       = 0,
+        });
+    }
+
+    env.dev.reset_io_counters();
+
+    namespace ps = pump::sender;
+    auto ctx = pump::core::make_root_context();
+
+    auto read_one = [&](value_ref vr, std::string& got, bool& done) {
+        value::read_value(&env.value_sched, vr)
+            >> ps::then([&got, &done](std::string s) {
+                got  = std::move(s);
+                done = true;
+            })
+            >> ps::submit(ctx);
+    };
+
+    // Round 1: cold cache. Each fresh paddr → NVMe miss → fill_and_decode
+    // admits the page into the cache (1-LBA, span=1, admit=true).
+    for (int i = 0; i < N; ++i) {
+        std::string got;
+        bool        done = false;
+        read_one(vrs[i], got, done);
+        advance_until(env, done);
+        CHECK(got == body_strs[i]);
+    }
+    auto reads_round1 = env.dev.get_read_count();
+    CHECK(reads_round1 == N);
+
+    // Round 2: cap=2 means at most 2 of the 5 entries survive in the cache,
+    // so the other ≥3 reads must hit NVMe again.
+    for (int i = 0; i < N; ++i) {
+        std::string got;
+        bool        done = false;
+        read_one(vrs[i], got, done);
+        advance_until(env, done);
+        CHECK(got == body_strs[i]);
+    }
+    auto reads_round2 = env.dev.get_read_count();
+    auto round2_misses = reads_round2 - reads_round1;
+    CHECK(round2_misses >= 3);
+    CHECK(round2_misses <= N);
+
+    printf("  case_5_cache_eviction_isolation: OK "
+           "(round1=%lu reads, round2=+%lu misses, cap=2 forces ≥3)\n",
+           static_cast<unsigned long>(reads_round1),
+           static_cast<unsigned long>(round2_misses));
+}
+
 }  // namespace
 
 int main() {
@@ -443,6 +545,7 @@ int main() {
     case_2_missing_key();
     case_3_corrupt_value_page();
     case_4_nvme_read_failure();
+    case_5_cache_eviction_isolation();
     printf("all passed\n");
     return 0;
 }

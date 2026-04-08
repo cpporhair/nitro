@@ -19,6 +19,8 @@
 #include "../format/types.hh"
 #include "../mock_nvme/scheduler.hh"
 #include "./scheduler.hh"
+#include "pump/sender/get_context.hh"
+#include "pump/sender/pop_context.hh"
 
 namespace apps::inconel::value {
 
@@ -26,7 +28,7 @@ namespace apps::inconel::value {
     using format::value_ref;
 
     inline auto
-    on_persist_leader(scheduler* sched, persist_leader&& alt) {
+    on_persist_leader(scheduler_base* sched, persist_leader&& alt) {
         uint64_t rid = alt.round_id;
         return just()
             >> as_stream(__mov__(alt.writes))
@@ -62,7 +64,7 @@ namespace apps::inconel::value {
     // their sender types can differ — flat() accepts arbitrary senders.
 
     inline auto
-    persist_values(scheduler* sched, std::span<put_entry> entries) {
+    persist_values(scheduler_base* sched, std::span<put_entry> entries) {
         return sched->prepare_persist(entries)
             >> visit()
             >> flat_map([sched]<typename T>(T &&alt) {
@@ -75,17 +77,20 @@ namespace apps::inconel::value {
     }
 
     inline auto
-    on_read_miss(scheduler* sched, value_ref vr, read_miss&& alt) {
-        auto buf = std::move(alt.buf);
-        uint64_t lba = alt.base.lba;
-        uint32_t span = alt.span_lbas;
+    on_read_miss(scheduler_base* sched, value_ref vr, read_miss&& alt) {
         return just()
-            >> flat_map([lba, span, buf]() {
-                return core::registry::local_nvme()->read(lba, buf->data(), span);
-            })
-            >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
-            >> flat_map([sched, vr, buf](bool /*ok=true*/) mutable {
-                return sched->fill_and_decode(vr, std::move(buf));
+            >> with_context(__fwd__(alt), vr)([sched]() {
+                return get_context<read_miss>()
+                    >> flat_map([](const read_miss &rm) {
+                        return core::registry::local_nvme()->read(
+                            rm.base.lba, rm.buf.get(), rm.span_lbas);
+                    })
+                    >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
+                    >> get_context<read_miss, value_ref>()
+                    >> flat_map([sched](read_miss &rm, const value_ref &vr, bool) mutable {
+                        return sched->fill_and_decode(vr, std::move(rm.buf),
+                                                      rm.buf_size, rm.admit_to_cache);
+                    });
             });
     }
 
@@ -97,7 +102,7 @@ namespace apps::inconel::value {
     //   value::read_value(sched, vr) >> then(callback) >> submit(ctx);
 
     inline auto
-    read_value(scheduler* sched, value_ref vr) {
+    read_value(scheduler_base* sched, value_ref vr) {
         return sched->prepare_read(vr)
             >> visit()
             >> flat_map([sched, vr](auto &&alt) {

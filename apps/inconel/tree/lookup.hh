@@ -29,9 +29,7 @@ namespace apps::inconel::tree {
         std::vector<std::pair<format::paddr, char*>> page_map;
     };
 
-    struct decision_need_cache {};
-
-    using batch_decision = std::variant<decision_done, decision_need_read, decision_need_cache>;
+    using batch_decision = std::variant<decision_done, decision_need_read>;
 
 }
 

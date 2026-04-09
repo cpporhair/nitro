@@ -16,6 +16,7 @@
 #include "pump/core/lock_free_queue.hh"
 
 #include "../core/page_cache.hh"
+#include "../core/panic.hh"
 #include "../core/tree_manifest.hh"
 #include "../format/tree_page.hh"
 #include "./lookup.hh"
@@ -261,10 +262,21 @@ namespace apps::inconel::tree {
                     const char* page = page_cache_.get(e.next_page);
                     if (page == nullptr) break;
 
-                    if (!tree_page_validate(page, s.page_size)) {
-                        e.result = lookup_absent{};
-                        e.resolved = true;
-                        break;
+                    auto status = inspect_tree_page(page, s.page_size);
+                    if (status != tree_page_status::ok) {
+                        // Corruption detected on a page we already
+                        // believed cached — there is no semantically
+                        // sound recovery from "the on-disk B+tree is
+                        // wrong", so we abort with enough context to
+                        // identify the offending slot and its failure
+                        // mode rather than silently turning it into
+                        // lookup_absent.
+                        core::panic_inconsistency(
+                            "tree::lookup_scheduler::process_entries",
+                            "corrupt tree page dev=%u lba=%lu status=%s",
+                            static_cast<unsigned>(e.next_page.device_id),
+                            static_cast<unsigned long>(e.next_page.lba),
+                            tree_page_status_to_string(status));
                     }
 
                     auto* hdr = reinterpret_cast<const tree_slot_header*>(page);

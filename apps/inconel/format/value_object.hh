@@ -7,7 +7,9 @@
 #include <span>
 #include <string_view>
 
-#include "./crc.hh"
+#include <absl/crc/crc32c.h>
+#include <absl/strings/string_view.h>
+
 #include "./types.hh"
 
 namespace apps::inconel::format {
@@ -51,7 +53,8 @@ namespace apps::inconel::format {
         value_object_header hdr{};
         hdr.magic    = VALUE_MAGIC;
         hdr.body_len = static_cast<uint32_t>(body.size());
-        hdr.body_crc = crc32c(body.data(), body.size());
+        hdr.body_crc = static_cast<uint32_t>(absl::ComputeCrc32c(
+            absl::string_view(body.data(), body.size())));
 
         std::memcpy(slot.data(), &hdr, sizeof(hdr));
         std::memcpy(slot.data() + sizeof(hdr), body.data(), body.size());
@@ -80,7 +83,9 @@ namespace apps::inconel::format {
         }
 
         const char* body_ptr = slot.data() + sizeof(hdr);
-        if (crc32c(body_ptr, expected_body_len) != hdr.body_crc) {
+        uint32_t computed = static_cast<uint32_t>(absl::ComputeCrc32c(
+            absl::string_view(body_ptr, expected_body_len)));
+        if (computed != hdr.body_crc) {
             r.status = value_decode_status::bad_crc;
             return r;
         }

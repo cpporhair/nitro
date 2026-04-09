@@ -111,7 +111,7 @@ namespace apps::inconel::tree {
 
         uint32_t
         record_size(uint16_t key_len) const {
-            return sizeof(uint16_t) + key_len + sizeof(paddr);
+            return internal_record_size(key_len);
         }
 
         uint32_t
@@ -125,12 +125,10 @@ namespace apps::inconel::tree {
             uint32_t needed = record_size(key_len);
             if (needed + sizeof(paddr) > free_space()) return false;  // reserve room for rightmost
 
-            auto* p = static_cast<char*>(buf) + offset;
-            std::memcpy(p, &key_len, sizeof(key_len));
-            p += sizeof(key_len);
-            std::memcpy(p, separator_key.data(), key_len);
-            p += key_len;
-            std::memcpy(p, &child_base, sizeof(child_base));
+            auto* rec = reinterpret_cast<internal_record*>(static_cast<char*>(buf) + offset);
+            rec->key_len = key_len;
+            std::memcpy(internal_record_key(rec), separator_key.data(), key_len);
+            std::memcpy(internal_record_child_base(rec), &child_base, sizeof(child_base));
 
             offset += needed;
             ++count;

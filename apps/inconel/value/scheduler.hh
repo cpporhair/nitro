@@ -24,6 +24,7 @@
 #include "pump/core/op_tuple_builder.hh"
 
 #include "../core/page_cache.hh"
+#include "../core/panic.hh"
 #include "../format/types.hh"
 #include "../format/value_object.hh"
 #include "./allocator.hh"
@@ -641,10 +642,9 @@ namespace apps::inconel::value {
                 // know what state the scheduler is in. Continuing would just
                 // propagate the corruption — abort hard rather than try to
                 // surface it as a recoverable exception.
-                std::fprintf(stderr,
-                    "value::finalize: unknown round_id %lu — invariant broken\n",
+                core::panic_inconsistency("value::scheduler::handle_finalize",
+                    "unknown round_id %lu",
                     static_cast<unsigned long>(item->round_id));
-                std::abort();
             }
 
             auto rnd = std::move(it->second);
@@ -812,18 +812,16 @@ namespace apps::inconel::value {
         handle_fill(_value_fill::req* item) {
             // CRITICAL: decode against the staging buffer FIRST, before
             // touching readonly_cache_. If the on-disk bytes are corrupt
-            // (bad magic / body_len / crc / truncated) we must surface an
-            // exception via item->fail() and leave the cache untouched —
-            // otherwise every subsequent reader of this paddr would be
-            // served the same poisoned page.
-            auto body_opt = try_decode_value(
+            // (bad magic / body_len / crc / truncated) the on-disk value
+            // area is wrong and there is no semantically sound recovery —
+            // every subsequent reader of this paddr would be served the
+            // same poisoned page. Abort hard with the offending value_ref
+            // and decode reason rather than collapse it into an exception.
+            auto decoded = try_decode_value(
                 std::span<const char>(item->buf.get(), item->buf_size),
                 item->vr);
-            if (!body_opt) {
-                item->fail(std::make_exception_ptr(std::runtime_error(
-                    "value::read: corrupt value object on disk (post-NVMe)")));
-                delete item;
-                return;
+            if (decoded.status != format::value_decode_status::ok) {
+                panic_decode_failure(item->vr, decoded.status, "post_nvme");
             }
 
             // Verified — admit policy was decided in handle_read and rides
@@ -839,7 +837,7 @@ namespace apps::inconel::value {
                 }
             }
 
-            item->cb(std::move(*body_opt));
+            item->cb(std::string(decoded.body.data(), decoded.body.size()));
             delete item;
         }
 
@@ -847,40 +845,71 @@ namespace apps::inconel::value {
 
         // Decode a value object from an in-memory page image at vr's slot.
         //
-        // Returns nullopt on ANY format error (truncated / bad_magic /
-        // bad_body_len / bad_crc) — the caller must distinguish "no value"
-        // from "on-disk corruption" and surface the latter as an exception.
-        // Never returns an empty std::string to mean "decode failed";
-        // empty body is a legitimate value.
+        // Returns the full format::value_decode_result so callers see the
+        // exact failure mode (truncated / bad_magic / bad_body_len /
+        // bad_crc) — every Inconel value-read path treats anything other
+        // than ok as on-disk corruption and panics, so we never collapse
+        // the reason here. Empty body is a legitimate value, distinct
+        // from any error.
         //
         // span<const char> is the uniform decode path: writable_pages_,
-        // readonly_cache_, and the fill staging buffer all reach this through
-        // a span construction at the call site, so the helper is agnostic to
-        // who owns the bytes.
-        std::optional<std::string>
+        // readonly_cache_, and the fill staging buffer all reach this
+        // through a span construction at the call site, so the helper is
+        // agnostic to who owns the bytes.
+        format::value_decode_result
         try_decode_value(std::span<const char> image, value_ref vr) const {
-            if (vr.byte_offset >= image.size()) return std::nullopt;
+            if (vr.byte_offset >= image.size()) {
+                return format::value_decode_result{
+                    .status = format::value_decode_status::truncated,
+                    .body   = {},
+                };
+            }
             auto slot = image.subspan(vr.byte_offset);
-            auto d = format::decode_value_object(slot, vr.len);
-            if (!d.ok()) return std::nullopt;
-            return std::string(d.body.data(), d.body.size());
+            return format::decode_value_object(slot, vr.len);
         }
 
-        // Serve a read req from an in-memory page image, surfacing
-        // corruption as item->fail() rather than a silent empty body.
+        // Serve a read req from an in-memory page image. Decode failures
+        // here mean the value area itself is corrupt (the slot we landed
+        // on has the wrong bytes), so we panic rather than surface a
+        // recoverable exception — see handle_fill for the same reasoning.
         // Caller is responsible for `delete item` and `return` after this.
         void
         serve_hit_or_fail(_value_read::req* item,
                           std::span<const char> image,
                           const char* source_label) {
-            auto body = try_decode_value(image, item->vr);
-            if (!body) {
-                std::string msg = "value::read: corrupt value object in ";
-                msg += source_label;
-                item->fail(std::make_exception_ptr(std::runtime_error(msg)));
-                return;
+            auto decoded = try_decode_value(image, item->vr);
+            if (decoded.status != format::value_decode_status::ok) {
+                panic_decode_failure(item->vr, decoded.status, source_label);
             }
-            item->cb(read_prepare_result{ read_hit{ std::move(*body) } });
+            item->cb(read_prepare_result{
+                read_hit{ std::string(decoded.body.data(), decoded.body.size()) }
+            });
+        }
+
+        [[noreturn]] static void
+        panic_decode_failure(const value_ref& vr,
+                             format::value_decode_status status,
+                             const char* source_label) {
+            core::panic_inconsistency("value::scheduler::decode",
+                "corrupt value object source=%s dev=%u lba=%lu byte_offset=%u len=%u status=%s",
+                source_label,
+                static_cast<unsigned>(vr.base.device_id),
+                static_cast<unsigned long>(vr.base.lba),
+                static_cast<unsigned>(vr.byte_offset),
+                static_cast<unsigned>(vr.len),
+                value_decode_status_to_string(status));
+        }
+
+        static const char*
+        value_decode_status_to_string(format::value_decode_status s) {
+            switch (s) {
+            case format::value_decode_status::ok:           return "ok";
+            case format::value_decode_status::truncated:    return "truncated";
+            case format::value_decode_status::bad_magic:    return "bad_magic";
+            case format::value_decode_status::bad_body_len: return "bad_body_len";
+            case format::value_decode_status::bad_crc:      return "bad_crc";
+            }
+            return "unknown";
         }
 
         std::optional<uint16_t>

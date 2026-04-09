@@ -1,11 +1,10 @@
 #ifndef APPS_INCONEL_CORE_TREE_MANIFEST_HH
 #define APPS_INCONEL_CORE_TREE_MANIFEST_HH
 
-#include <cassert>
-
 #include <absl/container/flat_hash_map.h>
 
 #include "../format/types.hh"
+#include "./panic.hh"
 
 namespace apps::inconel::core {
 
@@ -25,7 +24,19 @@ namespace apps::inconel::core {
         paddr
         resolve(paddr range_base) const {
             auto it = slot_map.find(range_base);
-            assert(it != slot_map.end());
+            if (it == slot_map.end()) {
+                // Internal-node child_base must always resolve via the
+                // manifest — anything else means the on-disk tree is
+                // pointing at a range we don't know about, which is
+                // unrecoverable corruption. Continuing past this would
+                // either dereference garbage (Release, no assert) or
+                // silently mis-route the lookup, so we abort here with
+                // the offending range so the operator can find it.
+                panic_inconsistency("tree_manifest::resolve",
+                    "missing range_base dev=%u lba=%lu",
+                    static_cast<unsigned>(range_base.device_id),
+                    static_cast<unsigned long>(range_base.lba));
+            }
             uint32_t idx = it->second;
             return { range_base.device_id,
                      range_base.lba + static_cast<uint64_t>(idx) * (tree_page_size / lba_size) };

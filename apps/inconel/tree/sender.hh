@@ -74,6 +74,7 @@ namespace apps::inconel::tree {
                                 if constexpr (std::is_same_v<std::decay_t<D>, decision_need_read>) {
                                     return on_decision_need_read(tree_sched, __fwd__(decision));
                                 } else {
+                                    static_assert(std::is_same_v<std::decay_t<D>, decision_done>);
                                     return just(true);
                                 }
                             })

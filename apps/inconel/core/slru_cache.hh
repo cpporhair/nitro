@@ -193,12 +193,24 @@ namespace apps::inconel::core {
             free_head_ = nodes_[idx].next;
             nodes_[idx].prev = NIL;
             nodes_[idx].next = NIL;
+            // Free nodes must always come back as probation-side; if any
+            // free path forgot to clear in_protected then a later
+            // promote_to_protected() would skip the demotion accounting
+            // and the protected segment would silently overflow.
+            assert(!nodes_[idx].in_protected);
             return idx;
         }
 
         void
         free_node(uint32_t idx) {
             nodes_[idx].occupied = false;
+            // INC-037: clear in_protected when retiring a node so the next
+            // alloc_node() that picks this slot starts in a known state.
+            // The promote_to_protected() / move_to_protected_head() paths
+            // both treat in_protected as authoritative for which list to
+            // unlink from, so a stale `true` here would corrupt the
+            // protected list once the slot is reused.
+            nodes_[idx].in_protected = false;
             nodes_[idx].next = free_head_;
             free_head_ = idx;
         }

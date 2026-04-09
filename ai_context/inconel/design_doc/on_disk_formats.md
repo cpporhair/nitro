@@ -23,7 +23,7 @@
 
 ### 1.3 CRC
 
-所有盘上对象使用 **CRC-32C**（SSE 4.2 硬件加速）。CRC 覆盖范围在每个对象格式中单独定义。
+所有盘上对象使用 **标准 CRC-32C**（Castagnoli 多项式 0x1EDC6F41，含标准 init/xor conditioning：初始值 0xFFFFFFFF，最终结果 xor 0xFFFFFFFF）。当前实现由 `absl::ComputeCrc32c` 提供，自动选择 SSE 4.2 / ARM CRC 等硬件加速路径。CRC 覆盖范围在每个对象格式中单独定义。
 
 ### 1.4 地址类型
 

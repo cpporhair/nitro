@@ -159,22 +159,17 @@ namespace apps::inconel::tree {
     private:
         static internal_entry
         read_internal_record(const char* p) {
-            uint16_t key_len;
-            std::memcpy(&key_len, p, sizeof(key_len));
-            p += sizeof(key_len);
-
+            auto* rec = reinterpret_cast<const internal_record*>(p);
             internal_entry e;
-            e.separator_key = std::string_view(p, key_len);
-            p += key_len;
-            std::memcpy(&e.child_base, p, sizeof(paddr));
+            e.separator_key = std::string_view(internal_record_key(rec), rec->key_len);
+            std::memcpy(&e.child_base, internal_record_child_base(rec), sizeof(paddr));
             return e;
         }
 
         static const char*
         skip_internal_record(const char* p) {
-            uint16_t key_len;
-            std::memcpy(&key_len, p, sizeof(key_len));
-            return p + sizeof(uint16_t) + key_len + sizeof(paddr);
+            auto* rec = reinterpret_cast<const internal_record*>(p);
+            return p + internal_record_size(rec->key_len);
         }
     };
 

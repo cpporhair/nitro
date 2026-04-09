@@ -11,6 +11,7 @@
 // tree traversal, value cache miss + NVMe read, and value object decoding.
 //
 
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <span>
@@ -18,6 +19,9 @@
 #include <string_view>
 #include <variant>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "apps/inconel/test/check.hh"
 
@@ -280,86 +284,107 @@ void case_2_missing_key() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  case_3: corrupt value page → read_value must throw, cache stays clean
+//  case_3: corrupt value page → process MUST panic (death test)
 //
-//  Procedure:
-//   1. Use the standard test_env (clean leaf + clean value page).
-//   2. Reach into the device backing store via test_write_raw and zero
-//      out the magic bytes of slot 0 in the value page — that turns it
-//      into bad_magic from value::format::decode_value_object's POV.
-//   3. tree::lookup is unaffected (leaf is still intact); the lookup
-//      returns the same value_ref as case_1.
-//   4. value::read_value goes through miss → NVMe read → handle_fill →
-//      try_decode_value(nullopt) → item->fail(...).
-//   5. any_exception catches the exception_ptr; assert the message
-//      mentions "corrupt" so we know the right path fired (not just
-//      some unrelated error).
-//   6. Issue a SECOND read_value for the same vr immediately after.
-//      If handle_fill had committed the corrupt page to readonly_cache_,
-//      the second read would NOT re-issue NVMe and we would either keep
-//      throwing from a hit path or return garbage. Verify the second
-//      read also throws via the same NVMe-read path (i.e., NVMe read
-//      counter increments), proving cache was NOT poisoned.
+//  Step 009 hardening: decode corruption is no longer surfaced as a
+//  recoverable exception. value::scheduler::handle_fill calls
+//  core::panic_inconsistency() *before* it touches readonly_cache_,
+//  so the only observable evidence is the SIGABRT it raises and the
+//  diagnostic line it writes to stderr just before aborting.
+//
+//  We can't observe a panic from inside the same process, so the
+//  read runs in a forked child whose stderr is redirected into a
+//  pipe. The parent waits for the child, then asserts:
+//
+//    1. The child died via SIGABRT  (WIFSIGNALED + WTERMSIG)
+//    2. The captured stderr contains the panic-site identifiers
+//       ("inconel panic" / "corrupt value object" / "source=post_nvme"
+//       / "status=bad_magic") so we know the right path fired and
+//       not some unrelated abort (e.g. CHECK failure).
+//
+//  Cache-poisoning is no longer observable in this test: handle_fill
+//  panics before any readonly_cache_.put(), so it is structurally
+//  impossible for the corrupt page to enter the cache. The old
+//  "second read also misses" assertion is dead under the new design
+//  and has been removed.
 // ════════════════════════════════════════════════════════════════
 
 void case_3_corrupt_value_page() {
-    test_env env;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        std::perror("case_3: pipe");
+        std::abort();
+    }
 
-    // Smash the magic bytes of slot 0 (which env.refs[0] points at).
-    void* dst = env.dev.test_write_raw(VALUE_LBA);
-    char* page = static_cast<char*>(dst);
-    // env.refs[0].byte_offset == 0; value_object_header.magic occupies
-    // the first 4 bytes of that slot.
-    page[0] = 0; page[1] = 0; page[2] = 0; page[3] = 0;
+    pid_t pid = fork();
+    CHECK(pid >= 0);
 
-    auto ctx = pump::core::make_root_context();
-    namespace ps = pump::sender;
+    if (pid == 0) {
+        // ── Child ──
+        // Redirect stderr into the pipe so the parent can read the
+        // panic diagnostic. Close the read end; close the write end's
+        // original FD after dup2 so EOF reaches the parent the moment
+        // the child exits.
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDERR_FILENO) < 0) _exit(127);
+        close(pipefd[1]);
 
-    auto run_one_read = [&](std::string& err_out, bool& done_out) {
+        test_env env;
+
+        // Smash the magic bytes of slot 0 (env.refs[0]'s slot).
+        // env.refs[0].byte_offset == 0; value_object_header.magic
+        // occupies the first 4 bytes of that slot.
+        void* dst  = env.dev.test_write_raw(VALUE_LBA);
+        char* page = static_cast<char*>(dst);
+        page[0] = 0; page[1] = 0; page[2] = 0; page[3] = 0;
+
+        auto ctx = pump::core::make_root_context();
+        namespace ps = pump::sender;
+        bool done = false;
+
+        // Drive the read. handle_fill will panic during the second
+        // advance pass, before this `then` ever runs.
         value::read_value(&env.value_sched, env.refs[0])
-            >> ps::any_exception([&err_out](std::exception_ptr ep) {
-                try { std::rethrow_exception(ep); }
-                catch (const std::exception& e) { err_out = e.what(); }
-                catch (...) { err_out = "<non-std exception>"; }
-                // Convert the error path to a normal value_t==std::string
-                // so the downstream then-stage still receives one value
-                // and the pipeline drains cleanly.
-                return ps::just(std::string{"<corrupt>"});
-            })
-            >> ps::then([&done_out](auto&&) { done_out = true; })
+            >> ps::then([&done](auto&&) { done = true; })
             >> ps::submit(ctx);
-    };
 
-    // Reset NVMe counters so we can tell whether read 2 actually went
-    // to disk again (proof the cache wasn't populated by read 1).
-    env.dev.reset_io_counters();
+        advance_until(env, done);
 
-    // ── First read: must throw ──
-    std::string err1;
-    bool done1 = false;
-    run_one_read(err1, done1);
-    advance_until(env, done1);
-    CHECK(!err1.empty());
-    CHECK(err1.find("corrupt") != std::string::npos);
-    auto reads_after_1 = env.dev.get_read_count();
-    CHECK(reads_after_1 >= 1);
+        // Reaching here means the panic did not fire — that itself
+        // is the regression we are testing for. Exit with a normal
+        // status so the parent's WIFSIGNALED / WTERMSIG checks fail
+        // loudly instead of silently passing.
+        _exit(0);
+    }
 
-    // ── Second read: must ALSO throw and ALSO go to NVMe (cache uncached) ──
-    std::string err2;
-    bool done2 = false;
-    run_one_read(err2, done2);
-    advance_until(env, done2);
-    CHECK(!err2.empty());
-    CHECK(err2.find("corrupt") != std::string::npos);
-    auto reads_after_2 = env.dev.get_read_count();
-    CHECK(reads_after_2 > reads_after_1
-          && "corrupt page must NOT have been admitted to readonly_cache_");
+    // ── Parent ──
+    close(pipefd[1]);
 
-    printf("  case_3_corrupt_value_page: OK (caught \"%s\", "
-           "nvme reads %lu→%lu, cache clean)\n",
-           err1.c_str(),
-           static_cast<unsigned long>(reads_after_1),
-           static_cast<unsigned long>(reads_after_2));
+    char   stderr_buf[4096] = {};
+    size_t total = 0;
+    while (total + 1 < sizeof(stderr_buf)) {
+        ssize_t n = read(pipefd[0], stderr_buf + total,
+                         sizeof(stderr_buf) - 1 - total);
+        if (n <= 0) break;
+        total += static_cast<size_t>(n);
+    }
+    close(pipefd[0]);
+
+    int   status = 0;
+    pid_t w      = waitpid(pid, &status, 0);
+    CHECK(w == pid);
+    CHECK(WIFSIGNALED(status));
+    CHECK(WTERMSIG(status) == SIGABRT);
+
+    std::string captured(stderr_buf, total);
+    CHECK(captured.find("inconel panic")        != std::string::npos);
+    CHECK(captured.find("corrupt value object") != std::string::npos);
+    CHECK(captured.find("source=post_nvme")     != std::string::npos);
+    CHECK(captured.find("status=bad_magic")     != std::string::npos);
+
+    printf("  case_3_corrupt_value_page: OK "
+           "(child SIGABRT on bad_magic via post_nvme, %zu bytes captured)\n",
+           total);
 }
 
 // ════════════════════════════════════════════════════════════════

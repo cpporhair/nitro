@@ -89,7 +89,8 @@ target_compile_options(sider_bench PRIVATE -Wno-unused-result -Wno-deprecated-de
 set(INCONEL_ABSL_LIBS
     absl::flat_hash_map
     absl::flat_hash_set
-    absl::inlined_vector)
+    absl::inlined_vector
+    absl::crc32c)
 
 add_executable(inconel_test_tree_lookup apps/inconel/test/test_tree_lookup.cc)
 target_include_directories(inconel_test_tree_lookup PRIVATE ${CMAKE_SOURCE_DIR})

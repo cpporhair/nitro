@@ -350,6 +350,20 @@ namespace apps::inconel::value {
         // durable on NVMe but still has at least one free slot, so the next
         // persist round for the same class will reuse it in-memory. LIFO
         // (pop_back) keeps the hottest partial page in front.
+        //
+        // Spec mapping (see runtime_memory_and_cache.md §6.3 and §8.6):
+        // `writable_pages_[ci]` is the engineering landing of the spec's
+        // "open frame held across persist rounds" idea. It is the resident
+        // continuation of a previously-durable partially-free page that the
+        // owner keeps live so the next round can keep filling it without
+        // re-reading it from device. It is **not** the spec's full
+        // `hole_page_list` (non-resident placement metadata), nor the spec's
+        // `open_frames[class_idx]` per-class single open DMA frame; the v1
+        // implementation collapses both into this per-class queue because
+        // there is no separate non-resident hole tracking yet and only one
+        // page is being filled at a time per class anyway. The
+        // `value_page_source::writable` enum value names exactly this
+        // population — pages popped here come back here on rollback.
         std::vector<std::vector<page_data>> writable_pages_;
 
         // readonly cache: paddr → 1-LBA page image. Holds raw char[] buffers
@@ -391,8 +405,6 @@ namespace apps::inconel::value {
             , readonly_cache_(std::move(cache))
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
-            class_sizes_view_ = std::span<const uint32_t>(
-                class_sizes_storage_.data(), class_sizes_storage_.size());
         }
 
         // ── Destructor ──
@@ -449,103 +461,184 @@ namespace apps::inconel::value {
         // ════════════════════════════════════════════════════════════════
         //  handle_persist  —  leader-follower round assembly
         // ════════════════════════════════════════════════════════════════
+        //
+        // Round build is split into four explicit phases (no goto, no
+        // exception_ptr smuggling):
+        //
+        //   1. collect_round_items(leader)        — drain followers up to cap
+        //   2. build_round(round, items)          — encode every entry
+        //   3. finalize_round_writes(round)       — build write_desc list
+        //   4. publish_round(round, items, ldr)   — install + fire leader cb
+        //
+        // build_round returns an explicit `persist_entry_status` so the
+        // caller can route each failure mode without inspecting the round
+        // state. Only `value_too_large` is recoverable (caller sent a body
+        // that doesn't fit any size class — pure caller-driven input).
+        // `out_of_space` and `encode_failure` are invariant breaks: v1 has
+        // no value reclaim, so an empty bump head means the runtime is in a
+        // state we can no longer reason about; an encode failure after a
+        // class has been picked means encode_value_object disagreed with
+        // find_min_class, which is an internal logic bug. Both panic
+        // immediately rather than masquerading as a recoverable exception.
+
+        enum class persist_entry_status : uint8_t {
+            ok = 0,
+            value_too_large,   // recoverable — caller body exceeds all classes
+            out_of_space,      // fatal — no Data Area left, no reclaim path
+            encode_failure,    // fatal — encode disagreed with find_min_class
+        };
+
+        // INC-028 — bound the per-round work. Without a cap, a single
+        // handle_persist invocation could drain the entire persist_q_ as
+        // followers, producing arbitrarily large rounds and unbounded tail
+        // latency. The cap is a private constant on purpose: this is a
+        // workload-shaping knob, not a runtime configuration surface, and
+        // promoting it to the start_options struct would expand the public
+        // API for an internal tuning parameter that hasn't yet earned a
+        // public name. Lift it later if benchmarks demand a different
+        // value, but do not feature-flag it now.
+        static constexpr uint32_t kMaxFollowersPerRound = 64;
 
         void
         handle_persist(_value_persist::req* leader_item) {
+            auto items = collect_round_items(leader_item);
+
             auto rnd = std::make_unique<round>();
             rnd->id = next_round_id_++;
 
-            // Drain leftover persist requests as followers.
-            std::vector<_value_persist::req*> all_items;
-            all_items.push_back(leader_item);
-            while (auto item = persist_q_.try_dequeue())
-                all_items.push_back(*item);
-
-            // Process every entry across all items, allocating slots and
-            // encoding value objects in-place into round pages.
-            //
-            // On any failure (out of space, encode error) we fail the entire
-            // round immediately — leader + all followers — and return without
-            // touching the inflight_rounds_ map.
-
-            std::optional<std::exception_ptr> failure;
-            for (auto* item : all_items) {
-                for (auto& entry : item->entries) {
-                    if (!persist_one_entry(*rnd, entry)) {
-                        failure = std::make_exception_ptr(
-                            std::runtime_error("value::persist: out of space or encode failure"));
-                        goto round_failed;
-                    }
+            auto status = build_round(*rnd, items);
+            if (status == persist_entry_status::value_too_large) {
+                // Recoverable: caller's body doesn't fit any class. Roll
+                // back every page touched this round (reverse-order so
+                // fresh_bump pages can be returned to the device head),
+                // then fail every item in this round — leader and
+                // followers alike — with a single shared exception_ptr.
+                rollback_pages(*rnd);
+                auto failure = std::make_exception_ptr(std::runtime_error(
+                    "value::persist: body length exceeds all size classes"));
+                for (auto* item : items) {
+                    item->fail(failure);
+                    delete item;
                 }
+                return;
+            }
+            if (status == persist_entry_status::out_of_space) {
+                core::panic_inconsistency("value::scheduler::handle_persist",
+                    "value Data Area exhausted; v1 has no reclaim path");
+            }
+            if (status == persist_entry_status::encode_failure) {
+                core::panic_inconsistency("value::scheduler::handle_persist",
+                    "encode_value_object failed after class selection — internal logic break");
             }
 
-            // Build write descriptors over round.pages (must be done after
-            // all entries are encoded — vector<round_page> must not realloc
-            // between encode and dispatch, so we built it inline above).
-            rnd->writes.reserve(rnd->pages.size());
-            for (auto& page : rnd->pages) {
-                rnd->writes.push_back(write_desc{
+            // status == ok
+            finalize_round_writes(*rnd);
+            publish_round(std::move(rnd), items, leader_item);
+        }
+
+        // ── collect_round_items ──
+        //
+        // Drain at most kMaxFollowersPerRound followers from persist_q_ on
+        // top of the leader. Anything beyond the cap stays in the queue and
+        // will be picked up by the next advance() invocation as the leader
+        // of its own round.
+
+        std::vector<_value_persist::req*>
+        collect_round_items(_value_persist::req* leader_item) {
+            std::vector<_value_persist::req*> items;
+            items.reserve(1 + kMaxFollowersPerRound);
+            items.push_back(leader_item);
+            while (items.size() < 1u + kMaxFollowersPerRound) {
+                auto next = persist_q_.try_dequeue();
+                if (!next) break;
+                items.push_back(*next);
+            }
+            return items;
+        }
+
+        // ── build_round ──
+        //
+        // Walk every entry across every item, encoding value objects into
+        // round pages. Stops on the first non-ok status; the caller is
+        // responsible for rollback.
+
+        persist_entry_status
+        build_round(round& rnd, std::span<_value_persist::req* const> items) {
+            for (auto* item : items) {
+                for (auto& entry : item->entries) {
+                    auto status = append_entry_to_round(rnd, entry);
+                    if (status != persist_entry_status::ok) return status;
+                }
+            }
+            return persist_entry_status::ok;
+        }
+
+        // ── finalize_round_writes ──
+        //
+        // Build the write_desc vector over the encoded pages. Must run
+        // after build_round has settled the round_page list because
+        // write_desc holds raw pointers into round_page.image; we relied on
+        // that contract before by deferring the descriptor build to the
+        // end of handle_persist, but it deserves its own named step now
+        // that the control flow is no longer linear.
+
+        void
+        finalize_round_writes(round& rnd) {
+            rnd.writes.reserve(rnd.pages.size());
+            for (auto& page : rnd.pages) {
+                rnd.writes.push_back(write_desc{
                     .lba      = page.base.lba,
                     .data     = page.image.get(),
                     .num_lbas = page.span_lbas,
                     .flags    = 0,
                 });
             }
-
-            {
-                // Stash the round, fire leader cb with writes, leave
-                // followers waiting.
-                uint64_t rid = rnd->id;
-                std::span<write_desc> writes_span(
-                    rnd->writes.data(), rnd->writes.size());
-
-                // followers receive the leader_item position 0 → make sure
-                // we don't include leader_item in followers vector.
-                for (size_t i = 1; i < all_items.size(); ++i)
-                    rnd->followers.push_back(all_items[i]);
-
-                inflight_rounds_.emplace(rid, std::move(rnd));
-
-                leader_item->cb(prepare_persist_result{
-                    persist_leader{rid, writes_span}
-                });
-                delete leader_item;
-            }
-            return;
-
-        round_failed:
-            // Roll back any pages we already touched and fail leader +
-            // followers. Pages popped from writable_pages_ are restored by
-            // rollback_pages; fresh_bump / whole_page sources are simply
-            // dropped (they were never durable so this is safe — except the
-            // bump head has already moved, which leaks Data Area capacity).
-            // v6 accepts this leak: persist failures here only happen on
-            // out-of-space conditions and the runtime is about to terminate.
-            rollback_pages(*rnd);
-            for (auto* item : all_items) {
-                item->fail(*failure);
-                delete item;
-            }
         }
 
-        // ── Allocate a slot for one entry, encoding into the page image. ──
+        // ── publish_round ──
         //
-        // Reuses an in-flight round_page if there's one with the same
-        // class_idx and free_mask != 0. Otherwise pulls a fresh page via
-        // alloc_.acquire_page() and seeds the round_page from open/ready
-        // state or a new buffer.
+        // Install the round into inflight_rounds_, fire the leader's
+        // callback with the write list, and stash the followers on the
+        // round so handle_finalize can wake them when the FUA write
+        // completes. Followers do not include the leader itself.
 
-        bool
-        persist_one_entry(round& rnd, put_entry& entry) {
+        void
+        publish_round(std::unique_ptr<round> rnd,
+                      std::span<_value_persist::req* const> items,
+                      _value_persist::req* leader_item) {
+            uint64_t rid = rnd->id;
+            std::span<write_desc> writes_span(
+                rnd->writes.data(), rnd->writes.size());
+
+            for (size_t i = 1; i < items.size(); ++i)
+                rnd->followers.push_back(items[i]);
+
+            inflight_rounds_.emplace(rid, std::move(rnd));
+
+            leader_item->cb(prepare_persist_result{
+                persist_leader{rid, writes_span}
+            });
+            delete leader_item;
+        }
+
+        // ── append_entry_to_round ──
+        //
+        // Allocate a slot for one entry and encode the value object into
+        // the page image. Reuses an in-flight round_page when one of the
+        // same class still has a free slot; otherwise pulls a fresh page
+        // via acquire_round_page (writable → whole_pool → fresh_bump).
+
+        persist_entry_status
+        append_entry_to_round(round& rnd, put_entry& entry) {
             uint32_t total = sizeof(format::value_object_header) + entry.body.size();
-            auto ci_opt = format::find_min_class(total, get_class_sizes_view());
-            if (!ci_opt) return false;
+            auto ci_opt = format::find_min_class(total, class_sizes_span());
+            if (!ci_opt) return persist_entry_status::value_too_large;
             uint16_t ci = *ci_opt;
 
             round_page* page = find_round_page_with_room(rnd, ci);
             if (!page) {
                 page = acquire_round_page(rnd, ci);
-                if (!page) return false;
+                if (!page) return persist_entry_status::out_of_space;
             }
 
             // Pick the lowest set bit (next free slot).
@@ -558,13 +651,15 @@ namespace apps::inconel::value {
                 off = static_cast<uint16_t>(slot * cs);
             }
 
-            // Encode value object into the slot.
+            // Encode value object into the slot. A failure here means
+            // encode_value_object disagreed with find_min_class about
+            // whether the body fits — that is an internal logic break, not
+            // a caller-driven recoverable error, so we surface it via the
+            // fatal status code instead of "restore the bit and pretend".
             std::span<char> slot_span(page->image.get() + off, cs);
             std::span<const char> body_span(entry.body.data(), entry.body.size());
             if (!format::encode_value_object(slot_span, body_span)) {
-                // restore the bit so rollback can return the page cleanly
-                page->free_mask |= (1ULL << slot);
-                return false;
+                return persist_entry_status::encode_failure;
             }
 
             // Fill the caller's value_ref.
@@ -572,7 +667,7 @@ namespace apps::inconel::value {
             entry.out_vr->byte_offset = off;
             entry.out_vr->len         = static_cast<uint32_t>(entry.body.size());
             entry.out_vr->flags       = 0;
-            return true;
+            return persist_entry_status::ok;
         }
 
         round_page*
@@ -702,14 +797,35 @@ namespace apps::inconel::value {
             }
         }
 
+        // ── rollback_pages ──
+        //
+        // Undo every page acquisition the current round made, in reverse
+        // order. Reverse order is required so that fresh_bump pages can be
+        // returned to the device head — `value_allocator::push_back_bump`
+        // only accepts the page that currently sits at bump_head, which is
+        // the most recently bumped page, i.e. the last one in rnd.pages.
+        // Walking forward would leak every fresh_bump page that isn't the
+        // very first acquisition.
+        //
+        //   - fresh_bump  → push_back_bump (returns LBAs to bump head)
+        //   - whole_page  → recycle_whole_page (back into the class pool)
+        //   - writable    → restore via install_writable_page with the
+        //                   original (pre-round) free_mask
+        //
+        // INC-017: previously fresh_bump and whole_page were silently
+        // dropped here, leaking Data Area capacity. The "accept bump head
+        // leak" comment is gone.
+
         void
         rollback_pages(round& rnd) {
-            for (auto& page : rnd.pages) {
+            for (auto it = rnd.pages.rbegin(); it != rnd.pages.rend(); ++it) {
+                auto& page = *it;
                 switch (page.source) {
                 case value_page_source::fresh_bump:
+                    alloc_.push_back_bump(page.base, page.span_lbas);
+                    break;
                 case value_page_source::whole_page:
-                    // Pages we allocated this round but never committed.
-                    // Drop them; bump head leak is acceptable for v6.
+                    alloc_.recycle_whole_page(page.class_idx, page.base);
                     break;
                 case value_page_source::writable:
                     // Restore with the original (pre-round) free_mask.
@@ -915,24 +1031,31 @@ namespace apps::inconel::value {
         std::optional<uint16_t>
         class_for_len(uint32_t body_len) const noexcept {
             uint32_t total = sizeof(format::value_object_header) + body_len;
-            return format::find_min_class(total, get_class_sizes_view());
+            return format::find_min_class(total, class_sizes_span());
         }
 
+        // Construct an ephemeral span over class_sizes_storage_ on demand.
+        // The previous version cached this view in a member field
+        // (`class_sizes_view_`); that field added zero value because
+        // building a span over an InlinedVector is a 16-byte register-pair
+        // operation that the compiler reduces to nothing on every
+        // optimisation level we ship. Removing the field also removes a
+        // post-construction init step that lived in the ctor body —
+        // class_sizes_storage_ alone is now the single source of truth.
         std::span<const uint32_t>
-        get_class_sizes_view() const noexcept {
-            return class_sizes_view_;
+        class_sizes_span() const noexcept {
+            return std::span<const uint32_t>(
+                class_sizes_storage_.data(), class_sizes_storage_.size());
         }
 
-        // Cached view used by find_min_class. class_sizes_storage_ owns the
-        // bytes (initialized in the ctor's init list from the input span);
-        // class_sizes_view_ is a stable span over that storage built once
-        // in the ctor body. Owning a copy means the input span doesn't have
-        // to outlive the scheduler. The 16 inline slots match the on-disk
+        // class_sizes_storage_ owns the per-class size bytes (initialised
+        // in the ctor init list from the input span). Owning a copy means
+        // the input span passed to the constructor does not have to
+        // outlive the scheduler. The 16 inline slots match the on-disk
         // value_size_classes upper bound (superblock §2 in
         // on_disk_formats.md), so the small-resident metadata stays inline
         // and avoids a heap allocation per scheduler.
         absl::InlinedVector<uint32_t, 16> class_sizes_storage_;
-        std::span<const uint32_t>         class_sizes_view_;
     };
 
     // ── scheduler_base sender factory deferred definitions ──

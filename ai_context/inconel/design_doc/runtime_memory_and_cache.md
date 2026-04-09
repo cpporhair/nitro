@@ -788,6 +788,22 @@ struct value_placement_config {
 
 也就是说，它不是一个孤立的特殊 buffer，而是 `value_alloc_sched` 持有的 value page runtime 的一种具体状态。
 
+### 8.6 实现注记 — 当前 `writable_pages_` 与 spec 概念的对应
+
+当前 `apps/inconel/value/scheduler.hh` 把 §6.3 的 `open_frames[class_idx]` 与 §6.4 的 `hole_page_list` partial-hole resident continuation 这两层概念，工程化合并成同一个 per-class 队列 `writable_pages_[ci]`。它的语义是：
+
+1. 队列中每个 entry 代表一页 “已经 durable on NVMe、但仍然有 free slot、由 scheduler 在本地保留页像以便下一轮 persist 继续填充”。
+2. 取页时按 LIFO（`pop_back`）走，保证最热的 partial page 最先被复用。
+3. round 提交后，若页仍有 free slot，commit 路径把它放回 `writable_pages_[ci]`；若 round 失败，rollback 路径把原始 `free_mask` 一起恢复回 `writable_pages_[ci]`。
+4. round 内 `value_page_source::writable` 这个枚举值的命名与 `writable_pages_` 一一对应：从这里取出去的页，rollback 也只能回到这里。
+
+它**不是**完整意义上的：
+
+- spec `hole_page_list`：那是 non-resident placement metadata（带 `free_mask` 的 `hole_page_descriptor`），由 allocator 在内存中追踪所有 partially-free pages 的 free slot 分布；当前实现里没有独立的 `hole_page_list`，因为 v1 没有跨 round 的 hole 回收路径。
+- spec per-class 单一 `open_frame`：那要求每个 class 同时只有一帧在被 fill，所有 `dirty_append` / `dirty_hole_fill` 状态切换都集中在那一帧上；当前实现允许同 class 多个 partial page 在 `writable_pages_[ci]` 里排队，是 spec 的一个超集，等到引入完整 frame state machine 时再收紧。
+
+未来引入 frame state machine（`dirty_append` / `dirty_hole_fill` / `clean_readonly` 的显式状态、`hole_page_list` 的非 resident 描述符、每 class 单一 open frame）时，`writable_pages_` 会被拆成两套结构：`hole_page_list` 负责非 resident metadata，per-class `open_frames` 负责正在 fill 的 DMA frame。本步只补这层语义说明，不改实现。
+
 ## 9. 读路径与 Zero-Copy 视图
 
 ### 9.1 Tree Lookup

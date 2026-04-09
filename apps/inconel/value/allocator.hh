@@ -181,6 +181,26 @@ namespace apps::inconel::value {
             classes_[class_idx].whole_pool.push_back(page_base);
         }
 
+        // ── push_back_bump ──
+        //
+        // Undo the most recent fresh bump. Used by value::scheduler when a
+        // persist round fails after `acquire_page` has already moved the
+        // bump head down: rolling back in reverse order over the round's
+        // pages allows each fresh_bump page to be returned to the device
+        // head with no leak. Preconditions:
+        //   - page_base.device_id matches this allocator's device
+        //   - page_base.lba == current bump head (i.e. this page is the
+        //     most recent bump and no later bump has happened in between)
+        // Both conditions are guaranteed by reverse-order rollback inside
+        // a single persist round; outside that contract this is a bug, so
+        // both checks are assert (not panic).
+        void
+        push_back_bump(paddr page_base, uint32_t span_lbas) noexcept {
+            assert(page_base.device_id == dev_.device_id);
+            assert(page_base.lba == dev_.bump_head_lba);
+            dev_.bump_head_lba += span_lbas;
+        }
+
         // ── inspectors ──
 
         const per_class&

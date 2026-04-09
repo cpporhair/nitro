@@ -90,8 +90,8 @@ void build_subLba_page_image(std::vector<char>& page,
 struct test_env {
     mock_device                          dev;
     scheduler                            nvme_sched;
-    lookup_scheduler<clock_cache>        tree_sched;
-    value::scheduler<clock_cache>        value_sched;
+    tree_lookup_sched<clock_cache>        tree_sched;
+    value::value_alloc_sched<clock_cache> value_sched;
     tree_manifest                        manifest;
 
     std::vector<std::string> keys;
@@ -287,7 +287,7 @@ void case_2_missing_key() {
 //  case_3: corrupt value page → process MUST panic (death test)
 //
 //  Step 009 hardening: decode corruption is no longer surfaced as a
-//  recoverable exception. value::scheduler::handle_fill calls
+//  recoverable exception. value::value_alloc_sched::handle_fill calls
 //  core::panic_inconsistency() *before* it touches readonly_cache_,
 //  so the only observable evidence is the SIGABRT it raises and the
 //  diagnostic line it writes to stderr just before aborting.
@@ -410,7 +410,7 @@ void case_4_nvme_read_failure() {
     auto ctx = pump::core::make_root_context();
     namespace ps = pump::sender;
 
-    // Way past the device end. value::scheduler::handle_read computes
+    // Way past the device end. value::value_alloc_sched::handle_read computes
     // span_lbas from vr.len (any sane class is fine) then constructs
     // a read_miss whose pipeline issues nvme.read at this bogus LBA.
     value_ref bogus{
@@ -478,7 +478,7 @@ void case_4_nvme_read_failure() {
 //  Round 2 also exercises the cache.put → evict → delete[] path repeatedly,
 //  giving step 9's manual valgrind run something to check. The test_env
 //  destructor at the end of the function then drives
-//  value::scheduler<Cache>::~scheduler → readonly_cache_.evict_one() drain,
+//  value::value_alloc_sched<Cache>::~value_alloc_sched → readonly_cache_.evict_one() drain,
 //  freeing the two surviving cached buffers. ASAN is not run on this test
 //  binary (share_nothing teardown bug, see feedback_share_nothing_no_drain),
 //  so leak verification is left to that valgrind pass.

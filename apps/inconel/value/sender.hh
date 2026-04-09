@@ -28,7 +28,7 @@ namespace apps::inconel::value {
     using format::value_ref;
 
     inline auto
-    on_persist_leader(scheduler_base* sched, persist_leader&& alt) {
+    on_persist_leader(value_alloc_sched_base* sched, persist_leader&& alt) {
         uint64_t rid = alt.round_id;
         return just()
             >> as_stream(__mov__(alt.writes))
@@ -64,7 +64,7 @@ namespace apps::inconel::value {
     // their sender types can differ — flat() accepts arbitrary senders.
 
     inline auto
-    persist_values(scheduler_base* sched, std::span<put_entry> entries) {
+    persist_values(value_alloc_sched_base* sched, std::span<put_entry> entries) {
         return sched->prepare_persist(entries)
             >> visit()
             >> flat_map([sched]<typename T>(T &&alt) {
@@ -77,7 +77,7 @@ namespace apps::inconel::value {
     }
 
     inline auto
-    on_read_miss(scheduler_base* sched, value_ref vr, read_miss&& alt) {
+    on_read_miss(value_alloc_sched_base* sched, value_ref vr, read_miss&& alt) {
         return just()
             >> with_context(__fwd__(alt), vr)([sched]() {
                 return get_context<read_miss>()
@@ -102,7 +102,7 @@ namespace apps::inconel::value {
     //   value::read_value(sched, vr) >> then(callback) >> submit(ctx);
 
     inline auto
-    read_value(scheduler_base* sched, value_ref vr) {
+    read_value(value_alloc_sched_base* sched, value_ref vr) {
         return sched->prepare_read(vr)
             >> visit()
             >> flat_map([sched, vr](auto &&alt) {

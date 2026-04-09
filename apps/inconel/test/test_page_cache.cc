@@ -111,7 +111,7 @@ static void test_update_existing(const char* label) {
 
     // Same-key put MUST return the old buf as an "evicted_entry" so the
     // caller can free it. Earlier the cache silently overwrote and leaked
-    // every superseded buf — this came up in inconel value::scheduler when
+    // every superseded buf — this came up in inconel value::value_alloc_sched when
     // two concurrent reads on the same paddr both reach handle_fill in one
     // advance round, calling put(P, buf1) then put(P, buf2).
     auto e2 = c.put(P(1), B(11));
@@ -342,7 +342,7 @@ static void test_slru_promotion() {
 
 // ── evict_one: drain cache at teardown ──
 //
-// Used by value::scheduler::~scheduler to release buffers the cache still
+// Used by value::value_alloc_sched::~value_alloc_sched to release buffers the cache still
 // owns. Both impls return one entry per call, exactly N times for N puts,
 // then nullopt with size()==0.
 

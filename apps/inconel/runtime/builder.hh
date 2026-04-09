@@ -29,8 +29,8 @@ namespace apps::inconel::runtime {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
-        tree::lookup_scheduler<TreeCache>,
-        value::scheduler<ValueCache>
+        tree::tree_lookup_sched<TreeCache>,
+        value::value_alloc_sched<ValueCache>
     >;
 
     // ── Build context ──
@@ -44,7 +44,7 @@ namespace apps::inconel::runtime {
         std::span<const uint32_t> cores;             // which cores to populate
         mock_nvme::mock_device*   device;            // nvme backing device
 
-        // tree cache capacity (entries). Applies to lookup_scheduler<TreeCache>.
+        // tree cache capacity (entries). Applies to tree_lookup_sched<TreeCache>.
         // Minimum legal value depends on the cache impl: clock_cache requires
         // >= 1, slru_cache requires >= 2 (so each segment gets at least one
         // slot under the default 0.8 protected ratio). Smaller values throw
@@ -63,18 +63,18 @@ namespace apps::inconel::runtime {
         format::paddr             value_data_area_base = {0, 0};
         format::paddr             value_data_area_end  = {0, 0};
 
-        // value cache capacity (entries). Applies to value::scheduler<ValueCache>.
+        // value cache capacity (entries). Applies to value::value_alloc_sched<ValueCache>.
         // Same minimum-capacity rules as tree_cache_capacity above.
         uint32_t                  value_cache_capacity = 32;
     };
 
     // ── build_runtime: construct schedulers + double-register ──
     //
-    // 1. Create one mock_nvme::scheduler and one lookup_scheduler<Cache> per core.
+    // 1. Create one mock_nvme::scheduler and one tree_lookup_sched<Cache> per core.
     // 2. Register each pair to PUMP runtime via add_core_schedulers (per-core tuple).
     // 3. Register the same pointers to core::registry::nvme_scheds and
-    //    core::registry::tree_lookup_scheds (lookup_scheduler<Cache>* implicitly
-    //    upcasts to lookup_scheduler_base*).
+    //    core::registry::tree_lookup_scheds (tree_lookup_sched<Cache>* implicitly
+    //    upcasts to tree_lookup_sched_base*).
     //
     // After this returns, application code uses core::registry::local_nvme()
     // / local_tree_lookup() etc., never touching the runtime pointer directly.
@@ -96,14 +96,14 @@ namespace apps::inconel::runtime {
             pump::core::this_core_id = core;
 
             auto* nvme = new mock_nvme::scheduler(opts.device);
-            auto* tlookup = new tree::lookup_scheduler<TreeCache>(
+            auto* tlookup = new tree::tree_lookup_sched<TreeCache>(
                 TreeCache(opts.tree_cache_capacity));
 
-            // value::scheduler is a singleton, pinned to cores[0]. Other
-            // cores get a nullptr placeholder so the PUMP per-core tuple
-            // shape stays uniform — share_nothing's advance loop skips
+            // value::value_alloc_sched is a singleton, pinned to cores[0].
+            // Other cores get a nullptr placeholder so the PUMP per-core
+            // tuple shape stays uniform — share_nothing's advance loop skips
             // nullptr slots automatically.
-            using value_sched_t = value::scheduler<ValueCache>;
+            using value_sched_t = value::value_alloc_sched<ValueCache>;
             value_sched_t* value_sched = nullptr;
             if (first && !opts.value_class_sizes.empty()) {
                 value_sched = new value_sched_t(
@@ -137,10 +137,10 @@ namespace apps::inconel::runtime {
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
         for (auto* s : core::registry::nvme_scheds.list)         delete s;
         for (auto* s : core::registry::tree_lookup_scheds.list) {
-            delete static_cast<tree::lookup_scheduler<TreeCache>*>(s);
+            delete static_cast<tree::tree_lookup_sched<TreeCache>*>(s);
         }
         if (core::registry::value_alloc_sched) {
-            using value_sched_t = value::scheduler<ValueCache>;
+            using value_sched_t = value::value_alloc_sched<ValueCache>;
             delete static_cast<value_sched_t*>(core::registry::value_alloc_sched);
         }
         core::registry::clear();

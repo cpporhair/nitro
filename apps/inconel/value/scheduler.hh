@@ -124,13 +124,13 @@ namespace apps::inconel::value {
     namespace _value_read     { struct req; }
     namespace _value_fill     { struct req; }
 
-    struct scheduler_base;
+    struct value_alloc_sched_base;
 
     // ── PUMP op/sender wrappers ──
     //
     // Each operation gets a req (heap-allocated, deleted after cb), an op
     // with a tag bool, and a sender that builds an op_list. start() is
-    // declared here and defined after `scheduler` is fully defined.
+    // declared here and defined after `value_alloc_sched` is fully defined.
 
     namespace _value_persist {
 
@@ -142,7 +142,7 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_persist_op = true;
-            scheduler_base*      sched;
+            value_alloc_sched_base*      sched;
             std::span<put_entry> entries;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -150,7 +150,7 @@ namespace apps::inconel::value {
         };
 
         struct sender {
-            scheduler_base*      sched;
+            value_alloc_sched_base*      sched;
             std::span<put_entry> entries;
 
             auto make_op() { return op{.sched = sched, .entries = entries}; }
@@ -173,7 +173,7 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_finalize_op = true;
-            scheduler_base* sched;
+            value_alloc_sched_base* sched;
             uint64_t        round_id;
             bool            ok;
 
@@ -182,7 +182,7 @@ namespace apps::inconel::value {
         };
 
         struct sender {
-            scheduler_base* sched;
+            value_alloc_sched_base* sched;
             uint64_t        round_id;
             bool            ok;
 
@@ -205,7 +205,7 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_read_op = true;
-            scheduler_base* sched;
+            value_alloc_sched_base* sched;
             value_ref       vr;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -213,7 +213,7 @@ namespace apps::inconel::value {
         };
 
         struct sender {
-            scheduler_base* sched;
+            value_alloc_sched_base* sched;
             value_ref       vr;
 
             auto make_op() { return op{.sched = sched, .vr = vr}; }
@@ -238,7 +238,7 @@ namespace apps::inconel::value {
 
         struct op {
             constexpr static bool value_fill_op = true;
-            scheduler_base*         sched;
+            value_alloc_sched_base*         sched;
             value_ref               vr;
             std::unique_ptr<char[]> buf;
             uint32_t                buf_size;
@@ -249,7 +249,7 @@ namespace apps::inconel::value {
         };
 
         struct sender {
-            scheduler_base*         sched;
+            value_alloc_sched_base*         sched;
             value_ref               vr;
             std::unique_ptr<char[]> buf;
             uint32_t                buf_size;
@@ -272,7 +272,7 @@ namespace apps::inconel::value {
         };
     }
 
-    // ── scheduler_base ──
+    // ── value_alloc_sched_base ──
     //
     // Non-templated layer holding the four PUMP queues, the schedule_*
     // enqueue helpers, and the sender factory entry points. Senders/ops only
@@ -280,18 +280,18 @@ namespace apps::inconel::value {
     // PUMP pipeline machinery (op_pusher / compute_sender_type) doesn't have
     // to know what Cache the scheduler uses.
     //
-    // The templated scheduler<Cache> publicly derives from this base; pointer
-    // implicit upcasting lets the runtime/registry/sender layers all work in
-    // terms of scheduler_base*.
+    // The templated value_alloc_sched<Cache> publicly derives from this base;
+    // pointer implicit upcasting lets the runtime/registry/sender layers all
+    // work in terms of value_alloc_sched_base*.
 
-    struct scheduler_base {
+    struct value_alloc_sched_base {
         pump::core::per_core::queue<_value_persist::req*>  persist_q_;
         pump::core::per_core::queue<_value_finalize::req*> finalize_q_;
         pump::core::per_core::queue<_value_read::req*>     read_q_;
         pump::core::per_core::queue<_value_fill::req*>     fill_q_;
 
         explicit
-        scheduler_base(size_t queue_depth = 2048)
+        value_alloc_sched_base(size_t queue_depth = 2048)
             : persist_q_(queue_depth)
             , finalize_q_(queue_depth)
             , read_q_(queue_depth)
@@ -308,7 +308,7 @@ namespace apps::inconel::value {
         //
         // Declared here, defined inline at the bottom of this header (after
         // the sender struct types are complete). This is the same pattern
-        // tree::lookup_scheduler_base uses for process() / submit_cache().
+        // tree::tree_lookup_sched_base uses for process() / submit_cache().
 
         auto prepare_persist(std::span<put_entry> entries);
         auto finalize_persist(uint64_t round_id, bool ok);
@@ -317,10 +317,10 @@ namespace apps::inconel::value {
                              uint32_t buf_size, bool admit_to_cache);
     };
 
-    // ── scheduler<Cache> ──
+    // ── value_alloc_sched<Cache> ──
 
     template <core::cache_concept Cache>
-    struct scheduler : scheduler_base {
+    struct value_alloc_sched : value_alloc_sched_base {
         // ── Per-round state (held in inflight_rounds_) ──
         //
         // Created by leader's prepare handle, consumed by finalize handle.
@@ -368,7 +368,7 @@ namespace apps::inconel::value {
 
         // readonly cache: paddr → 1-LBA page image. Holds raw char[] buffers
         // handed off via release() + put() — the scheduler is the sole
-        // owner of the cache, and ~scheduler() below drains it via
+        // owner of the cache, and ~value_alloc_sched() below drains it via
         // evict_one() because clock_cache / slru_cache do not free buffers
         // in their own destructors (they only own their slot/node arrays).
         //
@@ -393,13 +393,13 @@ namespace apps::inconel::value {
         absl::flat_hash_map<uint64_t, std::unique_ptr<round>> inflight_rounds_;
         uint64_t                                              next_round_id_ = 1;
 
-        scheduler(std::span<const uint32_t> class_sizes,
-                  uint32_t                  lba_size,
-                  paddr                     data_area_base,
-                  paddr                     data_area_end,
-                  Cache                     cache,
-                  size_t                    queue_depth = 2048)
-            : scheduler_base(queue_depth)
+        value_alloc_sched(std::span<const uint32_t> class_sizes,
+                          uint32_t                  lba_size,
+                          paddr                     data_area_base,
+                          paddr                     data_area_end,
+                          Cache                     cache,
+                          size_t                    queue_depth = 2048)
+            : value_alloc_sched_base(queue_depth)
             , alloc_(class_sizes, lba_size, data_area_base, data_area_end)
             , writable_pages_(class_sizes.size())
             , readonly_cache_(std::move(cache))
@@ -415,7 +415,7 @@ namespace apps::inconel::value {
         // evict_one() — neither clock_cache nor slru_cache frees buffers in
         // their own destructor (they only own slot/node arrays).
 
-        ~scheduler() {
+        ~value_alloc_sched() {
             while (auto e = readonly_cache_.evict_one()) {
                 delete[] e->buf;
             }
@@ -523,11 +523,11 @@ namespace apps::inconel::value {
                 return;
             }
             if (status == persist_entry_status::out_of_space) {
-                core::panic_inconsistency("value::scheduler::handle_persist",
+                core::panic_inconsistency("value::value_alloc_sched::handle_persist",
                     "value Data Area exhausted; v1 has no reclaim path");
             }
             if (status == persist_entry_status::encode_failure) {
-                core::panic_inconsistency("value::scheduler::handle_persist",
+                core::panic_inconsistency("value::value_alloc_sched::handle_persist",
                     "encode_value_object failed after class selection — internal logic break");
             }
 
@@ -737,7 +737,7 @@ namespace apps::inconel::value {
                 // know what state the scheduler is in. Continuing would just
                 // propagate the corruption — abort hard rather than try to
                 // surface it as a recoverable exception.
-                core::panic_inconsistency("value::scheduler::handle_finalize",
+                core::panic_inconsistency("value::value_alloc_sched::handle_finalize",
                     "unknown round_id %lu",
                     static_cast<unsigned long>(item->round_id));
             }
@@ -1006,7 +1006,7 @@ namespace apps::inconel::value {
         panic_decode_failure(const value_ref& vr,
                              format::value_decode_status status,
                              const char* source_label) {
-            core::panic_inconsistency("value::scheduler::decode",
+            core::panic_inconsistency("value::value_alloc_sched::decode",
                 "corrupt value object source=%s dev=%u lba=%lu byte_offset=%u len=%u status=%s",
                 source_label,
                 static_cast<unsigned>(vr.base.device_id),
@@ -1058,31 +1058,31 @@ namespace apps::inconel::value {
         absl::InlinedVector<uint32_t, 16> class_sizes_storage_;
     };
 
-    // ── scheduler_base sender factory deferred definitions ──
+    // ── value_alloc_sched_base sender factory deferred definitions ──
     //
     // Defined out-of-line so the sender struct types they return are visible
-    // by this point. Same pattern as tree::lookup_scheduler_base::process().
+    // by this point. Same pattern as tree::tree_lookup_sched_base::process().
 
     inline auto
-    scheduler_base::prepare_persist(std::span<put_entry> entries) {
+    value_alloc_sched_base::prepare_persist(std::span<put_entry> entries) {
         return _value_persist::sender{.sched = this, .entries = entries};
     }
 
     inline auto
-    scheduler_base::finalize_persist(uint64_t round_id, bool ok) {
+    value_alloc_sched_base::finalize_persist(uint64_t round_id, bool ok) {
         return _value_finalize::sender{.sched = this, .round_id = round_id, .ok = ok};
     }
 
     inline auto
-    scheduler_base::prepare_read(value_ref vr) {
+    value_alloc_sched_base::prepare_read(value_ref vr) {
         return _value_read::sender{.sched = this, .vr = vr};
     }
 
     inline auto
-    scheduler_base::fill_and_decode(value_ref vr,
-                                    std::unique_ptr<char[]> buf,
-                                    uint32_t buf_size,
-                                    bool admit_to_cache) {
+    value_alloc_sched_base::fill_and_decode(value_ref vr,
+                                            std::unique_ptr<char[]> buf,
+                                            uint32_t buf_size,
+                                            bool admit_to_cache) {
         return _value_fill::sender{
             .sched          = this,
             .vr             = vr,

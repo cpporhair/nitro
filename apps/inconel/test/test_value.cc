@@ -128,7 +128,7 @@ struct test_env {
     using tree_cache_t      = core::clock_cache;
     using value_cache_t     = core::clock_cache;
     using runtime_t         = runtime::inconel_runtime_t<tree_cache_t, value_cache_t>;
-    using value_scheduler_t = value::scheduler<value_cache_t>;
+    using value_scheduler_t = value::value_alloc_sched<value_cache_t>;
 
     mock_nvme::mock_device    dev;
     runtime_t*                rt = nullptr;
@@ -488,7 +488,7 @@ void case_6_cross_class() {
 //  This relies on clock_cache's LRU-ish ordering (last 2 puts survive when
 //  no gets touched the older entries). slru_cache with cap=2 has different
 //  invariants — case_7 is intentionally specific to clock since test_env
-//  hardcodes value::scheduler<core::clock_cache>.
+//  hardcodes value::value_alloc_sched<core::clock_cache>.
 // ════════════════════════════════════════════════════════════════
 
 void case_7_cache_evict() {
@@ -567,7 +567,7 @@ void case_7_cache_evict() {
 //  re-admitted the multi-LBA page, handle_read would still skip cache.get()
 //  on span > 1 and the test would still see reads_after_2 == 2. The
 //  write-path check has to look directly at readonly_cache_ via a white-box
-//  cast (allowed because test_env hardcodes value::scheduler<clock_cache>).
+//  cast (allowed because test_env hardcodes value::value_alloc_sched<clock_cache>).
 //
 //  Three independent assertions:
 //    [W1] After persist_values commits the multi-LBA page, readonly_cache_
@@ -592,7 +592,7 @@ void case_8_multi_lba_bypass() {
 
     auto* sched_base = core::registry::value_sched();
     // White-box cast: test_env publishes its concrete value scheduler type
-    // (test_env::value_scheduler_t == value::scheduler<value_cache_t>) so
+    // (test_env::value_scheduler_t == value::value_alloc_sched<value_cache_t>) so
     // case_8 inspects readonly_cache_ directly — the only way to assert
     // "commit_pages did NOT admit this page" without depending on a
     // behavior the read path would silently mask.

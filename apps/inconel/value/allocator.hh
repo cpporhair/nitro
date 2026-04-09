@@ -183,7 +183,7 @@ namespace apps::inconel::value {
 
         // ── push_back_bump ──
         //
-        // Undo the most recent fresh bump. Used by value::scheduler when a
+        // Undo the most recent fresh bump. Used by value::value_alloc_sched when a
         // persist round fails after `acquire_page` has already moved the
         // bump head down: rolling back in reverse order over the round's
         // pages allows each fresh_bump page to be returned to the device

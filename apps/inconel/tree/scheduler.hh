@@ -38,7 +38,6 @@ namespace apps::inconel::tree {
 
         std::vector<entry> entries;
         bool all_done = false;
-        bool first_call = true;
         uint32_t page_size{};
         uint32_t page_lbas{};
         const core::tree_manifest* manifest{};
@@ -72,12 +71,12 @@ namespace apps::inconel::tree {
     namespace _tree_lookup { struct req; }
     namespace _cache_pages { struct req; }
 
-    struct lookup_scheduler_base {
+    struct tree_lookup_sched_base {
         pump::core::per_core::queue<_tree_lookup::req*> lookup_queue_;
         pump::core::per_core::queue<_cache_pages::req*> cache_queue_;
 
         explicit
-        lookup_scheduler_base(size_t depth)
+        tree_lookup_sched_base(size_t depth)
             : lookup_queue_(depth), cache_queue_(depth) {}
 
         void schedule_lookup(_tree_lookup::req* r) { lookup_queue_.try_enqueue(r); }
@@ -92,7 +91,7 @@ namespace apps::inconel::tree {
     // ── process sender (lookup request) ──
     //
     // op/sender are non-templated; they only need access to enqueue methods
-    // exposed by lookup_scheduler_base. The cache type is irrelevant here.
+    // exposed by tree_lookup_sched_base. The cache type is irrelevant here.
 
     namespace _tree_lookup {
 
@@ -104,7 +103,7 @@ namespace apps::inconel::tree {
 
         struct op {
             constexpr static bool tree_lookup_op = true;
-            lookup_scheduler_base* sched;
+            tree_lookup_sched_base* sched;
             lookup_state* state;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -112,7 +111,7 @@ namespace apps::inconel::tree {
         };
 
         struct sender {
-            lookup_scheduler_base* sched;
+            tree_lookup_sched_base* sched;
             lookup_state* state;
 
             auto make_op() {
@@ -137,7 +136,7 @@ namespace apps::inconel::tree {
 
         struct op {
             constexpr static bool cache_pages_op = true;
-            lookup_scheduler_base* sched;
+            tree_lookup_sched_base* sched;
             std::vector<std::pair<paddr, char*>> page_map;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -145,7 +144,7 @@ namespace apps::inconel::tree {
         };
 
         struct sender {
-            lookup_scheduler_base* sched;
+            tree_lookup_sched_base* sched;
             std::vector<std::pair<paddr, char*>> page_map;
 
             auto make_op() {
@@ -166,7 +165,7 @@ namespace apps::inconel::tree {
     // dispatch, no variant visit, no abstraction overhead.
 
     template <core::cache_concept Cache>
-    struct lookup_scheduler : lookup_scheduler_base {
+    struct tree_lookup_sched : tree_lookup_sched_base {
         Cache page_cache_;
         absl::flat_hash_set<paddr> loading_pages_;             // reads in-flight
         std::vector<std::unique_ptr<char[]>> owned_bufs_;       // buffer ownership pool
@@ -174,8 +173,8 @@ namespace apps::inconel::tree {
         _tree_lookup::req* waiters_head_ = nullptr;             // intrusive waiter list
 
         explicit
-        lookup_scheduler(Cache cache, size_t depth = 2048)
-            : lookup_scheduler_base(depth)
+        tree_lookup_sched(Cache cache, size_t depth = 2048)
+            : tree_lookup_sched_base(depth)
             , page_cache_(std::move(cache)) {}
 
         bool advance() {
@@ -225,16 +224,6 @@ namespace apps::inconel::tree {
         void handle(_tree_lookup::req* r) {
             auto& s = *r->state;
 
-            if (s.first_call) {
-                s.first_call = false;
-                if (!s.manifest->has_root()) {
-                    s.all_done = true;
-                    r->cb(decision_done{});
-                    delete r;
-                    return;
-                }
-            }
-
             process_entries(s);
 
             if (s.all_done) {
@@ -272,7 +261,7 @@ namespace apps::inconel::tree {
                         // mode rather than silently turning it into
                         // lookup_absent.
                         core::panic_inconsistency(
-                            "tree::lookup_scheduler::process_entries",
+                            "tree::tree_lookup_sched::process_entries",
                             "corrupt tree page dev=%u lba=%lu status=%s",
                             static_cast<unsigned>(e.next_page.device_id),
                             static_cast<unsigned long>(e.next_page.lba),
@@ -334,12 +323,12 @@ namespace apps::inconel::tree {
     // ── Deferred definitions (need complete sender types) ──
 
     inline auto
-    lookup_scheduler_base::process(lookup_state& state) {
+    tree_lookup_sched_base::process(lookup_state& state) {
         return _tree_lookup::sender{this, &state};
     }
 
     inline auto
-    lookup_scheduler_base::submit_cache(std::vector<std::pair<paddr, char*>> page_map) {
+    tree_lookup_sched_base::submit_cache(std::vector<std::pair<paddr, char*>> page_map) {
         return _cache_pages::sender{this, std::move(page_map)};
     }
 

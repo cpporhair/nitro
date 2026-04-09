@@ -81,7 +81,7 @@ static void write_internal(mock_device& dev, uint64_t lba,
 struct test_env {
     mock_device dev;
     scheduler nvme_sched;
-    lookup_scheduler<clock_cache> tree_sched;
+    tree_lookup_sched<clock_cache> tree_sched;
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
@@ -234,7 +234,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
     // Build a fresh tree env (isolated from other tests' global env).
     mock_device dev(PS * 8192, LBS);
     scheduler nvme_sched(&dev);
-    lookup_scheduler<Cache> tree_sched(std::move(cache));
+    tree_lookup_sched<Cache> tree_sched(std::move(cache));
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
@@ -335,7 +335,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
 static void test_empty_tree() {
     mock_device dev(PS * 1024, LBS);
     scheduler ns(&dev);
-    lookup_scheduler<clock_cache> ts(clock_cache(8));
+    tree_lookup_sched<clock_cache> ts(clock_cache(8));
     auto m = tree_manifest::empty(PS, LBS);
 
     registry::clear();

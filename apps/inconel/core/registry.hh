@@ -8,8 +8,8 @@
 #include "pump/core/lock_free_queue.hh"  // for pump::core::this_core_id
 
 #include "../mock_nvme/scheduler.hh"
-#include "../tree/scheduler.hh"  // for tree::lookup_scheduler_base
-#include "../value/scheduler.hh" // for value::scheduler_base
+#include "../tree/scheduler.hh"  // for tree::tree_lookup_sched_base
+#include "../value/scheduler.hh" // for value::value_alloc_sched_base
 
 namespace apps::inconel::core::registry {
 
@@ -27,7 +27,7 @@ namespace apps::inconel::core::registry {
     // simple inline pointer fields when implemented.
     //
     // The registry stores ONLY non-templated base pointers. The Cache
-    // template parameter on lookup_scheduler<Cache> stays inside the builder.
+    // template parameter on tree_lookup_sched<Cache> stays inside the builder.
 
     struct nvme_list {
         std::vector<mock_nvme::scheduler*> list;     // all instances
@@ -36,16 +36,17 @@ namespace apps::inconel::core::registry {
     inline nvme_list nvme_scheds;
 
     struct tree_lookup_list {
-        std::vector<tree::lookup_scheduler_base*> list;
-        std::vector<tree::lookup_scheduler_base*> by_core;
+        std::vector<tree::tree_lookup_sched_base*> list;
+        std::vector<tree::tree_lookup_sched_base*> by_core;
     };
     inline tree_lookup_list tree_lookup_scheds;
 
-    // value::scheduler is a global singleton — only one instance exists,
-    // pinned to a specific core (cores[0] in the v6 builder). All access
-    // goes through value_sched(). The registry stores only the non-templated
-    // base pointer; the Cache template parameter stays inside the builder.
-    inline value::scheduler_base* value_alloc_sched = nullptr;
+    // value::value_alloc_sched is a global singleton — only one instance
+    // exists, pinned to a specific core (cores[0] in the v6 builder). All
+    // access goes through value_sched(). The registry stores only the
+    // non-templated base pointer; the Cache template parameter stays inside
+    // the builder.
+    inline value::value_alloc_sched_base* value_alloc_sched = nullptr;
 
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
@@ -91,9 +92,9 @@ namespace apps::inconel::core::registry {
     // installing the instance at startup. Application code uses this
     // helper rather than reading the variable directly.
 
-    inline value::scheduler_base*
+    inline value::value_alloc_sched_base*
     value_sched() {
-        assert(value_alloc_sched && "value::scheduler not registered");
+        assert(value_alloc_sched && "value::value_alloc_sched not registered");
         return value_alloc_sched;
     }
 
@@ -109,7 +110,7 @@ namespace apps::inconel::core::registry {
         return s;
     }
 
-    inline tree::lookup_scheduler_base*
+    inline tree::tree_lookup_sched_base*
     local_tree_lookup() {
         auto* s = tree_lookup_scheds.by_core[pump::core::this_core_id];
         assert(s && "current core has no tree_lookup scheduler");
@@ -123,14 +124,14 @@ namespace apps::inconel::core::registry {
         return nvme_scheds.by_core[core];
     }
 
-    inline tree::lookup_scheduler_base*
+    inline tree::tree_lookup_sched_base*
     tree_lookup_for_core(uint32_t core) {
         return tree_lookup_scheds.by_core[core];
     }
 
     // ── Cross-shard access by index ──
 
-    inline tree::lookup_scheduler_base*
+    inline tree::tree_lookup_sched_base*
     tree_lookup_at(uint32_t idx) {
         return tree_lookup_scheds.list[idx % tree_lookup_scheds.list.size()];
     }
@@ -152,7 +153,7 @@ namespace apps::inconel::core::registry {
     //     return front_scheds.list[key_hash % front_scheds.list.size()];
     // }
     //
-    // inline tree::lookup_scheduler_base*
+    // inline tree::tree_lookup_sched_base*
     // home_tree_lookup_for_front(uint32_t front_owner) {
     //     // Stable mapping established at startup; for now a simple modulo.
     //     return tree_lookup_scheds.list[front_owner % tree_lookup_scheds.list.size()];

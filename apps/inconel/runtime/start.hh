@@ -1,6 +1,7 @@
 #ifndef APPS_INCONEL_RUNTIME_START_HH
 #define APPS_INCONEL_RUNTIME_START_HH
 
+#include <exception>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -8,6 +9,7 @@
 #include "env/runtime/share_nothing.hh"
 
 #include "../core/page_cache.hh"
+#include "../core/panic.hh"
 #include "./builder.hh"
 
 namespace apps::inconel::runtime {
@@ -58,25 +60,40 @@ namespace apps::inconel::runtime {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     run_with(const start_options& opts) {
-        build_options bopts{
-            .cores                = opts.cores,
-            .device               = opts.device,
-            .tree_cache_capacity  = opts.tree_cache_capacity,
-            .value_class_sizes    = opts.value_class_sizes,
-            .lba_size             = opts.lba_size,
-            .value_data_area_base = opts.value_data_area_base,
-            .value_data_area_end  = opts.value_data_area_end,
-            .value_cache_capacity = opts.value_cache_capacity,
-        };
-        auto* rt = build_runtime<TreeCache, ValueCache>(bopts);
-        pump::env::runtime::start(rt, opts.cores, opts.main_core,
-            [](auto*, uint32_t /*core*/) {
-                // Per-core init hook. PUMP has already set this_core_id by
-                // the time this runs. Future per-core init (e.g. NUMA-local
-                // allocator warm-up) goes here.
-            });
-        // start() returns once every is_running_by_core[core] flag is false.
-        destroy_runtime<TreeCache, ValueCache>(rt);
+        // Init failures (build_runtime constructor faults, share_nothing
+        // start exceptions) are process-fatal: at this point neither the
+        // PUMP runtime nor the Inconel registry has reached a state we can
+        // partially unwind, so leaking via abort and letting the OS reclaim
+        // is strictly cleaner than half-initialized cleanup paths. Both
+        // std::exception and unknown throws funnel through panic so the
+        // operator gets a diagnostic before SIGABRT.
+        try {
+            build_options bopts{
+                .cores                = opts.cores,
+                .device               = opts.device,
+                .tree_cache_capacity  = opts.tree_cache_capacity,
+                .value_class_sizes    = opts.value_class_sizes,
+                .lba_size             = opts.lba_size,
+                .value_data_area_base = opts.value_data_area_base,
+                .value_data_area_end  = opts.value_data_area_end,
+                .value_cache_capacity = opts.value_cache_capacity,
+            };
+            auto* rt = build_runtime<TreeCache, ValueCache>(bopts);
+            pump::env::runtime::start(rt, opts.cores, opts.main_core,
+                [](auto*, uint32_t /*core*/) {
+                    // Per-core init hook. PUMP has already set this_core_id
+                    // by the time this runs. Future per-core init (e.g.
+                    // NUMA-local allocator warm-up) goes here.
+                });
+            // start() returns once every is_running_by_core[core] flag is false.
+            destroy_runtime<TreeCache, ValueCache>(rt);
+        } catch (const std::exception& e) {
+            core::panic_inconsistency("runtime::run_with",
+                "init failed: %s", e.what());
+        } catch (...) {
+            core::panic_inconsistency("runtime::run_with",
+                "init failed: unknown exception");
+        }
     }
 
     template <core::cache_concept TreeCache>

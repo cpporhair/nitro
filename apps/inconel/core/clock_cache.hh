@@ -78,7 +78,7 @@ namespace apps::inconel::core {
             // caller can free it. The cache only stores raw char*, so
             // overwriting silently would leak the previous owner's
             // allocation. Two concurrent misses on the same paddr (e.g.
-            // value::scheduler's read_q_ → fill_q_ pipeline draining a
+            // value::value_alloc_sched's read_q_ → fill_q_ pipeline draining a
             // batch of cold reads in one advance round) hit this path.
             if (auto it = index_.find(key); it != index_.end()) {
                 auto& s = slots_[it->second];

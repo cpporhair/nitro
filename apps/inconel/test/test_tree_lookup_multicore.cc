@@ -2,8 +2,8 @@
 // Multi-core tree lookup regression test
 //
 // Core 0: test driver, fires many independent lookup pipelines
-// Core 2: mock_nvme + lookup_scheduler (handles half the keys)
-// Core 4: mock_nvme + lookup_scheduler (handles other half)
+// Core 2: mock_nvme + tree_lookup_sched (handles half the keys)
+// Core 4: mock_nvme + tree_lookup_sched (handles other half)
 // Both mock_nvme share one mock_device (with mutex)
 //
 // Concurrency: 400 individual pipelines in-flight simultaneously,
@@ -113,7 +113,7 @@ private:
 
 struct core_schedulers {
     scheduler nvme_sched;
-    lookup_scheduler<clock_cache> tree_sched;
+    tree_lookup_sched<clock_cache> tree_sched;
     core_schedulers(mock_device* dev)
         : nvme_sched(dev), tree_sched(clock_cache(32)) {}
     void advance() { tree_sched.advance(); nvme_sched.advance(); }

@@ -1,6 +1,18 @@
 #ifndef APPS_INCONEL_CORE_TREE_MANIFEST_HH
 #define APPS_INCONEL_CORE_TREE_MANIFEST_HH
 
+// ── Why this file lives in core/ and not tree/ ──
+//
+// `tree_manifest` is an immutable runtime snapshot of the on-disk B+tree
+// layout: root slot, slot_map for shadow-range resolution, page geometry.
+// It is NOT a tree-writer-local helper, NOT a page-format helper, and NOT
+// internal state of the tree mutator. It is reader-visible and shared
+// across modules — tree_lookup, the runtime registry, and (eventually)
+// checkpoint/reclaim flows all hold and reason about manifest snapshots.
+// Putting it under tree/ would imply ownership by the tree-writer side,
+// which would be misleading. core/ is the right home for cross-module
+// immutable runtime snapshots, so the file stays here.
+
 #include <absl/container/flat_hash_map.h>
 
 #include "../format/types.hh"

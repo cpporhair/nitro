@@ -33,7 +33,7 @@ namespace apps::inconel::tree {
     // preserving share-nothing.
 
     inline auto
-    on_decision_need_read(lookup_scheduler_base* tree_sched, decision_need_read&& dec) {
+    on_decision_need_read(tree_lookup_sched_base* tree_sched, decision_need_read&& dec) {
         auto n = dec.read_descs.size();
         return just()
             >> with_context(__fwd__(dec))([tree_sched, n]() {
@@ -56,7 +56,7 @@ namespace apps::inconel::tree {
 
     template<typename key_range_t>
     inline auto
-    lookup(lookup_scheduler_base* tree_sched,
+    lookup(tree_lookup_sched_base* tree_sched,
            key_range_t&& keys,
            const core::tree_manifest* manifest) {
         return with_context(

@@ -33,6 +33,63 @@ namespace apps::inconel::format {
     };
     static_assert(sizeof(tree_slot_header) == 19);
 
+    // ── Slot directory helpers ──
+    //
+    // ODF §4.1: each tree page has the layout
+    //
+    //     [ tree_slot_header ]                          ← 19 bytes
+    //     [ uint16_t offsets[record_count] ]            ← slot directory
+    //     [ records payload ... ]
+    //
+    // The directory is a full per-record offset table sitting immediately
+    // after the header. `offsets[i]` is the in-page byte offset of the i-th
+    // record in logical key order — readers index slot `i` to land directly
+    // on a record without scanning every preceding one.
+    //
+    // The directory size is uniquely determined by `record_count`; it is
+    // not stored as a separate header field. These helpers concentrate the
+    // layout arithmetic so builders / readers never reach into the page by
+    // hand-rolled byte math.
+    //
+    // ── Why memcpy and not typed `uint16_t*` ──
+    //
+    // `tree_slot_header` is 19 bytes packed, so the directory starts at a
+    // page-internal offset that is **not** 2-byte aligned. Casting that
+    // address to `uint16_t*` and dereferencing it would be UB even though
+    // x86 happens to tolerate the misaligned access. We therefore expose
+    // only `load_tree_slot_offset` / `store_tree_slot_offset`, which copy
+    // the two bytes via `std::memcpy` (the standard sanctioned escape
+    // hatch for unaligned reads/writes). Modern compilers fold the
+    // 2-byte memcpy into a single mov, so there is no perf cost.
+    //
+    // For internal pages, `rightmost_child_base` (a trailing `paddr`) sits
+    // after the last separator record in the payload area and is *not*
+    // covered by the directory — it is reached via
+    // `tree_slot_header::free_space_offset - sizeof(paddr)`.
+
+    inline uint32_t
+    tree_slot_directory_bytes(uint16_t record_count) {
+        return static_cast<uint32_t>(sizeof(uint16_t)) * record_count;
+    }
+
+    inline uint16_t
+    load_tree_slot_offset(const tree_slot_header* hdr, uint16_t index) {
+        uint16_t value;
+        std::memcpy(&value,
+                    reinterpret_cast<const char*>(hdr) + sizeof(tree_slot_header)
+                        + static_cast<size_t>(index) * sizeof(uint16_t),
+                    sizeof(uint16_t));
+        return value;
+    }
+
+    inline void
+    store_tree_slot_offset(tree_slot_header* hdr, uint16_t index, uint16_t value) {
+        std::memcpy(reinterpret_cast<char*>(hdr) + sizeof(tree_slot_header)
+                        + static_cast<size_t>(index) * sizeof(uint16_t),
+                    &value,
+                    sizeof(uint16_t));
+    }
+
     struct __attribute__((packed)) leaf_record_header {
         uint64_t    data_ver;
         record_kind kind;

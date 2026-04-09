@@ -249,7 +249,7 @@ v1 建议 `wal_segment_size` >= 4 MiB，`MAX_KEY_LEN` = 1024 bytes。
 
 ## 4. Tree Page 格式
 
-### 4.1 通用 Slot Header
+### 4.1 通用 Slot Header 与 Slot Directory
 
 每个 tree slot（无论 internal 还是 leaf）都以相同的通用 header 开头：
 
@@ -266,23 +266,43 @@ struct __attribute__((packed)) tree_slot_header {
     uint32_t format_version;                         // 与 superblock.format_version 一致
     node_type type;                                  // internal / leaf
     uint16_t record_count;                           // 该页中的记录数
-    uint32_t free_space_offset;                      // 空闲空间起始偏移
+    uint32_t free_space_offset;                      // 空闲空间起始偏移（= header + directory + 已用 payload）
     uint32_t page_crc;                               // CRC-32C
 };
 // sizeof = 19
 // page_crc 校验范围 = [page_start, page_start + tree_page_size) 中除 page_crc 自身 4 bytes 外的所有内容
-// 即：header（除 page_crc）+ 所有 records + 尾部空闲空间
+// 即：header（除 page_crc）+ slot directory + 所有 records + 尾部空闲空间
 ```
+
+紧随 header 之后是 **full slot directory**，存放每条 record 的页内绝对偏移：
+
+```text
+offset 0x00 ─┬─ tree_slot_header (19 bytes) ────────┐
+             ├─ uint16_t offsets[record_count] ─────┤  ← slot directory
+             ├─ records payload ─────────────────────┤
+             ├─ free space ──────────────────────────┤
+offset end ──┴───────────────────────────────────────┘
+```
+
+约束：
+
+1. `offsets[i]` 按逻辑 key 升序排列，`offsets[i]` 是第 `i` 条 record 在页内的字节起点。
+2. directory 的字节数 = `sizeof(uint16_t) * record_count`，由 `record_count` 唯一决定，不在 header 中冗余存放。
+3. internal node 的 `rightmost_child_base` 仍紧跟在 separator records 之后写在 payload 区，不进入 directory。
+4. `free_space_offset` 表示 header + directory + 已写 payload 的尾端偏移，即下一条 record 应该写入的位置。
+
+读侧根据 `record_count` 重建 directory 起点（`buf + sizeof(tree_slot_header)`），所有逻辑访问都通过 `directory[i]` 直接定位 record 起点，避免 O(N) 顺扫。
 
 ### 4.2 Internal Node 格式
 
 ```text
 [ tree_slot_header ]
-[ separator_key_0 | child_base_0 ]
-[ separator_key_1 | child_base_1 ]
+[ uint16_t offsets[record_count] ]                   // separator records 的页内偏移
+[ separator_record_0 ]
+[ separator_record_1 ]
 ...
-[ separator_key_{n-1} | child_base_{n-1} ]
-[ rightmost_child_base ]                             // 最右子节点
+[ separator_record_{n-1} ]
+[ rightmost_child_base ]                             // 最右子节点（不进 directory）
 ```
 
 ```cpp
@@ -296,18 +316,20 @@ struct __attribute__((packed)) internal_record {
 
 查找规则：
 ```text
-给定 lookup_key，在 internal node 中找第一个 separator_key > lookup_key 的位置 i
+给定 lookup_key，在 directory 上做 binary search，找第一个 separator_key > lookup_key 的逻辑 index i
 → 走 child_base[i]（没找到 → 走 rightmost_child_base）
 // child_base[i] 是 separator_key[i] 的左子树，覆盖 [sep_{i-1}, sep_i)
 // child_base[0] 天然就是最左子节点，覆盖 (-inf, sep_0)
 ```
 
-Internal node 的记录按 separator key 升序排列。
+Internal node 的 directory 按 separator key 升序排列；rightmost child 的物理位置固定在
+`buf + free_space_offset - sizeof(paddr)`，可 O(1) 取出。
 
 ### 4.3 Leaf Node 格式
 
 ```text
 [ tree_slot_header ]
+[ uint16_t offsets[record_count] ]                   // 按 logical key 升序的 leaf record 偏移
 [ leaf_record_0 ]
 [ leaf_record_1 ]
 ...
@@ -336,7 +358,7 @@ struct __attribute__((packed)) leaf_record_header {
 // total = 11 + key_len
 ```
 
-Leaf 记录按 logical key 升序排列。同一逻辑 key 在同一个 leaf slot 中最多出现一次（同一 tree snapshot 下同 key 只有一个 winner）。
+Leaf 的 directory 按 logical key 升序排列，物理 record 顺序与 directory 顺序一致（builder 在 finalize 时按写入顺序生成 directory）。同一逻辑 key 在同一个 leaf slot 中最多出现一次（同一 tree snapshot 下同 key 只有一个 winner）。Lookup 直接对 directory 做 binary search，O(log N) 比较。
 
 #### `data_ver` 编码选择
 
@@ -385,37 +407,49 @@ Recovery 时使用此规则扫描 Data Area（详见 `recovery_and_wal_reclaim.m
 
 ### 4.6 Leaf 页容量估算
 
+每条 leaf record 需要 record 自身 + 2 字节 directory 偏移。
+
 假设 `tree_page_size = 16384`（16 KiB）：
 
 ```text
 可用空间 = 16384 - sizeof(tree_slot_header) = 16384 - 19 = 16365 bytes
+                                                    （directory + payload 共用）
 
-value record size = 11 + key_len + 18 = 29 + key_len
-tombstone record size = 11 + key_len
+value record size      = 11 + key_len + 18 = 29 + key_len
+tombstone record size  = 11 + key_len
+per-record dir entry   = 2 bytes
 
 假设 avg key_len = 32 bytes:
-  value record avg = 61 bytes
-  → ~268 records per leaf
+  value record + dir = 63 bytes
+  → 16365 / 63 ≈ ~259 records per leaf
 
 假设 avg key_len = 128 bytes:
-  value record avg = 157 bytes
-  → ~104 records per leaf
+  value record + dir = 159 bytes
+  → 16365 / 159 ≈ ~102 records per leaf
 ```
+
+`tree_page_size = 4096`（4 KiB）下的 32B key 容量约为 `(4096 - 19) / 63 ≈ 64 records`。
 
 ### 4.7 Internal 页容量估算
 
 ```text
-可用空间 = 16365 bytes
+可用空间 = 16365 bytes（directory + separator records + rightmost_child_base）
 
-internal record size = 2 + key_len + 10 = 12 + key_len
-加上末尾 rightmost_child_base = 10 bytes
+internal record size  = 2 + key_len + 10 = 12 + key_len
+per-record dir entry  = 2 bytes
+末尾 rightmost_child_base = sizeof(paddr) = 10 bytes（不进 directory）
+
+n 条 separator + 1 个 rightmost：
+  10 + n * (record_size + 2) <= 16365
 
 假设 avg separator_key_len = 32 bytes:
-  record avg = 44 bytes
-  → ~371 children per internal node
+  record + dir = 46 bytes
+  n <= (16365 - 10) / 46 ≈ 355
+  → ~356 children per internal node（355 separator + 1 rightmost）
 
 假设 avg separator_key_len = 128 bytes:
-  record avg = 140 bytes
+  record + dir = 142 bytes
+  n <= (16365 - 10) / 142 ≈ 115
   → ~116 children per internal node
 ```
 

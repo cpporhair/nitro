@@ -61,9 +61,9 @@
 |------|---------|---------|
 | §2 Superblock A/B | 双槽超级块、CRC 选择、元数据页 | magic=0x494E434F4E454C31, 占 2 LBA |
 | §3 WAL Segment | header + entry + trailer、跨 LBA 拼接 | magic=0x57414C53 |
-| §4 Tree Page | slot header、internal/leaf 节点、shadow range、空 slot 检测 | magic=0x54524545, 典型 16KiB |
+| §4 Tree Page | slot header + full slot directory、internal/leaf 节点、shadow range、空 slot 检测 | magic=0x54524545, 典型 16KiB |
 | §5 Value Object | 布局、size class、sub-LBA 策略 | magic=0x56414C55, ≤16 个 size class |
-| §6 参数关系 | 对齐约束、容量估算 | leaf ~268 条 (32B key)，internal ~371 children |
+| §6 参数关系 | 对齐约束、容量估算 | 16K leaf ~259 条 / 4K leaf 64 条 (32B key)，16K internal ~356 children |
 
 **核心地址类型：**
 ```

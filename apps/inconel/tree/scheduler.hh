@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 
 #include "pump/core/meta.hh"
@@ -98,7 +99,8 @@ namespace apps::inconel::tree {
         struct req {
             lookup_state* state;
             std::move_only_function<void(batch_decision&&)> cb;
-            req* next = nullptr;  // intrusive waiter list
+            uint32_t wait_gen = 0;       // bumped each time req is parked
+            bool     wake_enqueued = false;  // set when re-queued, cleared on dispatch
         };
 
         struct op {
@@ -166,11 +168,24 @@ namespace apps::inconel::tree {
 
     template <core::cache_concept Cache>
     struct tree_lookup_sched : tree_lookup_sched_base {
+        // Per-page single-flight bookkeeping. A wait_token records which
+        // generation of a req registered to wait for a given page; the
+        // generation lets stale registrations be filtered at completion
+        // time without having to walk every other inflight entry the req
+        // is also waiting on.
+        struct wait_token {
+            _tree_lookup::req* req;
+            uint32_t           wait_gen;
+        };
+
+        struct pending_read {
+            std::vector<wait_token> waiters;
+        };
+
         Cache page_cache_;
-        absl::flat_hash_set<paddr> loading_pages_;             // reads in-flight
-        std::vector<std::unique_ptr<char[]>> owned_bufs_;       // buffer ownership pool
-        std::vector<char*> free_bufs_;                          // recyclable evicted buffers
-        _tree_lookup::req* waiters_head_ = nullptr;             // intrusive waiter list
+        absl::flat_hash_map<paddr, pending_read> inflight_reads_;  // per-page single-flight
+        std::vector<std::unique_ptr<char[]>> owned_bufs_;          // buffer ownership pool
+        std::vector<char*> free_bufs_;                             // recyclable evicted buffers
 
         // INC-029 — bounded per-advance work budget. Without a cap, a single
         // advance() invocation could drain the entire queue, starving other
@@ -191,8 +206,10 @@ namespace apps::inconel::tree {
             bool progress = false;
 
             // Cache completions first: installing fresh pages may unblock
-            // waiters, which we then re-queue onto lookup_queue_ so the
-            // next loop can pick them up.
+            // waiters registered against those exact pages. For each page
+            // in the completed batch we install it into the cache, pop the
+            // matching pending_read entry, and re-queue every still-valid
+            // waiter exactly once (guarded by wait_gen + wake_enqueued).
             for (uint32_t i = 0; i < kMaxCacheOpsPerAdvance; ++i) {
                 auto item = cache_queue_.try_dequeue();
                 if (!item) break;
@@ -202,35 +219,34 @@ namespace apps::inconel::tree {
                     auto evicted = page_cache_.put(addr, buf);
                     if (evicted.has_value())
                         free_bufs_.push_back(evicted->buf);
-                    loading_pages_.erase(addr);
+
+                    // prepare_reads() emplaces an inflight_reads_ entry
+                    // for every read it actually issues, so a completion
+                    // landing here without a matching slot is an internal
+                    // bookkeeping break, not a benign race. Fail loudly
+                    // instead of silently dropping the wakeup, otherwise
+                    // any req parked on this page would hang forever.
+                    auto it = inflight_reads_.find(addr);
+                    if (it == inflight_reads_.end()) {
+                        core::panic_inconsistency(
+                            "tree::tree_lookup_sched::advance",
+                            "cache completion without inflight entry "
+                            "dev=%u lba=%lu",
+                            static_cast<unsigned>(addr.device_id),
+                            static_cast<unsigned long>(addr.lba));
+                    }
+                    pending_read pr = std::move(it->second);
+                    inflight_reads_.erase(it);
+
+                    for (auto& tok : pr.waiters) {
+                        if (tok.wait_gen != tok.req->wait_gen) continue;
+                        if (tok.req->wake_enqueued) continue;
+                        tok.req->wake_enqueued = true;
+                        lookup_queue_.try_enqueue(tok.req);
+                    }
                 }
                 r->cb(true);
                 delete r;
-
-                // Wake waiters that can progress (page cached or not loading)
-                _tree_lookup::req* still_waiting = nullptr;
-                auto* cur = waiters_head_;
-                waiters_head_ = nullptr;
-                while (cur) {
-                    auto* next = cur->next;
-                    cur->next = nullptr;
-                    bool can_progress = false;
-                    for (auto& e : cur->state->entries) {
-                        if (e.resolved) continue;
-                        if (!loading_pages_.count(e.next_page)) {
-                            can_progress = true;
-                            break;
-                        }
-                    }
-                    if (can_progress) {
-                        lookup_queue_.try_enqueue(cur);
-                    } else {
-                        cur->next = still_waiting;
-                        still_waiting = cur;
-                    }
-                    cur = next;
-                }
-                waiters_head_ = still_waiting;
 
                 progress = true;
             }
@@ -250,6 +266,11 @@ namespace apps::inconel::tree {
 
     private:
         void handle(_tree_lookup::req* r) {
+            // This dispatch consumes whatever wake credit we had; any
+            // re-park below must bump wait_gen and re-arm wake_enqueued
+            // through the inflight_reads_ path.
+            r->wake_enqueued = false;
+
             auto& s = *r->state;
 
             process_entries(s);
@@ -257,17 +278,50 @@ namespace apps::inconel::tree {
             if (s.all_done) {
                 r->cb(decision_done{});
                 delete r;
-            } else {
-                decision_need_read decision;
-                prepare_reads(s, decision);
-                if (!decision.read_descs.empty()) {
-                    r->cb(std::move(decision));
-                    delete r;
-                } else {
-                    // All needed pages are loading — wait for cache
-                    r->next = waiters_head_;
-                    waiters_head_ = r;
+                return;
+            }
+
+            decision_need_read decision;
+            prepare_reads(s, decision);
+            if (!decision.read_descs.empty()) {
+                r->cb(std::move(decision));
+                delete r;
+                return;
+            }
+
+            // No new reads to issue: every unresolved entry's next_page
+            // is already in flight (or just landed). Park this req on
+            // each such page under a fresh wait_gen so that any one of
+            // them can re-queue us exactly once.
+            r->wait_gen += 1;
+
+            absl::flat_hash_set<paddr> wait_pages;
+            for (auto& e : s.entries) {
+                if (e.resolved) continue;
+                if (page_cache_.contains(e.next_page)) continue;
+                wait_pages.insert(e.next_page);
+            }
+
+            if (wait_pages.empty()) {
+                // process_entries() saw no resolvable entry but every
+                // unresolved entry's next_page is already cached — that
+                // means the cache claims to have a page we somehow could
+                // not consume. There is no consistent recovery from this.
+                core::panic_inconsistency(
+                    "tree::tree_lookup_sched::handle",
+                    "park requested with no pages to wait on");
+            }
+
+            for (auto page : wait_pages) {
+                auto it = inflight_reads_.find(page);
+                if (it == inflight_reads_.end()) {
+                    core::panic_inconsistency(
+                        "tree::tree_lookup_sched::handle",
+                        "park page not in inflight_reads_ dev=%u lba=%lu",
+                        static_cast<unsigned>(page.device_id),
+                        static_cast<unsigned long>(page.lba));
                 }
+                it->second.waiters.push_back({r, r->wait_gen});
             }
         }
 
@@ -327,7 +381,11 @@ namespace apps::inconel::tree {
             for (auto& e : s.entries) {
                 if (e.resolved) continue;
                 if (page_cache_.contains(e.next_page)) continue;
-                if (loading_pages_.count(e.next_page)) continue;
+
+                // Single-flight: if any prior req already issued a read
+                // for this page, skip — we will park on its pending_read
+                // when handle() runs out of new reads to schedule.
+                if (inflight_reads_.contains(e.next_page)) continue;
 
                 char* buf;
                 if (!free_bufs_.empty()) {
@@ -337,7 +395,7 @@ namespace apps::inconel::tree {
                     owned_bufs_.push_back(std::make_unique<char[]>(s.page_size));
                     buf = owned_bufs_.back().get();
                 }
-                loading_pages_.insert(e.next_page);
+                inflight_reads_.emplace(e.next_page, pending_read{});
                 decision.page_map.emplace_back(e.next_page, buf);
                 decision.read_descs.push_back({
                     .lba = e.next_page.lba,

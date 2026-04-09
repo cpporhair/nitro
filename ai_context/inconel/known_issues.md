@@ -27,7 +27,6 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-039 | tree lookup inflight 仍是 `loading_pages_ + waiters_head_` 的简化模型，没对齐 spec RSM §4.7 的 `inflight_reads` single-flight 结构 | audit/tree.md F9 + design_doc/runtime_state_machine.md §4.7 | `normal` | 容器替换完成后，重做 tree lookup inflight bookkeeping：从全局 set + waiter 链收敛到按 page / frame 聚合的 pending_read map，避免继续固化当前简化模型 |
 
 ### 未来功能的基础，建议提前设计 + 实现
 
@@ -119,3 +118,4 @@
 | INC-032 | `format/crc.hh::crc32c` 用 raw SSE4.2 intrinsics，缺标准 CRC-32C 的 init/xor conditioning，跟外部工具（btrfs/ext4/iSCSI 等）不匹配；spec ODF §1.3 含糊 | audit/format.md F5 | step 009 已完成：删除 `format/crc.hh`，`tree_page` / `value_object` 调用点切到 `absl::ComputeCrc32c`，并在 ODF §1.3 明确标准 CRC-32C + init/xor conditioning 语义 |
 | INC-033 | `build_runtime` + `start.hh::run_with` 一连串 raw `new` 没 RAII，`start()` 抛或某个 scheduler 构造抛 → 已分配的 rt + scheduler 全 leak | audit/runtime.md R1 | step 011 已完成：`runtime::run_with()` 统一 catch `std::exception` / unknown exception 后直接 `panic_inconsistency(...)`，把 init failure 定义为 process-fatal，由 OS 回收 leaked 资源 |
 | INC-037 | `slru_cache::evict_one` 从 protected 段 evict 时不重置 `in_protected`，`free_node` 也不重置；recycled node 带 stale `in_protected==true` 进 free list，下一次 alloc_node + link_probation_head 后 get() 会走错 `if (n.in_protected)` 分支调 `unlink_protected` 操作 probation 列表的节点 → 破坏 protected 列表指针 + 错误递减 prot_size_；当前不可达（evict_one 仅 teardown 用），但 latent + AI 抄走会扩散 | audit/core.md C2 | step 009 已完成：`slru_cache::free_node()` 清 `in_protected=false`，`alloc_node()` 增加 `assert(!in_protected)`，把 stale state 与不变量一起收紧 |
+| INC-039 | tree lookup inflight 仍是 `loading_pages_ + waiters_head_` 的简化模型，没对齐 spec RSM §4.7 的 `inflight_reads` single-flight 结构 | audit/tree.md F9 + design_doc/runtime_state_machine.md §4.7 | step 013 已完成：tree lookup 的 inflight bookkeeping 改成按 `paddr` 聚合的 `inflight_reads_` single-flight map，用 `wait_gen + wake_enqueued` 处理多页等待、旧注册失效和重复唤醒，不再扫描全局 waiter 链 |

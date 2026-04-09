@@ -5,8 +5,9 @@
 #include <functional>
 #include <memory>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
+
+#include <absl/container/flat_hash_set.h>
 
 #include "pump/core/meta.hh"
 #include "pump/core/op_pusher.hh"
@@ -166,7 +167,7 @@ namespace apps::inconel::tree {
     template <core::cache_concept Cache>
     struct lookup_scheduler : lookup_scheduler_base {
         Cache page_cache_;
-        std::unordered_set<paddr> loading_pages_;              // reads in-flight
+        absl::flat_hash_set<paddr> loading_pages_;             // reads in-flight
         std::vector<std::unique_ptr<char[]>> owned_bufs_;       // buffer ownership pool
         std::vector<char*> free_bufs_;                          // recyclable evicted buffers
         _tree_lookup::req* waiters_head_ = nullptr;             // intrusive waiter list

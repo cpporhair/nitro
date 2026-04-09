@@ -17,6 +17,23 @@ namespace apps::inconel::format {
             if (device_id != rhs.device_id) return device_id < rhs.device_id;
             return lba < rhs.lba;
         }
+
+        // Abseil hash adapter — found via ADL by absl::Hash and any
+        // absl::flat_hash_{map,set}<paddr, ...> instantiation. The legacy
+        // std::hash<paddr> below is kept so existing std::unordered_*
+        // call sites outside this step continue to compile.
+        //
+        // The members are copied into locals first because paddr is
+        // __attribute__((packed)) — H::combine() takes its arguments by
+        // const&, and binding a reference directly to p.lba would trip
+        // -Waddress-of-packed-member.
+        template <typename H>
+        friend H
+        AbslHashValue(H h, const paddr& p) {
+            uint16_t dev = p.device_id;
+            uint64_t lba = p.lba;
+            return H::combine(std::move(h), dev, lba);
+        }
     };
     static_assert(sizeof(paddr) == 10);
 

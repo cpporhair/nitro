@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -15,6 +14,9 @@
 #include <string_view>
 #include <variant>
 #include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
 
 #include "pump/core/compute_sender_type.hh"
 #include "pump/core/lock_free_queue.hh"
@@ -369,9 +371,12 @@ namespace apps::inconel::value {
         // the optional uniformly with `if (auto evicted = ...) delete[]`.
         Cache readonly_cache_;
 
-        // leader-follower in-flight tracking
-        std::map<uint64_t, std::unique_ptr<round>> inflight_rounds_;
-        uint64_t                                   next_round_id_ = 1;
+        // leader-follower in-flight tracking. round_id is a monotonically
+        // increasing key only ever queried point-wise (find/erase by id);
+        // there is no ordered iteration, so a hash map is preferred over the
+        // RB-tree std::map originally used.
+        absl::flat_hash_map<uint64_t, std::unique_ptr<round>> inflight_rounds_;
+        uint64_t                                              next_round_id_ = 1;
 
         scheduler(std::span<const uint32_t> class_sizes,
                   uint32_t                  lba_size,
@@ -385,7 +390,8 @@ namespace apps::inconel::value {
             , readonly_cache_(std::move(cache))
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
-            class_sizes_view_ = std::span<const uint32_t>(class_sizes_storage_);
+            class_sizes_view_ = std::span<const uint32_t>(
+                class_sizes_storage_.data(), class_sizes_storage_.size());
         }
 
         // ── Destructor ──
@@ -892,9 +898,12 @@ namespace apps::inconel::value {
         // bytes (initialized in the ctor's init list from the input span);
         // class_sizes_view_ is a stable span over that storage built once
         // in the ctor body. Owning a copy means the input span doesn't have
-        // to outlive the scheduler.
-        std::vector<uint32_t> class_sizes_storage_;
-        std::span<const uint32_t> class_sizes_view_;
+        // to outlive the scheduler. The 16 inline slots match the on-disk
+        // value_size_classes upper bound (superblock §2 in
+        // on_disk_formats.md), so the small-resident metadata stays inline
+        // and avoids a heap allocation per scheduler.
+        absl::InlinedVector<uint32_t, 16> class_sizes_storage_;
+        std::span<const uint32_t>         class_sizes_view_;
     };
 
     // ── scheduler_base sender factory deferred definitions ──

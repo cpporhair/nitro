@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
+
+#include <absl/container/flat_hash_map.h>
 
 #include "../format/types.hh"
 
@@ -37,7 +38,7 @@ namespace apps::inconel::core {
         };
 
         std::vector<slot> slots_;
-        std::unordered_map<paddr, uint32_t> index_;
+        absl::flat_hash_map<paddr, uint32_t> index_;
         uint32_t hand_ = 0;
         uint32_t capacity_;
         uint32_t size_ = 0;

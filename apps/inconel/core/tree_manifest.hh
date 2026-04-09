@@ -2,7 +2,9 @@
 #define APPS_INCONEL_CORE_TREE_MANIFEST_HH
 
 #include <cassert>
-#include <unordered_map>
+
+#include <absl/container/flat_hash_map.h>
+
 #include "../format/types.hh"
 
 namespace apps::inconel::core {
@@ -11,7 +13,7 @@ namespace apps::inconel::core {
 
     struct tree_manifest {
         paddr root_slot;
-        std::unordered_map<paddr, uint32_t> slot_map;
+        absl::flat_hash_map<paddr, uint32_t> slot_map;
         uint32_t tree_page_size;
         uint32_t lba_size;
 

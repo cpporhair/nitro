@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
+
+#include <absl/container/flat_hash_map.h>
 
 #include "../format/types.hh"
 #include "./clock_cache.hh"  // for evicted_entry
@@ -42,7 +43,7 @@ namespace apps::inconel::core {
         };
 
         std::vector<node> nodes_;
-        std::unordered_map<paddr, uint32_t> index_;
+        absl::flat_hash_map<paddr, uint32_t> index_;
 
         uint32_t prot_head_ = NIL;
         uint32_t prot_tail_ = NIL;

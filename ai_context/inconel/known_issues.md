@@ -21,8 +21,6 @@
 | INC-005 | `tree_manifest::resolve` 用 assert，Release 退化 UB | audit/tree.md F2 | `urgent` | `resolve` 找不到 range_base 时调 INC-004 的 panic helper |
 | INC-007 | `tree_manifest` 模块归属 core/ vs tree/ 不明，spec 没明说 | audit/tree.md F6 | `low` | 拍板归属（core/ 多 sched 共享 vs tree/ owner）后做迁移或在当前位置加注释说明选择理由 |
 | INC-008 | spec ODF §4.2 的 `internal_record` 没有 import 到 `format/tree_page.hh`，layout 散在 page_builder/reader 4 处散文 memcpy（leaf record 是正确范本） | audit/tree.md F8 | `urgent` | `format/tree_page.hh` 加 `internal_record` packed struct + `static_assert(sizeof == 2)` + `internal_record_size(key_len)` helper；4 处 site 收敛到 struct 和 helper |
-| INC-009 | `loading_pages_` / `slot_map` 用 std::unordered_*，spec 用 flat_hash_map | audit/tree.md F9 | `urgent` | 引入 abseil，改用 absl::flat_hash_set/map |
-| INC-010 | spec 用 abseil 容器词汇（flat_hash_map/set、btree_map、small_vector），代码用 std::* | spec 全文 | `urgent` | 用 absl 等价物全面替换：unordered_* → flat_hash_*，small_vector → InlinedVector，memtable 落地时用 btree_map |
 | INC-011 | `tree_manifest::has_root()` 用 `lba == 0` 当 sentinel，依赖隐式不变量 | audit/tree.md F10 | `blocked` (tree_sched 写侧 / page allocator) | 等 allocator 落地知道哪些 lba 合法后定方案（optional<paddr> 或显式 bool 字段） |
 | INC-012 | leaf/internal page reader 全 linear scan，热路径每页 ~134/185 次比较 | audit/tree.md F11 | `normal` (flush 落地前完成) | spec 加 full slot directory（紧跟 tree_slot_header 的 uint16_t offsets[record_count]），page_builder finalize 写 directory，reader 用 binary search；CoW 上下文 InnoDB 稀疏方案不适用 |
 | INC-013 | `lookup_scheduler::handle` 的 `if (s.first_call)` 分支 + `lookup_state::first_call` 字段是 dead code（make_lookup_state 已处理空 manifest，coroutine 短路掉了 handle 入口） | audit/tree.md F12 | `low` | 删 `first_call` 字段 + 删 handle 里整个 if 块 |
@@ -51,7 +49,11 @@
 | INC-036 | `cache_concept`（page_cache.hh）value 类型是 raw `char*`，缺 `pin_count` 概念、缺 frame state machine（dirty_append/dirty_hole_fill/writeback_inflight/clean_readonly），跟 spec RMC §6.1 + §11 期望的 `lru_or_clock<frame_id, page_frame*>` + frame state 不符；与 INC-016 (buffer ownership / DMA 替换) 是正交两层 | audit/core.md C1 | `urgent` | 按 RMC §6.1 + §11 重做 cache_concept：value 类型从 `char*` 改成 `page_frame*`（含 buffer + pin_count + state），加 pin/unpin 操作，evict 跳过 pin_count > 0 / 非 clean_readonly 的 frame；clock_cache + slru_cache 同步迁移；概念重做完成前不允许新增 cache 实现 |
 | INC-037 | `slru_cache::evict_one` 从 protected 段 evict 时不重置 `in_protected`，`free_node` 也不重置；recycled node 带 stale `in_protected==true` 进 free list，下一次 alloc_node + link_probation_head 后 get() 会走错 `if (n.in_protected)` 分支调 `unlink_protected` 操作 probation 列表的节点 → 破坏 protected 列表指针 + 错误递减 prot_size_；当前不可达（evict_one 仅 teardown 用），但 latent + AI 抄走会扩散 | audit/core.md C2 | `urgent` | `slru_cache::free_node` 加 `nodes_[idx].in_protected = false;` 统一覆盖所有 free path；`alloc_node` 加 `assert(!nodes_[idx].in_protected)` 让不变量显式 |
 | INC-038 | `cache_concept::evict_one` 命名跟语义漂移：clock_cache 走 `index_.begin()` 非确定性（不按 clock policy），slru_cache 走 probation tail 后 protected tail（LRU 序），page_cache.hh 注释说 "teardown drain" 但名字像 "按 policy evict 一个"；concept 没规范，AI 给新 cache 实现 evict_one 时会两边各自漂 | audit/core.md C3 | `normal` | rename `evict_one` → `drain_one`（cache_concept + clock_cache + slru_cache + 所有 use site），page_cache.hh 文档明确 "drain_one is teardown-only, not policy eviction"；INC-036 重做 cache_concept 时顺手做掉 |
+| INC-039 | tree lookup inflight 仍是 `loading_pages_ + waiters_head_` 的简化模型，没对齐 spec RSM §4.7 的 `inflight_reads` single-flight 结构 | audit/tree.md F9 + design_doc/runtime_state_machine.md §4.7 | `normal` | 容器替换完成后，重做 tree lookup inflight bookkeeping：从全局 set + waiter 链收敛到按 page / frame 聚合的 pending_read map，避免继续固化当前简化模型 |
 
 ## Resolved
 
-（暂无）
+| ID | Issue | 来源 | 解决 |
+|----|-------|------|------|
+| INC-009 | `loading_pages_` / `slot_map` 用 std::unordered_*，spec 用 flat_hash_map | audit/tree.md F9 | step 008 已完成：`tree::lookup_scheduler::loading_pages_` → `absl::flat_hash_set`，`core::tree_manifest::slot_map` → `absl::flat_hash_map` |
+| INC-010 | spec 用 abseil 容器词汇（flat_hash_map/set、btree_map、small_vector），代码用 std::* | spec 全文 | step 008 已完成当前已实现代码的容器对齐：shared page_cache `index_`、value `classes_` / `class_sizes_storage_` / `inflight_rounds_` 已切到 Abseil；future 模块首次落地时直接按 spec 选型，不再作为当前 open mismatch issue |

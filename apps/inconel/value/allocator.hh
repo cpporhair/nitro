@@ -7,6 +7,8 @@
 #include <span>
 #include <vector>
 
+#include <absl/container/inlined_vector.h>
+
 #include "../format/types.hh"
 #include "../format/value_object.hh"
 
@@ -229,7 +231,10 @@ namespace apps::inconel::value {
     private:
         per_device_value_state dev_;
         uint32_t               lba_size_;
-        std::vector<per_class> classes_;
+        // on-disk format caps value_size_classes at 16 (superblock §2 in
+        // on_disk_formats.md), so the per-class metadata never grows past
+        // 16 entries — keep it inline to dodge the heap allocation.
+        absl::InlinedVector<per_class, 16> classes_;
     };
 
 }

@@ -15,6 +15,11 @@ include(pump/src/env/scheduler/net/tcp/tcp.cmake)
 include(pump/src/env/scheduler/net/udp/udp.cmake)
 include(pump/src/env/scheduler/cuda/cuda.cmake)
 
+# Abseil — used by apps/inconel/* for flat_hash_map / flat_hash_set /
+# InlinedVector. Step 008 only pulls the container subset; CRC migration
+# (absl::ComputeCrc32c) is intentionally left to INC-032.
+find_package(absl CONFIG REQUIRED)
+
 # KV
 add_executable(kv apps/kv/main.cc)
 target_include_directories(kv PRIVATE ${CMAKE_SOURCE_DIR}/apps/kv)
@@ -81,28 +86,34 @@ set_target_properties(sider_bench PROPERTIES
 target_compile_options(sider_bench PRIVATE -Wno-unused-result -Wno-deprecated-declarations)
 
 # Inconel tests
+set(INCONEL_ABSL_LIBS
+    absl::flat_hash_map
+    absl::flat_hash_set
+    absl::inlined_vector)
+
 add_executable(inconel_test_tree_lookup apps/inconel/test/test_tree_lookup.cc)
 target_include_directories(inconel_test_tree_lookup PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_lookup PRIVATE pthread)
+target_link_libraries(inconel_test_tree_lookup PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_tree_lookup_multicore apps/inconel/test/test_tree_lookup_multicore.cc)
 target_include_directories(inconel_test_tree_lookup_multicore PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_lookup_multicore PRIVATE pthread)
+target_link_libraries(inconel_test_tree_lookup_multicore PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_page_cache apps/inconel/test/test_page_cache.cc)
 target_include_directories(inconel_test_page_cache PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_page_cache PRIVATE ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_runtime apps/inconel/test/test_runtime.cc)
 target_include_directories(inconel_test_runtime PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_runtime PRIVATE pthread)
+target_link_libraries(inconel_test_runtime PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_value apps/inconel/test/test_value.cc)
 target_include_directories(inconel_test_value PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_value PRIVATE pthread)
+target_link_libraries(inconel_test_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_tree_value apps/inconel/test/test_tree_value.cc)
 target_include_directories(inconel_test_tree_value PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_value PRIVATE pthread)
+target_link_libraries(inconel_test_tree_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)

@@ -427,29 +427,59 @@ namespace apps::inconel::value {
         // return pages to writable_pages_, which makes them available for
         // subsequent persist rounds). persist next (consumes the freshly
         // freed pages). read/fill last.
+        //
+        // INC-029 — bounded per-advance work budget. Each of the four queues
+        // gets its own per-advance cap so a hot stream on one queue can't
+        // monopolise this scheduler's CPU and starve the other three (or
+        // other co-resident schedulers). Constants are private on purpose:
+        // these are workload-shaping knobs, not runtime/build configuration
+        // surfaces. Persist is counted in *leader rounds* — handle_persist
+        // is allowed to absorb up to kMaxFollowersPerRound followers
+        // internally, so a single round still represents up to 1 + cap
+        // entries of real work; that is why its per-advance budget is
+        // smaller than the other three.
+
+        static constexpr uint32_t kMaxFinalizePerAdvance      = 64;
+        static constexpr uint32_t kMaxPersistRoundsPerAdvance = 32;
+        static constexpr uint32_t kMaxReadPerAdvance          = 64;
+        static constexpr uint32_t kMaxFillPerAdvance          = 64;
 
         bool advance() {
             bool progress = false;
 
-            progress |= finalize_q_.drain([this](_value_finalize::req* r) {
-                handle_finalize(r);
-            });
+            for (uint32_t i = 0; i < kMaxFinalizePerAdvance; ++i) {
+                auto item = finalize_q_.try_dequeue();
+                if (!item) break;
+                handle_finalize(*item);
+                progress = true;
+            }
 
-            // Persist uses while + try_dequeue: handle_persist internally
-            // drains the queue's leftover items as followers, so the next
-            // try_dequeue returns nothing and the loop exits naturally.
-            while (auto item = persist_q_.try_dequeue()) {
+            // Persist budget is leader rounds: each handle_persist call still
+            // internally absorbs up to kMaxFollowersPerRound followers from
+            // persist_q_ via collect_round_items, but the outer advance()
+            // only counts that as one round of work. Anything beyond the
+            // round-budget stays queued and becomes its own leader on the
+            // next advance() invocation.
+            for (uint32_t i = 0; i < kMaxPersistRoundsPerAdvance; ++i) {
+                auto item = persist_q_.try_dequeue();
+                if (!item) break;
                 handle_persist(*item);
                 progress = true;
             }
 
-            progress |= read_q_.drain([this](_value_read::req* r) {
-                handle_read(r);
-            });
+            for (uint32_t i = 0; i < kMaxReadPerAdvance; ++i) {
+                auto item = read_q_.try_dequeue();
+                if (!item) break;
+                handle_read(*item);
+                progress = true;
+            }
 
-            progress |= fill_q_.drain([this](_value_fill::req* r) {
-                handle_fill(r);
-            });
+            for (uint32_t i = 0; i < kMaxFillPerAdvance; ++i) {
+                auto item = fill_q_.try_dequeue();
+                if (!item) break;
+                handle_fill(*item);
+                progress = true;
+            }
 
             return progress;
         }

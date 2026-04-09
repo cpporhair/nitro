@@ -27,7 +27,6 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-029 | tree + value 的 `advance()` 用 `.drain()` 把单 queue 吃光，多 queue 之间无 fairness 保证，单次 advance 延迟不可控（一个 queue 满了会饿死其他 queue 的处理） | audit/value.md V14 + tree 同源 | `urgent` | `advance()` 改成 bounded per-queue 处理：每 queue 每次 advance 最多处理 N 个 item，剩余等下一轮；用 bounded for + try_dequeue 替代 drain() |
 | INC-039 | tree lookup inflight 仍是 `loading_pages_ + waiters_head_` 的简化模型，没对齐 spec RSM §4.7 的 `inflight_reads` single-flight 结构 | audit/tree.md F9 + design_doc/runtime_state_machine.md §4.7 | `normal` | 容器替换完成后，重做 tree lookup inflight bookkeeping：从全局 set + waiter 链收敛到按 page / frame 聚合的 pending_read map，避免继续固化当前简化模型 |
 
 ### 未来功能的基础，建议提前设计 + 实现
@@ -116,6 +115,7 @@
 | INC-026 | `value::handle_persist` 用 `goto round_failed` + 嵌套循环 + 复杂错误传播，user 报告读不懂、无法有效 review 正确性 | audit/value.md V8 | step 010 已完成：`handle_persist` 拆成 `collect_round_items → build_round → finalize_round_writes → publish_round` 四阶段，去掉 `goto`，并改为显式 `persist_entry_status` 分流 |
 | INC-027 | `value::scheduler` 的 `class_sizes_storage_` + `class_sizes_view_` 双字段冗余（vector 可直接 decay 到 span，view 字段没必要） | audit/value.md V10 | step 010 已完成：删除 `class_sizes_view_` 成员，改成按需从 `class_sizes_storage_` 构造临时 `span` |
 | INC-028 | `value::handle_persist` 的 leader-follower 合并把整个 persist_q_ 吃光，单 round 无上限 → leader latency 不可控（特别影响 perf tuning 的 tail latency） | audit/value.md V14 | step 010 已完成：`handle_persist` 增加私有常量 `kMaxFollowersPerRound = 64`，单轮只合并 leader + 64 followers，剩余请求留给下一轮 `advance()` |
+| INC-029 | tree + value 的 `advance()` 用 `.drain()` 把单 queue 吃光，多 queue 之间无 fairness 保证，单次 advance 延迟不可控（一个 queue 满了会饿死其他 queue 的处理） | audit/value.md V14 + tree 同源 | step 012 已完成：tree `cache/lookup` 与 value `finalize/persist/read/fill` 全部改成 bounded per-queue loop，保留原队列顺序与 `advance()` 返回契约，不再单轮吃空整条 queue |
 | INC-032 | `format/crc.hh::crc32c` 用 raw SSE4.2 intrinsics，缺标准 CRC-32C 的 init/xor conditioning，跟外部工具（btrfs/ext4/iSCSI 等）不匹配；spec ODF §1.3 含糊 | audit/format.md F5 | step 009 已完成：删除 `format/crc.hh`，`tree_page` / `value_object` 调用点切到 `absl::ComputeCrc32c`，并在 ODF §1.3 明确标准 CRC-32C + init/xor conditioning 语义 |
 | INC-033 | `build_runtime` + `start.hh::run_with` 一连串 raw `new` 没 RAII，`start()` 抛或某个 scheduler 构造抛 → 已分配的 rt + scheduler 全 leak | audit/runtime.md R1 | step 011 已完成：`runtime::run_with()` 统一 catch `std::exception` / unknown exception 后直接 `panic_inconsistency(...)`，把 init failure 定义为 process-fatal，由 OS 回收 leaked 资源 |
 | INC-037 | `slru_cache::evict_one` 从 protected 段 evict 时不重置 `in_protected`，`free_node` 也不重置；recycled node 带 stale `in_protected==true` 进 free list，下一次 alloc_node + link_probation_head 后 get() 会走错 `if (n.in_protected)` 分支调 `unlink_protected` 操作 probation 列表的节点 → 破坏 protected 列表指针 + 错误递减 prot_size_；当前不可达（evict_one 仅 teardown 用），但 latent + AI 抄走会扩散 | audit/core.md C2 | step 009 已完成：`slru_cache::free_node()` 清 `in_protected=false`，`alloc_node()` 增加 `assert(!in_protected)`，把 stale state 与不变量一起收紧 |

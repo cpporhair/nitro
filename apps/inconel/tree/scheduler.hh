@@ -172,13 +172,32 @@ namespace apps::inconel::tree {
         std::vector<char*> free_bufs_;                          // recyclable evicted buffers
         _tree_lookup::req* waiters_head_ = nullptr;             // intrusive waiter list
 
+        // INC-029 — bounded per-advance work budget. Without a cap, a single
+        // advance() invocation could drain the entire queue, starving other
+        // schedulers and producing tail latency proportional to queue depth.
+        // Constants are private on purpose: this is a workload-shaping knob,
+        // not a runtime/build configuration surface. Cache completions and
+        // lookup requests get separate budgets so a hot lookup stream can't
+        // crowd out cache fills (or vice versa) within the same advance().
+        static constexpr uint32_t kMaxCacheOpsPerAdvance  = 64;
+        static constexpr uint32_t kMaxLookupOpsPerAdvance = 64;
+
         explicit
         tree_lookup_sched(Cache cache, size_t depth = 2048)
             : tree_lookup_sched_base(depth)
             , page_cache_(std::move(cache)) {}
 
         bool advance() {
-            bool a = cache_queue_.drain([this](_cache_pages::req* r) {
+            bool progress = false;
+
+            // Cache completions first: installing fresh pages may unblock
+            // waiters, which we then re-queue onto lookup_queue_ so the
+            // next loop can pick them up.
+            for (uint32_t i = 0; i < kMaxCacheOpsPerAdvance; ++i) {
+                auto item = cache_queue_.try_dequeue();
+                if (!item) break;
+                _cache_pages::req* r = *item;
+
                 for (auto& [addr, buf] : r->page_map) {
                     auto evicted = page_cache_.put(addr, buf);
                     if (evicted.has_value())
@@ -212,9 +231,18 @@ namespace apps::inconel::tree {
                     cur = next;
                 }
                 waiters_head_ = still_waiting;
-            });
-            bool b = lookup_queue_.drain([this](_tree_lookup::req* r) { handle(r); });
-            return a || b;
+
+                progress = true;
+            }
+
+            for (uint32_t i = 0; i < kMaxLookupOpsPerAdvance; ++i) {
+                auto item = lookup_queue_.try_dequeue();
+                if (!item) break;
+                handle(*item);
+                progress = true;
+            }
+
+            return progress;
         }
 
         template<typename runtime_t>

@@ -120,6 +120,10 @@ add_executable(inconel_test_tree_page_format apps/inconel/test/test_tree_page_fo
 target_include_directories(inconel_test_tree_page_format PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_page_format PRIVATE ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_wal_format apps/inconel/test/test_wal_format.cc)
+target_include_directories(inconel_test_wal_format PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_wal_format PRIVATE ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

@@ -154,8 +154,10 @@ constexpr uint32_t HEADER_SIZE = sizeof(wal_segment_header);  // = 26
 ### 3.3 WAL Entry
 
 ```cpp
-constexpr uint8_t WAL_OP_PUT    = 0x01;
-constexpr uint8_t WAL_OP_DELETE = 0x02;
+enum class wal_op_type : uint8_t {
+    put = 0x01,
+    del = 0x02,
+};
 // 0x03..0xFF 预留给 future large-value / multi-extent 等
 
 struct __attribute__((packed)) wal_entry_header {
@@ -163,7 +165,7 @@ struct __attribute__((packed)) wal_entry_header {
     uint32_t segment_gen;                            // 必须与 segment header 的 gen 一致
     uint64_t lsn;                                    // batch_lsn
     uint32_t entry_count;                            // 该 batch_lsn 的 canonical record 总数
-    uint8_t  op_type;                                // WAL_OP_PUT / WAL_OP_DELETE
+    uint8_t  op_type;                                // wal_op_type as raw byte
     uint32_t key_len;                                // key 字节数
 };
 // sizeof = 25
@@ -201,8 +203,10 @@ CRC 覆盖范围：从 `wal_entry_header.total_len` 开始到 `key_bytes` 末尾
 ### 3.4 Sealed Trailer
 
 ```cpp
+constexpr uint32_t WAL_SEAL_MAGIC = 0x5345414C;  // "SEAL"
+
 struct __attribute__((packed)) wal_sealed_trailer {
-    uint32_t magic;                                  // 0x5345414C ("SEAL")
+    uint32_t magic;                                  // WAL_SEAL_MAGIC
     uint32_t segment_gen;                            // 与 segment header 一致
     uint32_t write_end;                              // 最后一条 entry 之后的字节偏移
     uint64_t min_lsn;                                // 该 segment 中最小 lsn

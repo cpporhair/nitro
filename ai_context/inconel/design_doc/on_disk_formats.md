@@ -111,7 +111,9 @@ struct __attribute__((packed)) superblock {
 2. 更新时写入当前 **inactive** 的那个 slot（generation 较小的），generation + 1，FUA 写入。
 3. 只有当 `root_base_paddr` 变化时才需要更新（概要 §4.2 规则 3）。
 4. 两份都 CRC 错误 → 格式化损坏，需要人工介入。
-5. 两份 generation 相同但内容不同 → 不应出现（写入序列保证），作为格式化损坏处理。
+5. 两份 generation 相同但内容不同 → 不应出现（写入序列保证），作为格式化损坏处理。两份 generation 相同且字节完全一致则不算冲突，按 A 处理。
+
+A/B 选择规则的唯一实现是 `format/superblock.hh::choose_newer_superblock`；recovery / format / superblock-update 必须复用此 helper，禁止自建 generation 比较或 fall-through tie-break。
 
 ### 2.4 Reserved Metadata Pages
 

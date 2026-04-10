@@ -13,9 +13,11 @@
 //      results across cores
 //
 
-#include <atomic>
 #include "apps/inconel/test/check.hh"
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -27,7 +29,9 @@
 #include "pump/sender/submit.hh"
 
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/runtime/builder.hh"
+#include "apps/inconel/runtime/start.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "apps/inconel/tree/sender.hh"
 
@@ -39,6 +43,34 @@ using namespace apps::inconel;
 
 constexpr uint32_t PS  = 4096;
 constexpr uint32_t LBS = 4096;
+
+template <typename T>
+concept has_value_class_sizes_option = requires(T t) { t.value_class_sizes; };
+
+template <typename T>
+concept has_lba_size_option = requires(T t) { t.lba_size; };
+
+template <typename T>
+concept has_value_data_area_base_option = requires(T t) { t.value_data_area_base; };
+
+template <typename T>
+concept has_value_data_area_end_option = requires(T t) { t.value_data_area_end; };
+
+static_assert(!has_value_class_sizes_option<runtime::build_options>);
+static_assert(!has_lba_size_option<runtime::build_options>);
+static_assert(!has_value_data_area_base_option<runtime::build_options>);
+static_assert(!has_value_data_area_end_option<runtime::build_options>);
+
+static_assert(!has_value_class_sizes_option<runtime::start_options>);
+static_assert(!has_lba_size_option<runtime::start_options>);
+static_assert(!has_value_data_area_base_option<runtime::start_options>);
+static_assert(!has_value_data_area_end_option<runtime::start_options>);
+
+static uint64_t
+bootstrap_namespace_size_bytes() {
+    const auto& profile = format::kBootstrapFormatProfile;
+    return static_cast<uint64_t>(profile.lba_size) * profile.value_data_area_end.lba;
+}
 
 // ── Tree builder helpers (same shape as test_tree_lookup_multicore) ──
 
@@ -80,7 +112,7 @@ struct tree_data {
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
-    tree_data() : dev(PS * 8192, LBS) {
+    tree_data() : dev(bootstrap_namespace_size_bytes(), LBS) {
         dev.enable_thread_safety(&dev_mtx);
         build();
     }
@@ -120,7 +152,8 @@ private:
 
 template <core::cache_concept Cache>
 static void test_registry_population(const char* label) {
-    mock_device dev(PS * 1024, LBS);
+    CHECK(format::kBootstrapFormatProfile.lba_size == LBS);
+    mock_device dev(bootstrap_namespace_size_bytes(), LBS);
 
     std::vector<uint32_t> cores = {0, 2, 4};
     runtime::build_options opts{
@@ -154,8 +187,62 @@ static void test_registry_population(const char* label) {
                core::registry::tree_lookup_for_core(c));
     }
 
+    // 4. Standard runtime construction always installs the value singleton
+    //    from the bootstrap format profile. This is the contract step 017
+    //    adds: no more "empty value_class_sizes disables value" path.
+    using value_sched_t = value::value_alloc_sched<Cache>;
+    auto* value_base = core::registry::value_alloc_sched;
+    CHECK(value_base != nullptr);
+    auto* value_first = rt->template get_by_core<value_sched_t>(cores.front());
+    CHECK(value_first != nullptr);
+    CHECK(static_cast<value::value_alloc_sched_base*>(value_first) == value_base);
+    for (size_t i = 1; i < cores.size(); ++i)
+        CHECK(rt->template get_by_core<value_sched_t>(cores[i]) == nullptr);
+
     runtime::destroy_runtime<Cache, Cache>(rt);
     printf("  [%s] registry population: OK\n", label);
+}
+
+template <core::cache_concept Cache>
+static void expect_build_runtime_rejected(const runtime::build_options& opts) {
+    bool threw = false;
+    try {
+        auto* rt = runtime::build_runtime<Cache, Cache>(opts);
+        runtime::destroy_runtime<Cache, Cache>(rt);
+    } catch (const std::exception&) {
+        threw = true;
+        core::registry::clear();
+    }
+    CHECK(threw);
+}
+
+template <core::cache_concept Cache>
+static void test_bootstrap_profile_validation_fail_fast(const char* label) {
+    std::vector<uint32_t> cores = {0};
+
+    runtime::build_options null_device_opts{
+        .cores                = cores,
+        .device               = nullptr,
+        .tree_cache_capacity  = 16,
+        .value_cache_capacity = 16,
+    };
+    expect_build_runtime_rejected<Cache>(null_device_opts);
+
+    const auto& profile = format::kBootstrapFormatProfile;
+    CHECK(profile.lba_size == LBS);
+    CHECK(profile.value_data_area_end.lba > 1);
+    mock_device too_small(profile.lba_size * (profile.value_data_area_end.lba - 1),
+                          profile.lba_size);
+
+    runtime::build_options small_device_opts{
+        .cores                = cores,
+        .device               = &too_small,
+        .tree_cache_capacity  = 16,
+        .value_cache_capacity = 16,
+    };
+    expect_build_runtime_rejected<Cache>(small_device_opts);
+
+    printf("  [%s] bootstrap profile validation fail-fast: OK\n", label);
 }
 
 // ── Test 2: end-to-end multi-core lookup via registry ──
@@ -244,6 +331,8 @@ int main() {
 
     test_registry_population<clock_cache>("clock");
     test_registry_population<slru_cache>("slru ");
+    test_bootstrap_profile_validation_fail_fast<clock_cache>("clock");
+    test_bootstrap_profile_validation_fail_fast<slru_cache>("slru ");
     test_e2e_multicore_via_runtime<clock_cache>("clock");
     test_e2e_multicore_via_runtime<slru_cache>("slru ");
 

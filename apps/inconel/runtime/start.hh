@@ -33,6 +33,11 @@ namespace apps::inconel::runtime {
     // advance loops. Stop coordination is left to the application (signal
     // handler / RPC / external trigger).
 
+    // Step 017 / INC-034: the disk-format fields that used to live here
+    // (value_class_sizes / lba_size / value_data_area_{base,end}) are now
+    // owned by `format::kBootstrapFormatProfile` and read internally by
+    // build_runtime. `start_options` only keeps genuine per-run parameters:
+    // cache policy + capacity, runtime topology, and the live device handle.
     struct start_options {
         // Cache policies — each is "clock" or "slru".
         std::string_view tree_cache_policy;
@@ -48,13 +53,6 @@ namespace apps::inconel::runtime {
         std::span<const uint32_t> cores;
         uint32_t                  main_core = 0;
         mock_nvme::mock_device*   device;
-
-        // value scheduler configuration. Empty value_class_sizes disables
-        // the value scheduler (the runtime still builds, just without it).
-        std::span<const uint32_t> value_class_sizes;
-        uint32_t                  lba_size = 4096;
-        format::paddr             value_data_area_base = {0, 0};
-        format::paddr             value_data_area_end  = {0, 0};
     };
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
@@ -72,10 +70,6 @@ namespace apps::inconel::runtime {
                 .cores                = opts.cores,
                 .device               = opts.device,
                 .tree_cache_capacity  = opts.tree_cache_capacity,
-                .value_class_sizes    = opts.value_class_sizes,
-                .lba_size             = opts.lba_size,
-                .value_data_area_base = opts.value_data_area_base,
-                .value_data_area_end  = opts.value_data_area_end,
                 .value_cache_capacity = opts.value_cache_capacity,
             };
             auto* rt = build_runtime<TreeCache, ValueCache>(bopts);

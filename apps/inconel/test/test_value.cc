@@ -40,6 +40,7 @@
 #include "pump/sender/submit.hh"
 
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/format/value_object.hh"
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/value/sender.hh"
@@ -58,13 +59,31 @@ constexpr uint64_t DATA_AREA_BASE_LBA = 4000;  // value Data Area lower bound
 constexpr uint64_t DATA_AREA_END_LBA  = 8000;  // bumps from here downward
 constexpr uint64_t SEED_AREA_LBA = 1000;       // test_write_raw seed area
 
-const std::vector<uint32_t> CLASS_SIZES = {
+constexpr uint32_t EXPECTED_CLASS_SIZES[] = {
     64,     // class 0: sub-LBA, 64 slots/LBA, body <= 52
     256,    // class 1: sub-LBA, 16 slots/LBA, body <= 244
     1024,   // class 2: sub-LBA, 4 slots/LBA,  body <= 1012
     4096,   // class 3: LBA-equal, 1 slot,     body <= 4084
     16384,  // class 4: multi-LBA, span=4,     body <= 16372
 };
+
+std::span<const uint32_t> profile_class_sizes() {
+    return format::kBootstrapFormatProfile.class_sizes();
+}
+
+void check_bootstrap_profile_matches_value_expectations() {
+    const auto& profile = format::kBootstrapFormatProfile;
+    CHECK(profile.lba_size == LBA_SIZE);
+    CHECK(profile.value_data_area_base.device_id == 0);
+    CHECK(profile.value_data_area_base.lba == DATA_AREA_BASE_LBA);
+    CHECK(profile.value_data_area_end.device_id == 0);
+    CHECK(profile.value_data_area_end.lba == DATA_AREA_END_LBA);
+
+    auto classes = profile_class_sizes();
+    CHECK(classes.size() == sizeof(EXPECTED_CLASS_SIZES) / sizeof(EXPECTED_CLASS_SIZES[0]));
+    for (size_t i = 0; i < classes.size(); ++i)
+        CHECK(classes[i] == EXPECTED_CLASS_SIZES[i]);
+}
 
 // ── Helpers ──
 
@@ -89,7 +108,7 @@ void wait_for(std::shared_ptr<std::atomic<int>> counter, int target) {
 std::string decode_on_device(mock_nvme::mock_device& dev, value_ref vr) {
     // Determine span_lbas via class size
     size_t span_lbas = 1;
-    for (uint32_t cs : CLASS_SIZES) {
+    for (uint32_t cs : profile_class_sizes()) {
         if (sizeof(value_object_header) + vr.len <= cs) {
             span_lbas = (cs >= LBA_SIZE) ? cs / LBA_SIZE : 1;
             break;
@@ -143,10 +162,6 @@ struct test_env {
             .cores                = cores,
             .device               = &dev,
             .tree_cache_capacity  = 32,
-            .value_class_sizes    = CLASS_SIZES,
-            .lba_size             = LBA_SIZE,
-            .value_data_area_base = paddr{0, DATA_AREA_BASE_LBA},
-            .value_data_area_end  = paddr{0, DATA_AREA_END_LBA},
             .value_cache_capacity = value_cache_cap,
         };
         rt = runtime::build_runtime<tree_cache_t, value_cache_t>(opts);
@@ -658,6 +673,7 @@ void case_8_multi_lba_bypass() {
 int main() {
     printf("inconel value scheduler test:\n");
 
+    check_bootstrap_profile_matches_value_expectations();
     case_1_write_path();
     case_2_read_miss();
     case_3_cache_hit();

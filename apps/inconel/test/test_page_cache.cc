@@ -1,135 +1,287 @@
 //
-// page cache unit tests — clock + slru
+// read-only frame cache unit tests — clock + slru
 //
-// Verifies cache_concept compliance, basic put/get/contains, eviction
-// behavior, hot-page protection, and SLRU scan resistance.
+// Reviewer-owned step 018 tests. These intentionally lock the frame-cache
+// contract before production code is migrated away from raw char* entries.
 //
 
 #include "apps/inconel/test/check.hh"
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "apps/inconel/core/page_cache.hh"
+#include "apps/inconel/memory/frame.hh"
 
 using namespace apps::inconel::core;
 using namespace apps::inconel::format;
+using namespace apps::inconel::memory;
 
-// Compile-time check: both impls satisfy the concept.
 static_assert(cache_concept<clock_cache>);
 static_assert(cache_concept<slru_cache>);
 
-// ── Helpers ──
+namespace {
 
-static paddr P(uint64_t lba) { return paddr{0, lba}; }
+using domain = frame_id::domain;
 
-// Buffer pool — each char buffer is just a 1-byte marker.
-static std::vector<char> g_bufs(8192);
-static char* B(uint64_t i) { return &g_bufs[i]; }
+static paddr P(uint64_t lba) {
+    return paddr{0, lba};
+}
 
-// ── Generic API tests (templated on cache type) ──
+static frame_id FID(uint64_t lba,
+                    domain dom = domain::value_page,
+                    uint16_t span_lbas = 1) {
+    return frame_id{
+        .base = P(lba),
+        .span_lbas = span_lbas,
+        .dom = dom,
+    };
+}
+
+// Payload bytes are not owned by the cache in this phase; descriptors point
+// into this stable test pool so eviction can be tested without allocation.
+static std::array<std::array<char, 16>, 8192> g_bufs{};
+
+static char* B(uint64_t i) {
+    return g_bufs.at(i).data();
+}
+
+static page_frame Frame(uint64_t lba,
+                        frame_state st = frame_state::clean_readonly,
+                        domain dom = domain::value_page,
+                        uint16_t span_lbas = 1,
+                        uint64_t buf_idx = UINT64_MAX) {
+    if (buf_idx == UINT64_MAX) buf_idx = lba;
+    return page_frame{
+        .id = FID(lba, dom, span_lbas),
+        .st = st,
+        .buf = B(buf_idx),
+        .byte_len = static_cast<uint32_t>(4096U * span_lbas),
+        .pin_count = 0,
+        .crc_valid = true,
+    };
+}
+
+static bool has_frame(const std::vector<page_frame*>& xs, page_frame* f) {
+    return std::find(xs.begin(), xs.end(), f) != xs.end();
+}
 
 template <cache_concept Cache>
-static void test_basic(const char* label) {
-    // Capacity 20: leaves SLRU prob_cap = 20*0.2 = 4, enough to hold 4 fresh
-    // entries before any of them is promoted to protected. Both clock_cache
-    // and slru_cache use the same single-arg constructor, so the test stays
-    // template-uniform without needing per-cache helpers.
+static void test_basic_pin(const char* label) {
+    Cache c(20);
+    auto f = Frame(1);
+
+    CHECK(c.size() == 0);
+    CHECK(!c.contains(f.id));
+    {
+        auto miss = c.pin(f.id);
+        CHECK(miss.frame == nullptr);
+    }
+    CHECK(f.pin_count == 0);
+
+    auto ev = c.put(&f);
+    CHECK(!ev.has_value());
+    CHECK(c.size() == 1);
+    CHECK(c.contains(f.id));
+
+    {
+        auto pin = c.pin(f.id);
+        CHECK(pin.frame == &f);
+        CHECK(pin.frame->buf == f.buf);
+        CHECK(f.pin_count == 1);
+    }
+    CHECK(f.pin_count == 0);
+
+    printf("  [%s] basic pin: OK\n", label);
+}
+
+template <cache_concept Cache>
+static void test_put_rejects_non_clean_readonly(const char* label) {
+    Cache c(20);
+    auto dirty = Frame(2, frame_state::dirty_append);
+
+    bool threw = false;
+    try {
+        (void)c.put(&dirty);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+
+    CHECK(threw);
+    CHECK(c.size() == 0);
+    CHECK(!c.contains(dirty.id));
+
+    printf("  [%s] put rejects non-clean-readonly: OK\n", label);
+}
+
+template <cache_concept Cache>
+static void test_update_existing_returns_old_frame(const char* label) {
+    Cache c(20);
+    auto old_frame = Frame(42, frame_state::clean_readonly,
+                           domain::value_page, 1, 42);
+    auto new_frame = Frame(42, frame_state::clean_readonly,
+                           domain::value_page, 1, 1042);
+
+    auto e1 = c.put(&old_frame);
+    CHECK(!e1.has_value());
+
+    auto e2 = c.put(&new_frame);
+    CHECK(e2.has_value());
+    CHECK(*e2 == &old_frame);
+    CHECK(c.size() == 1);
+
+    {
+        auto pin = c.pin(old_frame.id);
+        CHECK(pin.frame == &new_frame);
+        CHECK(pin.frame->buf == B(1042));
+    }
+
+    printf("  [%s] update existing returns old frame: OK\n", label);
+}
+
+template <cache_concept Cache>
+static void test_update_existing_rejects_when_old_frame_pinned(const char* label) {
+    Cache c(20);
+    auto old_frame = Frame(43, frame_state::clean_readonly,
+                           domain::value_page, 1, 43);
+    auto replacement = Frame(43, frame_state::clean_readonly,
+                             domain::value_page, 1, 1043);
+
+    CHECK(!c.put(&old_frame).has_value());
+
+    {
+        auto pin = c.pin(old_frame.id);
+        CHECK(pin.frame == &old_frame);
+        CHECK(old_frame.pin_count == 1);
+
+        auto rejected = c.put(&replacement);
+        CHECK(rejected.has_value());
+        CHECK(*rejected == &replacement);
+        CHECK(c.size() == 1);
+
+        auto still_old = c.pin(old_frame.id);
+        CHECK(still_old.frame == &old_frame);
+        CHECK(old_frame.pin_count == 2);
+        CHECK(replacement.pin_count == 0);
+    }
+    CHECK(old_frame.pin_count == 0);
+
+    {
+        auto pin = c.pin(old_frame.id);
+        CHECK(pin.frame == &old_frame);
+    }
+
+    printf("  [%s] update existing rejects pinned old frame: OK\n", label);
+}
+
+template <cache_concept Cache>
+static void test_frame_id_domain_and_span_are_key_parts(const char* label) {
     Cache c(20);
 
-    CHECK(!c.contains(P(1)));
-    CHECK(c.get(P(1)) == nullptr);
-    CHECK(c.size() == 0);
+    auto tree = Frame(7, frame_state::clean_readonly,
+                      domain::tree_node, 4, 100);
+    auto value = Frame(7, frame_state::clean_readonly,
+                       domain::value_page, 1, 101);
+    auto value_span = Frame(7, frame_state::clean_readonly,
+                            domain::value_page, 4, 102);
 
-    auto e = c.put(P(1), B(1));
-    CHECK(!e.has_value());
-    CHECK(c.size() == 1);
-    CHECK(c.contains(P(1)));
-    CHECK(c.get(P(1)) == B(1));
-
-    // For SLRU, the get() above promotes P1 to protected. P2..P4 then go to
-    // probation; with prob_cap=4 there is exactly enough room for the three
-    // fresh entries, so total size = 1 (protected) + 3 (probation) = 4.
-    c.put(P(2), B(2));
-    c.put(P(3), B(3));
-    c.put(P(4), B(4));
-    CHECK(c.size() == 4);
-    CHECK(c.get(P(2)) == B(2));
-    CHECK(c.get(P(3)) == B(3));
-    CHECK(c.get(P(4)) == B(4));
-
-    printf("  [%s] basic: OK\n", label);
-}
-
-// Capacity eviction tests are split per cache type because LRU (clock) and
-// SLRU have fundamentally different "what counts as full" semantics:
-//
-//   clock(N): fills all N slots equally; (N+1)-th fresh put evicts the
-//             clock victim.
-//   slru(N) :  fresh entries only enter probation, whose capacity is roughly
-//             20% of N. The (prob_cap + 1)-th fresh put evicts probation tail.
-//
-// A single template can't capture both correctly without per-cache constants.
-
-static void test_clock_capacity_eviction() {
-    clock_cache c(3);
-    c.put(P(1), B(1));
-    c.put(P(2), B(2));
-    c.put(P(3), B(3));
+    CHECK(!c.put(&tree).has_value());
+    CHECK(!c.put(&value).has_value());
+    CHECK(!c.put(&value_span).has_value());
     CHECK(c.size() == 3);
 
-    auto e = c.put(P(4), B(4));
-    CHECK(e.has_value());
-    CHECK(c.size() == 3);
-    CHECK(c.contains(P(4)));
+    {
+        auto pin_tree = c.pin(tree.id);
+        auto pin_value = c.pin(value.id);
+        auto pin_value_span = c.pin(value_span.id);
+        CHECK(pin_tree.frame == &tree);
+        CHECK(pin_value.frame == &value);
+        CHECK(pin_value_span.frame == &value_span);
+    }
 
-    printf("  [clock] capacity eviction: OK\n");
+    printf("  [%s] frame_id domain/span keys: OK\n", label);
 }
 
-static void test_slru_capacity_eviction() {
-    // capacity 10 → prot_cap=8, prob_cap=2.
-    // Two fresh puts fill probation; the third evicts probation tail.
+static void test_clock_skips_pinned_on_runtime_eviction() {
+    clock_cache c(2);
+    auto f1 = Frame(10);
+    auto f2 = Frame(11);
+    auto f3 = Frame(12);
+
+    CHECK(!c.put(&f1).has_value());
+    CHECK(!c.put(&f2).has_value());
+
+    {
+        auto pin = c.pin(f1.id);
+        CHECK(pin.frame == &f1);
+        auto ev = c.put(&f3);
+        CHECK(ev.has_value());
+        CHECK(*ev == &f2);
+        CHECK(c.contains(f1.id));
+        CHECK(!c.contains(f2.id));
+        CHECK(c.contains(f3.id));
+        CHECK(f1.pin_count == 1);
+    }
+    CHECK(f1.pin_count == 0);
+
+    printf("  [clock] runtime eviction skips pinned: OK\n");
+}
+
+static void test_slru_skips_pinned_on_runtime_eviction() {
+    // capacity 10 -> probation capacity 2. Keep f1 in probation by setting
+    // pin_count directly; a pin() hit would be free to update SLRU policy and
+    // would not necessarily force an eviction on the next fresh insert.
     slru_cache c(10);
-    c.put(P(1), B(1));
-    c.put(P(2), B(2));
-    CHECK(c.size() == 2);
+    auto f1 = Frame(20);
+    auto f2 = Frame(21);
+    auto f3 = Frame(22);
 
-    auto e = c.put(P(3), B(3));
-    CHECK(e.has_value());
-    CHECK(c.size() == 2);            // prob still saturated
-    CHECK(c.contains(P(3)));         // newest entry stays
-    CHECK(!c.contains(P(1)));        // oldest probation entry evicted
+    CHECK(!c.put(&f1).has_value());
+    CHECK(!c.put(&f2).has_value());
+    f1.pin_count = 1;
 
-    printf("  [slru ] capacity eviction: OK\n");
+    auto ev = c.put(&f3);
+    CHECK(ev.has_value());
+    CHECK(*ev == &f2);
+    CHECK(c.contains(f1.id));
+    CHECK(!c.contains(f2.id));
+    CHECK(c.contains(f3.id));
+    f1.pin_count = 0;
+
+    printf("  [slru ] runtime eviction skips pinned: OK\n");
 }
 
 template <cache_concept Cache>
-static void test_update_existing(const char* label) {
-    Cache c(3);
-    auto e1 = c.put(P(1), B(1));
-    CHECK(!e1.has_value());                  // first insert: nothing displaced
+static void test_drain_one_teardown_only(const char* label) {
+    Cache c(20);
+    auto f1 = Frame(30);
+    auto f2 = Frame(31);
+    auto f3 = Frame(32);
 
-    // Same-key put MUST return the old buf as an "evicted_entry" so the
-    // caller can free it. Earlier the cache silently overwrote and leaked
-    // every superseded buf — this came up in inconel value::value_alloc_sched when
-    // two concurrent reads on the same paddr both reach handle_fill in one
-    // advance round, calling put(P, buf1) then put(P, buf2).
-    auto e2 = c.put(P(1), B(11));
-    CHECK(e2.has_value());
-    CHECK(e2->key == P(1));
-    CHECK(e2->buf == B(1));                  // old buf returned to caller
-    CHECK(c.size() == 1);
-    CHECK(c.get(P(1)) == B(11));             // cache now holds the new buf
+    CHECK(!c.put(&f1).has_value());
+    CHECK(!c.put(&f2).has_value());
+    CHECK(!c.put(&f3).has_value());
 
-    printf("  [%s] update existing returns old: OK\n", label);
+    std::vector<page_frame*> drained;
+    while (auto f = c.drain_one()) {
+        drained.push_back(*f);
+    }
+
+    CHECK(c.size() == 0);
+    CHECK(drained.size() == 3);
+    CHECK(has_frame(drained, &f1));
+    CHECK(has_frame(drained, &f2));
+    CHECK(has_frame(drained, &f3));
+    CHECK(!c.drain_one().has_value());
+
+    // No assertion is made about drain order. The API is a teardown drain,
+    // not "choose the policy victim now".
+    printf("  [%s] drain_one teardown pop: OK\n", label);
 }
-
-// Reject obviously broken capacities at construction. The cache impls
-// previously took any uint32_t and crashed on the first put()/get() for
-// capacity 0 (clock_cache, slru_cache) and capacity 1 (slru_cache),
-// which made it possible for a runtime config typo to bring the whole
-// scheduler down. Both impls now throw std::invalid_argument from the
-// ctor — verify each rejected boundary explicitly.
 
 static void test_clock_capacity_zero_throws() {
     bool threw = false;
@@ -156,8 +308,6 @@ static void test_slru_capacity_zero_throws() {
 }
 
 static void test_slru_capacity_one_throws() {
-    // capacity=1 → prot_cap = floor(1 * 0.8) = 0, prob_cap = 1.
-    // Pre-fix the first get() would try to demote prot_tail_=NIL.
     bool threw = false;
     try {
         slru_cache c(1);
@@ -170,7 +320,6 @@ static void test_slru_capacity_one_throws() {
 }
 
 static void test_slru_extreme_ratio_throws() {
-    // prot_ratio=0 → prot_cap=0 → reject.
     bool threw_low = false;
     try {
         slru_cache c(8, 0.0f);
@@ -180,7 +329,6 @@ static void test_slru_extreme_ratio_throws() {
     }
     CHECK(threw_low);
 
-    // prot_ratio=1.0 → prob_cap=0 → reject.
     bool threw_high = false;
     try {
         slru_cache c(8, 1.0f);
@@ -193,263 +341,86 @@ static void test_slru_extreme_ratio_throws() {
     printf("  [slru ] extreme prot_ratio throws: OK\n");
 }
 
-// Smallest legal capacity for each impl must still drive a full
-// put/get/evict cycle without hitting the fixed boundaries.
-
 static void test_clock_min_capacity_works() {
-    clock_cache c(1);                         // smallest legal
+    clock_cache c(1);
+    auto f1 = Frame(40);
+    auto f2 = Frame(41);
+
     CHECK(c.capacity() == 1);
+    CHECK(!c.put(&f1).has_value());
 
-    auto e1 = c.put(P(1), B(1));
-    CHECK(!e1.has_value());
-    CHECK(c.size() == 1);
-    CHECK(c.get(P(1)) == B(1));
+    {
+        auto pin = c.pin(f1.id);
+        CHECK(pin.frame == &f1);
+    }
 
-    auto e2 = c.put(P(2), B(2));              // evicts the only slot
-    CHECK(e2.has_value());
-    CHECK(e2->buf == B(1));
-    CHECK(c.get(P(2)) == B(2));
-    CHECK(c.get(P(1)) == nullptr);
+    auto ev = c.put(&f2);
+    CHECK(ev.has_value());
+    CHECK(*ev == &f1);
+    CHECK(!c.contains(f1.id));
+    CHECK(c.contains(f2.id));
 
-    auto e3 = c.evict_one();                  // drain
-    CHECK(e3.has_value());
-    CHECK(e3->buf == B(2));
-    CHECK(c.size() == 0);
+    auto drained = c.drain_one();
+    CHECK(drained.has_value());
+    CHECK(*drained == &f2);
+    CHECK(!c.drain_one().has_value());
 
     printf("  [clock] capacity=1 works: OK\n");
 }
 
 static void test_slru_min_capacity_works() {
-    slru_cache c(2);                          // prot_cap=1, prob_cap=1
+    slru_cache c(2);
+    auto f1 = Frame(50);
+    auto f2 = Frame(51);
+    auto f3 = Frame(52);
+
     CHECK(c.capacity() == 2);
+    CHECK(!c.put(&f1).has_value());
+    {
+        auto pin = c.pin(f1.id);
+        CHECK(pin.frame == &f1);
+    }
 
-    auto e1 = c.put(P(1), B(1));
-    CHECK(!e1.has_value());
-    CHECK(c.get(P(1)) == B(1));               // promotes P1 to protected
-
-    auto e2 = c.put(P(2), B(2));
-    CHECK(!e2.has_value());                   // P2 enters probation
-    CHECK(c.size() == 2);
-
-    auto e3 = c.put(P(3), B(3));              // prob full → evicts P2
-    CHECK(e3.has_value());
-    CHECK(e3->buf == B(2));
-    CHECK(c.contains(P(1)));                  // P1 (protected) survives
-    CHECK(c.contains(P(3)));
-    CHECK(!c.contains(P(2)));
+    CHECK(!c.put(&f2).has_value());
+    auto ev = c.put(&f3);
+    CHECK(ev.has_value());
+    CHECK(*ev == &f2);
+    CHECK(c.contains(f1.id));
+    CHECK(!c.contains(f2.id));
+    CHECK(c.contains(f3.id));
 
     printf("  [slru ] capacity=2 works: OK\n");
 }
 
-// Reproducer for the leak the put-existing fix addresses: do N back-to-back
-// puts on the same key, then drain via evict_one(). Each put should hand
-// back the previous buf (N-1 displaced + 1 still resident), so iterating
-// every returned buf accounts for all N allocations exactly once. Pre-fix
-// the cache silently overwrote and the displaced bufs were leaked.
-template <cache_concept Cache>
-static void test_put_same_key_drain_no_leak(const char* label) {
-    Cache c(8);
-    constexpr int N = 4;
-    std::vector<char*> seen;
-
-    for (int i = 0; i < N; ++i) {
-        auto e = c.put(P(42), B(100 + i));
-        if (i == 0) {
-            CHECK(!e.has_value());           // first insert displaces nothing
-        } else {
-            CHECK(e.has_value());            // every subsequent put displaces
-            CHECK(e->key == P(42));
-            CHECK(e->buf == B(100 + i - 1)); // and returns the previous buf
-            seen.push_back(e->buf);
-        }
-    }
-
-    // Drain the resident entry via evict_one.
-    CHECK(c.size() == 1);
-    auto last = c.evict_one();
-    CHECK(last.has_value());
-    CHECK(last->buf == B(100 + N - 1));
-    seen.push_back(last->buf);
-    CHECK(!c.evict_one().has_value());
-    CHECK(c.size() == 0);
-
-    // Every B(100), B(101), B(102), B(103) accounted for exactly once.
-    CHECK(seen.size() == static_cast<size_t>(N));
-    std::sort(seen.begin(), seen.end());
-    CHECK(std::unique(seen.begin(), seen.end()) == seen.end());
-
-    printf("  [%s] put same key drain no leak: OK\n", label);
-}
-
-static void test_clock_eviction_returns_buf() {
-    clock_cache c(2);
-    c.put(P(1), B(1));
-    c.put(P(2), B(2));
-    auto e = c.put(P(3), B(3));
-    CHECK(e.has_value());
-    CHECK(e->buf == B(1) || e->buf == B(2));
-    printf("  [clock] eviction returns buf: OK\n");
-}
-
-static void test_slru_eviction_returns_buf() {
-    // capacity 10 → prot_cap=8, prob_cap=2.
-    // Probation evicts in LRU order, so the third fresh put returns P1's buf.
-    slru_cache c(10);
-    c.put(P(1), B(1));
-    c.put(P(2), B(2));
-    auto e = c.put(P(3), B(3));
-    CHECK(e.has_value());
-    CHECK(e->buf == B(1));
-    printf("  [slru ] eviction returns buf: OK\n");
-}
-
-// ── Clock-specific: hot page survives sweeps ──
-
-static void test_clock_hot_page() {
-    clock_cache c(3);
-    c.put(P(1), B(1));   // will be the "hot" page
-    c.put(P(2), B(2));
-    c.put(P(3), B(3));
-
-    for (int round = 0; round < 5; ++round) {
-        c.get(P(1));   // refresh ref bit
-        c.put(P(100 + round), B(100 + round));  // cold insert
-    }
-
-    CHECK(c.contains(P(1)));
-    CHECK(c.get(P(1)) == B(1));
-    printf("  [clock] hot page survives sweeps: OK\n");
-}
-
-// ── SLRU-specific: probation → protected promotion ──
-
-static void test_slru_promotion() {
-    slru_cache c(10);
-    // P(1) inserted but never accessed → stays in probation
-    c.put(P(1), B(1));
-    // P(2) inserted and accessed → promoted to protected
-    c.put(P(2), B(2));
-    c.get(P(2));
-
-    // Scan to evict probation entries
-    for (int i = 0; i < 50; ++i) c.put(P(1000 + i), B(1000 + i));
-
-    CHECK(!c.contains(P(1)));   // probation-only → evicted
-    CHECK(c.contains(P(2)));    // promoted → still present
-
-    printf("  [slru] promotion to protected: OK\n");
-}
-
-// ── evict_one: drain cache at teardown ──
-//
-// Used by value::value_alloc_sched::~value_alloc_sched to release buffers the cache still
-// owns. Both impls return one entry per call, exactly N times for N puts,
-// then nullopt with size()==0.
-
-template <cache_concept Cache>
-static void test_evict_one(const char* label) {
-    // N kept small enough to fit SLRU probation (prob_cap = capacity * 0.2 = 4
-    // for capacity 20). Without any get() the entries never get promoted, so
-    // they all live in probation; the test would fail at N>4 with a premature
-    // eviction. clock_cache has no such constraint, but using the same N for
-    // both keeps the test single-template.
-    Cache c(20);
-    constexpr int N = 3;
-    for (int i = 1; i <= N; ++i) c.put(P(i), B(i));
-    CHECK(c.size() == N);
-
-    std::vector<char*> seen;
-    while (auto e = c.evict_one()) {
-        seen.push_back(e->buf);
-    }
-    CHECK(seen.size() == static_cast<size_t>(N));
-    CHECK(c.size() == 0);
-    CHECK(!c.evict_one().has_value());
-
-    // Each buffer evicted exactly once.
-    std::sort(seen.begin(), seen.end());
-    CHECK(std::unique(seen.begin(), seen.end()) == seen.end());
-
-    // After full drain the cache must be reusable.
-    c.put(P(42), B(42));
-    CHECK(c.size() == 1);
-    CHECK(c.contains(P(42)));
-    CHECK(c.get(P(42)) == B(42));
-
-    printf("  [%s] evict_one: OK\n", label);
-}
-
-template <cache_concept Cache>
-static void test_evict_one_empty(const char* label) {
-    Cache c(8);
-    CHECK(!c.evict_one().has_value());
-    CHECK(c.size() == 0);
-    printf("  [%s] evict_one (empty): OK\n", label);
-}
-
-// ── SLRU-specific: scan resistance ──
-
-static void test_slru_scan_resistance() {
-    // capacity 10 → protected_cap=8, probation_cap=2
-    slru_cache c(10);
-
-    // Insert 8 hot pages and immediately access them → all promoted to protected.
-    for (int i = 0; i < 8; ++i) {
-        c.put(P(i), B(i));
-        c.get(P(i));
-    }
-
-    // Scan: insert 100 cold pages.
-    int evicted_hot = 0;
-    for (int i = 0; i < 100; ++i) {
-        auto e = c.put(P(1000 + i), B(1000 + i));
-        if (e.has_value() && e->key.lba < 8) evicted_hot++;
-    }
-
-    CHECK(evicted_hot == 0);
-    for (int i = 0; i < 8; ++i)
-        CHECK(c.contains(P(i)));
-
-    printf("  [slru] scan resistance (0 hot pages evicted by 100 scans): OK\n");
-}
+}  // namespace
 
 int main() {
-    printf("page cache tests:\n");
+    printf("read-only frame cache tests:\n");
 
-    // ── Generic interface tests (both cache types) ──
-    test_basic<clock_cache>("clock");
-    test_basic<slru_cache>("slru ");
-    test_update_existing<clock_cache>("clock");
-    test_update_existing<slru_cache>("slru ");
+    test_basic_pin<clock_cache>("clock");
+    test_basic_pin<slru_cache>("slru ");
 
-    // ── Capacity-eviction tests (per-cache because LRU/SLRU differ) ──
-    test_clock_capacity_eviction();
-    test_slru_capacity_eviction();
-    test_clock_eviction_returns_buf();
-    test_slru_eviction_returns_buf();
+    test_put_rejects_non_clean_readonly<clock_cache>("clock");
+    test_put_rejects_non_clean_readonly<slru_cache>("slru ");
 
-    // ── Algorithm-specific behavior tests ──
-    test_clock_hot_page();
-    test_slru_promotion();
-    test_slru_scan_resistance();
+    test_update_existing_returns_old_frame<clock_cache>("clock");
+    test_update_existing_returns_old_frame<slru_cache>("slru ");
+    test_update_existing_rejects_when_old_frame_pinned<clock_cache>("clock");
+    test_update_existing_rejects_when_old_frame_pinned<slru_cache>("slru ");
 
-    // ── evict_one (drain at teardown) ──
-    test_evict_one<clock_cache>("clock");
-    test_evict_one<slru_cache>("slru ");
-    test_evict_one_empty<clock_cache>("clock");
-    test_evict_one_empty<slru_cache>("slru ");
+    test_frame_id_domain_and_span_are_key_parts<clock_cache>("clock");
+    test_frame_id_domain_and_span_are_key_parts<slru_cache>("slru ");
 
-    // ── put-existing must return old buf (regression: silent overwrite) ──
-    test_put_same_key_drain_no_leak<clock_cache>("clock");
-    test_put_same_key_drain_no_leak<slru_cache>("slru ");
+    test_clock_skips_pinned_on_runtime_eviction();
+    test_slru_skips_pinned_on_runtime_eviction();
 
-    // ── capacity-boundary rejection (regression: ctor crashed at use) ──
+    test_drain_one_teardown_only<clock_cache>("clock");
+    test_drain_one_teardown_only<slru_cache>("slru ");
+
     test_clock_capacity_zero_throws();
     test_slru_capacity_zero_throws();
     test_slru_capacity_one_throws();
     test_slru_extreme_ratio_throws();
-
-    // ── smallest legal capacity must still work end-to-end ──
     test_clock_min_capacity_works();
     test_slru_min_capacity_works();
 

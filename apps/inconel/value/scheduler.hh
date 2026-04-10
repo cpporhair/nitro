@@ -25,6 +25,7 @@
 
 #include "../core/page_cache.hh"
 #include "../core/panic.hh"
+#include "../memory/frame.hh"
 #include "../format/types.hh"
 #include "../format/value_object.hh"
 #include "./allocator.hh"
@@ -366,11 +367,11 @@ namespace apps::inconel::value {
         // population — pages popped here come back here on rollback.
         std::vector<std::vector<page_data>> writable_pages_;
 
-        // readonly cache: paddr → 1-LBA page image. Holds raw char[] buffers
-        // handed off via release() + put() — the scheduler is the sole
-        // owner of the cache, and ~value_alloc_sched() below drains it via
-        // evict_one() because clock_cache / slru_cache do not free buffers
-        // in their own destructors (they only own their slot/node arrays).
+        // readonly cache: frame_id → page_frame* for 1-LBA pages. The
+        // scheduler owns the page_frame descriptors and their backing
+        // buffers; the cache is a non-owning index with pin semantics.
+        // ~value_alloc_sched() drains via drain_one() and frees each
+        // frame's buf + descriptor.
         //
         // Decision D1 — multi-LBA bypass: only span_lbas == 1 pages enter
         // here. commit_pages and handle_fill both gate on the span before
@@ -378,12 +379,11 @@ namespace apps::inconel::value {
         // when admit == (span == 1). Multi-LBA full pages are dropped at
         // commit time (round_page's unique_ptr destructor frees them).
         //
-        // Lifetime contract for put() / evict_one() (full statement in
+        // Lifetime contract for put() / drain_one() (full statement in
         // core/page_cache.hh's cache_concept doc): every "Some(...)" return
-        // is a buf the caller must free. Both put-on-existing-key (an
-        // overwritten replacement) and put-when-cap-full (an LRU eviction)
-        // use the same channel. commit_pages and handle_fill below treat
-        // the optional uniformly with `if (auto evicted = ...) delete[]`.
+        // is a page_frame* the caller must free (buf + descriptor). Both
+        // put-on-existing-key (overwrite) and put-when-cap-full (eviction)
+        // use the same channel.
         Cache readonly_cache_;
 
         // leader-follower in-flight tracking. round_id is a monotonically
@@ -409,15 +409,15 @@ namespace apps::inconel::value {
 
         // ── Destructor ──
         //
-        // The cache holds raw char[] buffers handed off by commit_pages /
-        // handle_fill via release(). The scheduler is the sole owner of the
-        // cache, so on teardown we must drain every remaining buffer through
-        // evict_one() — neither clock_cache nor slru_cache frees buffers in
-        // their own destructor (they only own slot/node arrays).
+        // The cache holds non-owning page_frame* pointers. The scheduler is
+        // the sole owner of the backing buffers and frame descriptors, so
+        // on teardown we drain every remaining frame through drain_one()
+        // and free both the buffer and descriptor.
 
         ~value_alloc_sched() {
-            while (auto e = readonly_cache_.evict_one()) {
-                delete[] e->buf;
+            while (auto f = readonly_cache_.drain_one()) {
+                delete[] (*f)->buf;
+                delete *f;
             }
         }
 
@@ -811,9 +811,18 @@ namespace apps::inconel::value {
                     // bypasses the cache for span > 1 and the page would
                     // never be hit again, only evict useful 1-LBA entries.
                     if (page.span_lbas == 1) {
-                        char* raw = page.image.release();
-                        if (auto evicted = readonly_cache_.put(page.base, raw)) {
-                            delete[] evicted->buf;
+                        auto* pf = new memory::page_frame{
+                            .id        = memory::frame_id{page.base, 1,
+                                            memory::frame_id::domain::value_page},
+                            .st        = memory::frame_state::clean_readonly,
+                            .buf       = page.image.release(),
+                            .byte_len  = page.image_size,
+                            .pin_count = 0,
+                            .crc_valid = false,
+                        };
+                        if (auto evicted = readonly_cache_.put(pf)) {
+                            delete[] (*evicted)->buf;
+                            delete *evicted;
                         }
                     }
                     // span > 1: page.image's unique_ptr<char[]> destructor
@@ -924,13 +933,17 @@ namespace apps::inconel::value {
             }
 
             // 2. readonly_cache_ — only consulted when this class is
-            //    admissible (multi-LBA bypasses). The cache stores raw
-            //    char[] keyed by paddr; cached_size = lba_size since all
-            //    cache entries are 1-LBA by D1.
+            //    admissible (multi-LBA bypasses). Pin semantics: pin()
+            //    returns an RAII frame_pin that keeps the page resident
+            //    for the duration of the decode.
             if (admit) {
-                if (const char* p = readonly_cache_.get(item->vr.base)) {
+                auto pin = readonly_cache_.pin(
+                    memory::frame_id{item->vr.base, 1,
+                        memory::frame_id::domain::value_page});
+                if (pin.frame) {
                     serve_hit_or_fail(item,
-                                      std::span<const char>(p, alloc_.lba_size()),
+                                      std::span<const char>(pin.frame->buf,
+                                                            pin.frame->byte_len),
                                       "readonly_cache");
                     delete item;
                     return;
@@ -977,9 +990,18 @@ namespace apps::inconel::value {
             //            buf is freed here.
             //   bypass → unique_ptr stays in item, item->~req() frees it.
             if (item->admit_to_cache) {
-                char* raw = item->buf.release();
-                if (auto evicted = readonly_cache_.put(item->vr.base, raw)) {
-                    delete[] evicted->buf;
+                auto* pf = new memory::page_frame{
+                    .id        = memory::frame_id{item->vr.base, 1,
+                                    memory::frame_id::domain::value_page},
+                    .st        = memory::frame_state::clean_readonly,
+                    .buf       = item->buf.release(),
+                    .byte_len  = item->buf_size,
+                    .pin_count = 0,
+                    .crc_valid = false,
+                };
+                if (auto evicted = readonly_cache_.put(pf)) {
+                    delete[] (*evicted)->buf;
+                    delete *evicted;
                 }
             }
 

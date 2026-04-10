@@ -9,10 +9,14 @@
 
 #include <absl/container/flat_hash_map.h>
 
-#include "../format/types.hh"
-#include "./clock_cache.hh"  // for evicted_entry
+#include "../memory/frame.hh"
 
 namespace apps::inconel::core {
+
+    using memory::frame_id;
+    using memory::frame_state;
+    using memory::page_frame;
+    using memory::frame_pin;
 
     // ── Segmented LRU cache ──
     //
@@ -25,7 +29,8 @@ namespace apps::inconel::core {
     // First-time hit (in probation): promote to protected head; if protected
     // is full, demote protected tail back to probation head.
     // Repeat hit (in protected): move to protected head.
-    // Eviction: probation tail (single-access pages get evicted first).
+    // Eviction: probation tail (single-access pages get evicted first),
+    //   skipping entries with pin_count > 0.
     //
     // Scan resistance: a one-pass scan only fills probation, never threatens
     // protected segment where hot pages live.
@@ -34,8 +39,8 @@ namespace apps::inconel::core {
         static constexpr uint32_t NIL = UINT32_MAX;
 
         struct node {
-            paddr key;
-            char* buf = nullptr;
+            frame_id key{};
+            page_frame* frame = nullptr;
             uint32_t prev = NIL;
             uint32_t next = NIL;
             bool in_protected = false;
@@ -43,7 +48,7 @@ namespace apps::inconel::core {
         };
 
         std::vector<node> nodes_;
-        absl::flat_hash_map<paddr, uint32_t> index_;
+        absl::flat_hash_map<frame_id, uint32_t> index_;
 
         uint32_t prot_head_ = NIL;
         uint32_t prot_tail_ = NIL;
@@ -56,17 +61,6 @@ namespace apps::inconel::core {
 
         uint32_t free_head_ = NIL;  // free node list
 
-        // capacity = total slots; protected segment is 80%, probation 20%.
-        //
-        // Both segments must have at least one slot, otherwise:
-        //   - put() with prob_cap_=0 dereferences prob_tail_=NIL while
-        //     evicting, crashing on the first call.
-        //   - get()'s promote-to-protected path with prot_cap_=0 hits
-        //     `prot_size_ >= prot_cap_` and demotes prot_tail_=NIL.
-        // The smallest legal capacity that gives prot_cap >= 1 ∧ prob_cap >= 1
-        // under the default 0.8 ratio is 2 (prot_cap=1, prob_cap=1). Higher
-        // ratios shift the threshold; the prot_cap_/prob_cap_ check below
-        // catches both cases uniformly.
         explicit
         slru_cache(uint32_t capacity, float prot_ratio = 0.8f)
             : nodes_(capacity)
@@ -89,38 +83,49 @@ namespace apps::inconel::core {
             free_head_ = 0;
         }
 
-        const char*
-        get(paddr key) {
-            auto it = index_.find(key);
-            if (it == index_.end()) return nullptr;
+        // pin: look up a frame by id, promote it (probation→protected or
+        // protected→head), return an RAII pin that increments pin_count.
+        // Returns an empty pin (frame == nullptr) on miss.
+        frame_pin
+        pin(frame_id id) {
+            auto it = index_.find(id);
+            if (it == index_.end()) return frame_pin{nullptr};
             uint32_t idx = it->second;
             auto& n = nodes_[idx];
 
             if (n.in_protected) {
-                // Already in protected — move to head.
                 move_to_protected_head(idx);
             } else {
-                // In probation — promote to protected.
                 unlink_probation(idx);
                 promote_to_protected(idx);
             }
-            return n.buf;
+            return frame_pin{n.frame};
         }
 
         bool
-        contains(paddr key) const {
-            return index_.find(key) != index_.end();
+        contains(frame_id id) const {
+            return index_.find(id) != index_.end();
         }
 
-        std::optional<evicted_entry>
-        put(paddr key, char* buf) {
-            // Update existing entry — return the displaced buf so the
-            // caller can free it (see clock_cache::put for the rationale).
-            if (auto it = index_.find(key); it != index_.end()) {
+        // put: insert a clean_readonly frame. Returns the displaced
+        // page_frame* on replacement or eviction; returns f itself if
+        // probation is full and all entries are pinned (rejected).
+        // Returns nullopt when inserted into a free slot.
+        std::optional<page_frame*>
+        put(page_frame* f) {
+            if (!f || f->st != frame_state::clean_readonly) {
+                throw std::invalid_argument(
+                    "slru_cache::put: frame must be non-null and clean_readonly");
+            }
+
+            // Update existing entry — return the displaced frame. If the
+            // old frame is still pinned, reject the replacement: cache
+            // keeps the old frame (no promote/move), caller gets f back.
+            if (auto it = index_.find(f->id); it != index_.end()) {
                 uint32_t idx = it->second;
-                evicted_entry old{ key, nodes_[idx].buf };
-                nodes_[idx].buf = buf;
-                // Treat as a hit so it gets promoted/refreshed.
+                page_frame* old = nodes_[idx].frame;
+                if (old && old->pin_count > 0) return f;
+                nodes_[idx].frame = f;
                 if (nodes_[idx].in_protected) {
                     move_to_protected_head(idx);
                 } else {
@@ -130,41 +135,44 @@ namespace apps::inconel::core {
                 return old;
             }
 
-            std::optional<evicted_entry> result;
+            std::optional<page_frame*> result;
 
-            // Probation full → evict probation tail.
+            // Probation full → evict the LRU non-pinned probation entry.
             if (prob_size_ >= prob_cap_) {
-                uint32_t victim_idx = prob_tail_;
-                auto& v = nodes_[victim_idx];
-                result = evicted_entry{ v.key, v.buf };
-                unlink_probation(victim_idx);
-                index_.erase(v.key);
-                free_node(victim_idx);
+                uint32_t victim_idx = find_evictable_probation();
+                if (victim_idx != NIL) {
+                    auto& v = nodes_[victim_idx];
+                    result = v.frame;
+                    unlink_probation(victim_idx);
+                    index_.erase(v.key);
+                    free_node(victim_idx);
+                } else {
+                    // All probation entries pinned — reject insertion.
+                    return f;
+                }
             }
 
             // Allocate node from free list and insert at probation head.
             uint32_t idx = alloc_node();
             auto& n = nodes_[idx];
-            n.key = key;
-            n.buf = buf;
+            n.key = f->id;
+            n.frame = f;
             n.in_protected = false;
             n.occupied = true;
             link_probation_head(idx);
-            index_[key] = idx;
+            index_[f->id] = idx;
             return result;
         }
 
-        // Evict any one entry, returning its (key, buf) so the caller can
-        // release the underlying buffer. Used at scheduler teardown to drain
-        // the cache. Probation tail first (LRU within probation), then
-        // protected tail. Calling this repeatedly until it returns nullopt
-        // empties the cache.
-        std::optional<evicted_entry>
-        evict_one() {
+        // drain_one: teardown-only drain. Pulls one entry regardless of
+        // pin state and returns its page_frame*. Probation tail first, then
+        // protected tail. Returns nullopt when empty.
+        std::optional<page_frame*>
+        drain_one() {
             if (prob_tail_ != NIL) {
                 uint32_t idx = prob_tail_;
                 auto& n = nodes_[idx];
-                evicted_entry victim{ n.key, n.buf };
+                page_frame* victim = n.frame;
                 unlink_probation(idx);
                 index_.erase(n.key);
                 free_node(idx);
@@ -173,7 +181,7 @@ namespace apps::inconel::core {
             if (prot_tail_ != NIL) {
                 uint32_t idx = prot_tail_;
                 auto& n = nodes_[idx];
-                evicted_entry victim{ n.key, n.buf };
+                page_frame* victim = n.frame;
                 unlink_protected(idx);
                 index_.erase(n.key);
                 free_node(idx);
@@ -186,6 +194,20 @@ namespace apps::inconel::core {
         uint32_t capacity() const { return prot_cap_ + prob_cap_; }
 
     private:
+        // Find the closest-to-LRU non-pinned probation entry. Walks from
+        // tail (LRU) toward head (MRU). Returns NIL if all are pinned.
+        uint32_t
+        find_evictable_probation() const {
+            uint32_t idx = prob_tail_;
+            while (idx != NIL) {
+                if (!nodes_[idx].frame || nodes_[idx].frame->pin_count == 0) {
+                    return idx;
+                }
+                idx = nodes_[idx].prev;
+            }
+            return NIL;
+        }
+
         uint32_t
         alloc_node() {
             assert(free_head_ != NIL);
@@ -193,10 +215,6 @@ namespace apps::inconel::core {
             free_head_ = nodes_[idx].next;
             nodes_[idx].prev = NIL;
             nodes_[idx].next = NIL;
-            // Free nodes must always come back as probation-side; if any
-            // free path forgot to clear in_protected then a later
-            // promote_to_protected() would skip the demotion accounting
-            // and the protected segment would silently overflow.
             assert(!nodes_[idx].in_protected);
             return idx;
         }
@@ -204,12 +222,9 @@ namespace apps::inconel::core {
         void
         free_node(uint32_t idx) {
             nodes_[idx].occupied = false;
+            nodes_[idx].frame = nullptr;
             // INC-037: clear in_protected when retiring a node so the next
             // alloc_node() that picks this slot starts in a known state.
-            // The promote_to_protected() / move_to_protected_head() paths
-            // both treat in_protected as authoritative for which list to
-            // unlink from, so a stale `true` here would corrupt the
-            // protected list once the slot is reused.
             nodes_[idx].in_protected = false;
             nodes_[idx].next = free_head_;
             free_head_ = idx;
@@ -273,8 +288,6 @@ namespace apps::inconel::core {
             link_protected_head(idx);
         }
 
-        // Promote a probation entry to protected head.
-        // If protected is full, demote protected tail back to probation head.
         void
         promote_to_protected(uint32_t idx) {
             if (prot_size_ >= prot_cap_) {

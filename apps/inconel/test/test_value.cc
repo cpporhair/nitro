@@ -42,6 +42,7 @@
 #include "apps/inconel/core/registry.hh"
 #include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/format/value_object.hh"
+#include "apps/inconel/memory/frame.hh"
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/value/sender.hh"
 
@@ -50,6 +51,7 @@ using apps::inconel::format::paddr;
 using apps::inconel::format::value_ref;
 using apps::inconel::format::value_object_header;
 using apps::inconel::format::VALUE_MAGIC;
+using apps::inconel::memory::frame_id;
 
 namespace {
 
@@ -66,9 +68,19 @@ constexpr uint32_t EXPECTED_CLASS_SIZES[] = {
     4096,   // class 3: LBA-equal, 1 slot,     body <= 4084
     16384,  // class 4: multi-LBA, span=4,     body <= 16372
 };
+constexpr uint16_t MULTI_LBA_CLASS_SPAN =
+    EXPECTED_CLASS_SIZES[4] / LBA_SIZE;
 
 std::span<const uint32_t> profile_class_sizes() {
     return format::kBootstrapFormatProfile.class_sizes();
+}
+
+frame_id value_frame_id_for(paddr base, uint16_t span_lbas) {
+    return frame_id{
+        .base = base,
+        .span_lbas = span_lbas,
+        .dom = frame_id::domain::value_page,
+    };
 }
 
 void check_bootstrap_profile_matches_value_expectations() {
@@ -572,21 +584,21 @@ void case_7_cache_evict() {
 //  Decision D1 says only 1-LBA pages enter the readonly cache. Multi-LBA
 //  values bypass on:
 //    - read path: handle_read computes admit = (span == 1) and skips both
-//      cache.get() and cache.put() when admit is false.
+//      cache pin/admit when admit is false.
 //    - write path: commit_pages only releases the buf into the cache when
 //      page.span_lbas == 1; multi-LBA full pages are dropped (unique_ptr
 //      destructor frees the buf).
 //
 //  Falsifying *both* paths needs more than NVMe-read count alone. Counting
 //  reads only witnesses read-path bypass: if commit_pages regressed and
-//  re-admitted the multi-LBA page, handle_read would still skip cache.get()
-//  on span > 1 and the test would still see reads_after_2 == 2. The
+//  re-admitted the multi-LBA page, handle_read would still skip cache pin on
+//  span > 1 and the test would still see reads_after_2 == 2. The
 //  write-path check has to look directly at readonly_cache_ via a white-box
 //  cast (allowed because test_env hardcodes value::value_alloc_sched<clock_cache>).
 //
 //  Three independent assertions:
 //    [W1] After persist_values commits the multi-LBA page, readonly_cache_
-//         must NOT contain vr.base (write-path bypass).
+//         must NOT contain the multi-LBA value frame_id (write-path bypass).
 //    [R1] reads_after_1 == 1 — first read miss hits NVMe (handle_read
 //         bypass + bounded read 1 LBA-equivalent op).
 //    [R2] reads_after_2 == 2 — second read miss also hits NVMe; if
@@ -594,7 +606,7 @@ void case_7_cache_evict() {
 //         first miss, this would still bypass via [R1]'s assertion path
 //         (read side), but [W2] below catches admit-from-fill regressions.
 //    [W2] After two cache-miss reads, readonly_cache_ must STILL not
-//         contain vr.base (read-side fill bypass: admit_to_cache=false).
+//         contain the multi-LBA value frame_id (read-side fill bypass).
 // ════════════════════════════════════════════════════════════════
 
 void case_8_multi_lba_bypass() {
@@ -622,12 +634,14 @@ void case_8_multi_lba_bypass() {
         >> pump::sender::submit(ctx);
     wait_for(wctr, 1);
 
+    const auto multi_fid = value_frame_id_for(vr.base, MULTI_LBA_CLASS_SPAN);
+
     // [W1] Write-path bypass: commit_pages must drop the multi-LBA full
     //      page instead of admitting it to readonly_cache_. The page is
     //      class-4 (1 slot per page) so its only slot is consumed by the
     //      write, free_mask == 0, commit_pages enters the full-page branch.
     //      With D1 enforced, span_lbas != 1 → no put().
-    CHECK(!sched_typed->readonly_cache_.contains(vr.base));
+    CHECK(!sched_typed->readonly_cache_.contains(multi_fid));
 
     env.dev.reset_io_counters();
 
@@ -643,7 +657,7 @@ void case_8_multi_lba_bypass() {
     };
 
     // [R1] Read-path bypass: multi-LBA → admit=false → handle_read skips
-    //      cache.get() → miss → NVMe.
+    //      cache pin → miss → NVMe.
     std::string got1;
     read_one(vr, got1);
     auto reads_after_1 = env.dev.get_read_count();
@@ -659,8 +673,8 @@ void case_8_multi_lba_bypass() {
 
     // [W2] Read-side fill bypass: handle_fill must observe admit=false on
     //      multi-LBA reads and skip cache.put(). After two miss-driven
-    //      fills, readonly_cache_ still contains nothing for vr.base.
-    CHECK(!sched_typed->readonly_cache_.contains(vr.base));
+    //      fills, readonly_cache_ still contains no multi-LBA frame.
+    CHECK(!sched_typed->readonly_cache_.contains(multi_fid));
 
     printf("  case_8_multi_lba_bypass: OK "
            "(cache.contains(vr_multi)=false before+after %lu→%lu reads)\n",

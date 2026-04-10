@@ -49,7 +49,7 @@ namespace apps::inconel::tree {
                     >> all()
                     >> get_context<decision_need_read>()
                     >> flat_map([tree_sched](decision_need_read &ctx, bool) mutable {
-                        return tree_sched->submit_cache(std::move(ctx.page_map));
+                        return tree_sched->submit_cache(std::move(ctx.frames));
                     });
             });
     }

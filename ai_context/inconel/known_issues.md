@@ -31,11 +31,10 @@
 ### 未来功能的基础，建议提前设计 + 实现
 
 这些项现在不一定立刻“被用到”，但会冻结 format、runtime 边界或核心抽象。晚做通常会让后续大功能先搭在错误地基上。
-`INC-031` / `INC-034` 已分别由 step 016 / step 017 收敛；当前本组只剩 `INC-036`，继续保持独立成组，不和 runtime/profile 步混做。
+`INC-031` / `INC-034` / `INC-036` 已分别由 step 016 / step 017 / step 018 收敛；当前本组暂无 open 项。
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-036 | `cache_concept`（page_cache.hh）value 类型是 raw `char*`，缺 `pin_count` 概念、缺 frame state machine（dirty_append/dirty_hole_fill/writeback_inflight/clean_readonly），跟 spec RMC §6.1 + §11 期望的 `lru_or_clock<frame_id, page_frame*>` + frame state 不符；与 INC-016 (buffer ownership / DMA 替换) 是正交两层 | audit/core.md C1 | `urgent` | 按 RMC §6.1 + §11 重做 cache_concept：value 类型从 `char*` 改成 `page_frame*`（含 buffer + pin_count + state），加 pin/unpin 操作，evict 跳过 pin_count > 0 / 非 clean_readonly 的 frame；clock_cache + slru_cache 同步迁移；概念重做完成前不允许新增 cache 实现 |
 
 ### 最好等 Tree 写侧 / Allocator / Reclaim 模块
 
@@ -88,10 +87,10 @@
 ### 最好跟 Cache Concept 重构同批处理
 
 这些项单独做收益有限，跟核心抽象一起收才不容易再次漂移。
+`INC-038` 已由 step 018 跟 `INC-036` 同批收敛；当前本组暂无 open 项。
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-038 | `cache_concept::evict_one` 命名跟语义漂移：clock_cache 走 `index_.begin()` 非确定性（不按 clock policy），slru_cache 走 probation tail 后 protected tail（LRU 序），page_cache.hh 注释说 "teardown drain" 但名字像 "按 policy evict 一个"；concept 没规范，AI 给新 cache 实现 evict_one 时会两边各自漂 | audit/core.md C3 | `normal` | rename `evict_one` → `drain_one`（cache_concept + clock_cache + slru_cache + 所有 use site），page_cache.hh 文档明确 "drain_one is teardown-only, not policy eviction"；INC-036 重做 cache_concept 时顺手做掉 |
 
 ## Resolved
 
@@ -118,5 +117,7 @@
 | INC-032 | `format/crc.hh::crc32c` 用 raw SSE4.2 intrinsics，缺标准 CRC-32C 的 init/xor conditioning，跟外部工具（btrfs/ext4/iSCSI 等）不匹配；spec ODF §1.3 含糊 | audit/format.md F5 | step 009 已完成：删除 `format/crc.hh`，`tree_page` / `value_object` 调用点切到 `absl::ComputeCrc32c`，并在 ODF §1.3 明确标准 CRC-32C + init/xor conditioning 语义 |
 | INC-033 | `build_runtime` + `start.hh::run_with` 一连串 raw `new` 没 RAII，`start()` 抛或某个 scheduler 构造抛 → 已分配的 rt + scheduler 全 leak | audit/runtime.md R1 | step 011 已完成：`runtime::run_with()` 统一 catch `std::exception` / unknown exception 后直接 `panic_inconsistency(...)`，把 init failure 定义为 process-fatal，由 OS 回收 leaked 资源 |
 | INC-034 | `build_options` 把 4 个 disk format 字段（`value_class_sizes` / `lba_size` / `value_data_area_base` / `value_data_area_end`）暴露为 runtime config，但它们是 disk format 决定，一旦写数据就锁死不能改；当前还有"传空 → silent disable" 等 fail 路径 | audit/runtime.md R2 | step 017 已完成：新增 `format/format_profile.hh` 作为 bootstrap disk-format 单一来源，从 `build_options` / `start_options` 移除 4 个 disk-format 字段；标准 `build_runtime()` 总是构造 value scheduler，并对 device/profile 不匹配做 build 阶段 fail-fast |
+| INC-036 | `cache_concept`（page_cache.hh）value 类型是 raw `char*`，缺 `pin_count` 概念、缺 frame state machine（dirty_append/dirty_hole_fill/writeback_inflight/clean_readonly），跟 spec RMC §6.1 + §11 期望的 `lru_or_clock<frame_id, page_frame*>` + frame state 不符；与 INC-016 (buffer ownership / DMA 替换) 是正交两层 | audit/core.md C1 | step 018 已完成 readonly frame cache core：新增 `memory/frame.hh` 的 `frame_id` / `frame_state` / `page_frame` / `frame_pin`；`cache_concept` 从 raw `char*` / `get()` 迁到 `frame_id -> page_frame*` + `pin()` / `put(page_frame*)` / `drain_one()`；clock/slru 改为 pin-aware eviction，same-key replacement 也拒绝替换 pinned old frame；tree/value readonly cache 已迁到 `page_frame*`。value writable/open frame 的 resident state 细拆继续留给 step 019，不再阻塞 core readonly cache concept |
 | INC-037 | `slru_cache::evict_one` 从 protected 段 evict 时不重置 `in_protected`，`free_node` 也不重置；recycled node 带 stale `in_protected==true` 进 free list，下一次 alloc_node + link_probation_head 后 get() 会走错 `if (n.in_protected)` 分支调 `unlink_protected` 操作 probation 列表的节点 → 破坏 protected 列表指针 + 错误递减 prot_size_；当前不可达（evict_one 仅 teardown 用），但 latent + AI 抄走会扩散 | audit/core.md C2 | step 009 已完成：`slru_cache::free_node()` 清 `in_protected=false`，`alloc_node()` 增加 `assert(!in_protected)`，把 stale state 与不变量一起收紧 |
+| INC-038 | `cache_concept::evict_one` 命名跟语义漂移：clock_cache 走 `index_.begin()` 非确定性（不按 clock policy），slru_cache 走 probation tail 后 protected tail（LRU 序），page_cache.hh 注释说 "teardown drain" 但名字像 "按 policy evict 一个"；concept 没规范，AI 给新 cache 实现 evict_one 时会两边各自漂 | audit/core.md C3 | step 018 已完成：`evict_one` 全面 rename 为 `drain_one`（cache_concept + clock_cache + slru_cache + tree/value use site），`page_cache.hh` 明确 `drain_one()` 是 teardown-only drain，不承诺 policy victim；runtime eviction 语义只保留在 `put()` 内部 |
 | INC-039 | tree lookup inflight 仍是 `loading_pages_ + waiters_head_` 的简化模型，没对齐 spec RSM §4.7 的 `inflight_reads` single-flight 结构 | audit/tree.md F9 + design_doc/runtime_state_machine.md §4.7 | step 013 已完成：tree lookup 的 inflight bookkeeping 改成按 `paddr` 聚合的 `inflight_reads_` single-flight map，用 `wait_gen + wake_enqueued` 处理多页等待、旧注册失效和重复唤醒，不再扫描全局 waiter 链 |

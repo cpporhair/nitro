@@ -9,36 +9,39 @@
 
 #include <absl/container/flat_hash_map.h>
 
-#include "../format/types.hh"
+#include "../memory/frame.hh"
 
 namespace apps::inconel::core {
 
-    using format::paddr;
-
-    struct evicted_entry {
-        paddr key;
-        char* buf;
-    };
+    using memory::frame_id;
+    using memory::frame_state;
+    using memory::page_frame;
+    using memory::frame_pin;
 
     // ── Clock (second-chance) cache ──
     //
     // Fixed-capacity slot array + ref bit per slot + circular hand.
-    // get(): set ref=1 (single byte write, 1 cache line touch)
-    // put() on full cache: advance hand, clear ref=1 to ref=0, evict first ref=0
+    // pin(): find + set ref=1 + return RAII frame_pin (pin_count++)
+    // put() on full cache: advance hand, clear ref=1 to ref=0, skip
+    //   pinned entries, evict first ref=0 + pin_count=0
     //
     // Hot pages (root, upper internal) are touched every lookup, so their
     // ref bit is constantly refreshed and they are never evicted.
+    //
+    // Ownership: the cache stores page_frame* and never frees them. The
+    // caller is sole owner of backing buffers and frame descriptors; the
+    // cache is a non-owning index with pin-awareness.
 
     struct clock_cache {
         struct slot {
-            paddr key;
-            char* buf = nullptr;
+            frame_id key{};
+            page_frame* frame = nullptr;
             bool occupied = false;
             bool ref = false;
         };
 
         std::vector<slot> slots_;
-        absl::flat_hash_map<paddr, uint32_t> index_;
+        absl::flat_hash_map<frame_id, uint32_t> index_;
         uint32_t hand_ = 0;
         uint32_t capacity_;
         uint32_t size_ = 0;
@@ -46,12 +49,6 @@ namespace apps::inconel::core {
         explicit
         clock_cache(uint32_t capacity)
             : slots_(capacity), capacity_(capacity) {
-            // capacity == 0 would make put() fall straight into the
-            // "cache full" branch and indexing into an empty slots_ vector,
-            // crashing on the first call. Reject it at construction time
-            // (fail-fast) — runtime callers that propagate user-supplied
-            // capacities through build_options must clamp / validate before
-            // reaching here.
             if (capacity == 0) {
                 throw std::invalid_argument(
                     "clock_cache: capacity must be >= 1");
@@ -59,31 +56,45 @@ namespace apps::inconel::core {
             index_.reserve(capacity);
         }
 
-        const char*
-        get(paddr key) {
-            auto it = index_.find(key);
-            if (it == index_.end()) return nullptr;
-            slots_[it->second].ref = true;
-            return slots_[it->second].buf;
+        // pin: look up a frame by id, mark as recently used, return an
+        // RAII pin that increments pin_count. Returns an empty pin (frame
+        // == nullptr) on miss.
+        frame_pin
+        pin(frame_id id) {
+            auto it = index_.find(id);
+            if (it == index_.end()) return frame_pin{nullptr};
+            auto& s = slots_[it->second];
+            s.ref = true;
+            return frame_pin{s.frame};
         }
 
         bool
-        contains(paddr key) const {
-            return index_.find(key) != index_.end();
+        contains(frame_id id) const {
+            return index_.find(id) != index_.end();
         }
 
-        std::optional<evicted_entry>
-        put(paddr key, char* buf) {
-            // Update existing entry — return the displaced buf so the
-            // caller can free it. The cache only stores raw char*, so
-            // overwriting silently would leak the previous owner's
-            // allocation. Two concurrent misses on the same paddr (e.g.
-            // value::value_alloc_sched's read_q_ → fill_q_ pipeline draining a
-            // batch of cold reads in one advance round) hit this path.
-            if (auto it = index_.find(key); it != index_.end()) {
+        // put: insert a clean_readonly frame into the cache. Returns the
+        // displaced page_frame* in three cases:
+        //   - key already present → old frame for that key
+        //   - cache full, evictable victim found → victim frame
+        //   - cache full, all entries pinned → the input frame f (rejected)
+        // Returns nullopt when inserted into a free slot.
+        std::optional<page_frame*>
+        put(page_frame* f) {
+            if (!f || f->st != frame_state::clean_readonly) {
+                throw std::invalid_argument(
+                    "clock_cache::put: frame must be non-null and clean_readonly");
+            }
+
+            // Update existing entry — return the displaced frame so the
+            // caller can free it. If the old frame is still pinned, reject
+            // the replacement: cache keeps the old frame, caller gets f
+            // back (same semantics as "cannot evict, insertion rejected").
+            if (auto it = index_.find(f->id); it != index_.end()) {
                 auto& s = slots_[it->second];
-                evicted_entry old{ key, s.buf };
-                s.buf = buf;
+                if (s.frame && s.frame->pin_count > 0) return f;
+                page_frame* old = s.frame;
+                s.frame = f;
                 s.ref = true;
                 return old;
             }
@@ -92,49 +103,58 @@ namespace apps::inconel::core {
             if (size_ < capacity_) {
                 uint32_t idx = size_++;
                 auto& s = slots_[idx];
-                s.key = key;
-                s.buf = buf;
+                s.key = f->id;
+                s.frame = f;
                 s.occupied = true;
                 s.ref = false;
-                index_[key] = idx;
+                index_[f->id] = idx;
                 return std::nullopt;
             }
 
             // Cache full — clock sweep to find victim.
-            for (;;) {
+            // Skip entries with pin_count > 0. Limit to 2 full sweeps
+            // (first clears ref bits, second finds a ref=0 victim) to
+            // guarantee termination when all entries are pinned.
+            for (uint32_t sweep = 0; sweep < 2 * capacity_; ++sweep) {
                 auto& s = slots_[hand_];
+                hand_ = (hand_ + 1) % capacity_;
+
+                // Pinned frames must not be evicted.
+                if (s.frame && s.frame->pin_count > 0) continue;
+
                 if (!s.ref) {
                     // Evict this slot.
-                    evicted_entry victim{ s.key, s.buf };
+                    page_frame* victim = s.frame;
                     index_.erase(s.key);
 
-                    s.key = key;
-                    s.buf = buf;
+                    s.key = f->id;
+                    s.frame = f;
                     s.ref = false;
-                    index_[key] = hand_;
+                    index_[f->id] = (hand_ + capacity_ - 1) % capacity_;
 
-                    hand_ = (hand_ + 1) % capacity_;
                     return victim;
                 }
                 s.ref = false;
-                hand_ = (hand_ + 1) % capacity_;
             }
+
+            // All entries pinned — cannot evict; reject insertion.
+            return f;
         }
 
-        // Evict any one entry, returning its (key, buf) so the caller can
-        // release the underlying buffer. Used at scheduler teardown to drain
-        // the cache. O(1) amortized: pick from index_ rather than scanning.
-        // Calling this repeatedly until it returns nullopt empties the cache.
-        std::optional<evicted_entry>
-        evict_one() {
+        // drain_one: teardown-only drain. Pulls one entry out regardless
+        // of ref/pin state and returns its page_frame* so the caller can
+        // free the backing buffer and descriptor. Returns nullopt when
+        // empty. Calling repeatedly until nullopt empties the cache.
+        std::optional<page_frame*>
+        drain_one() {
             if (index_.empty()) return std::nullopt;
             auto it = index_.begin();
             uint32_t idx = it->second;
             auto& s = slots_[idx];
-            evicted_entry victim{ s.key, s.buf };
+            page_frame* victim = s.frame;
             index_.erase(it);
             s.occupied = false;
-            s.buf = nullptr;
+            s.frame = nullptr;
             s.ref = false;
             --size_;
             return victim;

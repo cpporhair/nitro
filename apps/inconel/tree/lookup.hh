@@ -5,6 +5,8 @@
 #include <variant>
 #include "../format/types.hh"
 
+namespace apps::inconel::memory { struct page_frame; }
+
 namespace apps::inconel::tree {
 
     struct lookup_value {
@@ -26,7 +28,7 @@ namespace apps::inconel::tree {
 
     struct decision_need_read {
         std::vector<format::read_desc> read_descs;
-        std::vector<std::pair<format::paddr, char*>> page_map;
+        std::vector<memory::page_frame*> frames;
     };
 
     using batch_decision = std::variant<decision_done, decision_need_read>;

@@ -97,26 +97,8 @@ namespace apps::inconel::value {
 
     using read_prepare_result = std::variant<read_hit, read_miss>;
 
-    // ── Internal page_data ──
-    //
-    // A page held by the scheduler in writable state — i.e. its NVMe image is
-    // already durable but it still has free slots, so the next persist round
-    // for the same class will reuse this page in-memory rather than allocate
-    // a fresh one. v7 keeps a flat per-class queue (writable_pages_[ci]) and
-    // pops the most recently installed page first (LIFO) so the hottest
-    // partial page is always picked up next.
-    //
-    // image is unique_ptr<char[]> rather than vector<char> so the same buffer
-    // representation flows through writable_pages_, the cache, and (later) a
-    // DMA pool — there is no vector→buffer→vector copy at any boundary.
-    // image_size is required because char[] does not carry its own length.
-
-    struct page_data {
-        paddr                   base;
-        uint64_t                free_mask;
-        std::unique_ptr<char[]> image;
-        uint32_t                image_size;
-    };
+    // page_data removed in step 019: replaced by value_page_frame-based
+    // open_frames_ and allocatable_frames_ (see value_alloc_sched below).
 
     // ── Forward declarations of req types (used by sender layer) ──
 
@@ -328,14 +310,9 @@ namespace apps::inconel::value {
         // Followers wait inside this round's followers vec.
 
         struct round_page {
-            paddr                   base;
-            uint16_t                class_idx;
-            uint32_t                span_lbas;
-            value_page_source       source;
-            uint64_t                original_free_mask; // for rollback
-            uint64_t                free_mask;          // updated as slots are filled
-            std::unique_ptr<char[]> image;
-            uint32_t                image_size;
+            memory::value_page_frame* frame;
+            value_page_source         source;
+            uint64_t                  original_free_mask; // for rollback
         };
 
         struct round {
@@ -347,25 +324,49 @@ namespace apps::inconel::value {
 
         value_allocator alloc_;
 
-        // writable pages — per class. Each entry is a page that's already
-        // durable on NVMe but still has at least one free slot, so the next
-        // persist round for the same class will reuse it in-memory. LIFO
-        // (pop_back) keeps the hottest partial page in front.
+        // ── Resident frame state (step 019) ──
         //
-        // Spec mapping (see runtime_memory_and_cache.md §6.3 and §8.6):
-        // `writable_pages_[ci]` is the engineering landing of the spec's
-        // "open frame held across persist rounds" idea. It is the resident
-        // continuation of a previously-durable partially-free page that the
-        // owner keeps live so the next round can keep filling it without
-        // re-reading it from device. It is **not** the spec's full
-        // `hole_page_list` (non-resident placement metadata), nor the spec's
-        // `open_frames[class_idx]` per-class single open DMA frame; the v1
-        // implementation collapses both into this per-class queue because
-        // there is no separate non-resident hole tracking yet and only one
-        // page is being filled at a time per class anyway. The
-        // `value_page_source::writable` enum value names exactly this
-        // population — pages popped here come back here on rollback.
-        std::vector<std::vector<page_data>> writable_pages_;
+        // open_frames_[ci]:  at most one per class — the active dirty
+        //   frame being used by the current or most-recent round. It is
+        //   produced by acquire_round_page (which installs the acquired
+        //   frame here) and cleared by commit_pages / rollback_pages
+        //   when the round finalizes.
+        //
+        //   Lifecycle within a single round:
+        //     acquire_round_page  → dirty_append, installed here
+        //     publish_round       → writeback_inflight, still here
+        //     handle_read         → readable in any state (freshest source)
+        //     commit / rollback   → cleared from here, frame moves to
+        //                           allocatable_frames_ (partial) or
+        //                           readonly_cache_ (full) or deleted
+        //
+        //   When acquire_round_page needs a new page but the current
+        //   open frame is inflight or full, it calls displace_open_frame
+        //   to clear the slot. An inflight displaced frame is owned by
+        //   its round_page and will be settled on finalize; a
+        //   clean_allocatable displaced frame goes to allocatable_frames_.
+        //
+        // allocatable_frames_[ci]:  clean_allocatable resident frames with
+        //   free slots remaining. Populated by commit (partial pages) and
+        //   rollback (writable source). LIFO pop (back) keeps the hottest
+        //   page in front.
+        //
+        // Allocation priority:
+        //   1. open_frames_[ci] — if usable (not inflight, has free slots)
+        //   2. allocatable_frames_[ci] → reopen as dirty_append
+        //   3. whole_pool / fresh_bump
+        //
+        // Read path priority (all resident states are safe to read):
+        //   1. open_frames_[ci] (dirty / inflight)
+        //   2. allocatable_frames_[ci] (clean_allocatable)
+        //   3. readonly_cache_ (clean_readonly)
+        //   4. NVMe miss
+        //
+        // Spec mapping: runtime_memory_and_cache.md §6.3 open_frames +
+        // §8.6. value_page_source::writable names the resident source
+        // for rollback purposes.
+        std::vector<memory::value_page_frame*>              open_frames_;
+        std::vector<std::vector<memory::value_page_frame*>> allocatable_frames_;
 
         // readonly cache: frame_id → page_frame* for 1-LBA pages. The
         // scheduler owns the page_frame descriptors and their backing
@@ -377,7 +378,7 @@ namespace apps::inconel::value {
         // here. commit_pages and handle_fill both gate on the span before
         // calling put(); handle_read symmetrically only consults the cache
         // when admit == (span == 1). Multi-LBA full pages are dropped at
-        // commit time (round_page's unique_ptr destructor frees them).
+        // commit time (frame buf + descriptor deleted directly).
         //
         // Lifetime contract for put() / drain_one() (full statement in
         // core/page_cache.hh's cache_concept doc): every "Some(...)" return
@@ -401,7 +402,8 @@ namespace apps::inconel::value {
                           size_t                    queue_depth = 2048)
             : value_alloc_sched_base(queue_depth)
             , alloc_(class_sizes, lba_size, data_area_base, data_area_end)
-            , writable_pages_(class_sizes.size())
+            , open_frames_(class_sizes.size(), nullptr)
+            , allocatable_frames_(class_sizes.size())
             , readonly_cache_(std::move(cache))
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
@@ -409,12 +411,29 @@ namespace apps::inconel::value {
 
         // ── Destructor ──
         //
-        // The cache holds non-owning page_frame* pointers. The scheduler is
-        // the sole owner of the backing buffers and frame descriptors, so
-        // on teardown we drain every remaining frame through drain_one()
-        // and free both the buffer and descriptor.
+        // open_frames_ and inflight round_pages may share frame pointers
+        // (the round_page references the same frame that sits in
+        // open_frames_). Free in-flight frames first, skipping any that
+        // are shared with open_frames_ (those are freed in the
+        // open_frames_ loop). Then free open, allocatable, and cache.
 
         ~value_alloc_sched() {
+            for (auto& [id, rnd] : inflight_rounds_) {
+                for (auto& page : rnd->pages) {
+                    if (!page.frame) continue;
+                    uint16_t ci = page.frame->class_idx;
+                    if (ci < open_frames_.size() &&
+                        open_frames_[ci] == page.frame) continue;
+                    delete[] page.frame->buf;
+                    delete page.frame;
+                }
+            }
+            for (auto* f : open_frames_) {
+                if (f) { delete[] f->buf; delete f; }
+            }
+            for (auto& list : allocatable_frames_) {
+                for (auto* f : list) { delete[] f->buf; delete f; }
+            }
             while (auto f = readonly_cache_.drain_one()) {
                 delete[] (*f)->buf;
                 delete *f;
@@ -424,9 +443,9 @@ namespace apps::inconel::value {
         // ── advance ──
         //
         // Order matters: finalize first (releases inflight rounds and may
-        // return pages to writable_pages_, which makes them available for
-        // subsequent persist rounds). persist next (consumes the freshly
-        // freed pages). read/fill last.
+        // install partial pages into open_frames_ / allocatable_frames_,
+        // making them available for subsequent persist rounds). persist
+        // next (consumes the freshly available pages). read/fill last.
         //
         // INC-029 — bounded per-advance work budget. Each of the four queues
         // gets its own per-advance cap so a hot stream on one queue can't
@@ -607,19 +626,19 @@ namespace apps::inconel::value {
         //
         // Build the write_desc vector over the encoded pages. Must run
         // after build_round has settled the round_page list because
-        // write_desc holds raw pointers into round_page.image; we relied on
-        // that contract before by deferring the descriptor build to the
-        // end of handle_persist, but it deserves its own named step now
-        // that the control flow is no longer linear.
+        // write_desc holds raw pointers into each frame's buf; we relied
+        // on that contract before by deferring the descriptor build to
+        // the end of handle_persist, but it deserves its own named step
+        // now that the control flow is no longer linear.
 
         void
         finalize_round_writes(round& rnd) {
             rnd.writes.reserve(rnd.pages.size());
             for (auto& page : rnd.pages) {
                 rnd.writes.push_back(write_desc{
-                    .lba      = page.base.lba,
-                    .data     = page.image.get(),
-                    .num_lbas = page.span_lbas,
+                    .lba      = page.frame->id.base.lba,
+                    .data     = page.frame->buf,
+                    .num_lbas = page.frame->id.span_lbas,
                     .flags    = 0,
                 });
             }
@@ -627,15 +646,23 @@ namespace apps::inconel::value {
 
         // ── publish_round ──
         //
-        // Install the round into inflight_rounds_, fire the leader's
-        // callback with the write list, and stash the followers on the
-        // round so handle_finalize can wake them when the FUA write
-        // completes. Followers do not include the leader itself.
+        // Freeze all round pages (dirty → writeback_inflight) so the buf
+        // is safe for NVMe DMA, install the round into inflight_rounds_,
+        // fire the leader's callback with the write list, and stash the
+        // followers on the round so handle_finalize can wake them when the
+        // FUA write completes. Followers do not include the leader itself.
 
         void
         publish_round(std::unique_ptr<round> rnd,
                       std::span<_value_persist::req* const> items,
                       _value_persist::req* leader_item) {
+            // Freeze: mark all round pages writeback_inflight so the
+            // next acquire_round_page knows not to write into them.
+            for (auto& page : rnd->pages) {
+                page.frame->st   = memory::frame_state::writeback_inflight;
+                page.frame->mode = memory::value_page_frame::open_mode::none;
+            }
+
             uint64_t rid = rnd->id;
             std::span<write_desc> writes_span(
                 rnd->writes.data(), rnd->writes.size());
@@ -654,9 +681,10 @@ namespace apps::inconel::value {
         // ── append_entry_to_round ──
         //
         // Allocate a slot for one entry and encode the value object into
-        // the page image. Reuses an in-flight round_page when one of the
+        // the page image. Reuses an existing round_page when one of the
         // same class still has a free slot; otherwise pulls a fresh page
-        // via acquire_round_page (writable → whole_pool → fresh_bump).
+        // via acquire_round_page (open_frames → allocatable_frames →
+        // whole_pool → fresh_bump).
 
         persist_entry_status
         append_entry_to_round(round& rnd, put_entry& entry) {
@@ -672,8 +700,9 @@ namespace apps::inconel::value {
             }
 
             // Pick the lowest set bit (next free slot).
-            uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(page->free_mask));
-            page->free_mask &= ~(1ULL << slot);
+            uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(page->frame->free_mask));
+            page->frame->free_mask &= ~(1ULL << slot);
+            page->frame->free_count--;
 
             uint32_t cs = alloc_.class_size(ci);
             uint16_t off = 0;
@@ -686,14 +715,14 @@ namespace apps::inconel::value {
             // whether the body fits — that is an internal logic break, not
             // a caller-driven recoverable error, so we surface it via the
             // fatal status code instead of "restore the bit and pretend".
-            std::span<char> slot_span(page->image.get() + off, cs);
+            std::span<char> slot_span(page->frame->buf + off, cs);
             std::span<const char> body_span(entry.body.data(), entry.body.size());
             if (!format::encode_value_object(slot_span, body_span)) {
                 return persist_entry_status::encode_failure;
             }
 
             // Fill the caller's value_ref.
-            entry.out_vr->base        = page->base;
+            entry.out_vr->base        = page->frame->id.base;
             entry.out_vr->byte_offset = off;
             entry.out_vr->len         = static_cast<uint32_t>(entry.body.size());
             entry.out_vr->flags       = 0;
@@ -706,50 +735,104 @@ namespace apps::inconel::value {
             // locality + faster termination on the common "still filling
             // the latest page" case)
             for (auto it = rnd.pages.rbegin(); it != rnd.pages.rend(); ++it) {
-                if (it->class_idx == ci && it->free_mask != 0)
+                if (it->frame->class_idx == ci && it->frame->free_mask != 0)
                     return &*it;
             }
             return nullptr;
         }
 
+        // ── displace_open_frame ──
+        //
+        // Move the current open frame for class ci out of open_frames_[ci]
+        // so a replacement can be installed.
+        //
+        // Only clean_allocatable frames go to allocatable_frames_ here.
+        // Dirty and writeback_inflight frames are owned by a round_page in
+        // the current or in-flight round; commit_pages / rollback_pages
+        // will settle them. Pushing them here would create a double
+        // reference (displace + round cleanup → double free).
+
+        void displace_open_frame(uint16_t ci) {
+            auto* old = open_frames_[ci];
+            if (!old) return;
+            open_frames_[ci] = nullptr;
+            if (old->st == memory::frame_state::clean_allocatable) {
+                allocatable_frames_[ci].push_back(old);
+            }
+        }
+
         round_page*
         acquire_round_page(round& rnd, uint16_t ci) {
-            // 1. Pop the most recent writable page for this class (LIFO).
-            //    All entries in writable_pages_[ci] have free slots and a
-            //    durable NVMe image we can mutate in-memory.
-            if (!writable_pages_[ci].empty()) {
-                auto pd = std::move(writable_pages_[ci].back());
-                writable_pages_[ci].pop_back();
+            // Priority 1: open_frames_[ci] — reuse if not inflight and has
+            // free slots. The frame stays in open_frames_[ci] (shared
+            // reference with round_page) so handle_read can hit it.
+            if (open_frames_[ci]) {
+                auto* frame = open_frames_[ci];
+                if (frame->st != memory::frame_state::writeback_inflight &&
+                    frame->free_mask != 0) {
+                    if (frame->st == memory::frame_state::clean_allocatable) {
+                        frame->st   = memory::frame_state::dirty_append;
+                        frame->mode = memory::value_page_frame::open_mode::append;
+                    }
+                    rnd.pages.push_back(round_page{
+                        .frame              = frame,
+                        .source             = value_page_source::writable,
+                        .original_free_mask = frame->free_mask,
+                    });
+                    return &rnd.pages.back();
+                }
+                // Current open frame is inflight or full — fall through
+                // to acquire a replacement. The old frame remains owned by
+                // its round_page; finalize will settle it as clean_readonly
+                // (1-LBA full), drop it (multi-LBA full), or roll it back.
+            }
+
+            // Priority 2: allocatable_frames_[ci] — clean_allocatable
+            // resident frame, reopen as dirty_append for continuation.
+            if (!allocatable_frames_[ci].empty()) {
+                auto* frame = allocatable_frames_[ci].back();
+                allocatable_frames_[ci].pop_back();
+                frame->st   = memory::frame_state::dirty_append;
+                frame->mode = memory::value_page_frame::open_mode::append;
+                displace_open_frame(ci);
+                open_frames_[ci] = frame;
                 rnd.pages.push_back(round_page{
-                    .base               = pd.base,
-                    .class_idx          = ci,
-                    .span_lbas          = alloc_.span_lbas(ci),
+                    .frame              = frame,
                     .source             = value_page_source::writable,
-                    .original_free_mask = pd.free_mask,
-                    .free_mask          = pd.free_mask,
-                    .image              = std::move(pd.image),
-                    .image_size         = pd.image_size,
+                    .original_free_mask = frame->free_mask,
                 });
                 return &rnd.pages.back();
             }
 
-            // 2. Ask allocator (whole_pool / bump)
+            // Priority 3: allocator (whole_pool / fresh bump).
             auto ar = alloc_.acquire_page(ci);
             if (!ar) return nullptr;
 
             uint32_t img_bytes = ar->span_lbas * alloc_.lba_size();
-            // make_unique<char[]>(N) value-initializes (zero-fills) — same
-            // semantics as the previous vector<char>(N, 0).
-            auto image = std::make_unique<char[]>(img_bytes);
+            auto* frame = new memory::value_page_frame{};
+            frame->id = memory::frame_id{
+                ar->page_base,
+                static_cast<uint16_t>(ar->span_lbas),
+                memory::frame_id::domain::value_page,
+            };
+            frame->st         = memory::frame_state::dirty_append;
+            frame->buf        = new char[img_bytes]();
+            frame->byte_len   = img_bytes;
+            frame->pin_count  = 0;
+            frame->crc_valid  = false;
+            frame->class_idx      = ci;
+            frame->slots_per_page = static_cast<uint16_t>(alloc_.slots_per_page(ci));
+            frame->free_mask      = ar->free_mask;
+            frame->free_count     = static_cast<uint16_t>(
+                __builtin_popcountll(ar->free_mask));
+            frame->mode           = memory::value_page_frame::open_mode::append;
+
+            displace_open_frame(ci);
+            open_frames_[ci] = frame;
             rnd.pages.push_back(round_page{
-                .base               = ar->page_base,
-                .class_idx          = ci,
-                .span_lbas          = ar->span_lbas,
+                .frame              = frame,
                 .source             = ar->source,
                 .original_free_mask = ar->free_mask,
-                .free_mask          = ar->free_mask,
-                .image              = std::move(image),
-                .image_size         = img_bytes,
             });
             return &rnd.pages.back();
         }
@@ -802,36 +885,52 @@ namespace apps::inconel::value {
         void
         commit_pages(round& rnd) {
             for (auto& page : rnd.pages) {
-                if (page.free_mask == 0) {
-                    // Full page. Decision D1: only 1-LBA pages enter the
-                    // readonly cache. Multi-LBA full pages are dropped here
-                    // (the round_page's unique_ptr destructor frees the buf
-                    // when the round goes out of scope) — admitting them
-                    // would waste bounded-cache capacity since handle_read
-                    // bypasses the cache for span > 1 and the page would
-                    // never be hit again, only evict useful 1-LBA entries.
-                    if (page.span_lbas == 1) {
+                auto* frame = page.frame;
+                uint16_t ci = frame->class_idx;
+                // Clear open_frames_ reference: the round is done, this
+                // frame is no longer the active dirty target. A newer
+                // round may have already displaced us (open != frame);
+                // only clear if we're still the current occupant.
+                if (open_frames_[ci] == frame) open_frames_[ci] = nullptr;
+
+                if (frame->free_mask == 0) {
+                    // Full page. Transition: writeback_inflight → clean_readonly.
+                    // Decision D1: only 1-LBA pages enter readonly_cache_.
+                    frame->free_count = 0;
+                    if (frame->id.span_lbas == 1) {
+                        // Transfer buf to a plain page_frame for the cache
+                        // (avoids polymorphic-delete UB since page_frame
+                        // has no virtual destructor).
                         auto* pf = new memory::page_frame{
-                            .id        = memory::frame_id{page.base, 1,
-                                            memory::frame_id::domain::value_page},
+                            .id        = frame->id,
                             .st        = memory::frame_state::clean_readonly,
-                            .buf       = page.image.release(),
-                            .byte_len  = page.image_size,
+                            .buf       = frame->buf,
+                            .byte_len  = frame->byte_len,
                             .pin_count = 0,
                             .crc_valid = false,
                         };
+                        frame->buf = nullptr;
+                        delete frame;
+                        page.frame = nullptr;
                         if (auto evicted = readonly_cache_.put(pf)) {
                             delete[] (*evicted)->buf;
                             delete *evicted;
                         }
+                    } else {
+                        // multi-LBA full page → drop (no cache value)
+                        delete[] frame->buf;
+                        delete frame;
+                        page.frame = nullptr;
                     }
-                    // span > 1: page.image's unique_ptr<char[]> destructor
-                    // frees the buf at end of round.
                 } else {
-                    // still has free slots → put back as a writable page
-                    install_writable_page(page.class_idx, page.base,
-                                          page.free_mask, std::move(page.image),
-                                          page.image_size);
+                    // Partial page: writeback_inflight → clean_allocatable.
+                    // Enters allocatable_frames_[ci], NOT readonly_cache_.
+                    frame->st         = memory::frame_state::clean_allocatable;
+                    frame->mode       = memory::value_page_frame::open_mode::none;
+                    frame->free_count = static_cast<uint16_t>(
+                        __builtin_popcountll(frame->free_mask));
+                    allocatable_frames_[ci].push_back(frame);
+                    page.frame = nullptr;
                 }
             }
         }
@@ -848,49 +947,47 @@ namespace apps::inconel::value {
         //
         //   - fresh_bump  → push_back_bump (returns LBAs to bump head)
         //   - whole_page  → recycle_whole_page (back into the class pool)
-        //   - writable    → restore via install_writable_page with the
-        //                   original (pre-round) free_mask
-        //
-        // INC-017: previously fresh_bump and whole_page were silently
-        // dropped here, leaking Data Area capacity. The "accept bump head
-        // leak" comment is gone.
+        //   - writable    → clear matching open_frames_ reference, restore
+        //                   original free_mask, set clean_allocatable, and
+        //                   return it to allocatable_frames_
 
         void
         rollback_pages(round& rnd) {
             for (auto it = rnd.pages.rbegin(); it != rnd.pages.rend(); ++it) {
                 auto& page = *it;
+                auto* frame = page.frame;
+                uint16_t ci = frame->class_idx;
+                if (open_frames_[ci] == frame) open_frames_[ci] = nullptr;
                 switch (page.source) {
                 case value_page_source::fresh_bump:
-                    alloc_.push_back_bump(page.base, page.span_lbas);
+                    alloc_.push_back_bump(frame->id.base, frame->id.span_lbas);
+                    delete[] frame->buf;
+                    delete frame;
+                    page.frame = nullptr;
                     break;
                 case value_page_source::whole_page:
-                    alloc_.recycle_whole_page(page.class_idx, page.base);
+                    alloc_.recycle_whole_page(ci, frame->id.base);
+                    delete[] frame->buf;
+                    delete frame;
+                    page.frame = nullptr;
                     break;
                 case value_page_source::writable:
-                    // Restore with the original (pre-round) free_mask.
-                    install_writable_page(page.class_idx, page.base,
-                                          page.original_free_mask,
-                                          std::move(page.image),
-                                          page.image_size);
+                    // Resident source: restore free_mask and transition to
+                    // clean_allocatable → allocatable_frames_.
+                    frame->free_mask  = page.original_free_mask;
+                    frame->free_count = static_cast<uint16_t>(
+                        __builtin_popcountll(page.original_free_mask));
+                    frame->st   = memory::frame_state::clean_allocatable;
+                    frame->mode = memory::value_page_frame::open_mode::none;
+                    allocatable_frames_[ci].push_back(frame);
+                    page.frame = nullptr;
                     break;
                 }
             }
         }
 
-        void
-        install_writable_page(uint16_t ci, paddr base, uint64_t free_mask,
-                              std::unique_ptr<char[]>&& image,
-                              uint32_t image_size) {
-            // v7: single per-class queue, no special "active" slot. Newest
-            // installs land at the back so the next acquire_round_page picks
-            // them up first (hot path stays in cache).
-            writable_pages_[ci].push_back(page_data{
-                .base       = base,
-                .free_mask  = free_mask,
-                .image      = std::move(image),
-                .image_size = image_size,
-            });
-        }
+        // install_writable_page removed in step 019: commit_pages and
+        // rollback_pages now populate allocatable_frames_ directly.
 
         // ════════════════════════════════════════════════════════════════
         //  handle_read  —  prepare cache lookup, fan out NVMe miss
@@ -916,23 +1013,34 @@ namespace apps::inconel::value {
             // capacity, and the buf pool stays single-sized.
             const bool admit = (span == 1);
 
-            // 1. writable_pages_[ci] — pages held by the scheduler with free
-            //    slots remaining. Their NVMe image is durable but the
-            //    in-memory copy is the freshest source for any reader (and
-            //    every value object encoded so far this round is only here).
-            //    Linear scan: N is small (typically 0-2 per class) so this is
-            //    cheaper than maintaining a paddr index.
-            for (auto& pd : writable_pages_[ci]) {
-                if (pd.base == item->vr.base) {
+            // 1. open_frames_[ci] — the active frame for this class
+            //    (dirty, inflight, or clean_allocatable). In-memory
+            //    image is the freshest resident source and is safe to
+            //    read in any of these states.
+            if (open_frames_[ci] &&
+                open_frames_[ci]->id.base == item->vr.base) {
+                serve_hit_or_fail(item,
+                    std::span<const char>(open_frames_[ci]->buf,
+                                          open_frames_[ci]->byte_len),
+                    "open_frames");
+                delete item;
+                return;
+            }
+
+            // 2. allocatable_frames_[ci] — clean_allocatable resident
+            //    frames with free slots. Linear scan: N is small (typically
+            //    0-2 per class).
+            for (auto* f : allocatable_frames_[ci]) {
+                if (f->id.base == item->vr.base) {
                     serve_hit_or_fail(item,
-                                      std::span<const char>(pd.image.get(), pd.image_size),
-                                      "writable_pages");
+                        std::span<const char>(f->buf, f->byte_len),
+                        "allocatable_frames");
                     delete item;
                     return;
                 }
             }
 
-            // 2. readonly_cache_ — only consulted when this class is
+            // 3. readonly_cache_ — only consulted when this class is
             //    admissible (multi-LBA bypasses). Pin semantics: pin()
             //    returns an RAII frame_pin that keeps the page resident
             //    for the duration of the decode.
@@ -942,19 +1050,18 @@ namespace apps::inconel::value {
                         memory::frame_id::domain::value_page});
                 if (pin.frame) {
                     serve_hit_or_fail(item,
-                                      std::span<const char>(pin.frame->buf,
-                                                            pin.frame->byte_len),
-                                      "readonly_cache");
+                        std::span<const char>(pin.frame->buf,
+                                              pin.frame->byte_len),
+                        "readonly_cache");
                     delete item;
                     return;
                 }
             }
 
-            // 3. miss → tell pipeline to issue NVMe read into a fresh buf.
-            //    The unique_ptr flows through the pipeline (see read_miss
-            //    and on_read_miss in sender.hh) and ends up in handle_fill
-            //    which either releases it into the cache (admit) or drops
-            //    it after decode (bypass).
+            // 4. NVMe miss → tell pipeline to issue NVMe read into a
+            //    fresh buf. The unique_ptr flows through the pipeline and
+            //    ends up in handle_fill which either releases it into the
+            //    cache (admit) or drops it after decode (bypass).
             uint32_t img_bytes = span * alloc_.lba_size();
             auto buf = std::make_unique<char[]>(img_bytes);
             item->cb(read_prepare_result{
@@ -1020,10 +1127,10 @@ namespace apps::inconel::value {
         // the reason here. Empty body is a legitimate value, distinct
         // from any error.
         //
-        // span<const char> is the uniform decode path: writable_pages_,
-        // readonly_cache_, and the fill staging buffer all reach this
-        // through a span construction at the call site, so the helper is
-        // agnostic to who owns the bytes.
+        // span<const char> is the uniform decode path: open_frames_,
+        // allocatable_frames_, readonly_cache_, and the fill staging
+        // buffer all reach this through a span construction at the call
+        // site, so the helper is agnostic to who owns the bytes.
         format::value_decode_result
         try_decode_value(std::span<const char> image, value_ref vr) const {
             if (vr.byte_offset >= image.size()) {

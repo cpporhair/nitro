@@ -19,17 +19,18 @@ namespace apps::inconel::value {
     // ── Page source enum ──
     //
     // Records why a particular page is being used in the current persist
-    // round. The distinction matters for rollback: writable pages must be
-    // returned to writable_pages_[ci] with the original free_mask, while
+    // round. The distinction matters for rollback: writable (resident)
+    // pages must be restored to clean_allocatable and returned to
+    // allocatable_frames_[ci] with the original free_mask, while
     // fresh_bump / whole_page pages were never durable and can be dropped.
     //
     // value_page_source::writable is only constructed by the scheduler in
-    // acquire_round_page when it pops from writable_pages_[ci];
-    // value_allocator::acquire_page never returns it (the allocator does not
-    // know about writable pages).
+    // acquire_round_page when it pops from open_frames_[ci] or
+    // allocatable_frames_[ci]; value_allocator::acquire_page never returns
+    // it (the allocator does not know about resident frames).
 
     enum class value_page_source : uint8_t {
-        writable,      // popped from writable_pages_[ci] (still has free slots)
+        writable,      // from open_frames_[ci] or allocatable_frames_[ci]
         whole_page,    // taken from whole_pool[ci] (recycled empty page)
         fresh_bump,    // freshly bumped from per_device head
     };
@@ -139,10 +140,10 @@ namespace apps::inconel::value {
         //   2. bump fresh from per_device head — return fresh_bump
         //   3. otherwise nullopt (out of space)
         //
-        // The "writable" path (pages still owned by the scheduler with free
-        // slots remaining) is handled entirely by the scheduler — the
-        // allocator does not know it exists. acquire_page is only called when
-        // the scheduler has exhausted writable_pages_[ci].
+        // The resident path (open_frames_ / allocatable_frames_) is
+        // handled entirely by the scheduler — the allocator does not know
+        // it exists. acquire_page is only called when the scheduler has
+        // exhausted both resident sources.
 
         std::optional<value_alloc_result>
         acquire_page(uint16_t class_idx) noexcept {

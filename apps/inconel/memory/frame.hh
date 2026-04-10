@@ -77,6 +77,29 @@ namespace apps::inconel::memory {
         bool        crc_valid;
     };
 
+    // ── value_page_frame ──
+    //
+    // Extends page_frame with allocator-visible sub-page state for value
+    // pages. free_mask tracks which slots are available; free_count mirrors
+    // its popcount for O(1) queries. open_mode distinguishes a sequential-
+    // fill page (append) from one reopened to fill previously-unused slots
+    // (hole_fill); none means the frame is not actively open for writing.
+    //
+    // Design mapping: runtime_memory_and_cache.md §5.5.
+
+    struct value_page_frame : page_frame {
+        uint16_t class_idx;
+        uint16_t slots_per_page;
+        uint64_t free_mask;
+        uint16_t free_count;
+
+        enum class open_mode : uint8_t {
+            none,
+            append,
+            hole_fill,
+        } mode;
+    };
+
     // ── frame_pin ──
     //
     // RAII pin token. Construction increments pin_count; destruction

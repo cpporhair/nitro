@@ -10,7 +10,7 @@
 //                            advanced
 //   case_3_cache_hit         second read of same vr — counter unchanged
 //   case_4_write_then_read   sender write then immediately read same vr —
-//                            should hit writable_pages_ / readonly_cache_
+//                            should hit resident frame / readonly_cache_
 //   case_5_sub_lba_same_page two sub-LBA values of the same class share a
 //                            page (vr.base equal, byte_offset different)
 //   case_6_cross_class       multiple classes including multi-LBA — each
@@ -24,12 +24,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "apps/inconel/test/check.hh"
@@ -52,6 +54,8 @@ using apps::inconel::format::value_ref;
 using apps::inconel::format::value_object_header;
 using apps::inconel::format::VALUE_MAGIC;
 using apps::inconel::memory::frame_id;
+using apps::inconel::memory::frame_state;
+using apps::inconel::memory::value_page_frame;
 
 namespace {
 
@@ -83,6 +87,10 @@ frame_id value_frame_id_for(paddr base, uint16_t span_lbas) {
     };
 }
 
+uint16_t slots_per_page_for_class(uint16_t ci) {
+    return static_cast<uint16_t>(LBA_SIZE / EXPECTED_CLASS_SIZES[ci]);
+}
+
 void check_bootstrap_profile_matches_value_expectations() {
     const auto& profile = format::kBootstrapFormatProfile;
     CHECK(profile.lba_size == LBA_SIZE);
@@ -112,6 +120,34 @@ void wait_for(std::shared_ptr<std::atomic<int>> counter, int target) {
     for (int i = 0; i < 200 && counter->load() < target; ++i)
         std::this_thread::sleep_for(10ms);
     CHECK(counter->load() >= target && "sender pipeline did not complete in time");
+}
+
+void persist_entries(value::value_alloc_sched_base* sched,
+                     auto& ctx,
+                     std::span<value::put_entry> entries) {
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    value::persist_values(sched, entries)
+        >> pump::sender::then([counter](bool ok) {
+            CHECK(ok);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+}
+
+std::string read_value_sync(value::value_alloc_sched_base* sched,
+                            auto& ctx,
+                            value_ref vr) {
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    std::string got;
+    value::read_value(sched, vr)
+        >> pump::sender::then([&got, counter](std::string s) {
+            got = std::move(s);
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
+    return got;
 }
 
 // Decode an on-device page slot at (lba, byte_offset) into the body bytes,
@@ -361,7 +397,7 @@ void case_3_cache_hit() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  case_4: write then read — should hit writable_pages_ / cache, no NVMe
+//  case_4: write then read — should hit resident frame / cache, no NVMe
 // ════════════════════════════════════════════════════════════════
 
 void case_4_write_then_read() {
@@ -385,9 +421,8 @@ void case_4_write_then_read() {
         >> pump::sender::submit(ctx);
     wait_for(counter, 1);
 
-    // Now read it back. This page is still in writable_pages_[0] (sub-LBA,
-    // only 1 slot used out of 64 → free_mask != 0). The read should not
-    // touch NVMe.
+    // Now read it back. This page is still resident with free slots
+    // remaining, so the read should not touch NVMe.
     std::string got;
     value::read_value(sched, vr)
         >> pump::sender::then([&got, counter](std::string s) {
@@ -399,7 +434,7 @@ void case_4_write_then_read() {
 
     CHECK(got == body);
     auto reads = env.dev.get_read_count();
-    CHECK(reads == 0 && "write_then_read should hit writable_pages_, no NVMe read");
+    CHECK(reads == 0 && "write_then_read should hit resident frame, no NVMe read");
 
     printf("  case_4_write_then_read: OK (0 device reads)\n");
 }
@@ -586,8 +621,7 @@ void case_7_cache_evict() {
 //    - read path: handle_read computes admit = (span == 1) and skips both
 //      cache pin/admit when admit is false.
 //    - write path: commit_pages only releases the buf into the cache when
-//      page.span_lbas == 1; multi-LBA full pages are dropped (unique_ptr
-//      destructor frees the buf).
+//      frame->id.span_lbas == 1; multi-LBA full pages are dropped.
 //
 //  Falsifying *both* paths needs more than NVMe-read count alone. Counting
 //  reads only witnesses read-path bypass: if commit_pages regressed and
@@ -682,6 +716,245 @@ void case_8_multi_lba_bypass() {
            static_cast<unsigned long>(reads_after_2));
 }
 
+// ════════════════════════════════════════════════════════════════
+//  case_9: value_page_frame type surface
+//
+//  Step 019 makes resident value-page state explicit. The test keeps this
+//  as a small compile/runtime contract so value_page_frame cannot collapse
+//  back into an untyped page_data/free_mask carrier.
+// ════════════════════════════════════════════════════════════════
+
+void case_9_value_page_frame_type_contract() {
+    char payload[LBA_SIZE]{};
+    value_page_frame frame{};
+    frame.id = value_frame_id_for(paddr{0, 1234}, 1);
+    frame.st = frame_state::dirty_append;
+    frame.buf = payload;
+    frame.byte_len = LBA_SIZE;
+    frame.pin_count = 0;
+    frame.crc_valid = true;
+    frame.class_idx = 0;
+    frame.slots_per_page = slots_per_page_for_class(0);
+    frame.free_mask = UINT64_MAX & ~1ULL;
+    frame.free_count = 63;
+    frame.mode = value_page_frame::open_mode::append;
+
+    CHECK(frame.id.base.lba == 1234);
+    CHECK(frame.st == frame_state::dirty_append);
+    CHECK(frame.buf == payload);
+    CHECK(frame.class_idx == 0);
+    CHECK(frame.slots_per_page == 64);
+    CHECK(frame.free_count == 63);
+    CHECK((frame.free_mask & 1ULL) == 0);
+    CHECK(frame.mode == value_page_frame::open_mode::append);
+
+    printf("  case_9_value_page_frame_type_contract: OK\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_10: partial writeback → clean_allocatable, not readonly cache
+//
+//  A sub-LBA page with remaining free slots is placement state. After
+//  writeback completes it must be resident as clean_allocatable, must not
+//  enter readonly_cache_, and read_value must hit that resident frame
+//  without NVMe.
+// ════════════════════════════════════════════════════════════════
+
+void case_10_partial_page_becomes_clean_allocatable() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string body = make_body("alloc", 30);  // class 0, one slot used
+    value_ref vr{};
+    std::vector<value::put_entry> entries = {{body, &vr}};
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries));
+
+    CHECK(vr.byte_offset == 0);
+    CHECK(sched_typed->open_frames_.size() == profile_class_sizes().size());
+    CHECK(sched_typed->open_frames_[0] == nullptr);
+    CHECK(sched_typed->allocatable_frames_[0].size() == 1);
+
+    auto* frame = sched_typed->allocatable_frames_[0].back();
+    CHECK(frame != nullptr);
+    CHECK(frame->id == value_frame_id_for(vr.base, 1));
+    CHECK(frame->st == frame_state::clean_allocatable);
+    CHECK(frame->mode == value_page_frame::open_mode::none);
+    CHECK(frame->class_idx == 0);
+    CHECK(frame->slots_per_page == slots_per_page_for_class(0));
+    CHECK(frame->free_count == 63);
+    CHECK((frame->free_mask & 1ULL) == 0);
+    CHECK((frame->free_mask & (1ULL << 1)) != 0);
+    CHECK(!sched_typed->readonly_cache_.contains(value_frame_id_for(vr.base, 1)));
+
+    env.dev.reset_io_counters();
+    auto got = read_value_sync(sched_base, ctx, vr);
+    CHECK(got == body);
+    CHECK(env.dev.get_read_count() == 0);
+
+    printf("  case_10_partial_page_becomes_clean_allocatable: OK "
+           "(free_count=%u, read hit resident frame)\n",
+           frame->free_count);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_11: next persist reopens clean_allocatable resident frame
+//
+//  The second persist is a separate round. It must consume the resident
+//  clean_allocatable frame from allocatable_frames_[0] instead of allocating
+//  a fresh page, then return it to clean_allocatable after writeback.
+// ════════════════════════════════════════════════════════════════
+
+void case_11_next_round_reopens_clean_allocatable_frame() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string b1 = make_body("r1", 30);
+    std::string b2 = make_body("r2", 30);
+    value_ref vr1{}, vr2{};
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+
+    std::vector<value::put_entry> entries1 = {{b1, &vr1}};
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries1));
+
+    CHECK(sched_typed->allocatable_frames_[0].size() == 1);
+    auto first_base = sched_typed->allocatable_frames_[0].back()->id.base;
+    CHECK(first_base == vr1.base);
+
+    std::vector<value::put_entry> entries2 = {{b2, &vr2}};
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries2));
+
+    CHECK(vr2.base == vr1.base);
+    CHECK(vr2.byte_offset == 64);
+    CHECK(sched_typed->open_frames_[0] == nullptr);
+    CHECK(sched_typed->allocatable_frames_[0].size() == 1);
+
+    auto* frame = sched_typed->allocatable_frames_[0].back();
+    CHECK(frame != nullptr);
+    CHECK(frame->id.base == first_base);
+    CHECK(frame->st == frame_state::clean_allocatable);
+    CHECK(frame->mode == value_page_frame::open_mode::none);
+    CHECK(frame->free_count == 62);
+    CHECK((frame->free_mask & 1ULL) == 0);
+    CHECK((frame->free_mask & (1ULL << 1)) == 0);
+    CHECK((frame->free_mask & (1ULL << 2)) != 0);
+    CHECK(!sched_typed->readonly_cache_.contains(value_frame_id_for(vr1.base, 1)));
+
+    env.dev.reset_io_counters();
+    CHECK(read_value_sync(sched_base, ctx, vr1) == b1);
+    CHECK(read_value_sync(sched_base, ctx, vr2) == b2);
+    CHECK(env.dev.get_read_count() == 0);
+
+    printf("  case_11_next_round_reopens_clean_allocatable_frame: OK "
+           "(same lba=%lu, free_count=%u)\n",
+           static_cast<unsigned long>(vr1.base.lba),
+           frame->free_count);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_12: full page → clean_readonly readonly cache
+//
+//  A full 1-LBA value page has no placement state left. It must not remain
+//  in open/allocatable resident lists; it becomes clean_readonly and enters
+//  readonly_cache_.
+// ════════════════════════════════════════════════════════════════
+
+void case_12_full_page_enters_readonly_cache_only() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string body = make_body("full", 4000);  // class 3, one full LBA
+    value_ref vr{};
+    std::vector<value::put_entry> entries = {{body, &vr}};
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries));
+
+    const auto fid = value_frame_id_for(vr.base, 1);
+    CHECK(sched_typed->open_frames_[3] == nullptr);
+    CHECK(sched_typed->allocatable_frames_[3].empty());
+    CHECK(sched_typed->readonly_cache_.contains(fid));
+
+    {
+        auto pin = sched_typed->readonly_cache_.pin(fid);
+        CHECK(pin.frame != nullptr);
+        CHECK(pin.frame->st == frame_state::clean_readonly);
+        CHECK(pin.frame->byte_len == LBA_SIZE);
+    }
+
+    env.dev.reset_io_counters();
+    CHECK(read_value_sync(sched_base, ctx, vr) == body);
+    CHECK(env.dev.get_read_count() == 0);
+
+    printf("  case_12_full_page_enters_readonly_cache_only: OK\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_13: prepared round exposes open_frames_ until finalize
+//
+//  Step 019 requires open_frames_[ci] to be a real dirty/inflight resident
+//  tier, not a dead read branch. Drive prepare_persist directly so the
+//  round is published but not finalized; read_value must hit open_frames_
+//  with no NVMe read, then finalize(false) must clear the open reference.
+// ════════════════════════════════════════════════════════════════
+
+void case_13_open_frame_visible_until_finalize() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string body = make_body("open", 30);  // class 0, one slot used
+    value_ref vr{};
+    std::vector<value::put_entry> entries = {{body, &vr}};
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+
+    uint64_t round_id = 0;
+    auto prep_ctr = std::make_shared<std::atomic<int>>(0);
+    sched_base->prepare_persist(std::span<value::put_entry>(entries))
+        >> pump::sender::then([&](value::prepare_persist_result res) {
+            auto* leader = std::get_if<value::persist_leader>(&res);
+            CHECK(leader != nullptr);
+            round_id = leader->round_id;
+            CHECK(leader->writes.size() == 1);
+            CHECK(leader->writes[0].lba == vr.base.lba);
+            prep_ctr->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(prep_ctr, 1);
+
+    auto* open = sched_typed->open_frames_[0];
+    CHECK(open != nullptr);
+    CHECK(open->id == value_frame_id_for(vr.base, 1));
+    CHECK(open->st == frame_state::writeback_inflight);
+    CHECK(open->mode == value_page_frame::open_mode::none);
+    CHECK(open->free_count == 63);
+    CHECK(sched_typed->allocatable_frames_[0].empty());
+
+    env.dev.reset_io_counters();
+    CHECK(read_value_sync(sched_base, ctx, vr) == body);
+    CHECK(env.dev.get_read_count() == 0);
+
+    auto finalize_ctr = std::make_shared<std::atomic<int>>(0);
+    sched_base->finalize_persist(round_id, false)
+        >> pump::sender::then([finalize_ctr]() {
+            finalize_ctr->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(finalize_ctr, 1);
+
+    CHECK(sched_typed->open_frames_[0] == nullptr);
+    CHECK(sched_typed->allocatable_frames_[0].empty());
+
+    printf("  case_13_open_frame_visible_until_finalize: OK "
+           "(read hit open_frames before rollback finalize)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -696,6 +969,11 @@ int main() {
     case_6_cross_class();
     case_7_cache_evict();
     case_8_multi_lba_bypass();
+    case_9_value_page_frame_type_contract();
+    case_10_partial_page_becomes_clean_allocatable();
+    case_11_next_round_reopens_clean_allocatable_frame();
+    case_12_full_page_enters_readonly_cache_only();
+    case_13_open_frame_visible_until_finalize();
 
     printf("all passed\n");
     return 0;

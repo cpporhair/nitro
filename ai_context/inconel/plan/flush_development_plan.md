@@ -179,34 +179,36 @@ capture base / pin input
 ### 主要产物
 
 1. tree geometry 的单一来源
-2. `tree_sched` skeleton
-3. `tree_worker_sched` skeleton
-4. registry / builder / read-domain wiring
-5. flush shared headers 的最小骨架
+2. `tree_worker_sched` skeleton
+3. registry / builder / read-domain wiring
+4. flush shared headers 的最小骨架
+5. `tree_sched` 的 landing point 冻结为下一阶段，而不是在本阶段自造 owner state
 
 ### 必须落地的点
 
-1. `tree_read_domain[i] { lookup, worker, cache }` 拓扑
-2. `tree_sched` round owner 的最小 carrier
-3. `tree_worker_sched` 的 sender surface / req-res shape
-4. runtime registry 可以定位 tree owner、lookup shards、worker shards
-5. 先把跨 scheduler 会共用的类型壳子立住：
+1. `tree_read_domain[i] { lookup, worker }` 的 pairing 拓扑先立住；cache ownership migration 延后到 worker 真正开始读 old leaf 前的专门 step
+2. `tree_worker_sched` 的 sender surface / req-res shape
+3. runtime registry 可以定位 lookup shards、worker shards
+4. 先把跨 scheduler 会共用的类型壳子立住：
    - `flush_round_id`
    - `flush_lookup_req`
    - `flush_worker_req`
    - 以及对应 result shell
+5. `tree_sched` 不在本阶段自造 `rounds map` 一类临时 owner state；其正式 skeleton 与 RSM §4.1 对齐，放到下一阶段和 round carrier 一起落
 
 ### 这一步不做
 
 1. `leaf_order`
 2. workset folding
-3. `keys_to_leaf_groups()`
-4. candidate build
+3. `keys_to_leaf_groups()` sender surface 与 mapping 算法
+4. candidate build 算法
 5. tree writes
+6. `tree_sched` runtime install
+7. cache / frame pool / inflight 的 owner 迁移
 
 ### 退出条件
 
-后续步骤可以在不再改 runtime 拓扑的前提下继续往 sender seam 填内容。
+后续步骤可以在不再改 geometry source、lookup/worker pairing、registry/builder wiring 的前提下继续往 sender seam 填内容；`tree_sched` 和 final cache ownership 则留给后续专门阶段收口。
 
 ## Phase 3 — Manifest Carrier 与 Round State
 
@@ -217,18 +219,20 @@ capture base / pin input
 ### 主要产物
 
 1. `tree_manifest.leaf_order`
-2. round-owned immutable arrays / views
-3. `tree_flush_request` / `tree_flush_result`
-4. flush round state carrier
-5. memtable-facing readonly views
+2. `tree_sched` skeleton（与 RSM §4.1 owner state 对齐）
+3. round-owned immutable arrays / views
+4. `tree_flush_request` / `tree_flush_result`
+5. flush round state carrier
+6. memtable-facing readonly views
 
 ### 必须落地的点
 
-1. `leaf_order` 跟 manifest 同生命周期
-2. round state 成为所有中间数组的唯一 owning side
-3. lookup/worker fanout 输入可以只传 span/view
-4. 明确 flush 对现有 `memtable_gen / memtable_entry` 只读依赖的 view/ref 形状
-5. 这一阶段结束后，shared carrier 的 owning side 与 borrowed view 边界固定
+1. `tree_sched` 不再是空 seat；它的 skeleton 与 RSM §4.1 的 owner state 对齐，而不是自造临时字段
+2. `leaf_order` 跟 manifest 同生命周期
+3. round state 成为所有中间数组的唯一 owning side
+4. lookup/worker fanout 输入可以只传 span/view
+5. 明确 flush 对现有 `memtable_gen / memtable_entry` 只读依赖的 view/ref 形状
+6. 这一阶段结束后，shared carrier 的 owning side 与 borrowed view 边界固定
 
 ### 这一步不做
 
@@ -236,10 +240,11 @@ capture base / pin input
 2. lookup mapping 算法
 3. candidate build
 4. tree writes
+5. final cache ownership migration
 
 ### 退出条件
 
-后续所有 sender seam 已经有稳定 carrier 可依赖，不需要边做算法边改 carrier。
+后续所有 sender seam 已经有稳定 carrier 可依赖，不需要边做算法边改 carrier；`tree_sched` 也已经以正式 owner state 形状进入 runtime 设计。
 
 ## Phase 4 — Memtable Fold / Workset
 

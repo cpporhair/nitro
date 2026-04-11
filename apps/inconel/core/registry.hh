@@ -41,6 +41,17 @@ namespace apps::inconel::core::registry {
     };
     inline tree_lookup_list tree_lookup_scheds;
 
+    // tree_worker_sched is non-templated in Phase 2 (step 022 §5, L-14).
+    // Phase 2's pairing seam between a lookup shard and its worker shard
+    // is expressed by "same core of installation" plus a shared
+    // read_domain_index, so a dedicated named tree_read_domain runtime
+    // object is deliberately absent (022 D5, §3, §7).
+    struct tree_worker_list {
+        std::vector<tree::tree_worker_sched*> list;
+        std::vector<tree::tree_worker_sched*> by_core;
+    };
+    inline tree_worker_list tree_worker_scheds;
+
     // value::value_alloc_sched is a global singleton — only one instance
     // exists, pinned to a specific core (cores[0] in the v6 builder). All
     // access goes through value_sched(). The registry stores only the
@@ -75,6 +86,7 @@ namespace apps::inconel::core::registry {
     init_capacity(uint32_t max_cores) {
         nvme_scheds.by_core.assign(max_cores, nullptr);
         tree_lookup_scheds.by_core.assign(max_cores, nullptr);
+        tree_worker_scheds.by_core.assign(max_cores, nullptr);
     }
 
     inline void
@@ -83,6 +95,8 @@ namespace apps::inconel::core::registry {
         nvme_scheds.by_core.clear();
         tree_lookup_scheds.list.clear();
         tree_lookup_scheds.by_core.clear();
+        tree_worker_scheds.list.clear();
+        tree_worker_scheds.by_core.clear();
         value_alloc_sched = nullptr;
     }
 
@@ -117,6 +131,13 @@ namespace apps::inconel::core::registry {
         return s;
     }
 
+    inline tree::tree_worker_sched*
+    local_tree_worker() {
+        auto* s = tree_worker_scheds.by_core[pump::core::this_core_id];
+        assert(s && "current core has no tree_worker scheduler");
+        return s;
+    }
+
     // ── Per-core access by explicit core_id ──
 
     inline mock_nvme::scheduler*
@@ -129,6 +150,11 @@ namespace apps::inconel::core::registry {
         return tree_lookup_scheds.by_core[core];
     }
 
+    inline tree::tree_worker_sched*
+    tree_worker_for_core(uint32_t core) {
+        return tree_worker_scheds.by_core[core];
+    }
+
     // ── Cross-shard access by index ──
 
     inline tree::tree_lookup_sched_base*
@@ -136,9 +162,19 @@ namespace apps::inconel::core::registry {
         return tree_lookup_scheds.list[idx % tree_lookup_scheds.list.size()];
     }
 
+    inline tree::tree_worker_sched*
+    tree_worker_at(uint32_t idx) {
+        return tree_worker_scheds.list[idx % tree_worker_scheds.list.size()];
+    }
+
     inline uint32_t
     tree_lookup_count() {
         return static_cast<uint32_t>(tree_lookup_scheds.list.size());
+    }
+
+    inline uint32_t
+    tree_worker_count() {
+        return static_cast<uint32_t>(tree_worker_scheds.list.size());
     }
 
     inline uint32_t

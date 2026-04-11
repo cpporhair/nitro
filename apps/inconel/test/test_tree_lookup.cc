@@ -27,6 +27,11 @@ using namespace apps::inconel::mock_nvme;
 
 constexpr uint32_t PS  = 4096;
 constexpr uint32_t LBS = 4096;
+const tree_geometry kTreeGeom{
+    .lba_size = LBS,
+    .tree_page_size = PS,
+    .shadow_slots_per_range = 1,
+};
 
 // ── Helpers ──
 
@@ -88,7 +93,7 @@ struct test_env {
     test_env()
         : dev(PS * 8192, LBS)
         , nvme_sched(&dev)
-        , tree_sched(clock_cache(32)) {
+        , tree_sched(0, &kTreeGeom, clock_cache(32)) {
         build();
         // Single-thread test runs everything on this_core_id == 0; register
         // both schedulers there so the sender's local_nvme() lookup works.
@@ -134,8 +139,7 @@ private:
             {{"e", {0, 2000}}, {"j", {0, 2004}}, {"p", {0, 2008}}},
             {0, 2012});
 
-        manifest.tree_page_size = PS;
-        manifest.lba_size = LBS;
+        manifest.geom = &kTreeGeom;
         manifest.root_slot = {0, 1000};
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
@@ -234,7 +238,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
     // Build a fresh tree env (isolated from other tests' global env).
     mock_device dev(PS * 8192, LBS);
     scheduler nvme_sched(&dev);
-    tree_lookup_sched<Cache> tree_sched(std::move(cache));
+    tree_lookup_sched<Cache> tree_sched(0, &kTreeGeom, std::move(cache));
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
@@ -262,8 +266,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
     write_internal(dev, 1000,
         {{"e", {0, 2000}}, {"j", {0, 2004}}, {"p", {0, 2008}}}, {0, 2012});
 
-    manifest.tree_page_size = PS;
-    manifest.lba_size = LBS;
+    manifest.geom = &kTreeGeom;
     manifest.root_slot = {0, 1000};
     for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                           3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
@@ -335,8 +338,8 @@ static void test_cache_eviction(Cache cache, const char* label) {
 static void test_empty_tree() {
     mock_device dev(PS * 1024, LBS);
     scheduler ns(&dev);
-    tree_lookup_sched<clock_cache> ts(clock_cache(8));
-    auto m = tree_manifest::empty(PS, LBS);
+    tree_lookup_sched<clock_cache> ts(0, &kTreeGeom, clock_cache(8));
+    auto m = tree_manifest::empty(&kTreeGeom);
 
     registry::clear();
     registry::init_capacity(8);

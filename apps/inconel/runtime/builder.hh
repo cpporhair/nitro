@@ -2,6 +2,7 @@
 #define APPS_INCONEL_RUNTIME_BUILDER_HH
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -11,6 +12,7 @@
 
 #include "../core/page_cache.hh"
 #include "../core/registry.hh"
+#include "../core/tree_geometry.hh"
 #include "../format/format_profile.hh"
 #include "../format/types.hh"
 #include "../mock_nvme/scheduler.hh"
@@ -27,13 +29,42 @@ namespace apps::inconel::runtime {
     // other (or different capacities). This template is the only place the
     // cache parameters appear at the runtime level — application code
     // interacts with schedulers via the non-templated core::runtime registry.
+    //
+    // Step 022 Phase 2 extends the tuple from 3 to 4 scheduler types by
+    // adding `tree::tree_worker_sched` between `tree_lookup_sched` and
+    // `value_alloc_sched`. Worker is non-templated in Phase 2 (cache /
+    // frame pool / inflight still lookup-local, see 022 §3, L-14); when
+    // the cache ownership migration step before Phase 5/6 lands, the
+    // worker will be templated on the same `TreeCache` as the lookup
+    // shard it pairs with.
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
         tree::tree_lookup_sched<TreeCache>,
+        tree::tree_worker_sched,
         value::value_alloc_sched<ValueCache>
     >;
+
+    // ── Bootstrap tree geometry ──
+    //
+    // Step 022 D3 / §1 约束 3: the tree geometry runtime carrier is
+    // constructed by the builder, and the bootstrap values are copied
+    // straight out of `format::kBootstrapFormatProfile` — the profile
+    // remains the single source of truth, this constant is just a
+    // runtime-shaped view of the same numbers. No independent
+    // "constexpr tree_geometry k{...}" with hand-written values is
+    // allowed here.
+    //
+    // Once INC-031 / INC-035 land, recovery will replace this
+    // compile-time constant with a runtime `tree_geometry` populated
+    // from the superblock it just read.
+
+    inline constexpr core::tree_geometry kBootstrapTreeGeometry = {
+        .lba_size               = format::kBootstrapFormatProfile.lba_size,
+        .tree_page_size         = format::kBootstrapFormatProfile.tree_page_size,
+        .shadow_slots_per_range = format::kBootstrapFormatProfile.shadow_slots_per_range,
+    };
 
     // ── Build context ──
     //
@@ -158,6 +189,42 @@ namespace apps::inconel::runtime {
             // cs == profile.lba_size is always a valid LBA-equal class.
         }
 
+        // Tree parameters (step 022 G1). `profile_is_self_consistent`
+        // already encodes the same invariants at compile time for
+        // `kBootstrapFormatProfile`, but the runtime leg is retained
+        // with a readable error message so a future dynamic profile
+        // (populated from a superblock after INC-031 / INC-035) goes
+        // through the same gate.
+        if (profile.tree_page_size == 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.tree_page_size is 0");
+        }
+        if (profile.tree_page_size % profile.lba_size != 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.tree_page_size is not "
+                "an integral multiple of profile.lba_size");
+        }
+        if (profile.shadow_slots_per_range == 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.shadow_slots_per_range is 0");
+        }
+        // M-2 (review §1): the cache key `memory::frame_id::span_lbas`
+        // is a uint16_t, and `make_tree_frame_id` feeds it
+        // `tree_page_size / lba_size` via a static_cast that would
+        // silently truncate. Reject any profile whose page_lbas
+        // overflows that width at build time so the truncation path
+        // can never be reached at runtime.
+        {
+            const uint64_t page_lbas =
+                static_cast<uint64_t>(profile.tree_page_size) / profile.lba_size;
+            if (page_lbas > std::numeric_limits<uint16_t>::max()) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile.tree_page_size / "
+                    "profile.lba_size exceeds uint16_t capacity of "
+                    "memory::frame_id::span_lbas");
+            }
+        }
+
         // ── tier 3: profile ↔ device agreement ──
         if (opts.device->get_lba_size() != profile.lba_size) {
             throw std::invalid_argument(
@@ -209,14 +276,30 @@ namespace apps::inconel::runtime {
         auto* rt = new inconel_runtime_t<TreeCache, ValueCache>();
 
         bool first = true;
+        // Step 022 §3 / §7 / §8: the read-domain pairing seam is
+        // expressed by "same-core install + shared read_domain_index".
+        // No named tree_read_domain runtime object is materialized;
+        // lookup and worker on the same core simply receive the same
+        // index value.
+        uint32_t next_read_domain_index = 0;
         for (uint32_t core : opts.cores) {
             // PUMP per_core::queue routes by this_core_id, so it must be set
             // before constructing schedulers that hold such queues.
             pump::core::this_core_id = core;
 
+            const uint32_t read_domain_index = next_read_domain_index++;
+
             auto* nvme = new mock_nvme::scheduler(opts.device);
+            // H-1 (review §1): every tree_lookup_sched is locked to a
+            // single tree_geometry instance — namely the bootstrap one
+            // owned by this translation unit. Any manifest fed to
+            // `process()` later on is asserted to reference the same
+            // pointer, so free-frame reuse cannot cross page sizes.
             auto* tlookup = new tree::tree_lookup_sched<TreeCache>(
+                read_domain_index,
+                &kBootstrapTreeGeometry,
                 TreeCache(opts.tree_cache_capacity));
+            auto* tworker = new tree::tree_worker_sched(read_domain_index);
 
             // Singleton: value_alloc_sched is pinned to cores[0]. Every other
             // core gets a nullptr placeholder so the PUMP per-core tuple shape
@@ -233,14 +316,17 @@ namespace apps::inconel::runtime {
                 core::registry::value_alloc_sched = value_sched;
             }
 
-            // PUMP runtime (typed)
-            rt->add_core_schedulers(core, nvme, tlookup, value_sched);
+            // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
+            // nvme, tree_lookup, tree_worker, value_alloc.
+            rt->add_core_schedulers(core, nvme, tlookup, tworker, value_sched);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme);
             core::registry::nvme_scheds.by_core[core] = nvme;
             core::registry::tree_lookup_scheds.list.push_back(tlookup);
             core::registry::tree_lookup_scheds.by_core[core] = tlookup;
+            core::registry::tree_worker_scheds.list.push_back(tworker);
+            core::registry::tree_worker_scheds.by_core[core] = tworker;
 
             first = false;
         }
@@ -249,11 +335,16 @@ namespace apps::inconel::runtime {
     }
 
     // ── tear_down: free schedulers + clear registry ──
+    //
+    // Destroy order follows step 022 §8: worker → lookup → value → nvme.
+    // In Phase 2 no cache ownership has been migrated, so frame
+    // destruction still happens inside `~tree_lookup_sched` (not in the
+    // worker, not in a named tree_read_domain).
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
-        for (auto* s : core::registry::nvme_scheds.list)         delete s;
+        for (auto* s : core::registry::tree_worker_scheds.list) delete s;
         for (auto* s : core::registry::tree_lookup_scheds.list) {
             delete static_cast<tree::tree_lookup_sched<TreeCache>*>(s);
         }
@@ -261,6 +352,7 @@ namespace apps::inconel::runtime {
             using value_sched_t = value::value_alloc_sched<ValueCache>;
             delete static_cast<value_sched_t*>(core::registry::value_alloc_sched);
         }
+        for (auto* s : core::registry::nvme_scheds.list) delete s;
         core::registry::clear();
         delete rt;
     }

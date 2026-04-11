@@ -34,6 +34,11 @@ using namespace apps::inconel::mock_nvme;
 
 constexpr uint32_t PS  = 4096;
 constexpr uint32_t LBS = 4096;
+const tree_geometry kTreeGeom{
+    .lba_size = LBS,
+    .tree_page_size = PS,
+    .shadow_slots_per_range = 1,
+};
 
 // ── Tree builder ──
 
@@ -102,8 +107,7 @@ private:
         write_internal(dev, 1000,
             {{"e", {0, 2000}}, {"j", {0, 2004}}, {"p", {0, 2008}}}, {0, 2012});
 
-        manifest.tree_page_size = PS;
-        manifest.lba_size = LBS;
+        manifest.geom = &kTreeGeom;
         manifest.root_slot = {0, 1000};
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
@@ -114,8 +118,8 @@ private:
 struct core_schedulers {
     scheduler nvme_sched;
     tree_lookup_sched<clock_cache> tree_sched;
-    core_schedulers(mock_device* dev)
-        : nvme_sched(dev), tree_sched(clock_cache(32)) {}
+    core_schedulers(mock_device* dev, uint32_t read_domain_index)
+        : nvme_sched(dev), tree_sched(read_domain_index, &kTreeGeom, clock_cache(32)) {}
     void advance() { tree_sched.advance(); nvme_sched.advance(); }
 };
 
@@ -126,8 +130,8 @@ int main() {
     const size_t N = td.all_records.size();  // 400
     printf("  built 3-level tree: %zu keys\n", N);
 
-    core_schedulers core2(&td.dev);
-    core_schedulers core4(&td.dev);
+    core_schedulers core2(&td.dev, 0);
+    core_schedulers core4(&td.dev, 1);
 
     // Register both core's schedulers — sender::lookup() uses
     // registry::local_nvme() which indexes by this_core_id.

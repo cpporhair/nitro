@@ -56,6 +56,11 @@ constexpr uint64_t DATA_AREA_BASE_LBA  = 4000;     // value data area lower
 constexpr uint64_t DATA_AREA_END_LBA   = 8000;     // bumps from here downward
 
 constexpr uint32_t VALUE_CLASS_SIZE = 256;         // sub-LBA, 16 slots/LBA
+const tree_geometry kTreeGeom{
+    .lba_size = LBA_SIZE,
+    .tree_page_size = TREE_PAGE_SIZE,
+    .shadow_slots_per_range = 1,
+};
 
 const std::vector<uint32_t> CLASS_SIZES = {
     64, 256, 1024, 4096, 16384,
@@ -101,7 +106,7 @@ struct test_env {
     explicit test_env(uint32_t value_cache_cap = 32)
         : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE)
         , nvme_sched(&dev)
-        , tree_sched(clock_cache(32))
+        , tree_sched(0, &kTreeGeom, clock_cache(32))
         , value_sched(std::span<const uint32_t>(CLASS_SIZES),
                       LBA_SIZE,
                       paddr{0, DATA_AREA_BASE_LBA},
@@ -170,8 +175,7 @@ private:
     }
 
     void configure_manifest() {
-        manifest.tree_page_size = TREE_PAGE_SIZE;
-        manifest.lba_size       = LBA_SIZE;
+        manifest.geom           = &kTreeGeom;
         manifest.root_slot      = paddr{0, LEAF_LBA};
         manifest.slot_map[paddr{0, LEAF_LBA}] = 0;
     }

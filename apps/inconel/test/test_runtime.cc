@@ -43,6 +43,11 @@ using namespace apps::inconel;
 
 constexpr uint32_t PS  = 4096;
 constexpr uint32_t LBS = 4096;
+const tree_geometry kTreeGeom{
+    .lba_size = LBS,
+    .tree_page_size = PS,
+    .shadow_slots_per_range = 1,
+};
 
 template <typename T>
 concept has_value_class_sizes_option = requires(T t) { t.value_class_sizes; };
@@ -139,8 +144,7 @@ private:
         write_internal(dev, 1000,
             {{"e", {0, 2000}}, {"j", {0, 2004}}, {"p", {0, 2008}}}, {0, 2012});
 
-        manifest.tree_page_size = PS;
-        manifest.lba_size = LBS;
+        manifest.geom = &kTreeGeom;
         manifest.root_slot = {0, 1000};
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
@@ -166,6 +170,7 @@ static void test_registry_population(const char* label) {
     // 1. List counts match the number of populated cores.
     CHECK(core::registry::nvme_count() == cores.size());
     CHECK(core::registry::tree_lookup_count() == cores.size());
+    CHECK(core::registry::tree_worker_count() == cores.size());
 
     // 2. by_core is filled exactly for the listed cores, nullptr elsewhere.
     for (uint32_t c = 0; c < std::thread::hardware_concurrency(); ++c) {
@@ -180,11 +185,13 @@ static void test_registry_population(const char* label) {
     for (uint32_t c : cores) {
         auto* nvme_p = rt->template get_by_core<mock_nvme::scheduler>(c);
         auto* tlookup_p = rt->template get_by_core<tree_lookup_sched<Cache>>(c);
+        auto* tworker_p = rt->template get_by_core<tree_worker_sched>(c);
         CHECK(nvme_p == core::registry::nvme_for_core(c));
         // tree_lookup is registered as base in the application registry,
         // but PUMP holds the full derived type. Compare via base upcast.
         CHECK(static_cast<tree_lookup_sched_base*>(tlookup_p) ==
                core::registry::tree_lookup_for_core(c));
+        CHECK(tworker_p == core::registry::tree_worker_for_core(c));
     }
 
     // 4. Standard runtime construction always installs the value singleton

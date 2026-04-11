@@ -57,6 +57,21 @@ namespace apps::inconel::format {
         uint8_t  value_class_count;
         uint32_t value_class_sizes[kMaxValueClassCount];
 
+        // ── tree parameters (step 022 / Phase 2 G1-G2) ──
+        //
+        // Added so the tree runtime has a single bootstrap source for the
+        // ODF §4.1 parameters it actually consumes. Runtime carrier lives in
+        // core/tree_geometry.hh; builder copies the two fields out of
+        // `kBootstrapFormatProfile` into a `tree_geometry` instance that every
+        // tree-side consumer references.
+        //
+        // Neither field has a compile-time-baked expected value. v1 tree page
+        // must be a multiple of `lba_size` and at least one LBA wide; shadow
+        // range must hold at least one slot. Anything else is a format drift
+        // and `profile_is_self_consistent` below must reject it.
+        uint32_t tree_page_size;
+        uint32_t shadow_slots_per_range;
+
         constexpr std::span<const uint32_t>
         class_sizes() const noexcept {
             return std::span<const uint32_t>(value_class_sizes, value_class_count);
@@ -81,6 +96,15 @@ namespace apps::inconel::format {
     //        - sub-LBA  (cs <  lba_size): lba_size % cs == 0
     //        - LBA-equal (cs == lba_size): always ok
     //        - multi-LBA (cs >  lba_size): cs % lba_size == 0
+    //   8. tree_page_size > 0 and an integral multiple of lba_size
+    //      (ODF §4.1 — a tree page occupies a whole number of LBAs).
+    //   9. shadow_slots_per_range >= 1
+    //      (ODF §4.1 / §10.7 — a shadow range must hold at least one slot).
+    //
+    // Rules 8 and 9 never bake in a specific numeric value: both 4 KiB and
+    // 64 KiB tree pages must satisfy them, and the bootstrap constant below
+    // can be rewritten to any other LBA-aligned page size without touching
+    // this predicate.
 
     constexpr bool
     profile_is_self_consistent(const format_profile& p) noexcept {
@@ -106,6 +130,12 @@ namespace apps::inconel::format {
             }
             // cs == p.lba_size is always a valid LBA-equal class.
         }
+
+        // ── tree parameters ──
+        if (p.tree_page_size == 0) return false;
+        if (p.tree_page_size % p.lba_size != 0) return false;
+        if (p.shadow_slots_per_range == 0) return false;
+
         return true;
     }
 
@@ -119,11 +149,23 @@ namespace apps::inconel::format {
     // `static_assert` below will fire on drift.
 
     inline constexpr format_profile kBootstrapFormatProfile = {
-        .lba_size             = 4096,
-        .value_data_area_base = paddr{0, 4000},
-        .value_data_area_end  = paddr{0, 8000},
-        .value_class_count    = 5,
-        .value_class_sizes    = { 64, 256, 1024, 4096, 16384 },
+        .lba_size               = 4096,
+        .value_data_area_base   = paddr{0, 4000},
+        .value_data_area_end    = paddr{0, 8000},
+        .value_class_count      = 5,
+        .value_class_sizes      = { 64, 256, 1024, 4096, 16384 },
+        // tree geometry bootstrap template. Both numbers are dev-time
+        // defaults — `profile_is_self_consistent` only enforces the
+        // LBA-alignment and non-zero invariants, not these specific
+        // values. Any LBA-aligned tree_page_size and any
+        // shadow_slots_per_range >= 1 must work end to end. The
+        // current values match the minimal shape the existing runtime
+        // fixtures exercise (single-LBA page, single-slot shadow
+        // range); they are neither a ceiling nor a requirement, and
+        // none of the production code paths are allowed to assume
+        // them.
+        .tree_page_size         = 4096,
+        .shadow_slots_per_range = 1,
     };
 
     static_assert(profile_is_self_consistent(kBootstrapFormatProfile),

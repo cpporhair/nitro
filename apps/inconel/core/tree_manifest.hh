@@ -17,16 +17,27 @@
 
 #include "../format/types.hh"
 #include "./panic.hh"
+#include "./tree_geometry.hh"
 
 namespace apps::inconel::core {
 
     using format::paddr;
 
+    // ── tree_manifest ─────────────────────────────────────────────
+    //
+    // Immutable runtime snapshot of the B+tree on-disk layout (RSM §4.5).
+    // Step 022 (Phase 2 M-5 / §2) changed the geometry access from two
+    // inline fields (`tree_page_size / lba_size`) to a single
+    // `const tree_geometry*`, so a reader-side snapshot no longer has
+    // to carry writer-only parameters like `shadow_slots_per_range` by
+    // value. The pointee is owned by the runtime builder and outlives
+    // every manifest snapshot it produces, so there is no lifetime
+    // concern for readers.
+
     struct tree_manifest {
         paddr root_slot;
         absl::flat_hash_map<paddr, uint32_t> slot_map;
-        uint32_t tree_page_size;
-        uint32_t lba_size;
+        const tree_geometry* geom;
 
         bool
         has_root() const {
@@ -50,18 +61,43 @@ namespace apps::inconel::core {
                     static_cast<unsigned long>(range_base.lba));
             }
             uint32_t idx = it->second;
-            return { range_base.device_id,
-                     range_base.lba + static_cast<uint64_t>(idx) * (tree_page_size / lba_size) };
+            // M-3 (review §1): an in-bounds `range_base` with an
+            // out-of-range slot index is the same class of
+            // unrecoverable manifest corruption as a missing
+            // range_base — `slot_paddr()` would otherwise cheerfully
+            // compute an address outside the shadow range and the
+            // lookup would read whatever happens to be on disk there.
+            if (idx >= geom->shadow_slots_per_range) {
+                panic_inconsistency("tree_manifest::resolve",
+                    "slot_index out of range dev=%u lba=%lu idx=%u shadow_slots=%u",
+                    static_cast<unsigned>(range_base.device_id),
+                    static_cast<unsigned long>(range_base.lba),
+                    static_cast<unsigned>(idx),
+                    static_cast<unsigned>(geom->shadow_slots_per_range));
+            }
+            return geom->slot_paddr(range_base, idx);
         }
 
         uint32_t
         page_lbas() const {
-            return tree_page_size / lba_size;
+            return geom->page_lbas();
         }
 
         static tree_manifest
-        empty(uint32_t tps, uint32_t lbs) {
-            return { .root_slot = {0, 0}, .slot_map = {}, .tree_page_size = tps, .lba_size = lbs };
+        empty(const tree_geometry* g) {
+            // M-2 (review round 2): `tree_manifest::geom` is a
+            // non-owning raw pointer, so the non-null contract has
+            // to live in every factory. Aggregate init with
+            // `.geom = nullptr` can still bypass this helper —
+            // callers that hand-build manifests get checked at the
+            // consumer side (e.g. `make_lookup_state`), but
+            // factory-built ones are caught here before the corrupt
+            // state ever reaches a consumer.
+            if (g == nullptr) {
+                panic_inconsistency("tree_manifest::empty",
+                    "tree_geometry pointer must not be null");
+            }
+            return { .root_slot = {0, 0}, .slot_map = {}, .geom = g };
         }
     };
 

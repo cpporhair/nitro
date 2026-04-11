@@ -1,6 +1,30 @@
 #ifndef APPS_INCONEL_TREE_SENDER_HH
 #define APPS_INCONEL_TREE_SENDER_HH
 
+// ── tree/sender.hh ── module-facing facade (step 022 §9, D12) ──
+//
+// This header is the single entry point external modules use to talk
+// to the tree domain (see `code_modules.md` §L2.tree). It explicitly
+// #includes the split sub-headers so both the public PUMP senders and
+// their `op_pusher` / `compute_sender_type` specializations become
+// visible in any translation unit that consumes the facade:
+//
+//   - `lookup_scheduler.hh` — point-read `process(state)` sender,
+//     submit_cache sender, the existing `lookup(...)` free function.
+//   - `worker_scheduler.hh` — Phase 2 `build_leaf_candidates(...)`
+//     sender returning an `unsupported_unimplemented`
+//     `flush_candidate_batch`. Real candidate build arrives in
+//     Phase 6.
+//
+// Adding a future tree-side public sender means:
+//   1. Define the op/sender and its PUMP specializations inside the
+//      owning sub-header.
+//   2. Add a free-function wrapper in this facade header (or let
+//      callers reach the underlying sender directly — see
+//      `build_leaf_candidates` below).
+//
+// External modules should not #include the sub-headers directly.
+
 #include "pump/core/meta.hh"
 #include "pump/coro/coro.hh"
 #include "pump/sender/generate.hh"
@@ -11,7 +35,8 @@
 #include "pump/sender/get_context.hh"
 #include "pump/sender/pop_context.hh"
 
-#include "./scheduler.hh"
+#include "./lookup_scheduler.hh"
+#include "./worker_scheduler.hh"
 #include "../core/registry.hh"
 #include "../mock_nvme/sender.hh"
 
@@ -89,6 +114,19 @@ namespace apps::inconel::tree {
                     });
             }
         );
+    }
+
+    // ── build_leaf_candidates (Phase 2 worker skeleton surface) ──
+    //
+    // Facade wrapper over `tree_worker_sched::submit_build`. In Phase 2
+    // the underlying handle always returns a
+    // `flush_candidate_batch { st = unsupported_unimplemented }` via
+    // the value path — this entry exists so any later sender pipeline
+    // that will eventually drive real candidate build can already
+    // reference a stable public name from `tree/sender.hh`.
+    inline auto
+    build_leaf_candidates(tree_worker_sched* worker, flush_worker_req req) {
+        return worker->submit_build(req);
     }
 
 }

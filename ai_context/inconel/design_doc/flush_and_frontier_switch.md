@@ -38,7 +38,7 @@ gen.max_lsn <= 当前已发布 durable_lsn → flush eligible
 2. 向每个 front_sched 投递 collect_eligible_gens(frontier.durable_lsn) 请求
 3. 每个 front_sched 回复：
    eligible_gens = [ gen for gen in imms if gen.max_lsn <= frontier.durable_lsn ]
-   // 返回的是 intrusive_ptr 引用，保证 gen 在 flush 期间不被释放
+   // 返回的是 std::shared_ptr<memtable_gen>，保证 gen 在 flush 期间不被释放
 4. reduce() 汇总所有 front_scheds 的 eligible gens
 ```
 
@@ -123,7 +123,7 @@ tree_local_flush(base_guard, sealed_gens, recovery_safe_lsn)
 Fold 的目标：对每个逻辑 key 计算本轮进入 tree-local flush 的 memtable winner，并把 losers 挂到各自 owning gen。
 
 ```text
-for each logical_key in sorted(memtable keys from sealed_gens):
+for each key (std::string_view) in sorted(memtable keys from sealed_gens):
     all_entries = 收集该 key 在所有选中 gens 中的 entries
     memtable_winner = max_by_data_ver(all_entries)
 
@@ -132,7 +132,7 @@ for each logical_key in sorted(memtable keys from sealed_gens):
             entry.owning_gen.loser_durable_refs.push({ entry.vh.durable, entry.data_ver })
 
     emit flush_key_group {
-        key,
+        key,              // string_view into winner's owning gen kv_arena
         memtable_winner,
         owning_gen,
     }
@@ -447,11 +447,13 @@ new CAT2 installed
   │               │
   │               ├── fronts vector → 析构
   │               │   │
-  │               │   └── 各 front_read_set 中 memtable_gen 的 intrusive_ptr ref--
+  │               │   └── 各 front_read_set 中 std::shared_ptr<memtable_gen> use_count--
   │               │       │
   │               │       └── 如果 gen ref → 0：
-  │               │           ├── gen 析构 → memtable_entry 析构
-  │               │           │   ├── value_handle 析构 → hot_blob ref--
+  │               │           ├── gen 析构（反向声明顺序）
+  │               │           │   ├── table 先析构（POD entries，trivial）
+  │               │           │   ├── kv_arena 后析构 → vector<unique_ptr<char[]>>
+  │               │           │   │   → 所有 chunk 一次 sweep → key/value bytes 全部消失
   │               │           │   └── （durable value_ref 不在此释放）
   │               │           └── gen.loser_durable_refs 进入回收判定
   │               │

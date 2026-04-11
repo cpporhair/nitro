@@ -554,7 +554,7 @@ recovered_max_lsn = max(
 
 // Step 12: 安装新 active memtables + 初始化 value allocator 输入
 for each front_sched (0 .. front_sched_count-1):
-    front.active = new memtable_gen { gen_id = next_gen_id++, st = active }
+    front.active = std::make_shared<memtable_gen>(gen_id = next_gen_id++, st = active)
     front.imms = []
     front.wal = 新的空 wal_stream_state
 

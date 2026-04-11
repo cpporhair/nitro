@@ -568,7 +568,7 @@ else:  // sub-LBA class, v1 page-based realization
 | 场景 | 是否校验 CRC |
 |------|-------------|
 | 前台 PUT 写入后 | 不需要（刚写的数据） |
-| memtable hit 读 | 不需要（走 hot_blob，不读盘） |
+| memtable hit 读 | 不需要（走 owning gen 的 `kv_arena` 切片，不读盘） |
 | tree hit → value read | 需要（从 SSD 读回，校验完整性） |
 | recovery | v1 不校验 value body（概要 §12.3 第 8 点） |
 

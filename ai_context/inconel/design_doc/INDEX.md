@@ -114,7 +114,7 @@ coord: canonicalize → assign_lsn
 | §6 Range Scan | memtable scan + tree scan + merge | 范围查询 |
 | §7 Tombstone 读语义 | 不穿透、遮蔽、range scan 影响 | tombstone 处理 |
 | §8 长读资源限制 | 超时/代距/内存背压策略 | 防资源泄漏 |
-| §9 Page/Frame Cache 模型 | tree-node cache、value read、hot_blob | 缓存集成 |
+| §9 Page/Frame Cache 模型 | tree-node cache、value read、memtable kv_arena 独立 | 缓存集成 |
 | §11 可见性判定总结 | 单条 winner 规则、永不回退 | 正确性审查 |
 
 **Point GET 关键路径：**
@@ -177,7 +177,7 @@ coord: acquire_read_handle → (cat, read_lsn)
 | 章节 | 内容 | 实现时查阅场景 |
 |------|------|---------------|
 | §2 对象分类（9 类） | 正确性 owner / cache / 放置元数据 | 确认对象生命周期 |
-| §3 正确性 Owner 图 | pin 链: read_handle → cat → prs → {fronts[], guard} → manifest, hot_blob | 理解引用关系 |
+| §3 正确性 Owner 图 | pin 链: read_handle → cat → prs → {fronts[] → shared_ptr<memtable_gen> → kv_arena, guard → manifest} | 理解引用关系 |
 | §5 Frame 抽象 | frame_id, frame_state, page_frame, value_page_frame | 实现 I/O buffer 管理 |
 | §6-7 SPDK DMA Pool | 按 size+NUMA 分池、per-core cache、跨 shard 流程 | DMA 内存分配 |
 | §9 Value 放置 + 状态耦合 | dirty_append/dirty_hole_fill/clean_readonly | value 写入策略 |

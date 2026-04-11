@@ -396,18 +396,33 @@ append_wal_entries_fua(frag)
 ```text
 insert_memtable_entries(frag):
     for entry in frag.entries:
+        // Probe-then-allocate for key: 避免同 gen 重复 key 浪费 arena
+        string_view incoming_key{entry.key}
+        it = active->table.find(incoming_key)
+        if (it == active->table.end()):
+            string_view arena_key =
+                active->kv_arena.allocate(entry.key.data(), entry.key.size())
+            it = active->table.try_emplace(arena_key).first
+
         if entry.op_type == PUT:
-            hot = make_hot_blob(entry.value_data, entry.value_len)
-            vh = value_handle { durable = entry.allocated_vr, hot = hot }
-            active->insert(entry.key, memtable_entry {
+            // Value bytes 同 arena：得到 value_view
+            string_view val_slice =
+                active->kv_arena.allocate(entry.value_data, entry.value_len)
+            value_view hot = { val_slice.data(), val_slice.size() }
+
+            it->second.push_back(memtable_entry {
                 data_ver = frag.batch_lsn,
-                kind     = value,
-                vh       = vh,
+                k        = memtable_entry::kind::value,
+                vh       = value_handle {
+                    durable = entry.allocated_vr,
+                    hot     = hot,
+                },
             })
         else:
-            active->insert(entry.key, memtable_entry {
+            it->second.push_back(memtable_entry {
                 data_ver = frag.batch_lsn,
-                kind     = tombstone,
+                k        = memtable_entry::kind::tombstone,
+                vh       = {},                              // hot = {nullptr, 0}
             })
 
     active->max_lsn = max(active->max_lsn, frag.batch_lsn)

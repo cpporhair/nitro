@@ -298,8 +298,8 @@ struct front_state {
     uint32_t owner_id;                              // 该 front scheduler 的编号
 
     // ── Memtable ──
-    intrusive_ptr<memtable_gen> active;              // 当前写入目标
-    small_vector<intrusive_ptr<memtable_gen>, 8> imms;  // sealed gens（newest → oldest）
+    std::shared_ptr<memtable_gen> active;             // 当前写入目标
+    small_vector<std::shared_ptr<memtable_gen>, 8> imms;  // sealed gens（newest → oldest）
 
     // ── WAL Stream ──
     wal_stream_state wal;                            // WAL 追加状态
@@ -317,20 +317,47 @@ struct memtable_gen {
     uint64_t min_lsn = UINT64_MAX;                   // 该 gen 中最小 batch_lsn
     uint64_t max_lsn = 0;                            // 该 gen 中最大 batch_lsn
 
+    // ── Per-gen bump arena ──
+    // kv_arena 同时持有 key bytes 与 value bytes。
+    //   - key 通过 table 的 std::string_view 指向 arena 切片
+    //   - value 通过 memtable_entry.vh.hot (value_view) 指向 arena 切片
+    // 单 writer（owning front_sched）、随 gen shared_ptr 一起生灭。
+    gen_arena kv_arena;
+
     // ── 索引结构 ──
-    // btree_map：cache 友好的 B-tree 有序容器（类似 absl::btree_map）
-    // 选择理由：单线程 scheduler 不需要 skip list 的无锁并发；
-    //   btree 宽节点 cache 局部性好，兼顾 O(log n) 写入和 O(k) range scan
-    // 语义约束：
-    //   - 按 logical key 有序
+    // key 类型是 std::string_view，指向 kv_arena。
+    //   - 按 key 字节序有序
     //   - 同 key 可存多个版本，按 data_ver 降序排列
-    btree_map<logical_key, small_vector<memtable_entry, 1>> table;
+    //   - 声明顺序在 kv_arena 之后，保证反向析构时 table 先于 arena 析构
+    absl::btree_map<std::string_view,
+                    absl::InlinedVector<memtable_entry, 1>> table;
 
     // ── 回收 ──
     retire_list<retired_value_ref> loser_durable_refs; // fold 输家的 {value_ref, data_ver}
-    std::atomic<uint32_t> ref_count;                 // 被 published_read_set 引用计数
+};
+
+// Per-gen bump allocator. 64KB chunk，超长 allocation 独占 chunk。
+struct gen_arena {
+    static constexpr std::size_t kChunkBytes = 64 * 1024;
+    std::vector<std::unique_ptr<char[]>> chunks;
+    char* bump_next = nullptr;
+    char* bump_end  = nullptr;
+
+    // Copy len bytes from src into arena, return view over slice.
+    // View validity = this arena's validity (= owning gen's validity).
+    std::string_view allocate(const char* src, std::size_t len);
 };
 ```
+
+**生命周期管理**：`memtable_gen` 本身**不**嵌 refcount。所有跨域引用（PRS、`front_state.active/imms`、flush round state）都通过 `std::shared_ptr<memtable_gen>` 持有，control block 里的 atomic 就是整条 pin 链的唯一 gate。构造走 `std::make_shared<memtable_gen>(...)`（object + control block 一次分配）。
+
+**kv_arena 的存在理由**：
+1. **消灭每 entry 的 per-key heap 分配**：insert 热路径从 `malloc + memcpy` 变成 `bump + memcpy`。
+2. **消灭每 PUT 的 `hot_blob` 独立分配**：value bytes 和 key bytes 住同一个 arena，无独立对象、无 deleter、无 `unique_ptr`。
+3. **批量释放**：gen 析构一次 sweep 释放所有 chunk，不是百万次 delete。
+4. **POD-friendly**：`memtable_entry` 与 `value_handle` 都变成 trivially copyable POD，`absl::InlinedVector` 的 relocate 走 trivial `memcpy` 路径。
+
+**为什么 shared_ptr 而不是 intrusive_ptr**：gen 量级小（每 front 几到十几个），shared_ptr 的 16B pointer + 融合 control block 总占用远小于写一套 intrusive_ptr glue 的维护成本；`memtable_gen` 既不需要 `shared_from_this` 也不需要 `weak_ptr`，切 shared_ptr 没有 corner case。
 
 ### 3.3 `memtable_entry`
 
@@ -340,19 +367,22 @@ struct memtable_entry {
 
     enum class kind : uint8_t { value, tombstone } k;
 
-    // kind == value 时有效：
+    // kind == value 时有效；memtable_entry 整体是 trivially copyable POD
     value_handle vh;
 };
 
+// POD：durable 是盘上位置；hot 是 value bytes 的视图，指向 owning
+// memtable_gen 的 kv_arena 切片。
 struct value_handle {
-    value_ref durable;                              // 稳定的盘上定位
-    intrusive_ptr<hot_blob> hot;                    // 内存值
+    value_ref  durable;
+    value_view hot;
 };
 
-struct hot_blob {
-    std::atomic<uint32_t> ref_count;
-    uint32_t len;
-    char data[];                                    // flexible array member
+// {pointer, length} 视图。本身是 POD；不 own 任何内存。
+// 生命周期与 owning memtable_gen 的 shared_ptr 绑定。
+struct value_view {
+    const char* data;
+    uint32_t    len;
 };
 
 struct retired_value_ref {
@@ -360,6 +390,13 @@ struct retired_value_ref {
     uint64_t data_ver;                              // 用于和 recovery_safe_lsn 比较
 };
 ```
+
+**value 内存的 owner 模型（冻结）**：
+
+1. value bytes 住在 owning `memtable_gen` 的 `kv_arena` 切片里；`value_handle.hot` 是指向这段切片的只读 view。没有独立的 `hot_blob` 对象。
+2. 跨核心读通过 `read_handle → publish_catalog → prs → front_read_set → std::shared_ptr<memtable_gen>` 的 pin 链间接保活，真正的 atomic gate 在 `std::shared_ptr<memtable_gen>` 的 control block——gen 活，arena 活，所有 value_view 有效。
+3. 因此 value 模块**不**维护 `value_ref -> hot_blob` 的 materialized 索引；memtable 被 flush、gen 被释放之后，同 key 后续读走 `tree_lookup → value_ref → value_alloc_sched.read_value()`，命中的是 value_page `readonly_frame_cache`。
+4. `memtable_entry` 与 `value_handle` 都是 trivially copyable POD；`absl::InlinedVector<memtable_entry, 1>` 的 relocate 是 trivial `memcpy`。
 
 ### 3.4 请求类型
 
@@ -369,7 +406,7 @@ struct retired_value_ref {
 | `insert_memtable_entries` | `(batch_lsn, entries[])` | void | all-WAL barrier 成功后的 memtable insert |
 | `seal_active` | — | `front_read_set` | seal 时由 coord_sched 投递 |
 | `batch_lookup` | `(keys[], read_lsn, front_read_set)` | `batch_lookup_results[]` | MultiGet 的 front-local 批量 memtable 查找；只是 `lookup_memtable` 的顺序包装 |
-| `lookup_memtable` | `(key, read_lsn, front_read_set)` | `variant<value_handle, tombstone, miss>` | point read（搜索 PRS snapshot 的 active/imms，概要 §8.1 step 3） |
+| `lookup_memtable` | `(key, read_lsn, front_read_set)` | `variant<value_view, tombstone, miss>` | point read（搜索 PRS snapshot 的 active/imms，概要 §8.1 step 3）；命中 value 时返回 `value_view` 指向 owning gen 的 `kv_arena` 切片，调用方必须在 read_handle 作用域内使用 |
 | `scan_memtable` | `(begin, end, read_lsn, front_read_set)` | `scan_result_set` | range scan（同上） |
 | `collect_eligible_gens` | `durable_lsn` | `eligible_gens[]` | flush Phase 1：收集 `max_lsn <= durable_lsn` 的 sealed gens |
 | `release_gens` | `gen_id_list` | void | frontier switch 后移除 imms |
@@ -396,19 +433,39 @@ value 已由 `value_alloc_sched` 完成 durable（leader-follower FUA）。`coor
 
 ```text
 for each canonical entry in entries[]:
+    // Probe-then-allocate 避免同 gen 重复 key 浪费 arena 空间
+    string_view incoming_key{entry.key}
+    it = active->table.find(incoming_key)
+    if (it == active->table.end()):
+        string_view arena_key =
+            active->kv_arena.allocate(entry.key.data(), entry.key.size())
+        it = active->table.try_emplace(arena_key).first
+
     if entry.op == PUT:
-        hot = make_hot_blob(entry.value_bytes, entry.value_len)
-        vh = value_handle { durable = entry.allocated_vr, hot = hot }
-        active->insert(entry.key, memtable_entry {
-            data_ver = batch_lsn, kind = value, vh = vh,
+        // value bytes 走同一个 arena，得到 value_view
+        string_view val_slice =
+            active->kv_arena.allocate(entry.value_bytes, entry.value_len)
+        value_view hot = { val_slice.data(), val_slice.size() }
+
+        it->second.push_back(memtable_entry {
+            data_ver = batch_lsn,
+            k        = memtable_entry::kind::value,
+            vh       = value_handle { .durable = entry.allocated_vr, .hot = hot },
         })
     else:  // DELETE
-        active->insert(entry.key, memtable_entry {
-            data_ver = batch_lsn, kind = tombstone,
+        it->second.push_back(memtable_entry {
+            data_ver = batch_lsn,
+            k        = memtable_entry::kind::tombstone,
+            vh       = {},                                  // hot = {nullptr, 0}
         })
+
     active->max_lsn = max(active->max_lsn, batch_lsn)
     active->min_lsn = min(active->min_lsn, batch_lsn)
 ```
+
+**arena allocate 的两个优化点**：
+1. **probe-then-allocate**：先 `find(incoming_key)`，不命中才 `allocate` 到 arena 里。跨 batch 写同一 key 时只有第一次占 arena，之后只在 bucket 里 push 新版本。
+2. **tombstone 不占 arena**：只 key 要 allocate，value 侧直接 `{nullptr, 0}`，一个 byte 都不占用。
 
 关键约束：
 
@@ -419,10 +476,10 @@ for each canonical entry in entries[]:
 ### 3.6 `handle_seal_active`
 
 ```text
-1. F = active                           // 旧 active → 将成为 sealed
-2. F.st = sealed
-3. N = new memtable_gen { gen_id = next_gen_id++, st = active }
-4. active = N
+1. F = active                           // 旧 active → shared_ptr<memtable_gen>
+2. F->st = sealed
+3. N = std::make_shared<memtable_gen>(gen_id = next_gen_id++, st = active)
+4. active = N                           // 旧 F 仍被 imms 和 PRS 共享持有
 5. imms.push_front(F)                   // F 进入 imms 最前面（最新）
 6. cb(front_read_set { active = N, imms = [F] ++ old_imms })
 ```
@@ -436,7 +493,7 @@ for each canonical entry in entries[]:
 ```text
 handle_lookup_memtable(key, read_lsn, frs):
     // frs = 调用方 read_handle 的 cat->prs->fronts[owner]
-    // frs.active / frs.imms 由 PRS snapshot 的 intrusive_ptr 保活
+    // frs.active / frs.imms 由 PRS snapshot 的 std::shared_ptr<memtable_gen> 保活
 
 1. 在 frs.active 中查找 key，收集所有 data_ver <= read_lsn 的 entries
 2. 在 frs.imms 中从新到旧查找 key，收集所有 data_ver <= read_lsn 的 entries
@@ -444,10 +501,12 @@ handle_lookup_memtable(key, read_lsn, frs):
 4. if winner 不存在:
        cb(miss)
    else if winner.kind == value:
-       cb(winner.vh)          // 直接返回 value_handle（含 hot_blob）
+       cb(winner.vh.hot)      // winner.vh.hot 本身就是 value_view，直接转发
    else:
        cb(tombstone)          // 上层返回 not found
 ```
+
+**Zero-copy view 的生命周期契约**：`cb` 回传的 `value_view` 指向 owning gen 的 `kv_arena` 切片，其有效期与调用方当前持有的 `read_handle` 绑定。调用链是 `read_handle → cat → prs → front_read_set → std::shared_ptr<memtable_gen> → memtable_entry → value_handle.hot → kv_arena chunk`——只要 `read_handle` 未释放，`shared_ptr<memtable_gen>` 的 `use_count > 0`，arena 的所有 chunk 都活着，view 就是稳定可读的。调用方必须在 `read_handle` 作用域内完成 view 的消费（例如写到 RESP/RPC 响应 buffer）；不允许把 view 保存在比 read_handle 更长寿的对象里。
 
 **线程安全**：dispatch 到 front_sched 执行是为了保证 btree_map 读操作的线程安全。sealed gen 是 immutable 的；PRS 中的 active gen 可能仍在被 front_sched 写入，但 lookup 在 front_sched 单线程上执行，与 `insert_memtable_entries` 串行，不存在竞争。
 
@@ -478,7 +537,7 @@ cb(results)
 2. cb(eligible_gens)
 ```
 
-返回的是 `intrusive_ptr<memtable_gen>` snapshot。flush round 在 reduce 后持有这些引用，因此即使后续有新的
+返回的是 `std::shared_ptr<memtable_gen>` snapshot。flush round 在 reduce 后持有这些引用，因此即使后续有新的
 seal/frontier switch，本轮选中的 gens 也不会在 fold 结束前被提前释放。
 
 #### `handle_release_gens`
@@ -603,7 +662,7 @@ struct retired_objects {
 
 struct tree_flush_request {
     std::shared_ptr<const checkpoint_guard> base_guard;
-    span<intrusive_ptr<memtable_gen>> sealed_gens;
+    span<std::shared_ptr<memtable_gen>> sealed_gens;
     uint64_t recovery_safe_lsn;
 };
 
@@ -611,7 +670,7 @@ struct tree_flush_result {
     bool ok;
     std::shared_ptr<const tree_manifest> new_manifest;
     retired_objects retired;
-    flat_hash_map<uint32_t, small_vector<intrusive_ptr<memtable_gen>, 8>> flushed_gens_by_front;
+    flat_hash_map<uint32_t, small_vector<std::shared_ptr<memtable_gen>, 8>> flushed_gens_by_front;
     small_vector<retired_value_ref, 64> memtable_losers;
     uint64_t flushed_max_lsn;
     flush_error error;
@@ -1337,27 +1396,29 @@ struct published_read_set {
 };
 ```
 
-`fronts` 中的每个 `front_read_set` 持有 `memtable_gen` 的 `intrusive_ptr`。当 prs 释放时，这些引用一起释放。
+`fronts` 中的每个 `front_read_set` 持有 `std::shared_ptr<memtable_gen>`。当 prs 释放时，这些引用一起释放。
 
-### 8.3 `value_handle` / `hot_blob` 生命周期
+### 8.3 `value_handle` 生命周期
 
 ```text
-创建：
-  1. 前台 PUT 时创建 hot_blob（内存 value bytes 的 copy）
-  2. value_handle = { value_ref（盘上位置）, hot_blob }
-  3. memtable_entry 持有 value_handle
+创建（insert_memtable_entries 内）：
+  1. active gen 的 kv_arena.allocate() 存 key bytes（probe-then-allocate）
+  2. active gen 的 kv_arena.allocate() 存 value bytes → 得到 value_view
+  3. memtable_entry.vh = { durable = value_ref, hot = value_view }
+  4. btree_map 的 bucket push 新版本
 
 存活期间：
-  - memtable entry live → hot_blob 有 ref → 不可释放
-  - hot_blob 独立于 page/frame cache（见 runtime_memory_and_cache.md §9.3）
-  - tree-path value read 使用 `read_value(value_ref)` copy 返回 owning bytes，不复用 hot_blob
+  - gen 活 → kv_arena 活 → arena 中所有 chunk 活 → key/value bytes 稳定可读
+  - memtable hit 时 lookup_memtable 直接返回 value_handle.hot（zero-copy view）
+  - value bytes 独立于 page/frame cache（见 runtime_memory_and_cache.md §9.3）
+  - tree-path value read 使用 `read_value(value_ref)` copy 返回 owning bytes，不复用 arena
 
 释放触发：
   - memtable_gen 从所有 published_read_set 中摘除
-  - memtable_gen.ref_count → 0
-  - memtable_gen 析构 → memtable_entry 析构 → value_handle 析构
-    → hot_blob.ref_count--（可能归零释放）
-    → value_ref 进入回收判定（见下）
+  - 最后一个 shared_ptr<memtable_gen> 析构 → use_count 归 0 → gen 析构
+  - gen 析构按反向声明顺序：先 table（只存 view，析构 trivial），后 kv_arena
+  - kv_arena 析构 → vector<unique_ptr<char[]>> 析构 → 所有 chunk 一次 free
+  - 所有 key/value bytes 同时消失；value_ref 进入回收判定（见下）
 
 durable value_ref 回收：
   - 如果该 value_ref 已经被 tree flush 覆盖（更新版本进入 tree）：

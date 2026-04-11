@@ -554,7 +554,7 @@ v1 允许落盘的对象只有以下四类：
 4. active / imm memtable 集合、`front_sched_count`、WAL stream 拓扑及其运行时挂接关系
 5. allocator head / free pools / WAL free list / active ownership
 6. batch cache、fan-out / reduce 中间态、retire lists 等请求态或回收态对象
-7. `ValueHandle.hot_blob`、value cache 索引等纯内存热数据对象
+7. `memtable_gen.kv_arena` 内的 key / value bytes（由 gen 的 shared_ptr 整体保活），以及 `readonly_frame_cache` 的 clean frame 驻留
 
 因此，详细设计的职责不是“再发明一批辅助持久化元数据”，而是：
 
@@ -752,13 +752,20 @@ live runtime 仍然需要一份“当前 guard 应该沿哪套结构遍历树”
 每个 front scheduler 的前台状态按代际管理：
 
 ```cpp
-struct hot_blob {
-    // in-memory value bytes; cache may index it but is not the sole owner
+// Pointer+length view into a memtable_gen's kv_arena.
+// POD; lifetime is tied to the owning gen's shared_ptr.
+struct value_view {
+    const char* data;
+    uint32_t    len;
 };
 
+// POD payload of a memtable PUT entry. `hot` points into
+// the owning gen's kv_arena (see §5.3 / §5.4). No heap
+// owner, no refcount; the arena frees everything in one
+// sweep when the last shared_ptr<memtable_gen> drops.
 struct value_handle {
-    value_ref durable;
-    intrusive_ptr<hot_blob> hot;
+    value_ref  durable;
+    value_view hot;
 };
 
 struct memtable_gen {
@@ -766,7 +773,10 @@ struct memtable_gen {
     enum class state { active, sealed } st;
     uint64_t min_lsn;
     uint64_t max_lsn;
-    // table payload omitted
+    // kv_arena + table + loser_durable_refs; see RSM §3.2.
+    // kv_arena holds BOTH key bytes and value bytes for this
+    // gen; table's key is std::string_view into kv_arena;
+    // value_handle.hot is a value_view into kv_arena.
 };
 ```
 
@@ -775,9 +785,9 @@ struct memtable_gen {
 1. `active`：当前写入目标。
 2. `sealed`：不再接收新写，但在被新 tree frontier 覆盖并且旧 catalog 释放前，仍必须参与读。
 3. `min_lsn/max_lsn` 只用于调度与 flush eligibility，不用于读可见性判断。
-4. memtable 中的 PUT entry 保存的是 `value_handle = { durable_ref, hot_blob }`；DELETE 保存 tombstone。
-5. `hot_blob` 是 memtable hit 的唯一值来源；只要对应 memtable entry 仍 live，`hot_blob` 就不能被真正淘汰到需要 SSD 回读的状态。
-6. value cache 可以额外索引或持有同一个 `hot_blob`，但 cache 只是性能优化，不是 correctness owner。
+4. memtable 中的 PUT entry 保存的是 `value_handle = { durable_ref, value_view }`；DELETE 保存 tombstone。
+5. memtable hit 的 value 来源是 owning `memtable_gen` 的 `kv_arena` 切片——`value_handle.hot` 就是指向这段切片的 view。gen 活则 arena 活则切片活；没有独立命名的 `hot_blob` 对象，也没有任何 refcount。只要对应 memtable entry 仍 live，value bytes 就不能被真正淘汰到需要 SSD 回读的状态。
+6. memtable 被 flush、gen 被释放之后，同 key 后续读走 `tree_lookup → value_ref → value_alloc_sched.read_value()`，命中 `value_page readonly_frame_cache`；value 模块不维护额外的 `value_ref -> value bytes` materialized 索引。
 
 ### 5.2 `checkpoint_guard`
 
@@ -813,8 +823,8 @@ struct checkpoint_guard {
 
 ```cpp
 struct front_read_set {
-    intrusive_ptr<memtable_gen> active;
-    small_vector<intrusive_ptr<memtable_gen>, 4> imms;  // newest -> oldest
+    std::shared_ptr<memtable_gen> active;
+    small_vector<std::shared_ptr<memtable_gen>, 4> imms;  // newest -> oldest
 };
 
 struct published_read_set {
@@ -939,7 +949,7 @@ struct wal_segment_runtime {
 7. 各目标 front schedulers 并行写 WAL：
    - append canonical WAL entry (FUA, PUT 记录 `value_ref`)
 8. all-WAL reduce 成功后，再并行执行 memtable insert：
-   - PUT    -> `value_handle { durable = value_ref, hot = hot_blob }`
+   - PUT    -> `value_handle { durable = value_ref, hot = value_view }`（view 指向 owning gen 的 `kv_arena` 切片）
    - DELETE -> tombstone
 9. all-memtable reduce()
 10. publish(batch_lsn)
@@ -957,7 +967,7 @@ struct wal_segment_runtime {
 7. 折叠完成后，`entry_count` 统计的是 canonical records 数，而不是原始客户端操作数。
 8. durable boundary 之后的三种表示必须表达同一个 canonical 结果：
    - WAL PUT 看到的是 `PUT(value_ref)`
-   - memtable PUT 看到的是 `PUT(value_handle { value_ref, hot_blob })`
+   - memtable PUT 看到的是 `PUT(value_handle { value_ref, value_view into kv_arena })`
    - recovery replay 看到的是 `PUT(key, data_ver, value_ref)`
    它们不能再回到原始 batch 内中间步骤。
 9. 如果 PUT 的 value object 已 durable，但对应 WAL record 最终没有 durable 成功，则该 value object 尚未进入可见或可恢复状态；运行时可以立即回收它，crash recovery 也会把它当作未引用垃圾处理。
@@ -1075,8 +1085,8 @@ Point GET 的规范顺序如下：
 1. 同 key 在 `active + imms` 中取 `lsn <= read_lsn` 的最大版本。
 2. tombstone 与 PUT/value 按同一套 winner 规则比较；winner 为 tombstone 时，对上层返回 not found。
 3. 只要 memtable 命中，无论命中的是 value 还是 tombstone，都不再回退到 tree。
-4. memtable 命中 value 时，必须直接从 `value_handle.hot_blob` 返回；它绝不能退化成一次 SSD 读。
-5. value cache 若存在，只能淘汰自己的索引或附加引用；只要 memtable entry 还持有 `hot_blob`，这块热值就不能被真正驱逐。
+4. memtable 命中 value 时，必须直接返回 `value_handle.hot`（POD `value_view` 指向 owning gen 的 `kv_arena` 切片，见 `runtime_state_machine.md` §3.7）；它绝不能退化成一次 SSD 读，也不走任何 value page cache。
+5. value bytes 住在 owning `memtable_gen` 的 `kv_arena` 里，没有独立的 `hot_blob` 对象；`value_alloc_sched` 不维护 `value_ref -> value bytes` 索引，memtable hit 的 view 生命周期完全由 `read_handle` 的 pin 链（经由 shared_ptr<memtable_gen>）保证。
 6. tree 侧可以有少量 `tree_lookup_sched` owner 的 node cache shard；它只是性能优化，不改变 `read_handle`、`tree_guard` 或可见性规则。
 
 读路径 handle 数据源断言（详细设计展开 handle 签名时必须对照）：
@@ -1364,7 +1374,7 @@ tree allocator -> [shadow ranges ... free space ... value slabs] <- value alloca
 ```text
 value object  : durable bytes in Value Area
 value_ref     : stable durable locator to that object
-value_handle  : runtime { durable_ref, hot_blob }
+value_handle  : runtime { durable_ref, value_view into kv_arena }
 ```
 
 PUT 的 steady-state 规则是：
@@ -1380,7 +1390,7 @@ persist value object
 
 1. 前台 PUT 先把 value body durable 到 Value Area。
 2. WAL PUT record 只记录 `value_ref`，不再内联原始 value bytes。
-3. memtable PUT entry 持有 `value_handle { durable_ref, hot_blob }`。
+3. memtable PUT entry 持有 `value_handle { durable_ref, value_view into kv_arena }`。
 4. steady-state flush 只把 winner 的 `value_ref` 物化进 tree；它不再重复写 value body。
 
 这里在概要层再冻结一条抽象边界：
@@ -1438,8 +1448,8 @@ write new tree slots that reference existing value_ref or carry tombstone record
    则 `V_old` 从这一轮开始就不再属于新 frontier，必须挂到旧 `checkpoint_guard` 的 retire list 上。
 2. `V_old` 不能在 install 新 guard 后立刻复用；只有最后一个 pin 旧 guard 的 reader 释放后，tree scheduler 才能把它真正回收到 value free pool。
 3. 若某个 `value_ref` 从未进入 tree、只在 memtable/WAL 层出现过，但在 flush fold 中已经输给了更新的 durable winner，则它先挂到 owning `memtable_gen` 的 retire list；在该 gen 释放、且它不可能再成为 recovery winner 之后，才允许回收。
-4. `hot_blob` 的回收只看内存引用；它不承担 recovery 正确性。只要 memtable entry 或 cache 仍持有它，就不能释放；一旦这些内存引用都消失，`hot_blob` 可以单独释放，不必等待 durable `value_ref` 一起回收。
-5. `recovery_safe_lsn` 约束的是“哪些更老历史版本不可能再从 recovery 输入中翻盘”；对 `memtable-only loser durable_ref`，v1 可以保守地用它作为物理 recycle barrier。它不是 `hot_blob` 的回收条件。
+4. memtable 中的 value bytes（住在 owning gen 的 `kv_arena`）只看 gen 的 shared_ptr；它不承担 recovery 正确性。只要 gen 还被 PRS / front_state / flush round 中任一方引用，整个 `kv_arena` 就不能释放；最后一个 shared_ptr 归零时，`kv_arena` 的所有 chunk 一次 sweep 释放，durable `value_ref` 的回收走独立的 retire list 路径。
+5. `recovery_safe_lsn` 约束的是“哪些更老历史版本不可能再从 recovery 输入中翻盘”；对 `memtable-only loser durable_ref`，v1 可以保守地用它作为物理 recycle barrier。它不是 memtable value bytes 的回收条件——value bytes 的回收条件是 "owning gen 的所有 shared_ptr 都已释放"。
 6. 详细设计必须保证每个被覆盖或被删除的 `value_ref`：
    - 恰好进入一次 retire 流程；
    - 不会因为重复挂接而 double free；
@@ -1838,7 +1848,7 @@ ensure_active_segment()
 ```text
 point_get(key)
   = on(coord_sched, acquire_read_handle())
- >> on(front(owner_front(key)), lookup_memtable(key, read_lsn, prs.fronts[owner]) >> if_memtable_value_then_return_hot_blob())
+ >> on(front(owner_front(key)), lookup_memtable(key, read_lsn, prs.fronts[owner]) >> if_memtable_value_then_return_view())
      >> if_miss(
       on(tree_lookup_sched(home_tree_lookup(owner_front(key))),
          tree_lookup(tree_guard, key))
@@ -1962,7 +1972,7 @@ wal_reclaim_round()
    - wal_space scheduler
    - `checkpoint_guard / tree_manifest`
    - `publish_gate` / seal 协议
-   - `ValueHandle / hot_blob / value cache` 生命周期
+   - `ValueHandle / kv_arena` 生命周期（per-gen arena 承载 kv bytes，shared_ptr<memtable_gen> 是唯一 pin gate）与 `value_page readonly_frame_cache` 的读路径集成
 
 2. **on_disk_formats.md**
    - superblock A/B
@@ -1993,7 +2003,7 @@ wal_reclaim_round()
 5. **read_api_and_pipeline.md**
    - GET / MultiGet / Scan 的 `read_handle` 生命周期
    - batch cache
-   - memtable hit 如何经由 `hot_blob` 返回且不退化成 SSD 读
+   - memtable hit 如何经由 `value_view` (指向 owning gen `kv_arena`) 返回且不退化成 SSD 读
    - memtable miss -> `tree_manifest` 驱动的 tree lookup sender 编排
    - tree tombstone 的读语义
    - 长读拖住 old CAT / old guard 的资源上界策略
@@ -2008,7 +2018,7 @@ Inconel 的最终概要模型可以压缩成下面几句：
 4. **一次逻辑读调用共享一个 `read_handle = {cat, read_lsn}`。**
 5. **tree 的结构一致性由 runtime 的 `checkpoint_guard/tree_manifest` 保证；它不要求持久化 `slot_seq`。**
 6. **DELETE 在 tree 中采用 `value -> tombstone -> absent` 的两阶段物化；tombstone 参与数据 winner 比较，物理删除在后续 leaf rewrite 时按 `recovery_safe_lsn` opportunistically 完成。**
-7. **WAL PUT 只保存 `value_ref`；memtable PUT 持有 `ValueHandle { durable_ref, hot_blob }`，因此 memtable hit 永远不退化成 SSD 读。**
+7. **WAL PUT 只保存 `value_ref`；memtable PUT 持有 `ValueHandle { durable_ref, value_view into kv_arena }`，因此 memtable hit 永远不退化成 SSD 读。**
 8. **WAL 用共享 segment pool 提供共享容量，但并发只发生在不同 segment 之间。**
 9. **恢复不重建旧 runtime frontier，而是 `scan tree leaf records + surviving WAL refs -> rebuild logical winners -> merge/flush into clean tree(reuse winner value_ref) -> reconstruct value runtime state -> clean start`。**
 10. **持久化白名单只有 `superblock / WAL / tree / value` 四类对象；所有 publish/frontier/reclaim 状态都是运行时对象。**

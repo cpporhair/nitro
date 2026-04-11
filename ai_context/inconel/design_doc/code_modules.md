@@ -77,10 +77,12 @@ apps/inconel/
 | `checkpoint_guard` | `manifest`, `retired` | tree(owns), coord(frontier switch), pipeline |
 | `tree_manifest` | `root_slot`, `slot_map`, `leaf_order` | tree(owns/构造), tree_lookup(只读消费), tree_worker(只读消费) |
 | `read_handle` | `cat`, `read_lsn` | coord(发放), pipeline(携带), front/tree/value(消费) |
-| `memtable_gen` | `gen_id`, `state`, `min/max_lsn`, `table`, `loser_durable_refs`, `ref_count` | front(owns), coord(seal), tree(flush collect) |
+| `memtable_gen` | `gen_id`, `state`, `min/max_lsn`, `kv_arena`, `table`, `loser_durable_refs`（生命周期由 `std::shared_ptr<memtable_gen>` 管理，无内嵌 refcount） | front(owns), coord(seal), tree(flush collect) |
 | `memtable_entry` | `data_ver`, `kind`, `vh` | front(存储/查询), pipeline(传递) |
-| `value_handle` / `hot_blob` | `durable: value_ref`, `hot: intrusive_ptr` | front(memtable 内), value(读), pipeline |
-| `front_read_set` | `active`, `imms` (intrusive_ptr) | coord(seal 产出), pipeline(读路径携带) |
+| `value_handle` | `durable: value_ref`, `hot: value_view`（POD，指向 owning gen `kv_arena` 切片） | front(memtable 内), pipeline（view 返回） |
+| `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；单 writer bump allocator，承载 key + value bytes | core（随 memtable_gen 生灭） |
+| `value_view` | `data: const char*, len: uint32_t`；zero-copy 返回类型 | front(lookup 返回), pipeline |
+| `front_read_set` | `active`, `imms`（均为 `std::shared_ptr<memtable_gen>`） | coord(seal 产出), pipeline(读路径携带) |
 | `canonical_entry` | `op_type`, `key`, `value`, `allocated_vr` | coord(产出), front/value(消费) |
 | `batch_ctx` | `batch_lsn`, `entry_count`, `canonical_entries[]`, `fragments[]` | coord(产出), pipeline(携带) |
 | `fragment` | `owner`, `batch_lsn`, `entry_count`, `entries[]` | coord(构造), front(消费) |
@@ -175,7 +177,7 @@ DMA 内存池和统一帧抽象。所有做 I/O 的 scheduler 共同使用。
 | WAL 写入 | `write_wal_entries(batch_lsn, entry_count, entries[])` → FUA append |
 | Memtable 插入 | `insert_memtable_entries(batch_lsn, entries[])` → CPU memtable insert |
 | Seal | `seal_active()` → `front_read_set`（rotate active→sealed，创建新 active） |
-| Memtable 查询 | `lookup_memtable(key, read_lsn, front_read_set)` → `variant<vh, tombstone, miss>` |
+| Memtable 查询 | `lookup_memtable(key, read_lsn, front_read_set)` → `variant<value_view, tombstone, miss>` |
 | 批量查询 | `batch_lookup(keys[], read_lsn, front_read_set)` → results[] |
 | Range scan | `scan_memtable(begin, end, read_lsn, front_read_set)` → `scan_result_set` |
 | Flush 支持 | `collect_eligible_gens(durable_lsn)` → eligible_gens[]，`release_gens(gen_ids[])` |

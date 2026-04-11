@@ -116,6 +116,9 @@ TCP (RESP2, io_uring accept)
 ### 设计文档（必须遵循）
 - @ai_context/inconel/design_doc/INDEX.md — 分层索引，实现任何 Inconel 功能前先读此文件定位需要查阅的具体章节
 
+### v1 语义（必须遵循）
+- `v1` 对 Inconel 只表示**功能范围冻结**，不表示质量标准降低。允许少做未纳入范围的能力，但凡已经纳入范围、已经进入 canonical path、或已经落到 production 代码里的能力，都必须按 production-grade 标准实现；禁止用“v1 先糊一个能跑的版本”当理由降低正确性、容量边界、异常路径、回收、背压或热路径效率标准。
+
 ### 三阶段文档检查流程
 
 对 `apps/inconel/` 的任何代码编写/修改，必须执行：

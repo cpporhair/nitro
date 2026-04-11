@@ -3,6 +3,8 @@
 > 适用范围：`apps/inconel/` 与 `ai_context/inconel/design_doc/` 对应的全部实现与 review。
 >
 > 目标：把“代码看起来还行”变成可执行、可否决、可留痕的工程标准。
+>
+> `v1` 只表示功能范围冻结，不表示质量标准降低。任何已经进入 production 代码或 canonical path 的能力，都必须按 production-grade 标准审查。
 
 ## 1. 使用方式
 

@@ -4,7 +4,7 @@
 >
 > 作用：后续详细设计、实现、测试和评审一律以本文件为准。
 >
-> 范围：本文冻结 **单盘 v1** 的系统语义，但所有持久地址、allocator、WAL segment 标识和 I/O 接口都按可扩到多盘的抽象定义。未来做多盘时，只允许替换“设备选择与并行策略”，不允许推翻本文的 batch / publish / read / recovery 基本模型。
+> 范围：本文冻结 **单盘 v1** 的系统语义，但所有持久地址、allocator、WAL segment 标识和 I/O 接口都按可扩到多盘的抽象定义。这里的 `v1` 只表示**功能范围冻结**，不表示可以降低质量标准；任何已经纳入范围或已经进入 canonical path 的能力，都必须按 production-grade 实现。未来做多盘时，只允许替换“设备选择与并行策略”，不允许推翻本文的 batch / publish / read / recovery 基本模型。
 >
 > 关系：`ai_context/Inconel/nvme_layout.md`、`ai_context/Inconel/wal_segment_pool.md`、`ai_context/Inconel/design_overview.md`、`ai_context/inconel.codex/published_read_set_redesign.md` 可以保留为历史讨论或实现草稿，但不再是规范依赖。后续详细设计不要求交叉阅读这些文档；即使它们全部移除，本文也必须足够。若与本文冲突，以本文为准。
 

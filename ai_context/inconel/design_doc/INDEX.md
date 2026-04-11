@@ -4,6 +4,46 @@
 
 ---
 
+## 项目硬约束与性能取向（最高优先级，非谈判项）
+
+Inconel 的定位是**生产级 KV 存储引擎**，不是研究原型，也不是"先跑通再说"的脚手架。这里的 `v1` 只表示**功能范围冻结**，**不表示质量等级下降**：允许少做部分外围或 future 功能，但凡已经纳入范围、已经进入 canonical path、或已经落到 production 代码里的能力，都必须按 production-grade 标准实现。这里冻结的是一条容量硬指标和一条性能取向：
+
+1. **容量下限：10 亿条 KV 起步**。所有设计、carrier 选型、容器选型、算法复杂度、热路径成本都必须按 10 亿 KV 做校准。spec 文本里出现的 "1 亿"、"每 leaf 64 条" 之类数字只是算术举例，不是目标；任何设计都不能只在小量级上自洽，也不能靠全局线性扫描、per-request 物化或其他只在小规模下勉强可用的结构蒙混过关。
+2. **性能取向：以 `RocksDB × 5` 作为方向性锚点。** 这不是当前阶段已经承诺可验收的 benchmark 数字，也不是没有标准 workload / 硬件 / 测法时就能直接宣称达成的合同条款；它的作用是强制所有实现按**极速 KV 系统**的标准审视 canonical 读/写路径，禁止为了"先跑通"接受明显拖慢热路径、放大 allocation/copy/queue hop/I/O 成本的结构。
+
+### 不可简化约束
+
+- 任何已经证明会伤害、或当前无法证明不伤害容量下限与性能取向的"简化"**一律禁止**，无论理由多充分、无论是不是"临时的"。不能先按最简单形状落代码，再把容量/效率验证留给以后。
+- `v1` 的合法含义只有**少做功能**，没有"把已做功能做成半成品"这层含义。允许暂不支持未纳入范围的能力；但对已经宣称支持、已经接入 canonical path、或已经写进 production 代码的能力，不允许只覆盖 happy path、不允许靠 mock/stub/seam 形态冒充完成、不允许把异常路径/背压/资源回收/边界条件留成"以后再补"。
+- "少做功能"的合法含义是**引擎外围能力可以不做**：比如暂不暴露网络协议层、不实现 `MERGE` / batch-atomic / TTL / range-delete / compression / encryption-at-rest / column family 这类可以挂在核心 KV 引擎之外的附加能力。这些省掉不影响存储引擎本身的容量与吞吐。
+- "少做功能"的**非法含义**：把"核心引擎组成部分"当 v1 可选简化。以下这些是**必选的生产能力**，任何阶段不允许以"v1 先不做"为由省略：
+  - **B+ tree shape-changing 路径的全部**：leaf split / parent rewrite / root change / consolidation。没有 split 树长不大，没有 consolidation 写入就卡死，没有 root-change 高度就封顶——这三条缺任何一条，10 亿 KV 都做不到。
+  - **Recovery 全流程**：崩溃后完整重建 CAT clean runtime。
+  - **Value allocator / placement / 回收**：sub-LBA / class pools / hole page / deferred reclaim。
+  - **WAL / durable_lsn / publish gate**：所有 durability 语义。
+  - **Flush / frontier switch / retire list**：后台物化管线和老 guard 回收链。
+  - **Memtable gen / seal / 跨 gen 合并**：前台写入骨架。
+- v1 **不允许**在容量、或与 canonical 热路径效率直接相关的结构成本上打折扣，即使临时折扣也不行。"先做差一点，后面再优化"这类措辞只要落在会影响 10 亿 KV 可行性，或把实现明显拉离"极速 KV 系统"这个性能取向的位置，**直接视为评审否决项**。
+- 阶段拆分是**开发顺序**工具，不是"v1 ship 哪些" 的划分线。允许先做 Phase 7（root-stable 子集）再做 Phase 8（shape-changing 子集）作为实现顺序，**但 v1 发布前两者必须都完成**；不允许 Phase 7 单独作为 "v1" 交付。
+- `RocksDB × 5` 在当前阶段是**设计和 review 用的性能锚点**，不是一句可以随口喊的结论。没有独立 benchmark 标准文档前，任何人都不能声称"已经达到这条线"；但也不能拿"反正还没 benchmark"当理由，把明显低效的结构放进 canonical 路径。
+- 任何可能触及这两条约束的决定，必须在所在阶段就按 10 亿 KV 的容量基线和"极速 KV 系统"的热路径标准把代价说清楚再落代码；算不清、证据不足或只给口头直觉，等同于不过关。
+- Review 时只要发现热路径 / carrier / 容器选择存在"小量级自洽、大量级代价爆炸"的结构性问题，直接退回重设计。
+
+### 容量快速校准参考
+
+下面这张表不是 spec 常量，只是让任何新设计在动笔前有一个量级参照：
+
+| 场景 | 4K tree page | 16K tree page |
+|---|---|---|
+| 每 leaf 记录数（32B key） | ~64 | ~259 |
+| 10 亿 KV 下 leaf 数 | ~15.6 M | ~3.86 M |
+| Tree 总页数 | ~15.8 M | ~3.87 M |
+| Tree 磁盘占用 | ~63 GB | ~62 GB |
+
+任何新增 runtime carrier（比如 `leaf_order` / `slot_map` / round state）在动笔前都要先按这两列算一次 per-manifest 内存占用，写进对应 step 文档或变更说明的"容量估算"节；量级评估不过关的结构不允许进代码。
+
+---
+
 ## 代码模块
 
 ### [code_modules.md](code_modules.md) — 代码模块划分与职责

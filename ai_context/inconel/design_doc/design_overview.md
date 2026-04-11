@@ -179,12 +179,29 @@ PUMP 在这里不是“只是一个异步框架”，而是系统并发模型的
              +-------reduce---+----------------+
                               |
                      +--------v--------+
-                     | tree scheduler  |
-                     | seal / flush    |
-                     | frontier switch |
-                     | reclaim         |
-                     +--------+--------+
-                              |
+                     | tree_sched      |
+                     | flush owner     |
+                     | alloc / delta   |
+                     | manifest write  |
+                     +---+---------+---+
+                         |         |
+               flush map |         | write / trim
+              read miss  |         |
+         +---------------+         +------------+
+         |                                        |
+ +-------v--------+                     +---------v--------+
+ | tree_lookup[]  |                     | tree_worker[]    |
+ | point lookup   |                     | old leaf read    |
+ | leaf mapping   |                     | candidate build  |
+ +-------+--------+                     +---------+--------+
+         |                                        |
+         +----------------+   +-------------------+
+                          |   |
+                 +--------v---v-------+
+                 | tree_read_domain[] |
+                 | tree_node cache    |
+                 +--------+-----------+
+                          |
                +----------+-----------+
                |                      |
         +------v------+        +------v------+
@@ -201,15 +218,16 @@ PUMP 在这里不是“只是一个异步框架”，而是系统并发模型的
                        SSD / FTL
 ```
 
-读路径还有一条单独的旁路：point read / MultiGet 的 memtable miss 不在 `front_sched` 上直接走树，而是稳定路由到少量 `tree_lookup_sched` 执行 tree traversal；这些 sched 持有 tree-node `readonly_frame_cache`，数量通常少于 `front_sched` 数量。
+读路径还有一条单独的旁路：point read / MultiGet 的 memtable miss 不在 `front_sched` 上直接走树，而是稳定路由到少量 `tree_lookup_sched` 执行 tree traversal。flush 中 old leaf read / candidate build 则路由到与其成对部署的 `tree_worker_sched`。每对 lookup/worker 共享一个 `tree_read_domain` 的 tree-node `readonly_frame_cache` shard；这些 shard 数量通常少于 `front_sched` 数量。
 
 这张图里最重要的结构关系是：
 
 1. 前台写先经 `value_alloc_sched` 统一持久化 value（leader-follower 合并并发 batch），拿到 `value_ref` 后再按 key hash fan-out 到各 `front_sched` 先写 WAL、all-WAL barrier 成功后再写 memtable。
 2. `front_sched` 只负责 WAL 追加、memtable 维护，以及 point read 的前台入口与 memtable lookup；tree miss 交给 `tree_lookup_sched`。
-3. 后台物化是一棵逻辑树。
-4. WAL 提交和 tree flush 是两条不同时间尺度的路径。
-5. NVMe I/O 是单独 owner 的执行域，不和上层状态混在一起。
+3. tree domain 已拆成三类 owner：`tree_sched` 持有 flush/allocator/manifest mutation；`tree_lookup_sched` 负责 traversal 与 batch leaf mapping；`tree_worker_sched` 负责 old leaf read / candidate build；lookup/worker 共享 `tree_read_domain` cache shard。
+4. 后台物化是一棵逻辑树。
+5. WAL 提交和 tree flush 是两条不同时间尺度的路径。
+6. NVMe I/O 是单独 owner 的执行域，不和上层状态混在一起。
 
 KV 层当前只提供以下保证：
 
@@ -242,7 +260,7 @@ same key -> same front scheduler (within one runtime)
 
 ### 1.7 系统组件总览
 
-从系统分层看，Inconel 由 7 类 scheduler 组成：
+从系统分层看，Inconel 由 8 类 scheduler 组成：
 
 1. **batch scheduler**（`coord_sched`，单实例）
    - 接收或生成 canonical batch image
@@ -260,22 +278,29 @@ same key -> same front scheduler (within one runtime)
 
 3. **tree lookup scheduler**（`tree_lookup_sched`，K 实例，运行时参数，通常少于 `front_sched` 数量）
    - 执行 tree point lookup / tree-side miss fill
-   - 持有 `tree_node` domain 的 `readonly_frame_cache`
+   - 执行 flush 中的 `keys_to_leaf_groups()`，把 sorted key groups 映射到 affected leaves
+   - 访问所属 `tree_read_domain` 的 `tree_node` `readonly_frame_cache`
    - 不拥有 WAL、memtable 或 tree flush/reclaim 可变状态
    - 路由采用稳定映射：每个 `front_sched` 在启动期绑定一个 home `tree_lookup_sched`；因此同 key 的 point miss 会稳定落到同一个 tree lookup shard
 
-4. **wal space scheduler**（`wal_space_sched`，单实例）
+4. **tree worker scheduler**（`tree_worker_sched`，K 实例，按 read-domain 与 `tree_lookup_sched` 成对部署）
+   - 执行 flush 中的 old leaf read / decode / candidate page materialization
+   - 与同 read-domain 的 `tree_lookup_sched` 共享 `tree_node` `readonly_frame_cache`
+   - 不拥有 allocator、manifest mutation 或 retire list
+
+5. **wal space scheduler**（`wal_space_sched`，单实例）
    - 管理 WAL segment `free -> active -> sealed -> free`
    - 只在换段和回收时参与
 
-5. **tree scheduler**（`tree_sched`，单实例）
+6. **tree scheduler**（`tree_sched`，单实例）
    - 选择可 flush 的 sealed gens
-   - fold 前台状态，写 tree slots，构造 new manifest
+   - 作为 tree-local flush round owner：fold 前台状态、汇总 lookup/worker 结果、规划 tree delta
+   - 写 tree slots，构造 new manifest（含 `leaf_order`）
    - NVMe FLUSH 后推进 flush_max_lsn
    - 委托 `coord_sched` 执行 frontier switch（构造 G1/PRS2/CAT2）
    - 执行 tree-side reclaim（TRIM old slots/ranges，投递 value 回收到 `value_alloc_sched`）
 
-6. **value alloc scheduler**（`value_alloc_sched`，单实例）
+7. **value alloc scheduler**（`value_alloc_sched`，单实例）
    - 集中管理 value page 分配、前台 value 持久化和 **tree-path value 读取**
    - 持有分配元数据：bump head、per-class `whole_page_pool` / `hole_page_list` / `extent_free_pool`、owner-local `generic_free_spans`
    - 持有全局唯一的 value_page `readonly_frame_cache`（读写共享），同时服务写侧 hole reuse 和读侧 `read_value`
@@ -285,10 +310,10 @@ same key -> same front scheduler (within one runtime)
    - `tree_sched` 完成 TRIM 后通过 `freed_slots` / `recycle_whole` 投递回收
    - 最佳实践是把它部署在独占核心上，但这属于部署建议，不是语义前提
 
-7. **nvme scheduler(s)**（`nvme_sched`，每核心 × 每设备各一个实例）
+8. **nvme scheduler(s)**（`nvme_sched`，每核心 × 每设备各一个实例）
    - 执行具体的 NVMe read / write / FLUSH / TRIM
    - 每个 `nvme_sched` 拥有独立的 SPDK qpair
-   - 各 scheduler 使用本核心的 `nvme_sched`：`value_alloc_sched` 用其核心的 qpair 做 value FUA；`front_sched` 用其核心的 qpair 做 WAL FUA；`tree_lookup_sched` 用其核心的 qpair 做 tree read；`tree_sched` 用其核心的 qpair 做 flush write / FLUSH / TRIM
+   - 各 scheduler 使用本核心的 `nvme_sched`：`value_alloc_sched` 用其核心的 qpair 做 value FUA；`front_sched` 用其核心的 qpair 做 WAL FUA；`tree_lookup_sched` / `tree_worker_sched` 用其核心的 qpair 做 tree read；`tree_sched` 用其核心的 qpair 做 flush write / FLUSH / TRIM
 
 ### 1.8 端到端数据流
 
@@ -308,8 +333,11 @@ client
 
 background:
 sealed memtable gens
-  -> tree scheduler fold
-  -> write tree slots that reference existing value_ref
+  -> tree-local flush pipeline
+       -> fold memtable winners
+       -> map keys to affected leaves
+       -> read old leaf / build candidate pages
+       -> write tree slots that reference existing value_ref
   -> NVMe FLUSH
   -> publish new tree_guard / new CAT
   -> reclaim old memtable / old tree data / old front-only values / old WAL segments
@@ -706,8 +734,9 @@ live runtime 仍然需要一份“当前 guard 应该沿哪套结构遍历树”
 1. 每个 `checkpoint_guard` 都持有一份 immutable `tree_manifest`。
 2. `tree_manifest` 必须能把“某个 range 在该 snapshot 下应读哪个具体 slot”解析成精确定位。
 3. 这个定位在实现上可以落成 `range_base -> slot_index`、`range_base -> runtime slot_seq` 或 `range_base -> exact slot paddr`；三者语义等价，任选其一。
-4. 具体 node page 可以因为内存压力被 cache 驱逐，但在最后一个 pin 该 guard 的 reader 释放前，这份 `tree_manifest` 不能丢。
-5. crash 后所有旧 `checkpoint_guard/tree_manifest` 一起消失；因此 recovery 不尝试从盘上恢复旧 runtime 的 tree frontier。
+4. `tree_manifest` 在实现上还同时携带一份 runtime-only immutable `leaf_order`，供 flush 侧做 batch leaf mapping；它的覆盖性、有序性和不重叠不变量见 `runtime_state_machine.md` §4.5。
+5. 具体 node page 可以因为内存压力被 cache 驱逐，但在最后一个 pin 该 guard 的 reader 释放前，这份 `tree_manifest` 不能丢。
+6. crash 后所有旧 `checkpoint_guard/tree_manifest` 一起消失；因此 recovery 不尝试从盘上恢复旧 runtime 的 tree frontier。
 
 因此：
 
@@ -757,7 +786,8 @@ struct memtable_gen {
 ```cpp
 struct tree_manifest {
     paddr root_slot;
-    // immutable mapping: range_base -> exact slot locator in this snapshot
+    slot_locator_map slot_map;              // immutable: range_base -> exact slot locator
+    small_vector<leaf_span, 0> leaf_order;  // runtime-only immutable leaf spans, key-ordered
 };
 
 struct checkpoint_guard {
@@ -1165,14 +1195,18 @@ statement-start stable Read Committed
 
 ```text
 1. 选择一批 flush-eligible sealed gens
-2. 对这些 gens 的 visible state 做 fold
-3. 对每个逻辑 key 计算本轮 flush 后应写入 tree 的 winner record
-4. 若 winner 为 value，则直接复用其已 durable 的 `value_ref`；steady-state flush 不重写 value body
-5. 写 tree slots（leaf 内写 value record 或 tombstone record），并在内存中构造新的 immutable `tree_manifest`
-6. 发 NVMe FLUSH
-7. 构造新的 checkpoint_guard = G1 { manifest = M1 }
-8. 在 `coord_sched` 上读取安装瞬间当前 catalog 的 `durable_lsn = D1`，发布 `CAT2 = { prs = PRS2, durable_lsn = D1 }`，使新 reader 开始使用 G1，并把本轮已覆盖的 gens 从 prs.imms 中摘掉
-9. 如 root_base_paddr 变化，再异步 FUA 更新 superblock A/B
+2. 构造 `tree_flush_request { base_guard, sealed_gens[], recovery_safe_lsn }`
+3. 在 tree-local flush pipeline 内：
+   - fold 这些 gens 的 visible state
+   - 计算每个逻辑 key 的 memtable winner
+   - 用 `manifest.leaf_order` 把 sorted key groups 映射到 affected leaves
+   - 读取 old leaf、生成 candidate pages
+   - 写 tree slots（leaf/internal 写 value record 或 tombstone record），并在内存中构造新的 immutable `tree_manifest`
+4. 发 NVMe FLUSH
+5. 产出 `tree_flush_result.success`
+6. 构造新的 checkpoint_guard = G1 { manifest = M1 }
+7. 在 `coord_sched` 上读取安装瞬间当前 catalog 的 `durable_lsn = D1`，发布 `CAT2 = { prs = PRS2, durable_lsn = D1 }`，使新 reader 开始使用 G1，并把本轮已覆盖的 gens 从 prs.imms 中摘掉
+8. 如 root_base_paddr 变化，再异步 FUA 更新 superblock A/B
 ```
 
 约束：
@@ -1181,14 +1215,15 @@ statement-start stable Read Committed
 2. flush 不是提交点。
 3. frontier switch 只在 tree slots durable 之后发生；steady-state flush 不额外创造新的 value body。
 4. old reader 只要还 pin 着旧 CAT / 旧 guard，对应旧 memtable / old tree data 就不能回收。
-5. 本轮 flush 产出的 tree 状态，必须等价于“把本轮选中的 sealed gens 中所有已发布更新，按 `batch_lsn` 顺序应用到 old tree 上”的结果。
-6. old reader 若在 flush 后发生 node cache miss，仍必须能通过它 pin 住的旧 `tree_manifest` 走到旧结构；因此 page image 可以被驱逐，但旧 manifest 不能提前释放。
-7. fold winner 在逻辑 key 维度上按 `data_ver` 比较；`data_ver` 在语义上等价于该记录对应的 `batch_lsn`。
-8. winner 为 value -> 写引用既有 `value_ref` 的 leaf value record，而不是重写 value body。
-9. winner 为 tombstone 时：
+5. `tree_local_flush` 的正式边界停在 `tree_flush_result`；frontier switch 与 gens release 是它的消费者，不属于该子模块内部。
+6. 本轮 flush 产出的 tree 状态，必须等价于“把本轮选中的 sealed gens 中所有已发布更新，按 `batch_lsn` 顺序应用到 old tree 上”的结果。
+7. old reader 若在 flush 后发生 node cache miss，仍必须能通过它 pin 住的旧 `tree_manifest` 走到旧结构；因此 page image 可以被驱逐，但旧 manifest 不能提前释放。
+8. fold winner 在逻辑 key 维度上按 `data_ver` 比较；`data_ver` 在语义上等价于该记录对应的 `batch_lsn`。
+9. winner 为 value -> 写引用既有 `value_ref` 的 leaf value record，而不是重写 value body。
+10. winner 为 tombstone 时：
    - 如果 old tree-visible 状态是 value，则本轮 flush 必须写 tombstone record，不能第一次 DELETE 就直接 absent。
    - steady-state 中不为旧 tombstone 维护单独的全局 revisit 队列。只有当其所在 leaf 因本轮 flush 被重写时，才会在生成新的 leaf image 时 opportunistically 检查：若 `tombstone.data_ver <= recovery_safe_lsn`、也就是所有更老旧版本都不可能再从 recovery 输入中出现，则可以直接省略该 record（tombstone -> absent）；否则本轮仍保留 tombstone record。
-10. `CAT2.durable_lsn` 不是 flush 重新计算出的新前沿，而是 install `CAT2` 那一刻旧 current catalog 已连续发布到的位置的原样继承。
+11. `CAT2.durable_lsn` 不是 flush 重新计算出的新前沿，而是 install `CAT2` 那一刻旧 current catalog 已连续发布到的位置的原样继承。
 
 ### 9.5 回收规则
 
@@ -1757,9 +1792,12 @@ Recovery 的全部工作：
 
 1. `coord_sched`：`batch_lsn` 分配、`publish_gate`、`current_publish_catalog` 的 owner
 2. `front(owner)`：当前运行期某个前台 owner，负责 WAL append、memtable、seal/release
-3. `tree_sched`：flush、frontier switch 后半段、tree reclaim 的 owner
-4. `wal_space_sched`：WAL segment 空间与回收的 owner
-5. `nvme(dev)`：设备 owner
+3. `tree_sched`：tree-local flush round、allocator、manifest 构造和 tree-side reclaim 的 owner
+4. `tree_lookup_sched`：tree traversal 与 `keys_to_leaf_groups()` 的 owner
+5. `tree_worker_sched`：old leaf read / decode / candidate build 的 owner
+6. `value_alloc_sched`：value write/read、allocator metadata 与 value-page cache 的 owner
+7. `wal_space_sched`：WAL segment 空间与回收的 owner
+8. `nvme(dev)`：设备 owner
 
 ### 14.1 前台写入 / 提交
 
@@ -1868,14 +1906,14 @@ flush_round()
       on(front(f1), pin_selected_imms()),
       ...
     )
- >> on(tree_sched, fold_visible_state())
- >> on(tree_sched, persist_tree_slots_from_existing_value_refs())
- >> on(tree_sched, build_new_tree_manifest())
- >> when_all(
-      on(nvme(d0), nvme_flush())
-    )
+ >> on(tree_sched, tree_local_flush({
+      .base_guard = old_guard,
+      .sealed_gens = pinned_gens,
+      .recovery_safe_lsn = recovery_safe_lsn,
+    }))
+ >> on(tree_sched, update_flush_max_lsn(tree_flush_result.flushed_max_lsn))
  >> on(coord_sched, build_g1_prs2_and_install_cat2())
- >> on(tree_sched, enqueue_reclaim())
+ >> // retired 由旧 G0 析构时自动投递到 tree_sched，不在此处 enqueue（见 flush_and_frontier_switch.md §8.1）
  >> maybe_root_change(
       on(tree_sched, update_superblock_async(new_root_base_paddr, covered_lsn))
     )

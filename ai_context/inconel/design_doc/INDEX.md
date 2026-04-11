@@ -20,7 +20,7 @@
 
 | 章节 | 内容 | 实现时查阅场景 |
 |------|------|---------------|
-| §1 系统定位与边界 | 7 种 scheduler、实例数、路由策略 | 新建 scheduler 或确认职责分工 |
+| §1 系统定位与边界 | 8 种 scheduler、实例数、路由策略 | 新建 scheduler 或确认职责分工 |
 | §2 冻结结论 | 持久化白名单（superblock/WAL/tree/value 四类）、单盘约束 | 任何涉及"要不要落盘"的决策 |
 | §6 序号与前沿 | batch_lsn, data_ver, durable_lsn, read_lsn, recovery_safe_lsn 语义 | 任何 LSN 相关逻辑 |
 | §7 写路径提交语义 | value FUA → WAL FUA → memtable → durable_lsn 三阶段 | 写路径持久化顺序 |
@@ -41,8 +41,8 @@
 
 | 内容 | 用途 |
 |------|------|
-| 24 个 scheduler handle 签名 | 确认接口参数不漂移 |
-| 16 个关键 struct 字段映射 | 确认字段在定义/引用处一致 |
+| scheduler handle 签名表 | 确认接口参数不漂移 |
+| 关键 struct 字段映射 | 确认字段在定义/引用处一致 |
 | Pipeline 跳转路径（5 条） | 确认 scheduler 间数据流无遗漏 |
 | **三条红线** | 实现前必读，防止走弯路 |
 
@@ -136,18 +136,18 @@ coord: acquire_read_handle → (cat, read_lsn)
 | 章节 | 内容 | 实现时查阅场景 |
 |------|------|---------------|
 | §2 Phase 1: 选 gen | 资格规则 (gen.max_lsn ≤ durable_lsn)、选择策略 | flush 触发判定 |
-| §3 Phase 2: Fold + Write Tree | fold 算法（4步）、loser 处理、shadow slot 选择、consolidation | 核心 flush 逻辑 |
+| §3 Phase 2: Tree-Local Flush | tree-local flush sub-pipeline：fold / leaf mapping / candidate build / plan+write | 核心 flush 逻辑 |
 | §4 Phase 3: Frontier Switch | new guard 构造、PRS2、CAT2 安装、front 通知 | 前沿切换实现 |
 | §5 Retire List Hooks | 旧 tree value、旧 slot/range、memtable loser、orphan、双 hook 防护 | 资源回收入口 |
 | §6 Root-Change vs Root-Stable | 条件判定、superblock 更新时机 | root 变更处理 |
 | §7 Old CAT/Guard Reclaim Chain | 引用计数归零链、value 回收判定、延迟扫描 | GC 正确性 |
 | §9 Consolidation 细节 | leaf/internal/root split 实现 | 树结构变更 |
 
-**Fold 算法 4 步：**
-1. 收集所有 memtable key，排序
-2. 通过 manifest + internal 定位受影响 leaf
-3. 并发 NVMe 读所有受影响 leaf
-4. 内存 merge（per-key winner: tree vs WAL）
+**Tree-Local Flush 4 段 owner seam：**
+1. `tree_sched.fold`: 对所有 sealed gens 做 per-key winner 裁决
+2. `tree_lookup_sched.keys_to_leaf_groups`: 用 `manifest.leaf_order` 把 sorted keys 映射到 affected leaves
+3. `tree_worker_sched.build_leaf_candidates`: 读 old leaf、merge、compact 出 candidate image
+4. `tree_sched.plan_tree_delta_from_candidates`: 写 tree slots + NVMe FLUSH
 
 **回收链：** CAT2 安装 → old CAT1 refs→0 → PRS1 refs→0 → fronts refs→0 → gen refs-- → loser_refs 可回收 → G0 refs→0 → retired dispatch (TRIM + value reclaim)
 
@@ -193,13 +193,13 @@ hole 复用: clean_allocatable → dirty_hole_fill → writeback_inflight → cl
 
 **DMA 池层次：** per-NUMA {4K, 8K, 16K, multi-LBA} → spdk_mempool (常驻帧) + spdk_iobuf (临时 buf)
 
-### [runtime_state_machine.md](runtime_state_machine.md) — 7 个 Scheduler 状态机
+### [runtime_state_machine.md](runtime_state_machine.md) — Tree Domain + 其余 Scheduler 状态机
 
 | 章节 | Scheduler | 实现时查阅场景 |
 |------|-----------|---------------|
 | §2 coord_sched | 协调器：LSN 分配、publish_gate、durable_lsn 推进、seal 触发 | 写/读/seal 协调 |
 | §3 front_sched | 前端：memtable、WAL stream、seal/lookup/collect | 前端操作实现 |
-| §4 tree_sched | 树管理：allocator、manifest、checkpoint_guard、fold | tree 操作实现 |
+| §4 tree domain | `tree_sched / tree_lookup_sched / tree_worker_sched`、allocator、manifest、checkpoint_guard | tree 操作实现 |
 | §5 wal_space_sched | WAL 空间：segment 分配/回收 | WAL 管理 |
 | §6 value_alloc_sched | 值分配/读取：bump head、class pools、dirty pages、frame cache | value I/O 实现 |
 | §7 nvme_sched | NVMe I/O：FUA write、FLUSH、TRIM | 底层 I/O |
@@ -213,8 +213,9 @@ hole 复用: clean_allocatable → dirty_hole_fill → writeback_inflight → cl
 |-----------|--------|------|---------|
 | coord_sched | 1 | 固定 | LSN、durable_lsn、seal、frontier switch |
 | front_sched | N (分片) | key_hash % N | memtable、WAL stream |
-| tree_sched | 1 | 固定 | tree allocator、manifest、fold |
-| tree_lookup_sched | M | key_hash % M | 无状态 tree 查询 |
+| tree_sched | 1 | 固定 | tree allocator、tree-local flush、reclaim |
+| tree_lookup_sched | M | key_hash % M | tree 查询、leaf mapping |
+| tree_worker_sched | M | read-domain % M | old leaf read、candidate build |
 | wal_space_sched | 1 | 固定 | WAL segment 池 |
 | value_alloc_sched | 1 | 固定 | value 分配/读取/缓存 |
 | nvme_sched | K | 轮询/指定 | NVMe I/O |

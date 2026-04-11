@@ -25,6 +25,9 @@
 | `collect_eligible_gens` | `(durable_lsn)` → `eligible_gens[]` | RSM §3.4/3.8, FF §2.2/8.1 |
 | `seal_active` | `()` → `front_read_set` | RSM §3.6, OV §9.2 |
 | `release_gens` | `(gen_id_list)` → `void` | RSM §3.8, FF §4.3 |
+| `tree_flush` | `(tree_flush_request)` → `tree_flush_result` | RSM §4.2, FF §3.1/§8.1, CM tree |
+| `keys_to_leaf_groups` | `(flush_lookup_req)` → `flush_leaf_group_result[]` | RSM §4.2/§4.7, FF §3.2/§3.4, CM tree |
+| `build_leaf_candidates` | `(flush_worker_req)` → `flush_candidate_batch` | RSM §4.2/§4.8, FF §3.2/§3.4, CM tree |
 | `persist_put_values` | `(batch PUT entries)` → `durable value_refs` | RSM §6.2, WP §2.1/5.4 |
 | `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
 | `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
@@ -34,7 +37,7 @@
 | `reclaim_check` | `(recovery_safe_lsn)` → `void` | RSM §5.4, RW §12.4 |
 | `tree_lookup` | `(key, manifest)` → `variant<leaf_value, leaf_tombstone, absent>` | RSM §4.7, RAP §4.2 |
 
-> 缩写：OV=design_overview, RSM=runtime_state_machine, WP=write_path_and_pipeline, RAP=read_api_and_pipeline, FF=flush_and_frontier_switch, RW=recovery_and_wal_reclaim, RMC=runtime_memory_and_cache, ODF=on_disk_formats
+> 缩写：OV=design_overview, RSM=runtime_state_machine, WP=write_path_and_pipeline, RAP=read_api_and_pipeline, FF=flush_and_frontier_switch, RW=recovery_and_wal_reclaim, RMC=runtime_memory_and_cache, CM=code_modules, ODF=on_disk_formats
 
 ## 2. 关键 Struct 字段
 
@@ -52,7 +55,7 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `front_read_set` | `active, imms` | OV §5.3 | RSM §3.4/3.7, RAP §4.2/4.3/5.3/6.3 |
 | `read_handle` | `cat, read_lsn` | OV §5.5 | RAP §2.1-2.4 |
 | `checkpoint_guard` | `manifest, retired { old_slots, old_ranges, old_tree_values }` | OV §5.2, RSM §4.6 | FF §4.1/5 |
-| `tree_manifest` | `root_slot, slot_map` | OV §4.4, RSM §4.5 | FF §3.8, RW §7.2 |
+| `tree_manifest` | `root_slot, slot_map, leaf_order` | OV §4.4/§9.4, RSM §4.5 | FF §3.4/§3.8, RW §7.2 |
 | `tree_allocator` | `head, free_ranges, shared_heads` | RSM §4.4 | RW §9.1 |
 | `data_area_heads` | `tree_head_lba (atomic), value_head_lba (atomic)` | RSM §4.3 | RSM §4.4/6.3 |
 | `value_alloc_state` | `dev_state, classes, open_frames, dirty_pages, deferred_freed, config` | RSM §6.3 | WP §5.4, RMC §7.1 |
@@ -71,9 +74,9 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 |------|-------|--------|---------|
 | value open frames (dirty_append / dirty_hole_fill) | `value_alloc_sched` | RMC §7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
 | value placement metadata (pools, hole_page_list, generic_free_spans) | `value_alloc_sched` | RMC §6.4/7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
-| **value_page readonly_frame_cache（读写共享）** | **`value_alloc_sched`** | RMC §7.1, RSM §6.1/6.5 | 如果 front_sched 或 tree_lookup_sched 持有 value_page cache → 错 |
+| **value_page readonly_frame_cache（读写共享）** | **`value_alloc_sched`** | RMC §7.1, RSM §6.1/6.5 | 如果 front_sched、tree_lookup_sched 或 tree_worker_sched 持有 value_page cache → 错 |
 | WAL tail frame | `front_sched` | RMC §7.1, RSM §3.9 | — |
-| tree node read-only frame cache（普通读路径） | `tree_lookup_sched` | RMC §7.1/9.1, RSM §4.7 | 如果 front_sched 持有 tree_node cache → 错 |
+| tree node read-only frame cache（普通读路径 + flush old-leaf read） | `tree_read_domain` shard | RMC §7.1/9.1, RSM §4/§4.7/§4.8 | 如果 front_sched 或 tree_sched 持有 tree_node cache → 错 |
 | tree flush write buffers | `tree_sched` | RMC §7.1 | — |
 | active/sealed memtable gens | `front_sched` | RSM §3.1 | — |
 | flush frontier snapshot (`durable_lsn` + `tree_guard`) | `coord_sched` | RSM §2.3, FF §2.2 | 如果 tree_sched 自行拼装当前 frontier → 错 |
@@ -117,7 +120,7 @@ coord_sched(close_gate) → fan-out front_scheds(seal_active) → reduce → coo
 
 ### Flush
 ```
-tree_sched(check_trigger_conditions) → coord_sched(capture_flush_frontier) → fan-out front_scheds(collect_eligible_gens) → reduce → tree_sched(fold, write_tree_slots, build_manifest) → nvme_flush → tree_sched(update_flush_max_lsn) → coord_sched(frontier_switch) → fan-out front_scheds(release_gens)
+tree_sched(check_trigger_conditions) → coord_sched(capture_flush_frontier) → fan-out front_scheds(collect_eligible_gens) → reduce → tree_sched(tree_flush) → tree_sched(update_flush_max_lsn) → coord_sched(frontier_switch) → fan-out front_scheds(release_gens)
 ```
 出现点：OV §9.4/14.6, FF §1.1/8.1
 
@@ -164,7 +167,8 @@ read_superblock → traverse_tree(leaf_records) + scan_wal(entries) → merge(lo
 | 被引用章节 | 引用方 |
 |-----------|--------|
 | RSM §4.7 (`tree_lookup_sched` 与 tree lookup) | RAP §4.2 "见 runtime_state_machine.md §4.7" |
-| RSM §4.8 (recovery_safe_lsn) | FF §6.2 "见 runtime_state_machine.md §4.8" |
+| RSM §4.8 (`tree_worker_sched` 与 candidate build) | FF §3.4 |
+| RSM §4.9 (recovery_safe_lsn) | FF §6.2 "见 runtime_state_machine.md §4.9" |
 | RSM §6 (value_alloc_sched) | WP §5.3, RMC §6.2, RAP §4.5/9.3 |
 | RSM §6.5 (`handle_read_value` / `handle_read_page_values`) | RAP §4.2/4.5/5.2/6.2 |
 | RSM §5.3-5.4 (wal_space_sched) | RW §12.4 |

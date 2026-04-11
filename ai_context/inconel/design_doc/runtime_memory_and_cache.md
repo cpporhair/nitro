@@ -658,18 +658,28 @@ struct free_span_descriptor {
    - **不**拥有 value_page cache（tree-path value read 统一由 `value_alloc_sched` 服务）
    - **不**拥有 value open pages 或 placement metadata
 
-3. `tree_lookup_sched`
-   - 拥有本 shard 的 `readonly_frame_cache`（tree_node domain，用于 point lookup / tree fill misses）
-   - 执行普通读路径的 tree traversal
+3. `tree_read_domain`
+   - 拥有本 shard 的 `readonly_frame_cache`（tree_node domain）
+   - 由同 shard 的 `tree_lookup_sched` / `tree_worker_sched` 共享
+   - 服务普通读路径的 tree traversal，以及 flush 中的 old-leaf read
+
+4. `tree_lookup_sched`
+   - 执行普通读路径的 tree traversal，以及 flush 中的 `keys_to_leaf_groups()`
+   - 访问所属 `tree_read_domain` 的 `readonly_frame_cache`
    - **不**拥有 value_page cache（tree hit value 后路由到 `value_alloc_sched` 读取）
 
-4. `tree_sched`
+5. `tree_worker_sched`
+   - 执行 flush 中的 old leaf read / decode / candidate materialization
+   - 访问所属 `tree_read_domain` 的 `readonly_frame_cache`
+   - **不**拥有 allocator、manifest mutation 或 retire list
+
+6. `tree_sched`
    - 拥有 tree flush write buffers
    - 拥有 `checkpoint_guard` retire lists
    - 决定 tree slot / old tree-visible value 何时真正回收
-   - 拥有本地 `readonly_frame_cache`（tree_node domain，用于 flush fold 读旧 leaf）
+   - **不**拥有 tree-node `readonly_frame_cache`
 
-5. read cache local shard（各 scheduler 内部）
+7. read cache local shard（各 scheduler 内部）
    - 只拥有 clean frame 的 local residency 索引
    - 不拥有 allocator 元数据
    - 不拥有 dirty 可写页
@@ -678,18 +688,18 @@ struct free_span_descriptor {
 
 hole 的 free-slot 分布、页是否已被 writer 打开、写满后需从可分配集合摘除——这些都是写侧 allocator 状态，必须有单一 owner。
 
-新模型下，这些元数据、DMA 写入 ownership 和 value_page 读缓存统一归 `value_alloc_sched`（单线程，天然互斥）。最佳实践是把它部署在独占核心上。`value_alloc_sched` 的 `readonly_frame_cache` 同时服务写侧 hole reuse（免去 device read）和读侧 tree-path value read（`read_value` / `read_page_values` 接口）。`front_sched` 和 `tree_lookup_sched` 不持有 value_page cache。
+新模型下，这些元数据、DMA 写入 ownership 和 value_page 读缓存统一归 `value_alloc_sched`（单线程，天然互斥）。最佳实践是把它部署在独占核心上。`value_alloc_sched` 的 `readonly_frame_cache` 同时服务写侧 hole reuse（免去 device read）和读侧 tree-path value read（`read_value` / `read_page_values` 接口）。`front_sched`、`tree_lookup_sched` 和 `tree_worker_sched` 都不持有 value_page cache。
 
 ### 7.3 允许重复 residency，但不允许重复可写 ownership
 
-**tree_node domain**：同一个 tree node page 可以在多个 `tree_lookup_sched` / `tree_sched` 的 `readonly_frame_cache` 中各自驻留。这只是空间换性能。
+**tree_node domain**：同一个 tree node page 可以在多个 `tree_read_domain` shards 的 `readonly_frame_cache` 中各自驻留。这只是空间换性能。同一个 shard 内由 `tree_lookup_sched` / `tree_worker_sched` 共享该 cache。
 
 **value_page domain**：`value_alloc_sched` 是 value_page cache 的**唯一 owner**。没有跨 shard 重复 residency，因此不存在 value_page 的 stale hit 问题。`value_alloc_sched` 内部 hole-fill writeback 后直接更新本地 cache，不需要跨 shard invalidate。
 
 通用约束：
 
 1. dirty frame 的可写 ownership 只能有一份，且只在 `value_alloc_sched` 上（value pages）或 `front_sched` 上（WAL tail）。
-2. tree 地址只有在完成跨 `tree_lookup_sched` / `tree_sched` shards 的 `tree_node` invalidate barrier 后，才允许进入 `free_ranges` 等可复用池（见 §10.2）。
+2. tree 地址只有在完成跨全部 `tree_read_domain` shards 的 `tree_node` invalidate barrier 后，才允许进入 `free_ranges` 等可复用池（见 §10.2）。
 3. value 地址的复用安全由 `value_alloc_sched` 单 owner 天然保证：旧 clean frame 在 writeback / 回收时由同一线程直接更新或删除，不需要跨 shard 协调。
 
 ## 8. Value Placement 与 Cache/Page State 的耦合
@@ -900,7 +910,7 @@ v1 在这里**不采用 `reuse_epoch`**。冻结协议如下：
 1. `tree_node`（需要跨 shard invalidate barrier）
    - 普通 old slot 不会单独重写复用；只有 enclosing range 进入 `free_ranges` 前才需要 barrier。
    - 因此 tree 侧 barrier 的粒度是”整个 old range 的所有 slot 地址”。
-   - 广播目标包括所有 `tree_lookup_sched` 的 tree-node cache shards，以及 `tree_sched` 自己为 flush fold 持有的 tree-node cache。
+   - 广播目标包括所有 `tree_read_domain` 的 tree-node cache shards；`tree_sched` 不在广播目标内，因为它不再持有 tree-node read cache。
 2. `value_page`（**无需跨 shard invalidate barrier**）
    - `value_alloc_sched` 是 value_page cache 的唯一 owner。hole-fill writeback 后直接更新本地 cache；whole page / extent 回收时直接从本地 cache 删除。
    - 因为不存在其它 shard 持有 value_page 的 clean 副本，不需要广播 invalidate。
@@ -997,7 +1007,7 @@ return_partial_page(frame):
 
 | 旧术语 | 在本文中的统一解释 |
 |--------|------------------|
-| `node_cache` | `readonly_frame_cache` 在 tree domain 的逻辑视图；运行时通常由 `tree_lookup_sched` / `tree_sched` 持有 |
+| `node_cache` | `readonly_frame_cache` 在 tree domain 的逻辑视图；运行时由 `tree_read_domain` 持有，供 `tree_lookup_sched` / `tree_worker_sched` 共享 |
 | `value_cache` | 底层应理解为 value frame residency；上层可再叠加 materialized view/blob 索引 |
 | `slab_page_buf` | `value_page_frame { st = dirty_append, mode = append }` |
 | hole reuse RMW 临时页 | `value_page_frame { st = dirty_hole_fill, mode = hole_fill }` |

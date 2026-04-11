@@ -59,11 +59,22 @@ namespace apps::inconel::core::registry {
     // the builder.
     inline value::value_alloc_sched_base* value_alloc_sched = nullptr;
 
+    // tree::tree_sched is a global singleton introduced in step 023
+    // (Phase 3 G5, D17/D18/D24). It owns the tree-local flush round
+    // state machine and is pinned to cores[0] alongside
+    // value::value_alloc_sched. All access goes through
+    // `tree_sched_singleton()`; no per-core helper is needed because
+    // `tree_sched` has exactly one instance.
+    //
+    // The field is named `tree_sched_singleton_ptr` (not
+    // `tree_sched`) so it does not collide with the `tree::`
+    // namespace inside this file.
+    inline tree::tree_sched* tree_sched_singleton_ptr = nullptr;
+
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
     // Singletons:
     //   inline coord::scheduler*       coord_sched       = nullptr;
-    //   inline tree::scheduler*        tree_sched        = nullptr;
     //   inline wal::scheduler*         wal_space_sched   = nullptr;
     //
     // Per-shard:
@@ -98,6 +109,7 @@ namespace apps::inconel::core::registry {
         tree_worker_scheds.list.clear();
         tree_worker_scheds.by_core.clear();
         value_alloc_sched = nullptr;
+        tree_sched_singleton_ptr = nullptr;
     }
 
     // ── Singleton access ──
@@ -110,6 +122,15 @@ namespace apps::inconel::core::registry {
     value_sched() {
         assert(value_alloc_sched && "value::value_alloc_sched not registered");
         return value_alloc_sched;
+    }
+
+    // tree_sched_singleton() follows the same pattern as value_sched()
+    // (023 D24). Application code never touches
+    // `tree_sched_singleton_ptr` directly.
+    inline tree::tree_sched*
+    tree_sched_singleton() {
+        assert(tree_sched_singleton_ptr && "tree::tree_sched not registered");
+        return tree_sched_singleton_ptr;
     }
 
     // ── Per-core fast access (current core) ──

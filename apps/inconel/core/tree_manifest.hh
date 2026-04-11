@@ -16,6 +16,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "../format/types.hh"
+#include "./leaf_order.hh"
 #include "./panic.hh"
 #include "./tree_geometry.hh"
 
@@ -33,11 +34,23 @@ namespace apps::inconel::core {
     // value. The pointee is owned by the runtime builder and outlives
     // every manifest snapshot it produces, so there is no lifetime
     // concern for readers.
+    //
+    // Step 023 (Phase 3 G1 / §2, D2-D7) adds an inline, by-value
+    // `leaf_order_index leaf_order`. The index is manifest-owned: when
+    // the surrounding `shared_ptr<const tree_manifest>` drops, every
+    // fence byte and every `leaf_span` retires atomically. RSM §4.5
+    // freezes leaf_order as runtime-only (NOT persisted) and immutable
+    // after construction — any change requires a whole new manifest
+    // snapshot built by the Phase 7 root-stable writer. Phase 3 only
+    // freezes the field; the populated-index builder
+    // (`rebuild_leaf_order_from_tree_delta`, FF §3.8) belongs to
+    // Phase 7.
 
     struct tree_manifest {
         paddr root_slot;
         absl::flat_hash_map<paddr, uint32_t> slot_map;
         const tree_geometry* geom;
+        leaf_order_index     leaf_order;  // step 023 §2, Phase 3 G1
 
         bool
         has_root() const {
@@ -97,7 +110,14 @@ namespace apps::inconel::core {
                 panic_inconsistency("tree_manifest::empty",
                     "tree_geometry pointer must not be null");
             }
-            return { .root_slot = {0, 0}, .slot_map = {}, .geom = g };
+            // Empty bootstrap manifest (023 D5): `spans` empty and
+            // `fence_pool` empty. Readers short-circuit on
+            // `!has_root()` before ever consulting `leaf_order`,
+            // so the empty index is correct by construction.
+            return { .root_slot  = {0, 0},
+                     .slot_map   = {},
+                     .geom       = g,
+                     .leaf_order = {} };
         }
     };
 

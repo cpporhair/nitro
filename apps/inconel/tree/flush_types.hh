@@ -1,33 +1,47 @@
 #ifndef APPS_INCONEL_TREE_FLUSH_TYPES_HH
 #define APPS_INCONEL_TREE_FLUSH_TYPES_HH
 
-// ── Flush shared shell types (step 022 / Phase 2 G4) ──
+// ── Flush shared shell types ──────────────────────────────────────
 //
-// Minimal cross-scheduler type shells for the tree-local flush
-// pipeline. Phase 2 only freezes the top-level identity and the
-// stable payload that every later phase will certainly need; any
-// field tied to round-owned-array ownership — including
-// `flush_key_group_ref`, `round_index`, or similar indirection
-// layers — is deliberately absent. Those belong to Phase 3 once the
-// owning side of the round state has been fixed.
+// Cross-scheduler type shells for the tree-local flush pipeline.
 //
-// Fail-fast convention (022 D11, §10): every flush result struct
-// carries a `flush_stage_status`. Unimplemented sender surfaces
-// return the result with `st = unsupported_unimplemented` via the
-// normal value path; we do not throw for unimplemented phases.
+// Phase 2 (step 022 G4) froze the top-level identity and the stable
+// payload every later phase would certainly need (flush_round_id,
+// flush_stage_status, the lookup / worker request identity fields,
+// the worker candidate result).
 //
-// Consumers:
-//   - tree/worker_scheduler.hh consumes `flush_worker_req` and
-//     produces `flush_candidate_batch`.
-//   - Phase 5 will add a `tree/lookup_scheduler.hh`-side sender
-//     consuming `flush_lookup_req` and producing
-//     `flush_leaf_group_result`. In Phase 2 those types exist but
-//     no sender consumes them yet.
+// Phase 3 (step 023 G2/G3/G6) extends the header with:
+//   - `tree_flush_request` / `tree_flush_result` — the full owner
+//     payload handed to `tree_sched::handle_tree_flush`. Shapes mirror
+//     RSM §4.2 one-for-one except for two deliberate deviations
+//     (Δ-1 / Δ-2) logged in 023 §与 RSM §4.1/§4.2 的偏差 and tracked
+//     for a follow-up doc-sync step.
+//   - `flush_key_group` — per-logical-key fold output. Phase 3 only
+//     freezes the shape so the Phase 4 fold step does not have to
+//     touch this header a second time.
+//   - `flush_lookup_req` / `flush_worker_req` re-gain the borrowed
+//     payload (`std::span<const flush_key_group>` /
+//     `std::span<const flush_leaf_group>`). 022 temporarily stripped
+//     those fields because no owning side existed; Phase 3 establishes
+//     the owning side in `tree/flush_round_state.hh` and the borrow
+//     is now safe. The span's backing storage is the round-owned
+//     vectors inside `flush_round_state` — see 023 §6.
+//
+// Fail-fast convention (022 D11, §10; reused in Phase 3): every flush
+// result struct carries a `flush_stage_status`. Unimplemented sender
+// surfaces return the result with `st = unsupported_unimplemented` via
+// the normal value path; we do not throw for unimplemented phases.
 
 #include <cstdint>
+#include <memory>
+#include <span>
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/inlined_vector.h>
 
+#include "../core/checkpoint_guard.hh"
+#include "../core/memtable.hh"
+#include "../core/retired_objects.hh"
 #include "../core/tree_manifest.hh"
 #include "../format/types.hh"
 
@@ -47,12 +61,51 @@ namespace apps::inconel::tree {
         unsupported_shape_change,
     };
 
+    // ── fold output ──────────────────────────────────────────────
+    //
+    // Per-logical-key fold result produced by the Phase 4 fold stage.
+    // Phase 3 only freezes the shape. `memtable_winner` / the raw
+    // `winner_*` triple below are the references the rest of the
+    // flush pipeline carries through to leaf candidate build / writer.
+    //
+    // None of the bytes are owned here:
+    //
+    //   - `key` is a `std::string_view` into the winner gen's
+    //     kv_arena (RSM §3.2). The pin chain
+    //     `tree_flush_request.sealed_gens[*]` keeps that arena alive
+    //     for the full flush round.
+    //   - `winner_value` is a `value_handle` (POD). Both halves
+    //     follow the same pin chain.
+    //
+    // Memtable losers for the same key are pushed onto
+    // `winner_gen->loser_durable_refs` by the fold step itself
+    // (Phase 4); they are not carried on this struct. Phase 3 forbids
+    // any "owning" variant of this struct — anything that would
+    // require copying value bytes through the round_state belongs
+    // outside the flush pipeline.
+
+    struct flush_key_group {
+        std::string_view                     key;
+        uint64_t                             winner_data_ver;
+        core::memtable_entry::kind           winner_kind;
+        core::value_handle                   winner_value;  // valid iff winner_kind == kind::value
+        std::shared_ptr<core::memtable_gen>  winner_gen;
+    };
+
     // ── leaf mapping stage (Phase 5 consumer) ────────────────────
 
+    // Phase 3 re-attaches the borrowed payload that 022 review M-3
+    // had to strip. `groups` points at the round-owned
+    // `flush_round_state.workset` vector and is valid for the
+    // lifetime of the enclosing round (see 023 §6). `tree_sched`
+    // MUST NOT let a `flush_lookup_req` outlive the round_state it
+    // borrows from; Phase 5 will land the dispatch logic that
+    // enforces it — Phase 3 only freezes the field.
     struct flush_lookup_req {
-        flush_round_id             round_id;
-        uint32_t                   read_domain_index;
-        const core::tree_manifest* base_manifest;
+        flush_round_id                    round_id;
+        uint32_t                          read_domain_index;
+        const core::tree_manifest*        base_manifest;
+        std::span<const flush_key_group>  groups;   // borrows from flush_round_state
     };
 
     struct flush_leaf_group {
@@ -67,28 +120,22 @@ namespace apps::inconel::tree {
         absl::InlinedVector<flush_leaf_group, 8>  leaf_groups;
     };
 
-    // ── candidate materialization stage (Phase 6 consumer; Phase 2
-    //    already wires the worker skeleton so the sender exists but
-    //    returns unsupported_unimplemented) ────────────────────────
+    // ── candidate materialization stage (Phase 6 consumer) ───────
     //
-    // Phase 2 intentionally does NOT carry any leaf-group payload
-    // inside `flush_worker_req`. The earlier draft held a
-    // `std::span<const flush_leaf_group>` borrowed view here, but a
-    // borrowed view crossing an async `per_core::queue` is a
-    // lifetime trap: the sender copies the req into its own op,
-    // enqueues it, and the worker consumes it on another scheduler
-    // tick — the caller's backing storage may already be gone.
-    // Round-owned-array ownership belongs to Phase 3 (see 022 D10,
-    // review round 2 M-3). When that step lands, the real payload
-    // will be added alongside an explicit owner contract; until
-    // then Phase 2 only carries the fields whose ownership is
-    // already unambiguous.
+    // Phase 3 re-attaches the borrowed `leaf_groups` payload that
+    // 022 review M-3 had to strip for the same ownership reason as
+    // above. The span points at the round-owned
+    // `flush_round_state.leaf_groups` vector; Phase 3's Phase-2-era
+    // worker handle still does NOT deref it (the handle keeps
+    // returning `unsupported_unimplemented`), but the field must be
+    // present so Phase 6 does not have to refloat this carrier.
 
     struct flush_worker_req {
-        flush_round_id             round_id;
-        uint32_t                   read_domain_index;
-        const core::tree_manifest* base_manifest;
-        uint64_t                   recovery_safe_lsn;
+        flush_round_id                    round_id;
+        uint32_t                          read_domain_index;
+        const core::tree_manifest*        base_manifest;
+        uint64_t                          recovery_safe_lsn;
+        std::span<const flush_leaf_group> leaf_groups;  // borrows from flush_round_state
     };
 
     struct flush_leaf_candidate {
@@ -102,6 +149,69 @@ namespace apps::inconel::tree {
         uint32_t                                     read_domain_index;
         flush_stage_status                           st;
         absl::InlinedVector<flush_leaf_candidate, 8> leaves;
+    };
+
+    // ── owner-level flush request / result ──────────────────────
+    //
+    // `tree_flush_request` is the envelope the coord_sched eventually
+    // hands to `tree_sched` at seal time. Phase 3 only freezes field
+    // layout; the Phase 3 `handle_tree_flush` inspects `base_guard`
+    // and `sealed_gens` for fail-fast validation, then returns an
+    // `unsupported_unimplemented` result via the value path (D22).
+    //
+    // Deviation Δ-1 (023 §与 RSM §4.1/§4.2 的偏差): RSM §4.2 declares
+    // `sealed_gens` as a `std::span<std::shared_ptr<memtable_gen>>`.
+    // Phase 3 promotes it to an owning
+    // `absl::InlinedVector<..., 8>`. A borrowed span crossing the
+    // `tree_sched` ingress queue would repeat the M-3 bug from 022
+    // review §1: the op copies args into a heap req, the caller's
+    // stack frame returns, and `tree_sched::advance()` consumes the
+    // req in a different scheduler tick — by which time the
+    // caller-side backing storage is gone. Owning InlinedVector at
+    // inline capacity 8 still zero-allocates for the common Phase 4
+    // round size. The `shared_ptr` copies bump refcount on the
+    // caller's core (correct ownership transfer); `tree_sched` only
+    // ever sees fully pinned gens. A doc-sync step after Phase 3
+    // will propagate this back to RSM / FF / cross_doc.
+
+    struct tree_flush_request {
+        std::shared_ptr<const core::checkpoint_guard>                base_guard;
+        absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>  sealed_gens;
+        uint64_t                                                     recovery_safe_lsn;
+    };
+
+    // Deviation Δ-2 (023 §与 RSM §4.1/§4.2 的偏差): RSM §4.2 shows
+    // `tree_flush_result` with a `bool ok` plus a separate
+    // `flush_error error` field. Phase 3 unifies the status into a
+    // single `flush_stage_status st`, matching the existing carrier
+    // convention already used by `flush_leaf_group_result` and
+    // `flush_candidate_batch` (022 D11). Having two status fields on
+    // one result struct invites subtle bugs where callers inspect
+    // `ok` but forget to consult `error`. A doc-sync step after
+    // Phase 3 will propagate this back to RSM / FF / cross_doc.
+    //
+    // Phase 3 never emits a successful `tree_flush_result`: the only
+    // value `tree_sched::advance()` ever returns is
+    //   { st                    = unsupported_unimplemented,
+    //     new_manifest          = nullptr,
+    //     retired               = {},
+    //     flushed_gens_by_front = {},
+    //     memtable_losers       = {},
+    //     flushed_max_lsn       = 0 }.
+    // Phases 4-7 progressively replace that with real content
+    // without changing the field layout.
+
+    struct tree_flush_result {
+        flush_stage_status                          st = flush_stage_status::ok;
+        std::shared_ptr<const core::tree_manifest>  new_manifest;
+        core::retired_objects                       retired;
+        absl::flat_hash_map<
+            uint32_t,
+            absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>>
+                                                    flushed_gens_by_front;
+        absl::InlinedVector<core::retired_value_ref, 64>
+                                                    memtable_losers;
+        uint64_t                                    flushed_max_lsn = 0;
     };
 
 }  // namespace apps::inconel::tree

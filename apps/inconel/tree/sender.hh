@@ -1,12 +1,13 @@
 #ifndef APPS_INCONEL_TREE_SENDER_HH
 #define APPS_INCONEL_TREE_SENDER_HH
 
-// ── tree/sender.hh ── module-facing facade (step 022 §9, D12) ──
+// ── tree/sender.hh ── module-facing facade (step 022 §9, D12;
+//                       extended by step 023 §10) ──
 //
 // This header is the single entry point external modules use to talk
 // to the tree domain (see `code_modules.md` §L2.tree). It explicitly
-// #includes the split sub-headers so both the public PUMP senders and
-// their `op_pusher` / `compute_sender_type` specializations become
+// #includes the split sub-headers so every public PUMP sender and
+// its `op_pusher` / `compute_sender_type` specializations become
 // visible in any translation unit that consumes the facade:
 //
 //   - `lookup_scheduler.hh` — point-read `process(state)` sender,
@@ -15,13 +16,18 @@
 //     sender returning an `unsupported_unimplemented`
 //     `flush_candidate_batch`. Real candidate build arrives in
 //     Phase 6.
+//   - `owner_scheduler.hh` — Phase 3 `tree_flush(...)` sender driving
+//     `tree_sched::handle_tree_flush`. Returns an
+//     `unsupported_unimplemented` `tree_flush_result` via the value
+//     path in Phase 3 (023 D22); Phase 4-7 progressively replace
+//     the stub with fold → leaf mapping → candidate build → writer.
 //
 // Adding a future tree-side public sender means:
 //   1. Define the op/sender and its PUMP specializations inside the
 //      owning sub-header.
 //   2. Add a free-function wrapper in this facade header (or let
 //      callers reach the underlying sender directly — see
-//      `build_leaf_candidates` below).
+//      `build_leaf_candidates` / `tree_flush` below).
 //
 // External modules should not #include the sub-headers directly.
 
@@ -36,6 +42,7 @@
 #include "pump/sender/pop_context.hh"
 
 #include "./lookup_scheduler.hh"
+#include "./owner_scheduler.hh"
 #include "./worker_scheduler.hh"
 #include "../core/registry.hh"
 #include "../mock_nvme/sender.hh"
@@ -127,6 +134,21 @@ namespace apps::inconel::tree {
     inline auto
     build_leaf_candidates(tree_worker_sched* worker, flush_worker_req req) {
         return worker->submit_build(req);
+    }
+
+    // ── tree_flush (Phase 3 owner skeleton surface, 023 D23) ──
+    //
+    // Facade wrapper over `tree_sched::submit_flush`. Phase 3's
+    // underlying handle always returns
+    // `tree_flush_result { st = unsupported_unimplemented }` via the
+    // value path (023 D22). Phase 4-7 progressively replace that
+    // with fold → leaf mapping → candidate build → writer without
+    // changing this facade's signature. External modules reach
+    // `tree_sched` exclusively through this function plus the
+    // singleton helper in `core/registry.hh`.
+    inline auto
+    tree_flush(tree_sched* sched, tree_flush_request req) {
+        return sched->submit_flush(std::move(req));
     }
 
 }

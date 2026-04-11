@@ -30,20 +30,32 @@ namespace apps::inconel::runtime {
     // cache parameters appear at the runtime level — application code
     // interacts with schedulers via the non-templated core::runtime registry.
     //
-    // Step 022 Phase 2 extends the tuple from 3 to 4 scheduler types by
+    // Step 022 Phase 2 extended the tuple from 3 to 4 scheduler types by
     // adding `tree::tree_worker_sched` between `tree_lookup_sched` and
     // `value_alloc_sched`. Worker is non-templated in Phase 2 (cache /
     // frame pool / inflight still lookup-local, see 022 §3, L-14); when
     // the cache ownership migration step before Phase 5/6 lands, the
     // worker will be templated on the same `TreeCache` as the lookup
     // shard it pairs with.
+    //
+    // Step 023 Phase 3 (§9, D25) extends the tuple from 4 to 5 scheduler
+    // types by appending `tree::tree_sched` at the tail. `tree_sched`
+    // is a singleton and is pinned to cores[0] alongside
+    // `value::value_alloc_sched`; every other core's PUMP per-core
+    // tuple carries a nullptr in this slot (same pattern as the value
+    // singleton). Tuple tail is the chosen position because a tail
+    // singleton does not disturb the existing per-core advance order
+    // for the other schedulers, and `tree_sched` is an owner-level
+    // round driver whose work is always entered through its own queue
+    // rather than through advance-order coupling with peers.
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
         tree::tree_lookup_sched<TreeCache>,
         tree::tree_worker_sched,
-        value::value_alloc_sched<ValueCache>
+        value::value_alloc_sched<ValueCache>,
+        tree::tree_sched
     >;
 
     // ── Bootstrap tree geometry ──
@@ -316,9 +328,22 @@ namespace apps::inconel::runtime {
                 core::registry::value_alloc_sched = value_sched;
             }
 
+            // Singleton: tree::tree_sched is pinned to cores[0] (step
+            // 023 §9, D18/D25). Every other core carries a nullptr
+            // placeholder in the per-core tuple so share_nothing's
+            // `run()` loop skips the empty slot. The singleton is
+            // constructed before the `add_core_schedulers` call below
+            // so the first core's tuple gets the real pointer and
+            // every subsequent core's tuple gets nullptr.
+            tree::tree_sched* tsched = nullptr;
+            if (first) {
+                tsched = new tree::tree_sched();
+                core::registry::tree_sched_singleton_ptr = tsched;
+            }
+
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
-            // nvme, tree_lookup, tree_worker, value_alloc.
-            rt->add_core_schedulers(core, nvme, tlookup, tworker, value_sched);
+            // nvme, tree_lookup, tree_worker, value_alloc, tree_sched.
+            rt->add_core_schedulers(core, nvme, tlookup, tworker, value_sched, tsched);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme);
@@ -336,14 +361,23 @@ namespace apps::inconel::runtime {
 
     // ── tear_down: free schedulers + clear registry ──
     //
-    // Destroy order follows step 022 §8: worker → lookup → value → nvme.
-    // In Phase 2 no cache ownership has been migrated, so frame
-    // destruction still happens inside `~tree_lookup_sched` (not in the
-    // worker, not in a named tree_read_domain).
+    // Destroy order follows step 023 §9 / D26:
+    //   tree_sched → tree_worker → tree_lookup → value → nvme.
+    // `tree_sched` is Phase 3's newest addition and its destructor is
+    // trivial (no cache, no frame pool, no inflight state), so we
+    // delete it first to keep the order stable as later phases add
+    // the real reclaim_q plumbing. The worker → lookup → value → nvme
+    // tail matches step 022 §8 and is unchanged: in Phase 3 no cache
+    // ownership has been migrated, so frame destruction still happens
+    // inside `~tree_lookup_sched` (not in the worker, not in a named
+    // tree_read_domain).
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
+        if (core::registry::tree_sched_singleton_ptr) {
+            delete core::registry::tree_sched_singleton_ptr;
+        }
         for (auto* s : core::registry::tree_worker_scheds.list) delete s;
         for (auto* s : core::registry::tree_lookup_scheds.list) {
             delete static_cast<tree::tree_lookup_sched<TreeCache>*>(s);

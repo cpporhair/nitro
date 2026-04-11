@@ -116,6 +116,10 @@ add_executable(inconel_test_tree_value apps/inconel/test/test_tree_value.cc)
 target_include_directories(inconel_test_tree_value PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_flush_carriers apps/inconel/test/test_flush_carriers.cc)
+target_include_directories(inconel_test_flush_carriers PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_flush_carriers PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_tree_page_format apps/inconel/test/test_tree_page_format.cc)
 target_include_directories(inconel_test_tree_page_format PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_page_format PRIVATE ${INCONEL_ABSL_LIBS})

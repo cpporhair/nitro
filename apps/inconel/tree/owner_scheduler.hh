@@ -1,48 +1,32 @@
 #ifndef APPS_INCONEL_TREE_OWNER_SCHEDULER_HH
 #define APPS_INCONEL_TREE_OWNER_SCHEDULER_HH
 
-// ── tree_sched — tree-domain flush round owner (step 023 §7) ──
+// ── tree_sched — tree-domain flush round owner ──
 //
-// Phase 3 (step 023 G4/G5) lands `tree_sched` as the singleton owner
-// of the tree-local flush round state machine (RSM §1, OV §1.7). The
-// scheduler holds the `tree_state` aggregate defined by RSM §4.1 and
-// a single ingress queue — `flush_q` — for `tree_flush_request`
-// deliveries.
+// Phase 3 (step 023) landed `tree_sched` as the singleton owner of
+// the tree-local flush round state machine (RSM §1, OV §1.7).
 //
-// Phase 3 intentionally does NOT implement any flush algorithm. The
-// `handle_tree_flush` path is stubbed per 023 D22:
+// Phase 4 (step 024) implements the first real algorithm:
 //
-//   1. `base_guard` must be non-null.
-//   2. `sealed_gens` must be non-empty. FF §2.3 reserves the empty-
-//      round fast path for Phase 4; Phase 3 keeps it strict so call
-//      sites cannot silently rely on the stub returning `ok`.
-//   3. If either check fails, `tree_sched::advance()` calls
-//      `core::panic_inconsistency` (matching worker_scheduler.hh
-//      M-4 fail-fast convention).
-//   4. Otherwise, the handle fires the callback with a fully
-//      populated `tree_flush_result { st = unsupported_unimplemented,
-//      new_manifest = nullptr, ... }` via the value path. No
-//      `flush_round_state` is allocated, no `tree_state` field is
-//      mutated, no LSN cursor advances. This is deliberate: a
-//      prototype that allocates+frees a round_state without Phase 4-7
-//      following it up would exercise the allocation path but not
-//      validate any downstream stage, muddling the Phase 3/4 seam.
+//   - `advance()` validates inputs, allocates `flush_round_state`,
+//     parks it in `tree_state.active_rounds`, runs
+//     `fold_pinned_gens()` + `build_key_partitions()`, then unparks.
+//   - Empty sealed_gens → ok (D8); empty workset → ok with
+//     `new_manifest = base_manifest` (D19); non-empty workset →
+//     `unsupported_unimplemented` (Phase 5-7 downstream pending).
+//   - Losers pushed directly into each gen's `loser_durable_refs`
+//     during fold; `clear()` at fold start ensures idempotency.
+//   - Fail-fast: null gen / non-sealed / dup gen_id / null guard /
+//     null manifest / zero lookup count → `panic_inconsistency`.
 //
 // `reclaim_q` exists on `tree_state` for structural fidelity to RSM
-// §4.1, but Phase 3 has no producer and no consumer: `advance()`
-// deliberately does NOT drain it (023 D21). The real producer is
-// `~checkpoint_guard()` posting a reclaim_task during
-// frontier_switch; the real consumer is the Phase 8+ TRIM dispatch.
-// Phase 3 uses `struct reclaim_task;` as a forward declaration — the
-// queue only holds `reclaim_task*`, so the full type is not needed
-// here.
+// §4.1, but has no producer and no consumer yet: `advance()` does
+// NOT drain it (023 D21).
 //
-// File split (022 D12, §9; carried through Phase 3 023 D23): the
-// op/sender/op_pusher/compute_sender_type specializations live in
-// this header alongside the scheduler definition. `tree/scheduler.hh`
-// aggregates the tree-domain sub-headers; `tree/sender.hh` exports
-// the outward-facing `tree::tree_flush(tree_sched*, tree_flush_request)`
-// facade.
+// File split (022 D12, §9): op/sender/op_pusher/compute_sender_type
+// specializations live here alongside the scheduler.
+// `tree/scheduler.hh` aggregates sub-headers; `tree/sender.hh`
+// exports the outward-facing facade.
 
 #include <cstddef>
 #include <cstdint>
@@ -57,9 +41,22 @@
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+
 #include "../core/panic.hh"
 #include "../format/types.hh"
+#include "./flush_round_state.hh"
 #include "./flush_types.hh"
+#include "./memtable_fold.hh"
+
+// Forward declaration to break include cycle:
+// registry.hh → tree/scheduler.hh → owner_scheduler.hh.
+// The full definition lives in core/registry.hh, which every
+// translation unit that instantiates advance() also includes.
+namespace apps::inconel::core::registry {
+    inline uint32_t tree_lookup_count();
+}
 
 namespace apps::inconel::tree {
 
@@ -112,7 +109,44 @@ namespace apps::inconel::tree {
         // Phase 3 — see 023 D21 / §7. `advance()` deliberately does
         // NOT drain this queue.
         pump::core::per_core::queue<reclaim_task*> reclaim_q{256};
+
+        // ── Phase 4: active flush rounds (D1/D2) ─────────────────
+        //
+        // Key is `flush_round_id.v` (uint64_t).
+        // `flush_round_id` has no `AbslHashValue`; `.v` is used
+        // directly as hash key.
+        //
+        // Phase 4 round lifecycle: park at fold start, unpark at fold
+        // end (same advance tick). Phase 5+ will extend the window
+        // across multiple advance ticks when async fanout is introduced.
+        absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
+            active_rounds;
+        uint64_t next_round_id = 1;
     };
+
+    // ── build_flushed_gens_by_front (D18) ──────────────────────────
+    //
+    // Groups pinned gens by their front_owner_index. All ok paths
+    // must call this so outer flow can release_gens correctly.
+    // front_owner_index == UINT32_MAX is the invalid sentinel (D17)
+    // and triggers panic_inconsistency.
+
+    static inline auto
+    build_flushed_gens_by_front(
+        const absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>& gens)
+    {
+        absl::flat_hash_map<uint32_t,
+                            absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>>
+            result;
+        for (const auto& g : gens) {
+            if (g->front_owner_index == UINT32_MAX)
+                core::panic_inconsistency(
+                    "build_flushed_gens_by_front",
+                    "memtable_gen.front_owner_index not initialized");
+            result[g->front_owner_index].push_back(g);
+        }
+        return result;
+    }
 
     // ── PUMP req / op / sender for tree_flush ────────────────────
 
@@ -192,9 +226,12 @@ namespace apps::inconel::tree {
             return _tree_flush::sender{ this, std::move(args) };
         }
 
-        // Phase 3 advance(): drain at most kMaxFlushOpsPerAdvance
+        // Phase 4 advance(): drain at most kMaxFlushOpsPerAdvance
         // flush requests per tick. reclaim_q is intentionally NOT
         // drained (023 D21, §7).
+        //
+        // Phase 4 flow: validate → park round_state → fold →
+        // partition → unpark → cb. Full algorithm in plan §5.
         bool
         advance() {
             bool progress = false;
@@ -203,23 +240,8 @@ namespace apps::inconel::tree {
                 if (!item) break;
                 auto* r = *item;
 
-                // Carrier-contract validation. All three checks match
-                // the fail-fast convention the worker already uses
-                // (worker_scheduler.hh M-4 in step 022): a malformed
-                // request is a caller-side bug and must surface near
-                // the producer, not be masked as
-                // `unsupported_unimplemented`. Phase 4 will relax
-                // these to structured statuses once real round
-                // handling exists and empty-round is a legitimate
-                // fast path; for Phase 3 we keep it strict.
-                //
-                // 023 review M-1: the middle check — "outer guard
-                // non-null but inner manifest is null" — is not a
-                // "Phase 4 problem", it is a Phase 3 carrier-contract
-                // violation right now. Letting it slip through the
-                // `unsupported_unimplemented` stub would disguise a
-                // real caller bug as "just not implemented yet", so
-                // we panic alongside the other two checks.
+                // ── Stage 1: input validation ──
+
                 if (r->args.base_guard == nullptr) {
                     core::panic_inconsistency(
                         "tree::tree_sched::advance",
@@ -230,24 +252,108 @@ namespace apps::inconel::tree {
                         "tree::tree_sched::advance",
                         "tree_flush_request.base_guard->manifest is null");
                 }
+
+                // D8: sealed_gens.empty() downgraded from Phase 3
+                // panic to fast-path success. Empty sealed_gens means
+                // no gen to release, flushed_gens_by_front is empty.
+                // M-1: populate new_manifest = base manifest so all ok
+                // paths uniformly guarantee new_manifest != nullptr.
                 if (r->args.sealed_gens.empty()) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance",
-                        "tree_flush_request.sealed_gens is empty");
+                    tree_flush_result res{
+                        .st                    = flush_stage_status::ok,
+                        .new_manifest          = r->args.base_guard->manifest,
+                        .flushed_gens_by_front = {},
+                        .flushed_max_lsn       = 0,
+                    };
+                    r->cb(std::move(res));
+                    delete r;
+                    progress = true;
+                    continue;
                 }
 
-                // Phase 3 stub: no `flush_round_state` allocation,
-                // no `tree_state` mutation, no LSN cursor movement.
-                // The value-path return shape mirrors the carrier
-                // contract Phase 4-7 will progressively populate;
-                // for now every field is its default.
+                // D9/D10/D11: per-gen validation.
+                {
+                    absl::flat_hash_set<uint64_t> seen_ids;
+                    for (const auto& g : r->args.sealed_gens) {
+                        if (g == nullptr)
+                            core::panic_inconsistency(
+                                "tree::tree_sched::advance",
+                                "sealed_gens contains null gen");
+                        if (g->st != core::memtable_gen::state::sealed)
+                            core::panic_inconsistency(
+                                "tree::tree_sched::advance",
+                                "sealed_gens contains non-sealed gen");
+                        if (!seen_ids.insert(g->gen_id).second)
+                            core::panic_inconsistency(
+                                "tree::tree_sched::advance",
+                                "sealed_gens contains duplicate gen_id");
+                    }
+                }
+
+                // ── Stage 2: allocate round_state and park ──
+
+                auto rs = std::make_unique<flush_round_state>();
+                rs->round_id = flush_round_id{ state.next_round_id++ };
+                rs->pinned_base_guard = std::move(r->args.base_guard);
+                rs->pinned_gens = std::move(r->args.sealed_gens);
+                rs->recovery_safe_lsn = r->args.recovery_safe_lsn;
+
+                auto round_id_v = rs->round_id.v;
+                state.active_rounds.emplace(round_id_v, std::move(rs));
+                auto& round = *state.active_rounds[round_id_v];
+
+                // ── Stage 3: fold (side effects round-local, D16) ──
+
+                fold_pinned_gens(round);
+
+                // ── Stage 4: empty workset fast path ──
+                //
+                // Non-empty sealed_gens but all gen tables are empty.
+                // Empty gens are allowed to seal (RSM §479). ok path
+                // must populate flushed_gens_by_front (D18) so outer
+                // flow can release these empty gens.
+
+                if (round.workset.empty()) {
+                    auto gens_by_front =
+                        build_flushed_gens_by_front(round.pinned_gens);
+                    // D19: empty delta → new_manifest = base manifest.
+                    auto base_manifest = round.pinned_base_guard->manifest;
+                    state.active_rounds.erase(round_id_v);  // unpark
+
+                    tree_flush_result res{
+                        .st                    = flush_stage_status::ok,
+                        .new_manifest          = std::move(base_manifest),
+                        .flushed_gens_by_front = std::move(gens_by_front),
+                        .flushed_max_lsn       = 0,
+                    };
+                    r->cb(std::move(res));
+                    delete r;
+                    progress = true;
+                    continue;
+                }
+
+                // ── Stage 5: build partitions ──
+
+                auto lookup_count = core::registry::tree_lookup_count();
+                if (lookup_count == 0)
+                    core::panic_inconsistency(
+                        "tree::tree_sched::advance",
+                        "registry::tree_lookup_count() is 0");
+                build_key_partitions(round, lookup_count);
+
+                // ── Stage 6: unpark, return unsupported_unimplemented ──
+                //
+                // Phase 5-7 downstream not implemented. Losers were
+                // already pushed into each gen's loser_durable_refs
+                // during fold, but gen is not released on the
+                // unsupported path → losers are not drained → no harm.
+                // No flushed_gens_by_front needed on unsupported path.
+
+                state.active_rounds.erase(round_id_v);  // unpark
+
                 tree_flush_result res{
-                    .st                    = flush_stage_status::unsupported_unimplemented,
-                    .new_manifest          = nullptr,
-                    .retired               = {},
-                    .flushed_gens_by_front = {},
-                    .memtable_losers       = {},
-                    .flushed_max_lsn       = 0,
+                    .st              = flush_stage_status::unsupported_unimplemented,
+                    .flushed_max_lsn = 0,
                 };
                 r->cb(std::move(res));
                 delete r;

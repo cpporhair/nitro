@@ -133,9 +133,11 @@ namespace apps::inconel::core {
 
     // ── retire_list<T> ──────────────────────────────────────
     //
-    // Single-writer / single-reader append+drain container.
-    // Used for memtable_gen::loser_durable_refs. No internal
-    // locking: caller discipline enforces the invariant.
+    // Single-writer / single-reader container.
+    // Used for memtable_gen::loser_durable_refs. Normal lifecycle
+    // is push -> drain; tree flush fold may clear+rebuild the list
+    // when retrying an unfinished round on the same sealed gen.
+    // No internal locking: caller discipline enforces the invariant.
 
     template <typename T>
     struct retire_list {
@@ -156,6 +158,11 @@ namespace apps::inconel::core {
         std::size_t
         size() const noexcept {
             return items_.size();
+        }
+
+        void
+        clear() noexcept {
+            items_.clear();
         }
 
       private:
@@ -186,8 +193,8 @@ namespace apps::inconel::core {
     // front_sched is the sole writer while st == state::active.
     // Once sealed, table and kv_arena are immutable to all
     // mutators except the flush round currently folding this
-    // gen, which may append to loser_durable_refs only (never
-    // to table or arena).
+    // gen, which may clear+rebuild loser_durable_refs only
+    // (never touch table or arena).
     //
     // kv_arena holds all gen-local bytes (both keys and values).
     // The btree_map's key is std::string_view into kv_arena;
@@ -214,6 +221,9 @@ namespace apps::inconel::core {
             active,
             sealed,
         } st;
+
+        uint32_t front_owner_index = UINT32_MAX;  // Phase 4 D17
+                                                   // UINT32_MAX = invalid sentinel
 
         uint64_t min_lsn = UINT64_MAX;
         uint64_t max_lsn = 0;

@@ -120,21 +120,39 @@ tree_local_flush(base_guard, sealed_gens, recovery_safe_lsn)
 
 ### 3.3 Workset Fold 与 Memtable-Only Loser
 
-Fold 的目标：对每个逻辑 key 计算本轮进入 tree-local flush 的 memtable winner，并把 losers 挂到各自 owning gen。
+Fold 的目标：对每个逻辑 key 计算本轮进入 tree-local flush 的 memtable winner，并把 losers 直接推入各自 owning gen 的 `loser_durable_refs`。如果 unfinished round 在同一 sealed gen 上重试，fold 开头对该 gen 执行 `loser_durable_refs.clear()` 后按本轮结果重建；成功 round 之后不再重复触碰这批 losers。
 
 ```text
-for each key (std::string_view) in sorted(memtable keys from sealed_gens):
-    all_entries = 收集该 key 在所有选中 gens 中的 entries
-    memtable_winner = max_by_data_ver(all_entries)
+// fold 开头：clear 每个 gen 的 loser_durable_refs（幂等保证）
+for each gen in pinned_gens:
+    gen->loser_durable_refs.clear()
 
-    for entry in all_entries where entry != memtable_winner:
-        if entry.kind == value:
-            entry.owning_gen.loser_durable_refs.push({ entry.vh.durable, entry.data_ver })
+for each key (std::string_view) in sorted(memtable keys from sealed_gens):
+    // 利用 InlinedVector 内 data_ver 严格递增：
+    //   back() = gen-local winner (O(1))
+    //   [0..n-2] = intra-gen losers (零比较)
+    // 跨 gen 只比较 K 个 gen-local winner (O(K))
+
+    for each gen holding this key:
+        // intra-gen losers: 直推 gen，零比较
+        for entry in entries[0..n-2]:
+            if entry.kind == value:
+                gen->loser_durable_refs.push({ entry.vh.durable, entry.data_ver })
+        extract gen-local winner = back()
+
+    global_winner = max_by_data_ver(gen-local winners)
+
+    // inter-gen losers: 直推各自 gen
+    for gen-local winner != global_winner:
+        if kind == value:
+            gen->loser_durable_refs.push({ entry.vh.durable, entry.data_ver })
 
     emit flush_key_group {
-        key,              // string_view into winner's owning gen kv_arena
-        memtable_winner,
-        owning_gen,
+        key,                       // string_view into winner's owning gen kv_arena
+        winner_data_ver,
+        winner_kind,
+        winner_value,
+        winner_pinned_gen_index,   // index into round_state.pinned_gens[]
     }
 ```
 
@@ -143,6 +161,7 @@ for each key (std::string_view) in sorted(memtable keys from sealed_gens):
 1. workset 只携带 durable `value_ref`，不复制 value body。
 2. `memtable-only loser` 只挂接到 owning `memtable_gen`，本阶段不直接做 reclaim。
 3. empty round 可以在 fold 后直接返回 success(empty delta)。
+4. 同一个 sealed `memtable_gen` 不得同时属于两个 in-flight flush rounds；否则一个 round 的 clear+rebuild 会擦掉另一个 round 已挂接的 losers。
 
 ### 3.4 Leaf Mapping、Candidate Build 与写 Tree
 
@@ -358,6 +377,11 @@ for each front_sched:
 
 挂接目标：loser entry 所属 memtable_gen 的 loser_durable_refs
 
+挂接时机：
+  - fold 期间直接 push
+  - unfinished round 若在同一 sealed gen 上重试，允许 clear+rebuild
+  - 不需要等到 finish_flush_round 再 commit
+
 释放条件：
   1. owning gen 不再被任何 published CAT 触达（gen 释放）
   2. loser.data_ver <= recovery_safe_lsn（不可能在 recovery 中翻盘）
@@ -387,8 +411,9 @@ for each front_sched:
 2. memtable-only loser 只在遍历 gen 记录时被识别，
    每条 memtable_entry 只属于一个 gen → 不会跨 gen 重复
 
-3. 一旦挂接到 retire list，后续 fold / 其他 flush round 不再触碰该 value_ref
-   （因为它已不在 tree-visible 状态或 memtable 中）
+3. 成功 round 挂接完成后，后续 fold / 其他 flush round 不再触碰该 value_ref。
+   唯一例外是 unfinished round 在同一 sealed gen 上的 retry：允许先 clear
+   该 gen 的 loser_durable_refs，再按本轮 fold 结果完整重建。
 ```
 
 ## 6. Root-Change 与 Root-Stable 两类 Flush

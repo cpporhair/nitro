@@ -69,6 +69,7 @@
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/tree/flush_round_state.hh"
 #include "apps/inconel/tree/flush_types.hh"
+#include "apps/inconel/tree/memtable_fold.hh"
 #include "apps/inconel/tree/owner_scheduler.hh"
 
 using namespace apps::inconel;
@@ -126,17 +127,43 @@ concept has_field_retired = requires(T& t) { t.retired; };
 static_assert(!has_field_retired<core::checkpoint_guard>,
               "D27: checkpoint_guard.retired is frontier_switch step");
 
-// 023 D30: tree_state must NOT pre-create the Phase 4 fields. Leaving
-// them out means the diff that adds them in Phase 4 is the visible
-// signal to reviewers that round-state plumbing has begun.
+// Phase 4 (024): tree_state.active_rounds and next_round_id now exist.
+// Flipped from Phase 3 negative assertions (023 D30).
 template <typename T>
 concept has_active_rounds = requires(T& t) { t.active_rounds; };
 template <typename T>
 concept has_next_round_id = requires(T& t) { t.next_round_id; };
-static_assert(!has_active_rounds<tree::tree_state>,
-              "D30: tree_state.active_rounds is Phase 4");
-static_assert(!has_next_round_id<tree::tree_state>,
-              "D30: tree_state.next_round_id is Phase 4");
+static_assert(has_active_rounds<tree::tree_state>,
+              "Phase 4: tree_state.active_rounds must exist");
+static_assert(has_next_round_id<tree::tree_state>,
+              "Phase 4: tree_state.next_round_id must exist");
+
+// Phase 4: flush_key_partition layout.
+static_assert(std::is_same_v<
+    decltype(std::declval<tree::flush_key_partition>().read_domain_index),
+    uint32_t>,
+    "Phase 4: flush_key_partition.read_domain_index must be uint32_t");
+static_assert(std::is_same_v<
+    decltype(std::declval<tree::flush_key_partition>().groups),
+    std::span<const tree::flush_key_group>>,
+    "Phase 4: flush_key_partition.groups must be span<const flush_key_group>");
+
+// Phase 4: flush_round_state new fields.
+template <typename T>
+concept has_partitions = requires(T& t) { t.partitions; };
+template <typename T>
+concept has_staged_memtable_losers = requires(T& t) { t.staged_memtable_losers; };
+static_assert(has_partitions<tree::flush_round_state>,
+              "Phase 4: flush_round_state.partitions must exist");
+// E-2: staging removed — losers pushed directly into gen.
+static_assert(!has_staged_memtable_losers<tree::flush_round_state>,
+              "E-2: flush_round_state.staged_memtable_losers must NOT exist");
+
+// Phase 4: memtable_gen.front_owner_index (D17).
+template <typename T>
+concept has_front_owner_index = requires(T& t) { t.front_owner_index; };
+static_assert(has_front_owner_index<core::memtable_gen>,
+              "Phase 4 D17: memtable_gen.front_owner_index must exist");
 
 // 023 D20: tree_allocator is a Phase 3 placeholder with no methods.
 // `allocate()` / `recycle(...)` belong to Phase 7. SFINAE-detect that
@@ -207,12 +234,13 @@ make_empty_guard() {
 }
 
 static std::shared_ptr<core::memtable_gen>
-make_dummy_sealed_gen(uint64_t gen_id) {
+make_dummy_sealed_gen(uint64_t gen_id, uint32_t front_idx = 0) {
     auto g = std::make_shared<core::memtable_gen>();
-    g->gen_id  = gen_id;
-    g->st      = core::memtable_gen::state::sealed;
-    g->min_lsn = gen_id;
-    g->max_lsn = gen_id;
+    g->gen_id            = gen_id;
+    g->st                = core::memtable_gen::state::sealed;
+    g->front_owner_index = front_idx;
+    g->min_lsn           = gen_id;
+    g->max_lsn           = gen_id;
     return g;
 }
 
@@ -477,6 +505,9 @@ test_flush_round_state_defaults() {
     CHECK(s.memtable_losers.empty());
     CHECK(s.flushed_max_lsn == 0);
 
+    // Phase 4 new field default to empty.
+    CHECK(s.partitions.empty());
+
     // Same field-by-field as tree_flush_result default — if any field
     // ever drifts between the two structs, this comparison breaks.
     tree::tree_flush_result r;
@@ -503,6 +534,9 @@ test_tree_state_defaults() {
     CHECK(s.alloc.head.lba       == 0);
     CHECK(s.alloc.head.device_id == 0);
     CHECK(s.alloc.free_ranges.empty());
+    // Phase 4 fields.
+    CHECK(s.active_rounds.empty());
+    CHECK(s.next_round_id == 1);
     printf("  tree_state defaults aligned to RSM §4.1: OK\n");
 }
 
@@ -538,27 +572,34 @@ in_child_provoke_null_base_guard() {
     std::_Exit(3);
 }
 
+// Phase 4 D8: sealed_gens.empty() is now a fast-path success, not a
+// panic. This test verifies the ok result with empty flushed_gens_by_front.
 static void
-in_child_provoke_empty_sealed_gens() {
+test_empty_sealed_gens_ok() {
     pump::core::this_core_id = 0;
     tree::tree_sched ts;
+    auto guard = make_empty_guard();
+    bool fired = false;
     auto* r = new tree::_tree_flush::req{
         .args = tree::tree_flush_request{
-            .base_guard        = make_empty_guard(),
+            .base_guard        = guard,
             .sealed_gens       = {},
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) {
-            std::fprintf(stderr,
-                "child(empty sealed_gens): cb fired but should have panicked\n");
-            std::_Exit(2);
+        .cb = [&](tree::tree_flush_result&& res) {
+            CHECK(res.st == tree::flush_stage_status::ok);
+            // M-1: new_manifest populated even on empty sealed_gens path.
+            CHECK(res.new_manifest == guard->manifest);
+            CHECK(res.flushed_gens_by_front.empty());
+            CHECK(res.flushed_max_lsn == 0);
+            fired = true;
         },
     };
     ts.schedule_flush(r);
-    ts.advance();  // expected: panic_inconsistency → abort()
-    std::fprintf(stderr,
-        "child(empty sealed_gens): advance() returned but should have panicked\n");
-    std::_Exit(3);
+    bool prog = ts.advance();
+    CHECK(prog);
+    CHECK(fired);
+    printf("  empty sealed_gens → ok (D8): OK\n");
 }
 
 // 023 review M-1: a non-null guard wrapping a null manifest must be
@@ -631,18 +672,148 @@ expect_child_aborts(void (*fn)(), const char* label) {
     printf("  panic: %s → SIGABRT: OK\n", label);
 }
 
+// Phase 4 D9: non-sealed gen → panic.
 static void
-test_panics_d22() {
+in_child_provoke_non_sealed_gen() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+    auto g = std::make_shared<core::memtable_gen>();
+    g->gen_id            = 1;
+    g->st                = core::memtable_gen::state::active;  // NOT sealed
+    g->front_owner_index = 0;
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = make_empty_guard(),
+            .sealed_gens       = { g },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+    };
+    ts.schedule_flush(r);
+    ts.advance();
+    std::_Exit(3);
+}
+
+// Phase 4 D10: duplicate gen_id → panic.
+static void
+in_child_provoke_duplicate_gen_id() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+    auto g0 = make_dummy_sealed_gen(42, 0);
+    auto g1 = make_dummy_sealed_gen(42, 0);  // same gen_id!
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = make_empty_guard(),
+            .sealed_gens       = { g0, g1 },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+    };
+    ts.schedule_flush(r);
+    ts.advance();
+    std::_Exit(3);
+}
+
+// Phase 4 D11: null gen in sealed_gens → panic.
+static void
+in_child_provoke_null_gen() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = make_empty_guard(),
+            .sealed_gens       = { nullptr },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+    };
+    ts.schedule_flush(r);
+    ts.advance();
+    std::_Exit(3);
+}
+
+// Phase 4 D12: tree_lookup_count() == 0 with non-empty workset → panic.
+// Construct a gen with a real key+entry so fold produces a non-empty
+// workset, but do NOT register any lookup sched.
+static void
+in_child_provoke_zero_lookup_count() {
+    pump::core::this_core_id = 0;
+    core::registry::clear();  // ensure no lookup scheds registered
+
+    tree::tree_sched ts;
+    auto g = make_dummy_sealed_gen(1, 0);
+    // Insert a key so fold produces non-empty workset.
+    auto key_sv = g->kv_arena.allocate("key1", 4);
+    g->table[key_sv].push_back(core::memtable_entry{
+        .data_ver = 10,
+        .k        = core::memtable_entry::kind::tombstone,
+        .vh       = {},
+    });
+
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = make_empty_guard(),
+            .sealed_gens       = { g },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+    };
+    ts.schedule_flush(r);
+    ts.advance();
+    std::_Exit(3);
+}
+
+// M-2: front_owner_index == UINT32_MAX sentinel → panic via
+// build_flushed_gens_by_front. Construct a sealed gen with the
+// default UINT32_MAX sentinel (never explicitly assigned), submit
+// it with an empty table so the empty-workset ok path calls
+// build_flushed_gens_by_front.
+static void
+in_child_provoke_sentinel_front_owner_index() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+    // Deliberately do NOT set front_owner_index — leave it at UINT32_MAX.
+    auto g = std::make_shared<core::memtable_gen>();
+    g->gen_id  = 1;
+    g->st      = core::memtable_gen::state::sealed;
+    g->min_lsn = 1;
+    g->max_lsn = 1;
+    // front_owner_index stays UINT32_MAX (invalid sentinel)
+
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = make_empty_guard(),
+            .sealed_gens       = { g },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+    };
+    ts.schedule_flush(r);
+    ts.advance();  // expected: build_flushed_gens_by_front → panic
+    std::_Exit(3);
+}
+
+static void
+test_panics() {
+    // Phase 3 carry-over panics.
     expect_child_aborts(&in_child_provoke_null_base_guard,
                         "null base_guard");
-    expect_child_aborts(&in_child_provoke_empty_sealed_gens,
-                        "empty sealed_gens");
-    // 023 review M-1
     expect_child_aborts(&in_child_provoke_null_inner_manifest,
                         "null inner manifest (M-1)");
-    // 023 review M-2
     expect_child_aborts(&in_child_provoke_leaf_order_out_of_bounds,
                         "leaf_order out-of-bounds (M-2)");
+    // Phase 4 new panics.
+    expect_child_aborts(&in_child_provoke_non_sealed_gen,
+                        "non-sealed gen (D9)");
+    expect_child_aborts(&in_child_provoke_duplicate_gen_id,
+                        "duplicate gen_id (D10)");
+    expect_child_aborts(&in_child_provoke_null_gen,
+                        "null gen (D11)");
+    expect_child_aborts(&in_child_provoke_zero_lookup_count,
+                        "zero lookup count (D12)");
+    // M-2: sentinel front_owner_index.
+    expect_child_aborts(&in_child_provoke_sentinel_front_owner_index,
+                        "sentinel front_owner_index (D17/M-2)");
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -674,12 +845,15 @@ test_advance_drain_cap() {
                 .sealed_gens       = { gen },
                 .recovery_safe_lsn = i,
             },
-            .cb = [&fired](tree::tree_flush_result&& res) {
-                CHECK(res.st == tree::flush_stage_status::unsupported_unimplemented);
-                CHECK(!res.new_manifest);
+            .cb = [&fired, &guard](tree::tree_flush_result&& res) {
+                // Phase 4: empty table gens → ok (empty workset fast path).
+                CHECK(res.st == tree::flush_stage_status::ok);
+                // D19: new_manifest == base manifest.
+                CHECK(res.new_manifest == guard->manifest);
                 CHECK(res.flushed_max_lsn == 0);
                 CHECK(res.retired.old_slots.empty());
-                CHECK(res.flushed_gens_by_front.empty());
+                // D18: flushed_gens_by_front is populated.
+                CHECK(!res.flushed_gens_by_front.empty());
                 CHECK(res.memtable_losers.empty());
                 fired.fetch_add(1, std::memory_order_release);
             },
@@ -731,7 +905,8 @@ test_handle_pin_release_value_path() {
             .recovery_safe_lsn = 0,
         },
         .cb = [&fired](tree::tree_flush_result&& res) {
-            CHECK(res.st == tree::flush_stage_status::unsupported_unimplemented);
+            // Phase 4: empty table gen → ok (empty workset fast path).
+            CHECK(res.st == tree::flush_stage_status::ok);
             fired = true;
         },
     };
@@ -794,11 +969,593 @@ test_runtime_singleton_lifecycle(const char* label) {
     printf("  [%s] runtime tree_sched singleton lifecycle: OK\n", label);
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Helper: make a sealed gen with entries in its table.
+// ────────────────────────────────────────────────────────────────────────
+
+static void
+add_value_entry(core::memtable_gen& g, std::string_view key_str,
+                uint64_t data_ver, format::paddr durable_base = {0, 100})
+{
+    auto key_sv = g.kv_arena.allocate(key_str.data(), key_str.size());
+    core::value_handle vh{};
+    vh.durable = format::value_ref{
+        .base = durable_base, .byte_offset = 0,
+        .len = 16, .flags = 0 };
+    vh.hot = core::value_view{ nullptr, 0 };
+    g.table[key_sv].push_back(core::memtable_entry{
+        .data_ver = data_ver,
+        .k        = core::memtable_entry::kind::value,
+        .vh       = vh,
+    });
+}
+
+static void
+add_tombstone_entry(core::memtable_gen& g, std::string_view key_str,
+                    uint64_t data_ver)
+{
+    auto key_sv = g.kv_arena.allocate(key_str.data(), key_str.size());
+    g.table[key_sv].push_back(core::memtable_entry{
+        .data_ver = data_ver,
+        .k        = core::memtable_entry::kind::tombstone,
+        .vh       = {},
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────���──────
+// Fold correctness tests (free function, no scheduler, no registry)
+// ────────────────────────────────────────────────────────────────────────
+
+// Case 1: single gen, single key, single entry.
+static void
+test_fold_single_gen_single_key() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    add_value_entry(*g, "aaa", 10);
+    rs.pinned_gens.push_back(g);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].key == "aaa");
+    CHECK(rs.workset[0].winner_data_ver == 10);
+    CHECK(rs.workset[0].winner_kind == core::memtable_entry::kind::value);
+    CHECK(rs.workset[0].winner_pinned_gen_index == 0);
+    CHECK(g->loser_durable_refs.size() == 0);
+    printf("  fold: single gen, single key: OK\n");
+}
+
+// Case 2: single gen, single key, two entries (data_ver 10 and 20).
+static void
+test_fold_single_gen_two_entries() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    add_value_entry(*g, "aaa", 10, {0, 100});
+    // Same key, higher data_ver — append to the same InlinedVector.
+    {
+        auto it = g->table.find(std::string_view("aaa"));
+        CHECK(it != g->table.end());
+        core::value_handle vh{};
+        vh.durable = format::value_ref{
+            .base = {0, 200}, .byte_offset = 0,
+            .len = 16, .flags = 0 };
+        vh.hot = core::value_view{ nullptr, 0 };
+        it->second.push_back(core::memtable_entry{
+            .data_ver = 20,
+            .k        = core::memtable_entry::kind::value,
+            .vh       = vh,
+        });
+    }
+    rs.pinned_gens.push_back(g);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_data_ver == 20);
+    // Loser (dv=10) pushed directly into gen.
+    CHECK(g->loser_durable_refs.size() == 1);
+    printf("  fold: single gen, two entries: OK\n");
+}
+
+// Case 3: two gens, same key.
+static void
+test_fold_two_gens_same_key() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_value_entry(*g0, "key", 5, {0, 100});
+    add_value_entry(*g1, "key", 15, {0, 200});
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_data_ver == 15);
+    CHECK(rs.workset[0].winner_pinned_gen_index == 1);  // g1 is pinned_gens[1]
+    // g0 is the loser — pushed directly into g0.
+    CHECK(g0->loser_durable_refs.size() == 1);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: two gens, same key: OK\n");
+}
+
+// Case 4: two gens, disjoint keys.
+static void
+test_fold_two_gens_disjoint_keys() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_value_entry(*g0, "aaa", 5);
+    add_value_entry(*g1, "bbb", 15);
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 2);
+    CHECK(rs.workset[0].key == "aaa");
+    CHECK(rs.workset[1].key == "bbb");
+    CHECK(g0->loser_durable_refs.size() == 0);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: two gens, disjoint keys: OK\n");
+}
+
+// Case 5: tombstone winner.
+static void
+test_fold_tombstone_winner() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    add_tombstone_entry(*g, "key", 10);
+    rs.pinned_gens.push_back(g);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_kind == core::memtable_entry::kind::tombstone);
+    CHECK(g->loser_durable_refs.size() == 0);
+    printf("  fold: tombstone winner: OK\n");
+}
+
+// Case 6: tombstone loser not staged.
+static void
+test_fold_tombstone_loser_not_staged() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_tombstone_entry(*g0, "key", 5);  // tombstone loser
+    add_value_entry(*g1, "key", 15);     // value winner
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_data_ver == 15);
+    // Tombstone loser has no durable value_ref → not pushed.
+    CHECK(g0->loser_durable_refs.size() == 0);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: tombstone loser not pushed: OK\n");
+}
+
+// Case 7: value loser + tombstone winner.
+static void
+test_fold_value_loser_tombstone_winner() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_value_entry(*g0, "key", 5, {0, 100});     // value loser
+    add_tombstone_entry(*g1, "key", 15);           // tombstone winner
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_kind == core::memtable_entry::kind::tombstone);
+    CHECK(rs.workset[0].winner_data_ver == 15);
+    // Value loser pushed directly into g0.
+    CHECK(g0->loser_durable_refs.size() == 1);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: value loser + tombstone winner: OK\n");
+}
+
+// Case 8: all gens have empty tables.
+static void
+test_fold_all_empty_gens() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.empty());
+    CHECK(g0->loser_durable_refs.size() == 0);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: all empty gens: OK\n");
+}
+
+// Case 9: single gen, same key, multiple entries.
+static void
+test_fold_single_gen_multi_entry_same_key() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    // Insert 3 entries for the same key. data_ver must be strictly
+    // ascending (production invariant: entries come from consecutive
+    // batches with monotonically increasing batch_lsn).
+    auto key_sv = g->kv_arena.allocate("key", 3);
+    for (uint64_t dv : {5ul, 10ul, 15ul}) {
+        core::value_handle vh{};
+        vh.durable = format::value_ref{
+            .base = {0, static_cast<uint64_t>(dv * 10)},
+            .byte_offset = 0, .len = 16, .flags = 0 };
+        vh.hot = core::value_view{ nullptr, 0 };
+        g->table[key_sv].push_back(core::memtable_entry{
+            .data_ver = dv,
+            .k        = core::memtable_entry::kind::value,
+            .vh       = vh,
+        });
+    }
+    rs.pinned_gens.push_back(g);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 1);
+    CHECK(rs.workset[0].winner_data_ver == 15);
+    // dv=5 and dv=10 are losers, pushed directly into gen.
+    CHECK(g->loser_durable_refs.size() == 2);
+    printf("  fold: single gen, multi-entry same key: OK\n");
+}
+
+// Case 10: direct push verification (comprehensive).
+static void
+test_fold_direct_push() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_value_entry(*g0, "a", 5, {0, 100});
+    add_value_entry(*g0, "b", 6, {0, 101});
+    add_value_entry(*g1, "a", 15, {0, 200});
+    add_value_entry(*g1, "c", 16, {0, 201});
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    tree::fold_pinned_gens(rs);
+
+    CHECK(rs.workset.size() == 3);  // a, b, c
+    // g0's "a" (dv=5) is loser → pushed into g0.
+    CHECK(g0->loser_durable_refs.size() == 1);
+    // g1 has no losers.
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: direct push: OK\n");
+}
+
+// Case 11: fold idempotency — clear at start ensures re-fold
+// of the same gens produces correct results without double-push.
+static void
+test_fold_idempotency() {
+    tree::flush_round_state rs;
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 0);
+    add_value_entry(*g0, "key", 5, {0, 100});
+    add_value_entry(*g1, "key", 15, {0, 200});
+    rs.pinned_gens.push_back(g0);
+    rs.pinned_gens.push_back(g1);
+
+    // First fold.
+    tree::fold_pinned_gens(rs);
+    CHECK(rs.workset.size() == 1);
+    CHECK(g0->loser_durable_refs.size() == 1);
+
+    // Re-fold (simulating retry after unsupported_unimplemented).
+    // Must clear workset manually since fold only clears losers.
+    rs.workset.clear();
+    tree::fold_pinned_gens(rs);
+    CHECK(rs.workset.size() == 1);
+    // Clear at fold start ensures no double-push.
+    CHECK(g0->loser_durable_refs.size() == 1);
+    CHECK(g1->loser_durable_refs.size() == 0);
+    printf("  fold: idempotency (re-fold): OK\n");
+}
+
+static void
+test_fold_all() {
+    test_fold_single_gen_single_key();
+    test_fold_single_gen_two_entries();
+    test_fold_two_gens_same_key();
+    test_fold_two_gens_disjoint_keys();
+    test_fold_tombstone_winner();
+    test_fold_tombstone_loser_not_staged();
+    test_fold_value_loser_tombstone_winner();
+    test_fold_all_empty_gens();
+    test_fold_single_gen_multi_entry_same_key();
+    test_fold_direct_push();
+    test_fold_idempotency();
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Partition tests (free function, no scheduler, no registry)
+// ────────────────────────────────────────────────────────────────────────
+
+// Partition case 1: N=100 keys, K=4 lookup shards.
+static void
+test_partition_100_keys_4_shards() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    for (int i = 0; i < 100; ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "k%05d", i);
+        add_value_entry(*g, std::string_view(buf, 6), static_cast<uint64_t>(i + 1));
+    }
+    rs.pinned_gens.push_back(g);
+    tree::fold_pinned_gens(rs);
+    CHECK(rs.workset.size() == 100);
+
+    tree::build_key_partitions(rs, 4);
+
+    CHECK(rs.partitions.size() == 4);
+    uint32_t total = 0;
+    for (const auto& p : rs.partitions) {
+        CHECK(p.groups.size() == 25);
+        CHECK(p.groups.data() >= rs.workset.data());
+        CHECK(p.groups.data() + p.groups.size() <=
+              rs.workset.data() + rs.workset.size());
+        total += static_cast<uint32_t>(p.groups.size());
+    }
+    CHECK(total == 100);
+    printf("  partition: 100 keys, 4 shards: OK\n");
+}
+
+// Partition case 2: N=2 keys, K=4 shards → 2 partitions.
+static void
+test_partition_2_keys_4_shards() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    add_value_entry(*g, "aaa", 1);
+    add_value_entry(*g, "bbb", 2);
+    rs.pinned_gens.push_back(g);
+    tree::fold_pinned_gens(rs);
+    CHECK(rs.workset.size() == 2);
+
+    tree::build_key_partitions(rs, 4);
+
+    CHECK(rs.partitions.size() == 2);
+    CHECK(rs.partitions[0].groups.size() == 1);
+    CHECK(rs.partitions[1].groups.size() == 1);
+    printf("  partition: 2 keys, 4 shards: OK\n");
+}
+
+// Partition case 3: span validity.
+static void
+test_partition_span_validity() {
+    tree::flush_round_state rs;
+    auto g = make_dummy_sealed_gen(1, 0);
+    for (int i = 0; i < 10; ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "k%05d", i);
+        add_value_entry(*g, std::string_view(buf, 6), static_cast<uint64_t>(i + 1));
+    }
+    rs.pinned_gens.push_back(g);
+    tree::fold_pinned_gens(rs);
+
+    tree::build_key_partitions(rs, 3);
+
+    for (const auto& p : rs.partitions) {
+        CHECK(p.groups.data() >= rs.workset.data());
+        CHECK(p.groups.data() + p.groups.size() <=
+              rs.workset.data() + rs.workset.size());
+    }
+    // Verify coverage: all workset elements are covered.
+    uint32_t total = 0;
+    for (const auto& p : rs.partitions) {
+        total += static_cast<uint32_t>(p.groups.size());
+    }
+    CHECK(total == 10);
+    printf("  partition: span validity: OK\n");
+}
+
+static void
+test_partitions_all() {
+    test_partition_100_keys_4_shards();
+    test_partition_2_keys_4_shards();
+    test_partition_span_validity();
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Handle lifecycle tests (need tree_sched + registry)
+// ────────────────────────────────────────────────────────────────────────
+
+// Helper: push a lookup sched entry into registry so
+// tree_lookup_count() > 0. Uses a raw reinterpret_cast
+// placeholder — advance() is never called through this pointer.
+static tree::tree_lookup_sched_base* fake_lookup_ptr =
+    reinterpret_cast<tree::tree_lookup_sched_base*>(0xDEAD'BEEF'0000'0001ULL);
+
+// Handle case 1: sealed_gens empty → ok, empty flushed_gens_by_front.
+// (Already covered by test_empty_sealed_gens_ok above.)
+
+// Handle case 2: non-empty gens, all empty tables → ok.
+static void
+test_handle_empty_tables_ok() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+
+    auto guard = make_empty_guard();
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 1);
+
+    bool fired = false;
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = guard,
+            .sealed_gens       = { g0, g1 },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [&](tree::tree_flush_result&& res) {
+            CHECK(res.st == tree::flush_stage_status::ok);
+            // D19: new_manifest == base manifest.
+            CHECK(res.new_manifest == guard->manifest);
+            // D18: flushed_gens_by_front populated.
+            CHECK(res.flushed_gens_by_front.size() == 2);
+            CHECK(res.flushed_gens_by_front.count(0) == 1);
+            CHECK(res.flushed_gens_by_front.count(1) == 1);
+            CHECK(res.flushed_gens_by_front[0].size() == 1);
+            CHECK(res.flushed_gens_by_front[1].size() == 1);
+            CHECK(res.flushed_max_lsn == 0);
+            fired = true;
+        },
+    };
+    ts.schedule_flush(r);
+    bool prog = ts.advance();
+    CHECK(prog);
+    CHECK(fired);
+    CHECK(ts.state.active_rounds.empty());
+    printf("  handle: empty tables → ok + flushed_gens_by_front: OK\n");
+}
+
+// Handle case 3: non-empty gens, non-empty workset → unsupported.
+static void
+test_handle_nonempty_workset_unsupported() {
+    pump::core::this_core_id = 0;
+
+    // Need at least one lookup sched in registry.
+    core::registry::tree_lookup_scheds.list.push_back(fake_lookup_ptr);
+
+    tree::tree_sched ts;
+
+    auto guard = make_empty_guard();
+    auto g = make_dummy_sealed_gen(1, 0);
+    add_value_entry(*g, "key", 10);
+
+    bool fired = false;
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = guard,
+            .sealed_gens       = { g },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [&](tree::tree_flush_result&& res) {
+            CHECK(res.st == tree::flush_stage_status::unsupported_unimplemented);
+            fired = true;
+        },
+    };
+    ts.schedule_flush(r);
+    bool prog = ts.advance();
+    CHECK(prog);
+    CHECK(fired);
+    CHECK(ts.state.active_rounds.empty());
+    // Single gen, single key → no losers.
+    CHECK(g->loser_durable_refs.size() == 0);
+
+    core::registry::tree_lookup_scheds.list.clear();
+    printf("  handle: non-empty workset → unsupported: OK\n");
+}
+
+// Handle case 4: round-id monotonicity.
+static void
+test_handle_round_id_monotonicity() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+
+    auto guard = make_empty_guard();
+    uint64_t prev_id = 0;
+    for (int i = 0; i < 3; ++i) {
+        auto g = make_dummy_sealed_gen(static_cast<uint64_t>(i + 1), 0);
+        bool fired = false;
+        auto* r = new tree::_tree_flush::req{
+            .args = tree::tree_flush_request{
+                .base_guard        = guard,
+                .sealed_gens       = { g },
+                .recovery_safe_lsn = 0,
+            },
+            .cb = [&](tree::tree_flush_result&&) { fired = true; },
+        };
+        ts.schedule_flush(r);
+        ts.advance();
+        CHECK(fired);
+        CHECK(ts.state.next_round_id > prev_id + 1);
+        prev_id = ts.state.next_round_id - 1;
+    }
+    printf("  handle: round-id monotonicity: OK\n");
+}
+
+// Handle case 5: pin chain release after cb.
+static void
+test_handle_pin_chain_release() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+
+    auto guard = make_empty_guard();
+    auto g = make_dummy_sealed_gen(1, 0);
+    CHECK(guard.use_count() == 1);
+    CHECK(g.use_count() == 1);
+
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = guard,
+            .sealed_gens       = { g },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [](tree::tree_flush_result&&) {},
+    };
+    CHECK(guard.use_count() == 2);
+    CHECK(g.use_count() == 2);
+
+    ts.schedule_flush(r);
+    ts.advance();
+
+    CHECK(guard.use_count() == 1);
+    CHECK(g.use_count() == 1);
+    printf("  handle: pin chain release: OK\n");
+}
+
+// Handle case 6: flushed_gens_by_front multi-front.
+static void
+test_handle_gens_by_front_multi() {
+    pump::core::this_core_id = 0;
+    tree::tree_sched ts;
+
+    auto guard = make_empty_guard();
+    auto g0 = make_dummy_sealed_gen(1, 0);
+    auto g1 = make_dummy_sealed_gen(2, 1);
+    auto g2 = make_dummy_sealed_gen(3, 0);
+
+    bool fired = false;
+    auto* r = new tree::_tree_flush::req{
+        .args = tree::tree_flush_request{
+            .base_guard        = guard,
+            .sealed_gens       = { g0, g1, g2 },
+            .recovery_safe_lsn = 0,
+        },
+        .cb = [&](tree::tree_flush_result&& res) {
+            CHECK(res.st == tree::flush_stage_status::ok);
+            CHECK(res.flushed_gens_by_front.size() == 2);
+            CHECK(res.flushed_gens_by_front.at(0).size() == 2);  // g0, g2
+            CHECK(res.flushed_gens_by_front.at(1).size() == 1);  // g1
+            fired = true;
+        },
+    };
+    ts.schedule_flush(r);
+    ts.advance();
+    CHECK(fired);
+    printf("  handle: flushed_gens_by_front multi-front: OK\n");
+}
+
+static void
+test_handles_all() {
+    test_handle_empty_tables_ok();
+    test_handle_nonempty_workset_unsupported();
+    test_handle_round_id_monotonicity();
+    test_handle_pin_chain_release();
+    test_handle_gens_by_front_multi();
+}
+
 }  // namespace
 
 int
 main() {
-    printf("inconel flush carrier (Phase 3 / step 023) test:\n");
+    printf("inconel flush carrier (Phase 3+4 / step 023+024) test:\n");
 
     // Pure type/value tests — no scheduler, no runtime, no fork.
     test_leaf_span_layout();
@@ -813,12 +1570,24 @@ main() {
     test_flush_round_state_defaults();
     test_tree_state_defaults();
 
+    // Phase 4 fold tests (free function, no scheduler).
+    test_fold_all();
+
+    // Phase 4 partition tests (free function, no scheduler).
+    test_partitions_all();
+
     // Panic tests must run while the parent is still single-threaded.
-    test_panics_d22();
+    test_panics();
+
+    // Phase 4 empty sealed_gens → ok (D8).
+    test_empty_sealed_gens_ok();
 
     // Direct tree_sched smoke (no PUMP runtime, single-threaded).
     test_advance_drain_cap();
     test_handle_pin_release_value_path();
+
+    // Phase 4 handle lifecycle tests.
+    test_handles_all();
 
     // Full runtime build / destroy lifecycle.
     test_runtime_singleton_lifecycle<core::clock_cache>("clock");

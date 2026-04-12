@@ -771,6 +771,7 @@ struct value_handle {
 struct memtable_gen {
     uint64_t gen_id;
     enum class state { active, sealed } st;
+    uint32_t front_owner_index;   // owning front index; UINT32_MAX = invalid
     uint64_t min_lsn;
     uint64_t max_lsn;
     // kv_arena + table + loser_durable_refs; see RSM §3.2.
@@ -784,10 +785,11 @@ struct memtable_gen {
 
 1. `active`：当前写入目标。
 2. `sealed`：不再接收新写，但在被新 tree frontier 覆盖并且旧 catalog 释放前，仍必须参与读。
-3. `min_lsn/max_lsn` 只用于调度与 flush eligibility，不用于读可见性判断。
-4. memtable 中的 PUT entry 保存的是 `value_handle = { durable_ref, value_view }`；DELETE 保存 tombstone。
-5. memtable hit 的 value 来源是 owning `memtable_gen` 的 `kv_arena` 切片——`value_handle.hot` 就是指向这段切片的 view。gen 活则 arena 活则切片活；没有独立命名的 `hot_blob` 对象，也没有任何 refcount。只要对应 memtable entry 仍 live，value bytes 就不能被真正淘汰到需要 SSD 回读的状态。
-6. memtable 被 flush、gen 被释放之后，同 key 后续读走 `tree_lookup → value_ref → value_alloc_sched.read_value()`，命中 `value_page readonly_frame_cache`；value 模块不维护额外的 `value_ref -> value bytes` materialized 索引。
+3. `front_owner_index` 记录该 gen 属于哪个 front；empty-delta flush 的 `flushed_gens_by_front` 由它分组构建。默认 `UINT32_MAX` 仅作 invalid sentinel，正式路径必须在 gen 创建时赋值。
+4. `min_lsn/max_lsn` 只用于调度与 flush eligibility，不用于读可见性判断。
+5. memtable 中的 PUT entry 保存的是 `value_handle = { durable_ref, value_view }`；DELETE 保存 tombstone。
+6. memtable hit 的 value 来源是 owning `memtable_gen` 的 `kv_arena` 切片——`value_handle.hot` 就是指向这段切片的 view。gen 活则 arena 活则切片活；没有独立命名的 `hot_blob` 对象，也没有任何 refcount。只要对应 memtable entry 仍 live，value bytes 就不能被真正淘汰到需要 SSD 回读的状态。
+7. memtable 被 flush、gen 被释放之后，同 key 后续读走 `tree_lookup → value_ref → value_alloc_sched.read_value()`，命中 `value_page readonly_frame_cache`；value 模块不维护额外的 `value_ref -> value bytes` materialized 索引。
 
 ### 5.2 `checkpoint_guard`
 
@@ -1242,7 +1244,7 @@ statement-start stable Read Committed
 1. **old memtable_gen**
    - 跟着旧 `publish_catalog` 的引用走。
    - 最后一个 pin 旧 CAT 的 reader 释放后，相关 gens 才能 free。
-   - `memtable-only loser durable_ref` 先挂到其 owning `memtable_gen` 的 retire list 上；只有该 gen 不再被任何 published CAT 触达后，它才允许进入物理 value reclaim 判定。
+   - `memtable-only loser durable_ref` 在 flush fold 期间直接挂到其 owning `memtable_gen` 的 retire list 上；只有该 gen 不再被任何 published CAT 触达后，它才允许进入物理 value reclaim 判定。若 unfinished round 在同一 sealed gen 上重试，允许先 clear 再按本轮 fold 结果重建。
 
 2. **old tree slot / old tree-visible value / old range**
    - 挂在旧 `checkpoint_guard` 的 retire list 上。
@@ -1447,7 +1449,7 @@ write new tree slots that reference existing value_ref or carry tombstone record
    - tombstone
    则 `V_old` 从这一轮开始就不再属于新 frontier，必须挂到旧 `checkpoint_guard` 的 retire list 上。
 2. `V_old` 不能在 install 新 guard 后立刻复用；只有最后一个 pin 旧 guard 的 reader 释放后，tree scheduler 才能把它真正回收到 value free pool。
-3. 若某个 `value_ref` 从未进入 tree、只在 memtable/WAL 层出现过，但在 flush fold 中已经输给了更新的 durable winner，则它先挂到 owning `memtable_gen` 的 retire list；在该 gen 释放、且它不可能再成为 recovery winner 之后，才允许回收。
+3. 若某个 `value_ref` 从未进入 tree、只在 memtable/WAL 层出现过，但在 flush fold 中已经输给了更新的 durable winner，则它在 fold 期间直接挂到 owning `memtable_gen` 的 retire list；在该 gen 释放、且它不可能再成为 recovery winner 之后，才允许回收。若 unfinished round 在同一 sealed gen 上重试，允许对该 list clear+rebuild。
 4. memtable 中的 value bytes（住在 owning gen 的 `kv_arena`）只看 gen 的 shared_ptr；它不承担 recovery 正确性。只要 gen 还被 PRS / front_state / flush round 中任一方引用，整个 `kv_arena` 就不能释放；最后一个 shared_ptr 归零时，`kv_arena` 的所有 chunk 一次 sweep 释放，durable `value_ref` 的回收走独立的 retire list 路径。
 5. `recovery_safe_lsn` 约束的是“哪些更老历史版本不可能再从 recovery 输入中翻盘”；对 `memtable-only loser durable_ref`，v1 可以保守地用它作为物理 recycle barrier。它不是 memtable value bytes 的回收条件——value bytes 的回收条件是 "owning gen 的所有 shared_ptr 都已释放"。
 6. 详细设计必须保证每个被覆盖或被删除的 `value_ref`：

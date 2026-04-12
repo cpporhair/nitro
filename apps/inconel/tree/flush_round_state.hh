@@ -98,6 +98,22 @@ namespace apps::inconel::tree {
         // `flush_lookup_req.groups`. Phase 3 leaves this empty.
         std::vector<flush_key_group> workset;
 
+        // ── populated by Phase 4 (partition plan for Phase 5 lookup fanout) ──
+        //
+        // Stable as long as workset is not reallocated after
+        // `build_key_partitions()` completes. Each partition's `groups`
+        // span points into `workset` above.
+        std::vector<flush_key_partition> partitions;
+
+        // ── Phase 4 fold pushes losers directly into gen ──
+        //
+        // Losers are pushed into each gen's `loser_durable_refs`
+        // during fold (not staged on round_state). fold_pinned_gens
+        // calls `gen->loser_durable_refs.clear()` at the start for
+        // idempotency, then pushes losers directly. If the round
+        // fails, gen is not released → losers are not drained → no
+        // harm. See review E-2 §7 for the full rationale.
+
         // ── populated by Phase 5 (lookup fanout merge) ──
         //
         // Sorted by `leaf_range_base` ascending after the per-shard

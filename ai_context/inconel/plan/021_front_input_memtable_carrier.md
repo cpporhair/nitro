@@ -152,13 +152,16 @@ namespace apps::inconel::core {
     };
 
     // ── retire_list<T> ──────────────────────────────────────────
-    // Single-writer / single-reader append+drain container for
-    // memtable_gen::loser_durable_refs.
+    // Single-writer / single-reader container for
+    // memtable_gen::loser_durable_refs. Normal lifecycle is
+    // push -> drain; tree flush fold may also clear+rebuild the
+    // list when retrying an unfinished round on the same sealed gen.
     template <typename T>
     struct retire_list {
         void push(T v);
         template <typename F> void drain(F&& f);
         std::size_t size() const noexcept;
+        void clear() noexcept;
       private:
         absl::InlinedVector<T, 16> items_;
     };
@@ -191,6 +194,7 @@ namespace apps::inconel::core {
     struct memtable_gen {
         uint64_t gen_id;
         enum class state : uint8_t { active, sealed } st;
+        uint32_t front_owner_index = UINT32_MAX;
         uint64_t min_lsn = UINT64_MAX;
         uint64_t max_lsn = 0;
 

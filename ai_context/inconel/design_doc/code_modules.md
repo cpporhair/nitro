@@ -77,7 +77,7 @@ apps/inconel/
 | `checkpoint_guard` | `manifest`, `retired` | tree(owns), coord(frontier switch), pipeline |
 | `tree_manifest` | `root_slot`, `slot_map`, `leaf_order` | tree(owns/构造), tree_lookup(只读消费), tree_worker(只读消费) |
 | `read_handle` | `cat`, `read_lsn` | coord(发放), pipeline(携带), front/tree/value(消费) |
-| `memtable_gen` | `gen_id`, `state`, `min/max_lsn`, `kv_arena`, `table`, `loser_durable_refs`（生命周期由 `std::shared_ptr<memtable_gen>` 管理，无内嵌 refcount） | front(owns), coord(seal), tree(flush collect) |
+| `memtable_gen` | `gen_id`, `state`, `front_owner_index`, `min/max_lsn`, `kv_arena`, `table`, `loser_durable_refs`（生命周期由 `std::shared_ptr<memtable_gen>` 管理，无内嵌 refcount） | front(owns), coord(seal), tree(fold / loser attach) |
 | `memtable_entry` | `data_ver`, `kind`, `vh` | front(存储/查询), pipeline(传递) |
 | `value_handle` | `durable: value_ref`, `hot: value_view`（POD，指向 owning gen `kv_arena` 切片） | front(memtable 内), pipeline（view 返回） |
 | `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；单 writer bump allocator，承载 key + value bytes | core（随 memtable_gen 生灭） |

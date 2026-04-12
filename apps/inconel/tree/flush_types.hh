@@ -64,32 +64,49 @@ namespace apps::inconel::tree {
     // ── fold output ──────────────────────────────────────────────
     //
     // Per-logical-key fold result produced by the Phase 4 fold stage.
-    // Phase 3 only freezes the shape. `memtable_winner` / the raw
-    // `winner_*` triple below are the references the rest of the
-    // flush pipeline carries through to leaf candidate build / writer.
+    // `memtable_winner` / the raw `winner_*` triple below are the
+    // references the rest of the flush pipeline carries through to
+    // leaf candidate build / writer.
     //
-    // None of the bytes are owned here:
+    // Nothing here is owning — all lifetime is borrowed from the
+    // enclosing `flush_round_state`:
     //
     //   - `key` is a `std::string_view` into the winner gen's
-    //     kv_arena (RSM §3.2). The pin chain
-    //     `tree_flush_request.sealed_gens[*]` keeps that arena alive
-    //     for the full flush round.
-    //   - `winner_value` is a `value_handle` (POD). Both halves
-    //     follow the same pin chain.
+    //     kv_arena (RSM §3.2). `round_state.pinned_gens` keeps
+    //     every gen's arena alive for the full flush round.
+    //   - `winner_value` is a `value_handle` (POD). Same pin chain.
+    //   - `winner_pinned_gen_index` is an index into
+    //     `round_state.pinned_gens[]`, not an owning shared_ptr.
+    //     This avoids O(unique_keys) refcount bumps and keeps the
+    //     workset a pure borrowed-view carrier.
     //
-    // Memtable losers for the same key are pushed onto
-    // `winner_gen->loser_durable_refs` by the fold step itself
-    // (Phase 4); they are not carried on this struct. Phase 3 forbids
-    // any "owning" variant of this struct — anything that would
-    // require copying value bytes through the round_state belongs
-    // outside the flush pipeline.
+    // Memtable losers for the same key are pushed directly into
+    // each gen's `loser_durable_refs` by the fold step (Phase 4);
+    // they are not carried on this struct.
 
     struct flush_key_group {
-        std::string_view                     key;
-        uint64_t                             winner_data_ver;
-        core::memtable_entry::kind           winner_kind;
-        core::value_handle                   winner_value;  // valid iff winner_kind == kind::value
-        std::shared_ptr<core::memtable_gen>  winner_gen;
+        std::string_view            key;
+        uint64_t                    winner_data_ver;
+        core::memtable_entry::kind  winner_kind;
+        core::value_handle          winner_value;  // valid iff winner_kind == kind::value
+        uint32_t                    winner_pinned_gen_index;  // index into round_state.pinned_gens
+    };
+
+    // ── partition plan for Phase 5 lookup dispatch ──────────────
+    //
+    // Phase 4 `build_key_partitions()` produces one partition per
+    // lookup shard. Each partition's `groups` span borrows
+    // contiguous elements from `flush_round_state.workset`. The
+    // span is valid as long as the round_state exists AND the
+    // workset vector is not reallocated after partitioning.
+    //
+    // Phase 5 `dispatch_key_partitions_to_lookup()` fans out these
+    // partitions, converting each into a `flush_lookup_req` with
+    // `groups` pointing at the same span.
+
+    struct flush_key_partition {
+        uint32_t                          read_domain_index;
+        std::span<const flush_key_group>  groups;  // borrows from flush_round_state.workset
     };
 
     // ── leaf mapping stage (Phase 5 consumer) ────────────────────

@@ -63,7 +63,7 @@ design_doc/
 
 同时要在正式设计里写清楚：
 
-1. flush 对现有 `memtable_gen / memtable_entry` 是**只读复用**
+1. flush 对现有 `memtable_gen / memtable_entry` 的 `table` / `kv_arena` 是**只读复用**；允许在 fold 期间写 `memtable_gen::loser_durable_refs`
 2. flush 新增的只是跨 scheduler 传递的 shared carrier
 3. 真正的 workset carriers（如 `flush_key_group[]` 一类）留到后续 phase 落代码时实现
 

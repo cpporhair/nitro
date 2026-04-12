@@ -314,6 +314,7 @@ struct front_state {
 struct memtable_gen {
     uint64_t gen_id;                                 // 代际 ID，全局唯一递增
     enum class state : uint8_t { active, sealed } st;
+    uint32_t front_owner_index = UINT32_MAX;         // owning front index; UINT32_MAX = invalid sentinel
     uint64_t min_lsn = UINT64_MAX;                   // 该 gen 中最小 batch_lsn
     uint64_t max_lsn = 0;                            // 该 gen 中最大 batch_lsn
 
@@ -333,6 +334,8 @@ struct memtable_gen {
                     absl::InlinedVector<memtable_entry, 1>> table;
 
     // ── 回收 ──
+    // flush fold 期间直接挂接 memtable-only losers。成功 round 继续保留；
+    // unfinished retry on the same sealed gen may clear+rebuild this list.
     retire_list<retired_value_ref> loser_durable_refs; // fold 输家的 {value_ref, data_ver}
 };
 
@@ -1425,7 +1428,8 @@ durable value_ref 回收：
     → 挂在旧 checkpoint_guard.retired.old_tree_values 上
     → 最后 reader 释放旧 guard 后回收
   - 如果该 value_ref 从未进入 tree（memtable-only loser）：
-    → 挂在 owning memtable_gen.loser_durable_refs 上
+    → flush fold 期间直接挂在 owning memtable_gen.loser_durable_refs 上
+    → 未完成 round 若在同一 sealed gen 上重试，允许 clear+rebuild
     → gen 释放且 data_ver <= recovery_safe_lsn 后回收
 ```
 

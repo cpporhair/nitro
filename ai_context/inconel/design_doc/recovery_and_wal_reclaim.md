@@ -749,7 +749,7 @@ wal_reclaim_round()
 | 来源 | 挂接位置 | 释放条件 |
 |------|---------|---------|
 | old tree-visible value | old checkpoint_guard.retired | guard 释放 + `data_ver <= recovery_safe_lsn` |
-| memtable-only loser | owning memtable_gen.loser_durable_refs | gen 释放 + `data_ver <= recovery_safe_lsn` |
+| memtable-only loser | owning memtable_gen.loser_durable_refs（flush fold 期间直接挂接；unfinished retry 可 clear+rebuild） | gen 释放 + `data_ver <= recovery_safe_lsn` |
 | pre-WAL orphan | 无（直接回收或 recovery 清理） | WAL 写入失败时立即回收 |
 
 ### 13.2 Boot Recovery 的 Value 回收
@@ -782,7 +782,8 @@ Recovery 不是“枚举所有曾经分配过的 slot”，而是直接重建下
 
 路径 B（正常提交 + 同 gen 内被覆盖）：
   value_ref → WAL + memtable
-  → fold 时输给同 key 更新版本
+  → fold 时输给同 key 更新版本（直接挂到 owning gen loser_durable_refs）
+  → unfinished round 若在同一 sealed gen 上重试，先 clear 再重建
   → value_ref 挂到 owning gen loser_durable_refs
   → gen 释放且 recovery_safe 后回收
 

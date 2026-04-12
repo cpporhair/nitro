@@ -47,7 +47,7 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 |--------|---------|--------|--------|
 | `coord_state` | `next_lsn, gate, current_cat, ready_set, seal_in_progress, cat_epoch` | RSM §2.1 | — |
 | `front_state` | `owner_id, active, imms, wal` | RSM §3.1 | — |
-| `memtable_gen` | `gen_id, st, min_lsn, max_lsn, kv_arena, table, loser_durable_refs`（无内嵌 refcount；生命周期由 `std::shared_ptr<memtable_gen>` 管理） | OV §5.1, RSM §3.2 | FF §3.3, RW §6 |
+| `memtable_gen` | `gen_id, st, front_owner_index, min_lsn, max_lsn, kv_arena, table, loser_durable_refs`（无内嵌 refcount；生命周期由 `std::shared_ptr<memtable_gen>` 管理；flush 可写 `loser_durable_refs`） | OV §5.1, RSM §3.2 | FF §3.3, RW §6 |
 | `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；`allocate(src, len) -> string_view` | RSM §3.2 | RMC §9.3 |
 | `memtable_entry` | `data_ver, kind, vh`（trivially copyable POD） | RSM §3.3 | RAP §4.3 |
 | `value_handle` | `durable: value_ref, hot: value_view`（POD）；`hot` 指向 owning gen 的 `kv_arena` 切片 | OV §5.1, RSM §3.3 | RAP §4.4 |

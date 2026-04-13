@@ -151,6 +151,17 @@ namespace apps::inconel::tree {
         pump::core::per_core::queue<_tree_lookup::req*> lookup_queue_;
         pump::core::per_core::queue<_cache_pages::req*> cache_queue_;
 
+        // Pending lookup count. Incremented on enqueue, decremented
+        // when a lookup completes (done / need_read). Read by the
+        // paired flush worker to throttle background reads when
+        // lookup is busy (Phase 6, 026 D14).
+        //
+        // Plain uint32_t — not atomic. Both schedule_lookup() and
+        // advance() run on this scheduler's core (callers switch via
+        // `on(tree_lookup_sched)` before submitting). The paired
+        // worker reads it on the same core in the same advance loop.
+        uint32_t pending_lookups = 0;
+
         explicit
         tree_lookup_sched_base(uint32_t rdi,
                                const core::tree_geometry* geom,
@@ -160,7 +171,10 @@ namespace apps::inconel::tree {
             , lookup_queue_(depth)
             , cache_queue_(depth) {}
 
-        void schedule_lookup(_tree_lookup::req* r) { lookup_queue_.try_enqueue(r); }
+        void schedule_lookup(_tree_lookup::req* r) {
+            ++pending_lookups;
+            lookup_queue_.try_enqueue(r);
+        }
         void schedule_cache(_cache_pages::req* r)  { cache_queue_.try_enqueue(r); }
 
         auto process(lookup_state& state);
@@ -341,6 +355,7 @@ namespace apps::inconel::tree {
             process_entries(s);
 
             if (s.all_done) {
+                --pending_lookups;
                 r->cb(decision_done{});
                 delete r;
                 return;
@@ -349,6 +364,7 @@ namespace apps::inconel::tree {
             decision_need_read decision;
             prepare_reads(s, decision);
             if (!decision.read_descs.empty()) {
+                --pending_lookups;
                 r->cb(std::move(decision));
                 delete r;
                 return;

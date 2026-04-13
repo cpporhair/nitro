@@ -53,7 +53,7 @@ namespace apps::inconel::runtime {
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
         tree::tree_lookup_sched<TreeCache>,
-        tree::tree_worker_sched,
+        tree::tree_worker_sched<TreeCache>,
         value::value_alloc_sched<ValueCache>,
         tree::tree_sched
     >;
@@ -311,7 +311,11 @@ namespace apps::inconel::runtime {
                 read_domain_index,
                 &kBootstrapTreeGeometry,
                 TreeCache(opts.tree_cache_capacity));
-            auto* tworker = new tree::tree_worker_sched(read_domain_index);
+            auto* tlookup_typed = static_cast<tree::tree_lookup_sched<TreeCache>*>(tlookup);
+            auto* tworker = new tree::tree_worker_sched<TreeCache>(
+                read_domain_index,
+                &tlookup_typed->page_cache_,
+                tlookup);
 
             // Singleton: value_alloc_sched is pinned to cores[0]. Every other
             // core gets a nullptr placeholder so the PUMP per-core tuple shape
@@ -378,7 +382,8 @@ namespace apps::inconel::runtime {
         if (core::registry::tree_sched_singleton_ptr) {
             delete core::registry::tree_sched_singleton_ptr;
         }
-        for (auto* s : core::registry::tree_worker_scheds.list) delete s;
+        for (auto* s : core::registry::tree_worker_scheds.list)
+            delete static_cast<tree::tree_worker_sched<TreeCache>*>(s);
         for (auto* s : core::registry::tree_lookup_scheds.list) {
             delete static_cast<tree::tree_lookup_sched<TreeCache>*>(s);
         }

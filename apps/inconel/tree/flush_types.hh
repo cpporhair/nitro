@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include <absl/container/flat_hash_map.h>
@@ -172,10 +173,43 @@ namespace apps::inconel::tree {
         std::span<const flush_leaf_group> leaf_groups;  // borrows from flush_round_state
     };
 
+    // ── candidate decision types (Phase 6 D1) ────────────────────
+    //
+    // Worker's process_candidates() returns one of these. The
+    // pipeline dispatches NVMe reads for need_read, then re-enters
+    // the worker. Unlike lookup's batch_decision, candidate_need_read
+    // carries no `frames` vector — buffers are owned by
+    // candidate_build_state::page_bufs, not by the cache.
+
+    struct candidate_done {};
+
+    struct candidate_need_read {
+        std::vector<format::read_desc> read_descs;
+    };
+
+    using candidate_decision = std::variant<candidate_done, candidate_need_read>;
+
+    // ── candidate materialization stage (Phase 6) ───────────────
+    //
+    // Phase 6 (step 026) extends the Phase 2 shell with real content:
+    //   - `candidate_page`: complete page image ready for NVMe write.
+    //     Owned by the candidate; tree_sched takes it for bounded
+    //     writes in Phase 7.
+    //   - `retired_old_values`: old leaf value_refs that were
+    //     superseded by memtable winners during the merge. Collected
+    //     per-leaf, aggregated at tree_sched in finish_flush_round.
+    //   - `record_count`: number of records in the candidate page.
+    //     Zero means all records were compacted away (tombstone gc).
+
     struct flush_leaf_candidate {
         paddr              leaf_range_base;
         paddr              old_slot_paddr;
         flush_stage_status st;
+
+        std::vector<char>  candidate_page;
+        absl::InlinedVector<core::retired_value_ref, 16>
+                           retired_old_values;
+        uint16_t           record_count = 0;
     };
 
     struct flush_candidate_batch {

@@ -124,6 +124,10 @@ add_executable(inconel_test_leaf_mapping apps/inconel/test/test_leaf_mapping.cc)
 target_include_directories(inconel_test_leaf_mapping PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_leaf_mapping PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_candidate_build apps/inconel/test/test_candidate_build.cc)
+target_include_directories(inconel_test_candidate_build PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_candidate_build PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_tree_page_format apps/inconel/test/test_tree_page_format.cc)
 target_include_directories(inconel_test_tree_page_format PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_page_format PRIVATE ${INCONEL_ABSL_LIBS})

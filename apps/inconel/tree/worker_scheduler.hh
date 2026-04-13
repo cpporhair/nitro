@@ -1,34 +1,23 @@
 #ifndef APPS_INCONEL_TREE_WORKER_SCHEDULER_HH
 #define APPS_INCONEL_TREE_WORKER_SCHEDULER_HH
 
-// ── tree_worker_sched — Phase 2 skeleton (step 022 §5, D7) ──
+// ── tree_worker_sched — Phase 6 cache-aware worker (step 026) ──
 //
-// Hosts the `build_leaf_candidates(flush_worker_req)` PUMP sender
-// surface so that later phases (Phase 6 actual candidate build) can
-// attach real logic without changing the sender shape, op layout, or
-// runtime tuple position.
+// Split into non-templated base + templated derived, mirroring
+// tree_lookup_sched_base / tree_lookup_sched<Cache>:
 //
-// Phase 2 constraints:
+//   tree_worker_sched_base  — queues, schedule methods, PUMP ops.
+//                             Registry stores base pointers.
+//   tree_worker_sched<Cache> — holds Cache* (shared read_domain cache),
+//                              advance() calls cache->pin() directly.
 //
-//   1. Worker is **non-templated**. Cache / frame pool / inflight are
-//      still lookup-local in Phase 2 (step 022 §3, §4, §6) — the worker
-//      does not need a Cache template parameter until the cache
-//      ownership migration step before Phase 5/6.
-//   2. Worker does not read old leaves, does not merge, does not
-//      compact, does not touch NVMe. The handle simply returns a
-//      `flush_candidate_batch` with
-//      `st = flush_stage_status::unsupported_unimplemented` through
-//      the normal value path (022 D11, §10) — no exception channel.
-//   3. `read_domain_index` is stored here so `registry::by_core[core]`
-//      can cheaply answer "which worker shares a domain with this
-//      lookup" without materializing a named `tree_read_domain`
-//      runtime object (022 D5, §3).
+// The shared Cache instance is owned by whoever constructs the
+// read_domain (currently tree_lookup_sched<Cache> owns it; a future
+// step may extract it into a dedicated read_domain object). The
+// worker holds a non-owning pointer set at construction time.
 //
-// File split (022 D12, §9): the op/sender/op_pusher/compute_sender_type
-// specializations for this sender live in this header, next to their
-// definitions. `tree/scheduler.hh` is an umbrella shim and
-// `tree/sender.hh` is the outward-facing facade that #includes both
-// sub-headers.
+// Both lookup and worker call cache->pin(fid) with the same syntax
+// — no type erasure, no function pointers.
 
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +32,7 @@
 #include "pump/core/op_tuple_builder.hh"
 
 #include "../core/panic.hh"
+#include "./candidate_build.hh"
 #include "./flush_types.hh"
 #include "./leaf_mapping.hh"
 
@@ -50,7 +40,7 @@ namespace apps::inconel::tree {
 
     // ── PUMP req / op / sender for build_leaf_candidates ──
 
-    struct tree_worker_sched;
+    struct tree_worker_sched_base;
 
     namespace _build_leaf_candidates {
 
@@ -62,16 +52,16 @@ namespace apps::inconel::tree {
         struct op {
             constexpr static bool build_leaf_candidates_op = true;
 
-            tree_worker_sched* sched;
-            flush_worker_req   args;
+            tree_worker_sched_base* sched;
+            flush_worker_req        args;
 
             template <uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            tree_worker_sched* sched;
-            flush_worker_req   args;
+            tree_worker_sched_base* sched;
+            flush_worker_req        args;
 
             auto
             make_op() {
@@ -88,7 +78,7 @@ namespace apps::inconel::tree {
 
     }  // namespace _build_leaf_candidates
 
-    // ── PUMP req / op / sender for leaf_mapping (Phase 5 D6-D8) ──
+    // ── PUMP req / op / sender for leaf_mapping (Phase 5) ──
 
     namespace _leaf_mapping {
 
@@ -100,16 +90,16 @@ namespace apps::inconel::tree {
         struct op {
             constexpr static bool leaf_mapping_op = true;
 
-            tree_worker_sched* sched;
-            flush_mapping_req  args;
+            tree_worker_sched_base* sched;
+            flush_mapping_req       args;
 
             template <uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            tree_worker_sched* sched;
-            flush_mapping_req  args;
+            tree_worker_sched_base* sched;
+            flush_mapping_req       args;
 
             auto
             make_op() {
@@ -126,22 +116,70 @@ namespace apps::inconel::tree {
 
     }  // namespace _leaf_mapping
 
-    // ── tree_worker_sched ──
-    //
-    // Single queue (`build_q`), single handle. Bounded drain per
-    // advance() tick so no one scheduler starves the runtime loop.
+    // ── PUMP req / op / sender for process_candidates (Phase 6) ──
 
-    struct tree_worker_sched {
-        static constexpr uint32_t kMaxBuildOpsPerAdvance       = 64;
-        static constexpr uint32_t kMaxLeafMappingOpsPerAdvance = 64;  // D8
+    namespace _process_candidates {
+
+        struct req {
+            candidate_build_state* state;
+            std::move_only_function<void(candidate_decision&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool process_candidates_op = true;
+
+            tree_worker_sched_base* sched;
+            candidate_build_state*  state;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_worker_sched_base* sched;
+            candidate_build_state*  state;
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .state = state };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _process_candidates
+
+    // ── tree_worker_sched_base (non-templated) ───────────────────
+    //
+    // Holds queues and schedule/submit methods. PUMP ops reference
+    // this type. Registry stores pointers to this type.
+
+    struct tree_worker_sched_base {
+        static constexpr uint32_t kMaxBuildOpsPerAdvance            = 64;
+        static constexpr uint32_t kMaxLeafMappingOpsPerAdvance      = 64;
+        static constexpr uint32_t kMaxProcessCandidatesOpsPerAdvance = 8;
 
         uint32_t                                                      read_domain_index;
+        tree_lookup_sched_base*                                       paired_lookup = nullptr;
+
         pump::core::per_core::queue<_build_leaf_candidates::req*>     build_q;
-        pump::core::per_core::queue<_leaf_mapping::req*>              leaf_mapping_q;  // Phase 5
+        pump::core::per_core::queue<_leaf_mapping::req*>              leaf_mapping_q;
+        pump::core::per_core::queue<_process_candidates::req*>        candidates_q;
 
         explicit
-        tree_worker_sched(uint32_t rdi, std::size_t depth = 2048)
-            : read_domain_index(rdi), build_q(depth), leaf_mapping_q(depth) {}
+        tree_worker_sched_base(uint32_t rdi,
+                               tree_lookup_sched_base* lookup = nullptr,
+                               std::size_t depth = 2048)
+            : read_domain_index(rdi)
+            , paired_lookup(lookup)
+            , build_q(depth)
+            , leaf_mapping_q(depth)
+            , candidates_q(depth) {}
 
         void
         schedule_build(_build_leaf_candidates::req* r) {
@@ -153,25 +191,50 @@ namespace apps::inconel::tree {
             leaf_mapping_q.try_enqueue(r);
         }
 
-        // Sender factory (mirrors tree_lookup_sched_base::process).
-        // Callers normally reach this through
-        // `tree::build_leaf_candidates(worker, req)` in tree/sender.hh.
+        void
+        schedule_process_candidates(_process_candidates::req* r) {
+            candidates_q.try_enqueue(r);
+        }
+
         auto
         submit_build(flush_worker_req args) {
             return _build_leaf_candidates::sender{ this, args };
         }
 
-        // Phase 5 sender factory for leaf mapping.
         auto
         submit_leaf_mapping(flush_mapping_req args) {
             return _leaf_mapping::sender{ this, std::move(args) };
         }
 
+        auto
+        submit_process_candidates(candidate_build_state* state) {
+            return _process_candidates::sender{ this, state };
+        }
+    };
+
+    // ── tree_worker_sched<Cache> (templated) ─────────────────────
+    //
+    // Holds a non-owning Cache* — the same read_domain cache that
+    // tree_lookup_sched<Cache> uses. advance() calls cache->pin()
+    // directly — same syntax as lookup, no type erasure.
+
+    template <core::cache_concept Cache>
+    struct tree_worker_sched : tree_worker_sched_base {
+        Cache* cache_;
+
+        explicit
+        tree_worker_sched(uint32_t rdi,
+                          Cache* cache,
+                          tree_lookup_sched_base* lookup = nullptr,
+                          std::size_t depth = 2048)
+            : tree_worker_sched_base(rdi, lookup, depth)
+            , cache_(cache) {}
+
         bool
         advance() {
             bool progress = false;
 
-            // ── drain build_q (Phase 2) ──
+            // ── drain build_q (Phase 2 stub) ──
             for (uint32_t i = 0; i < kMaxBuildOpsPerAdvance; ++i) {
                 auto item = build_q.try_dequeue();
                 if (!item) break;
@@ -208,7 +271,6 @@ namespace apps::inconel::tree {
                 if (!item) break;
                 auto* r = *item;
 
-                // Fail-fast: routing validation (025 §fail-fast)
                 if (r->args.read_domain_index != read_domain_index) {
                     core::panic_inconsistency(
                         "tree::tree_worker_sched::advance(leaf_mapping)",
@@ -223,8 +285,6 @@ namespace apps::inconel::tree {
                         static_cast<unsigned>(read_domain_index));
                 }
 
-                // Run the mapping algorithm. keys_to_leaf_groups
-                // sets result.st directly.
                 flush_leaf_group_result res{
                     .round_id          = r->args.round_id,
                     .read_domain_index = r->args.read_domain_index,
@@ -234,6 +294,19 @@ namespace apps::inconel::tree {
                 keys_to_leaf_groups(r->args, res);
 
                 r->cb(std::move(res));
+                delete r;
+                progress = true;
+            }
+
+            // ── drain candidates_q (Phase 6) ──
+            for (uint32_t i = 0; i < kMaxProcessCandidatesOpsPerAdvance; ++i) {
+                auto item = candidates_q.try_dequeue();
+                if (!item) break;
+                auto* r = *item;
+
+                auto decision = process_candidate_groups(
+                    *r->state, paired_lookup, cache_);
+                r->cb(std::move(decision));
                 delete r;
                 progress = true;
             }
@@ -248,7 +321,7 @@ namespace apps::inconel::tree {
         }
     };
 
-    // ── Deferred op::start definition (needs full tree_worker_sched) ──
+    // ── Deferred op::start definitions ──────────────────────────
 
     template <uint32_t pos, typename ctx_t, typename scope_t>
     void
@@ -262,8 +335,6 @@ namespace apps::inconel::tree {
         });
     }
 
-    // ── Deferred _leaf_mapping::op::start (needs full tree_worker_sched) ──
-
     template <uint32_t pos, typename ctx_t, typename scope_t>
     void
     _leaf_mapping::op::start(ctx_t& ctx, scope_t& scope) {
@@ -276,13 +347,25 @@ namespace apps::inconel::tree {
         });
     }
 
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _process_candidates::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_process_candidates(new _process_candidates::req{
+            state,
+            [ctx = ctx, scope = scope](candidate_decision&& d) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(d));
+            },
+        });
+    }
+
 }  // namespace apps::inconel::tree
 
 // ── PUMP specializations ──
 
 namespace pump::core {
 
-    // build_leaf_candidates op_pusher
+    // build_leaf_candidates
     template <uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
         && (get_current_op_type_t<pos, scope_t>::build_leaf_candidates_op)
@@ -308,7 +391,7 @@ namespace pump::core {
         }
     };
 
-    // leaf_mapping op_pusher (Phase 5)
+    // leaf_mapping
     template <uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
         && (get_current_op_type_t<pos, scope_t>::leaf_mapping_op)
@@ -331,6 +414,32 @@ namespace pump::core {
         consteval static auto
         get_value_type_identity() {
             return std::type_identity<apps::inconel::tree::flush_leaf_group_result>{};
+        }
+    };
+
+    // process_candidates
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::process_candidates_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::tree::_process_candidates::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<apps::inconel::tree::candidate_decision>{};
         }
     };
 

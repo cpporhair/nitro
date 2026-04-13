@@ -47,8 +47,8 @@ namespace apps::inconel::core::registry {
     // read_domain_index, so a dedicated named tree_read_domain runtime
     // object is deliberately absent (022 D5, §3, §7).
     struct tree_worker_list {
-        std::vector<tree::tree_worker_sched*> list;
-        std::vector<tree::tree_worker_sched*> by_core;
+        std::vector<tree::tree_worker_sched_base*> list;
+        std::vector<tree::tree_worker_sched_base*> by_core;
     };
     inline tree_worker_list tree_worker_scheds;
 
@@ -152,7 +152,7 @@ namespace apps::inconel::core::registry {
         return s;
     }
 
-    inline tree::tree_worker_sched*
+    inline tree::tree_worker_sched_base*
     local_tree_worker() {
         auto* s = tree_worker_scheds.by_core[pump::core::this_core_id];
         assert(s && "current core has no tree_worker scheduler");
@@ -171,7 +171,7 @@ namespace apps::inconel::core::registry {
         return tree_lookup_scheds.by_core[core];
     }
 
-    inline tree::tree_worker_sched*
+    inline tree::tree_worker_sched_base*
     tree_worker_for_core(uint32_t core) {
         return tree_worker_scheds.by_core[core];
     }
@@ -183,7 +183,7 @@ namespace apps::inconel::core::registry {
         return tree_lookup_scheds.list[idx % tree_lookup_scheds.list.size()];
     }
 
-    inline tree::tree_worker_sched*
+    inline tree::tree_worker_sched_base*
     tree_worker_at(uint32_t idx) {
         return tree_worker_scheds.list[idx % tree_worker_scheds.list.size()];
     }

@@ -19,7 +19,7 @@
 //   - `flush_key_group` — per-logical-key fold output. Phase 3 only
 //     freezes the shape so the Phase 4 fold step does not have to
 //     touch this header a second time.
-//   - `flush_lookup_req` / `flush_worker_req` re-gain the borrowed
+//   - `flush_mapping_req` / `flush_worker_req` re-gain the borrowed
 //     payload (`std::span<const flush_key_group>` /
 //     `std::span<const flush_leaf_group>`). 022 temporarily stripped
 //     those fields because no owning side existed; Phase 3 establishes
@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/inlined_vector.h>
@@ -101,7 +102,7 @@ namespace apps::inconel::tree {
     // workset vector is not reallocated after partitioning.
     //
     // Phase 5 `dispatch_key_partitions_to_lookup()` fans out these
-    // partitions, converting each into a `flush_lookup_req` with
+    // partitions, converting each into a `flush_mapping_req` with
     // `groups` pointing at the same span.
 
     struct flush_key_partition {
@@ -111,14 +112,15 @@ namespace apps::inconel::tree {
 
     // ── leaf mapping stage (Phase 5 consumer) ────────────────────
 
-    // Phase 3 re-attaches the borrowed payload that 022 review M-3
-    // had to strip. `groups` points at the round-owned
-    // `flush_round_state.workset` vector and is valid for the
-    // lifetime of the enclosing round (see 023 §6). `tree_sched`
-    // MUST NOT let a `flush_lookup_req` outlive the round_state it
-    // borrows from; Phase 5 will land the dispatch logic that
-    // enforces it — Phase 3 only freezes the field.
-    struct flush_lookup_req {
+    // Phase 5 (D17): renamed from `flush_mapping_req` — the target
+    // scheduler changed from `tree_lookup_sched` to
+    // `tree_worker_sched`, so the name follows.
+    //
+    // `groups` points at the round-owned `flush_round_state.workset`
+    // vector and is valid for the lifetime of the enclosing round
+    // (see 023 §6). `tree_sched` MUST NOT let a `flush_mapping_req`
+    // outlive the round_state it borrows from.
+    struct flush_mapping_req {
         flush_round_id                    round_id;
         uint32_t                          read_domain_index;
         const core::tree_manifest*        base_manifest;
@@ -128,6 +130,7 @@ namespace apps::inconel::tree {
     struct flush_leaf_group {
         paddr leaf_range_base;
         paddr old_slot_paddr;
+        std::span<const flush_key_group> keys;  // borrows from flush_round_state.workset
     };
 
     struct flush_leaf_group_result {
@@ -135,6 +138,20 @@ namespace apps::inconel::tree {
         uint32_t                                  read_domain_index;
         flush_stage_status                        st;
         absl::InlinedVector<flush_leaf_group, 8>  leaf_groups;
+    };
+
+    // ── Phase 5 fold/merge stage carriers (D10, D11) ────────────
+
+    struct flush_fold_result {
+        flush_round_id                     round_id;
+        flush_stage_status                 st;
+        std::vector<flush_key_partition>   partitions;
+        const core::tree_manifest*         base_manifest;
+    };
+
+    struct flush_merge_request {
+        flush_round_id                            round_id;
+        std::vector<flush_leaf_group_result>      mapping_results;
     };
 
     // ── candidate materialization stage (Phase 6 consumer) ───────

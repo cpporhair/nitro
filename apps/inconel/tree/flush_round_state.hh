@@ -5,7 +5,7 @@
 //
 // Owning side for everything a single tree-local flush round
 // produces and consumes between stages. Every borrowed view inside
-// the flush sub-stage carriers — `flush_lookup_req.groups`,
+// the flush sub-stage carriers — `flush_mapping_req.groups`,
 // `flush_worker_req.leaf_groups`, and any future intermediate span
 // — points into this struct's owning vectors.
 //
@@ -22,7 +22,7 @@
 //      subsequent stage handle on `tree_sched` can find the live
 //      round_state by `round_id` without re-routing through the
 //      queue payload. Phase 3 does NOT pre-create that map.
-//   3. Each `flush_lookup_req` / `flush_worker_req` carries a
+//   3. Each `flush_mapping_req` / `flush_worker_req` carries a
 //      `round_id` plus a borrowed span into this round_state. The
 //      span is safe as long as `tree_sched` has not freed the
 //      round_state, which it MUST NOT do until every fan-out has
@@ -95,7 +95,7 @@ namespace apps::inconel::tree {
         // ── populated by Phase 4 (memtable fold / workset build) ──
         //
         // Sorted by `key` ascending. Backing storage for
-        // `flush_lookup_req.groups`. Phase 3 leaves this empty.
+        // `flush_mapping_req.groups`. Phase 3 leaves this empty.
         std::vector<flush_key_group> workset;
 
         // ── populated by Phase 4 (partition plan for Phase 5 lookup fanout) ──

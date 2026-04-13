@@ -279,17 +279,27 @@ capture base / pin input
 
 `fold_memtables_into_sorted_key_groups()` 已可独立作为 sender seam 向下游提供稳定输入。
 
-## Phase 5 — Lookup Fanout / Leaf Mapping
+## Phase 5 — Worker Fanout / Leaf Mapping
+
+### 架构
+
+Phase 5 建立 flush pipeline 的跨 scheduler 骨架：**一次 fan-out 到 K 个 `tree_worker_sched`，一次 fan-in 回 `tree_sched`**。worker handle 随后续 phase 增长（Phase 6 加 build，Phase 8 加 split），但 pipeline 结构（一次 fanout）不变。
+
+`tree_lookup_sched` 不参与 flush pipeline——它只服务前台读路径。flush page 级工作统一在 worker，原因：代码隔离 + cache 复用（worker/lookup 共享 read_domain cache，正常运行时 lookup 已经把 tree page 读进 cache）+ 一次 fanout 省掉多轮往返。
 
 ### 目标
 
-实现 `dispatch_key_partitions_to_lookup(...)` 和 `keys_to_leaf_groups()`。
+1. `tree_sched` 拆阶段：`submit_flush_fold`（fold + partition）+ `submit_flush_merge`（合并 worker 结果）
+2. worker 新增 `_leaf_mapping` handle + `keys_to_leaf_groups()` 映射算法
+3. `sender.hh` 用 PUMP sender 组合编排 fanout/fan-in pipeline
 
 ### 主要产物
 
-1. key partition fanout sender
-2. `keys_to_leaf_groups()`
-3. fan-in merge / dedupe seam
+1. PUMP pipeline 编排（`loop >> concurrent >> flat_map(worker->submit_leaf_mapping)`)
+2. `keys_to_leaf_groups()` — sorted merge 算法
+3. `merge_lookup_leaf_groups()` — fan-in 合并 / dedupe
+4. `tree_sched` 的 `_flush_fold` / `_flush_merge` 两个 PUMP sender surface
+5. worker 的 `_leaf_mapping` PUMP sender surface
 
 ### 必须落地的点
 
@@ -298,47 +308,52 @@ capture base / pin input
 3. 不允许扫全树 leaf
 4. 相邻 partition 命中同一 leaf 时，回到 `tree_sched` 统一 merge
 5. `leaf_order` 不变量失败应 fail-fast
+6. 跨 scheduler 调用通过 PUMP sender pipeline，不在 advance() 内部手动 enqueue
 
 ### 这一步不做
 
-1. old leaf read
-2. candidate build
-3. tree writes
+1. old leaf read / candidate build（Phase 6 扩展同一 worker handle）
+2. tree writes（Phase 7）
+3. split（Phase 8 扩展同一 worker handle）
 
 ### 退出条件
 
-`dispatch_key_partitions_to_lookup(...)` 已能稳定产出 `flush_leaf_group_result[]`。
+worker fanout → fan-in → merge 已形成稳定闭环，产出 `flush_leaf_group_result[]`。Phase 6 可在不改 pipeline 结构的前提下扩展 worker handle。
 
-## Phase 6 — Worker Fanout / Candidate Build
+## Phase 6 — Candidate Build（扩展 Worker Handle）
+
+### 架构
+
+Phase 6 在 Phase 5 建立的 **同一次 fanout** 上扩展 worker handle：worker 从"只做 mapping"升级为"mapping + 读旧页 + merge + 构造 candidate"。pipeline 结构不变，fan-in 回 tree_sched 的 merge handle 也相应扩展以处理 candidate results。
 
 ### 目标
 
-实现 `dispatch_leaf_partitions_to_workers(...)` 和 `build_leaf_candidates()`。
+扩展 worker handle，实现 `build_leaf_candidates()`。
 
 ### 主要产物
 
-1. leaf partition fanout sender
-2. old leaf read/decode
-3. merge + compact
-4. `flush_leaf_candidate`
+1. old leaf read/decode（通过 read_domain cache / NVMe）
+2. merge old records + memtable winners
+3. page-local compact（tombstone && data_ver <= recovery_safe_lsn）
+4. `flush_leaf_candidate` 返回
 
 ### 必须落地的点
 
-1. worker 只做 page materialization
-2. worker 不做 slot/range 分配
-3. worker 不改 manifest
-4. `tombstone && data_ver <= recovery_safe_lsn` 的 compact 规则
-5. split / consolidation / parent rewrite 形态必须显式 `unsupported_*`
+1. worker 不做 slot/range 分配（tree_allocator 在 tree_sched 上）
+2. worker 不改 manifest
+3. `tombstone && data_ver <= recovery_safe_lsn` 的 compact 规则
+4. split / consolidation / parent rewrite 形态必须显式 `unsupported_*`
+5. 同一个 worker handle，同一次 fanout——不另起 fan-out/fan-in
 
 ### 这一步不做
 
-1. tree delta planning
-2. bounded writes
-3. device flush
+1. tree delta planning / NVMe 地址分配（Phase 7 扩展 tree_sched merge handle）
+2. bounded writes / device flush（Phase 7）
+3. split 处理（Phase 8 扩展同一 worker handle）
 
 ### 退出条件
 
-`dispatch_leaf_partitions_to_workers(...)` 已能稳定产出 candidate proposals。
+worker fanout 已能稳定产出 candidate proposals。pipeline 结构与 Phase 5 相同。
 
 ## Phase 7 — Root-Stable Writer
 

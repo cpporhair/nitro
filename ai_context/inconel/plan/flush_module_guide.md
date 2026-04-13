@@ -110,166 +110,123 @@ tree-local flush pipeline 负责：
 
 ### 2.4 tree-local flush 的 PUMP sender 视图
 
-本文真正指导开发的那一段，也就是 tree-local flush 本体，在 sender 形状上应看成：
+tree-local flush 的 pipeline 只有**一次 fan-out / fan-in**。worker 做全部 page 级重活（mapping + 读旧页 + merge + 构造新页 + 处理 split），tree_sched 只做轻量协调（fold / 合并结果 / 分配 NVMe 地址 / 写盘）：
 
 ```text
 tree_local_flush(base_guard, gens)
-  = on(tree_sched, capture_flush_base_and_pin_input(base_guard, gens))
-  >> flat_map([sched](flush_round_id rid) {
-       return sched->fold_memtables_into_sorted_key_groups(rid)
-         >> flat_map([sched, rid](auto&& key_parts) {
-              return dispatch_key_partitions_to_lookup(sched, rid, key_parts);
+  = tree_sched->submit_flush_fold(req)                    // fold + partition
+  >> flat_map([owner](flush_fold_result&& fr) {
+       return dispatch_partitions_to_workers(fr)           // 一次 fanout 到 K 个 worker
+         >> flat_map([owner](auto&& worker_results) {
+              return owner->submit_flush_merge(worker_results);  // 合并 + 分配 NVMe 地址
             })
-         >> flat_map([sched, rid](auto&& leaf_group_results) {
-              return sched->merge_lookup_leaf_groups(rid, std::move(leaf_group_results));
-            })
-         >> flat_map([sched, rid](auto&& leaf_parts) {
-              return dispatch_leaf_partitions_to_workers(sched, rid, leaf_parts);
-            })
-         >> flat_map([sched, rid](auto&& build_results) {
-              return sched->plan_tree_delta_from_candidates(rid, std::move(build_results));
-            })
-         >> flat_map([sched, rid](auto&& write_plan) {
-              return submit_tree_page_writes_bounded(sched, rid, write_plan)
-                >> flat_map([sched, rid](bool ok) {
-                     return sched->record_tree_page_write_result(rid, ok);
-                   });
-            })
-         >> flat_map([sched, rid](auto&&) {
-              return core::registry::local_nvme()->flush()
-                >> flat_map([sched, rid](bool ok) {
-                     return sched->record_device_flush_result(rid, ok);
+         >> flat_map([owner](auto&& write_plan) {
+              return submit_tree_page_writes_bounded(write_plan)
+                >> flat_map([owner](bool) {
+                     return core::registry::local_nvme()->flush();
+                   })
+                >> flat_map([owner](bool) {
+                     return owner->finish_flush_round();
                    });
             });
-     })
-  >> flat_map([sched](flush_round_id rid) {
-       return sched->finish_flush_round(rid);
-     })
+     }) >> flat()
 ```
 
 如果按 owner seam 读这段 sender：
 
-1. `tree_sched` 负责 round owner 状态、fanout/fanin、tree delta、write coordination
-2. `dispatch_key_partitions_to_lookup(...)` 是 `tree_sched -> tree_lookup_sched` 的 sender fanout
-3. `dispatch_leaf_partitions_to_workers(...)` 是 `tree_sched -> tree_worker_sched` 的 sender fanout
+1. `tree_sched` 负责 round owner 状态（fold / merge / allocate / write coordination）
+2. `dispatch_partitions_to_workers(...)` 是**唯一一次** `tree_sched -> tree_worker_sched` 的 sender fanout
+3. `tree_lookup_sched` 不参与 flush pipeline——它只服务前台读路径
 4. bounded writes completion 全收齐之后，才允许 `nvme()->flush()`
 
 ### 2.5 fanout 子流程的 sender 视图
 
-为了让后续 step 文档拆得更自然，还需要把两个 fanout 看成独立 sender seam：
+只有一次 fanout。每个 worker 独立完成自己 partition 的全部 page 工作：
 
 ```text
-dispatch_key_partitions_to_lookup(sched, rid, key_parts)
-  = just(std::move(key_parts))
-  >> map_each([sched, rid](flush_key_partition& part) {
-       auto* lookup = tree_read_domains[part.read_domain_index].lookup;
-       return lookup->keys_to_leaf_groups({
-           .round_id = rid,
+dispatch_partitions_to_workers(fold_result)
+  = loop(fold_result.partitions.size())
+  >> concurrent()
+  >> flat_map([](flush_fold_result& ctx, size_t i) {
+       auto& part = ctx.partitions[i];
+       auto* worker = registry::tree_worker_at(part.read_domain_index);
+       return worker->submit_flush_work({
+           .round_id = ctx.round_id,
            .read_domain_index = part.read_domain_index,
-           .base_manifest = sched->base_manifest(rid),
+           .base_manifest = ctx.base_manifest,
            .groups = part.groups,
+           .recovery_safe_lsn = ctx.recovery_safe_lsn,
        });
      })
-  >> collect_all()
+  >> to_vector()
 ```
 
-```text
-dispatch_leaf_partitions_to_workers(sched, rid, leaf_parts)
-  = just(std::move(leaf_parts))
-  >> map_each([sched, rid](flush_leaf_partition& part) {
-       auto* worker = tree_read_domains[part.read_domain_index].worker;
-       return worker->build_leaf_candidates({
-           .round_id = rid,
-           .read_domain_index = part.read_domain_index,
-           .leaves = part.leaves,
-           .recovery_safe_lsn = sched->recovery_safe_lsn(rid),
-       });
-     })
-  >> collect_all()
-```
+worker handle 随 phase 增长：
 
-这两段的意义不是冻结最终 C++ 类型，而是冻结：
+| Phase | worker handle 做什么 | 返回什么 |
+|---|---|---|
+| Phase 5 | keys_to_leaf_groups mapping | leaf groups |
+| Phase 6 | mapping + 读旧页 + merge + 构造 candidate | candidate pages |
+| Phase 8 | mapping + build + split 处理 | candidates with split info |
 
-1. lookup fanout 的输入输出边界
-2. worker fanout 的输入输出边界
-3. collect/join 发生的位置必须回到 `tree_sched`
+始终同一 handle、同一 fanout、同一 fan-in。后续 phase 扩展 handle 逻辑，不另起 fanout。
+
+这段冻结的是：
+
+1. worker fanout 的输入输出边界
+2. collect/join 发生的位置必须回到 `tree_sched`
+3. `tree_lookup_sched` 不参与 flush fanout
 
 后续所有 step 文档，都应该先回答自己切的是 tree-local flush sender 的哪一段。如果一个 step 文档连自己切的是哪一段都没说清楚，后面大概率会把设计边界和实现边界混在一起。
 
 ## 3. 模块拆分与 owner 边界
 
-### 3.1 三类 scheduler 的职责冻结
+### 3.1 两类 scheduler 的职责
 
-flush 模块按三类职责拆：
+flush 模块按两类职责拆：
 
 ```text
-tree_sched        = round owner / tree mutation / write coordination
-tree_lookup_sched = key/range -> tree leaf mapping
-tree_worker_sched = old page -> candidate page materialization
+tree_sched        = round owner / 轻量协调（fold / merge / allocate / write）
+tree_worker_sched = 全部 page 级重活（mapping / read / merge / build / split）
 ```
+
+`tree_lookup_sched` **不参与 flush pipeline**——它只服务前台读路径（point lookup / range scan）。flush 的 page 工作统一放 `tree_worker_sched`，原因：
+
+1. **代码隔离**。lookup 和 worker 分开是为了维护性，flush 逻辑统一在 worker，避免散布两个 scheduler。
+2. **cache 复用**。worker 和 lookup 在同一个 `tree_read_domain` 共享 cache shard。正常运行时 lookup 处理前台读把 tree page 读进 cache，worker 做 flush 时直接 cache hit。这个收益来自 read_domain 架构，和 flush 在哪个 scheduler 无关。
+3. **一次 fanout**。mapping 和 build 在同一个 worker handle 里，不需要两轮 fan-out/fan-in。
 
 #### `tree_sched`
 
-它是 flush round owner，只负责 owner-only 状态与写侧决策：
+flush round owner，只负责 owner-only 状态与轻量协调：
 
 1. 接收请求
 2. 捕获 base guard / base manifest
 3. pin memtable gens
-4. 构造 sorted workset
-5. 分发 lookup / worker task
-6. 汇总结果
-7. 规划 tree delta / manifest delta
-8. 分配 shadow slot / range
-9. 提交 tree writes
-10. 提交 device flush
-11. 返回 `tree_flush_result`
+4. 构造 sorted workset + partition
+5. 分发 worker task（一次 fanout）
+6. 合并 worker 结果
+7. 分配 NVMe 地址（shadow slot / new range）
+8. 提交 tree writes + device flush
+9. 返回 `tree_flush_result`
 
-所有会修改：
-
-1. tree manifest
-2. tree allocator
-3. retired 集合
-4. flush round 状态
-
-的逻辑都只允许在 `tree_sched` 上执行。
-
-#### `tree_lookup_sched`
-
-它服务所有 tree structure query。在 flush 中只负责：
-
-```text
-flush_key_partition
-  -> keys_to_leaf_groups()
-  -> flush_leaf_group[]
-```
-
-这里：
-
-1. 不读 value body
-2. 不构造 page
-3. 不分配 slot
-4. 不修改 manifest
-
-选择它的原因不是算子本身一定很重，而是为了冻结“key/range 到 leaf mapping”这条独立 seam。
+所有会修改 tree manifest / tree allocator / retired 集合 / flush round 状态的逻辑只在 `tree_sched` 上执行。
 
 #### `tree_worker_sched`
 
-它服务 flush 的 page materialization，只负责：
+它服务 flush 的全部 page 级工作。一个 worker handle 随 phase 增长：
 
 ```text
-flush_leaf_partition
-  -> read/decode old leaf pages
-  -> merge old records + memtable winners
-  -> build leaf candidate pages
-  -> return candidate proposals
+Phase 5: flush_key_partition → keys_to_leaf_groups() → flush_leaf_group[]
+Phase 6: + read/decode old leaf → merge → build candidate pages
+Phase 8: + handle leaf split → build split page images
 ```
 
-这里：
+worker 的约束（所有 phase 共有）：
 
-1. 不判断 key 属于哪个 leaf
-2. 不分配 slot
-3. 不修改 manifest
-4. 不执行 root change
+1. 不分配 slot / range（tree_allocator 在 tree_sched 上）
+2. 不修改 manifest
+3. 不执行 root change 决策（返回 split info 让 tree_sched 处理）
 
 ### 3.2 read domain 作为固定拓扑
 
@@ -519,20 +476,22 @@ worker 读取 old leaf page 后，在本地做：
    - pinned gens
    - sorted `flush_key_group[]`
    - partition policy
-5. **leaf mapping**
-   - `keys_to_leaf_groups()`
-   - lookup fanout / fan-in merge
-6. **candidate build**
+5. **worker fanout / leaf mapping**
+   - `tree_sched` 拆阶段（fold + merge）
+   - PUMP sender pipeline 编排（一次 fanout）
+   - worker `_leaf_mapping` handle + `keys_to_leaf_groups()` 算法
+   - fan-in merge / dedupe
+6. **candidate build**（扩展同一 worker handle，同一 fanout）
    - old leaf read/decode
    - merge/compact
    - candidate proposal
 7. **root-stable writer**
-   - tree delta planning
+   - tree_sched merge handle 扩展：NVMe 地址分配 / tree delta planning
    - bounded writes
    - device flush
    - tree-local result
-8. **tree shape growth**
-   - leaf split
+8. **tree shape growth**（扩展同一 worker handle）
+   - leaf split（worker 构造 split page images，tree_sched 分配地址）
    - parent rewrite
    - root change
 

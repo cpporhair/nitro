@@ -137,6 +137,57 @@ namespace apps::inconel::core {
                                s.fence_upper_len);
         }
 
+        // ── find_leaf_for_key (Phase 5 D3) ──
+        //
+        // Binary-search the sorted spans for the leaf whose
+        // [fence_lower, fence_upper) range contains `key`.
+        //
+        // Returns the index into `spans` on success, or `spans.size()`
+        // if the key falls outside every leaf range. The caller
+        // interprets out-of-range as `unsupported_shape_change` (key
+        // beyond tree coverage) rather than a panic — the tree simply
+        // needs to grow, which is a Phase 8 shape-changing operation.
+        //
+        // Complexity: O(log L) where L = spans.size().
+        //
+        // Fence convention (D2):
+        //   - fence_lower empty = negative infinity (first leaf)
+        //   - fence_upper empty = positive infinity (last leaf)
+        //
+        // The search finds the rightmost span whose fence_lower <= key,
+        // then verifies key < fence_upper. Binary search uses the
+        // upper_bound trick on fence_lower: we seek the first span
+        // whose fence_lower > key, then step back one.
+        std::size_t
+        find_leaf_for_key(std::string_view key) const {
+            if (spans.empty()) return spans.size();
+
+            // Upper-bound on fence_lower: find first span with
+            // fence_lower > key.
+            std::size_t lo = 0, hi = spans.size();
+            while (lo < hi) {
+                std::size_t mid = lo + (hi - lo) / 2;
+                auto lower = fence_lower(spans[mid]);
+                // empty lower = -∞, always <= key → go right
+                if (lower.empty() || lower <= key)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+
+            // lo == 0 means every span's fence_lower > key → key is
+            // below the tree's minimum.
+            if (lo == 0) return spans.size();
+
+            std::size_t idx = lo - 1;
+            auto upper = fence_upper(spans[idx]);
+            // empty upper = +∞ → key is in range
+            if (!upper.empty() && key >= upper)
+                return spans.size();
+
+            return idx;
+        }
+
       private:
         // Shared implementation: reject every {offset, length} pair
         // that does not fit entirely within `fence_pool`. The

@@ -181,9 +181,9 @@ static_assert(!has_method_recycle<tree::tree_allocator>,
 // requests are spans of const elements (read-only borrows that point
 // into the round-owned vectors of flush_round_state).
 static_assert(std::is_same_v<
-    decltype(std::declval<tree::flush_lookup_req>().groups),
+    decltype(std::declval<tree::flush_mapping_req>().groups),
     std::span<const tree::flush_key_group>>,
-    "G6: flush_lookup_req.groups must be std::span<const flush_key_group>");
+    "G6: flush_mapping_req.groups must be std::span<const flush_key_group>");
 static_assert(std::is_same_v<
     decltype(std::declval<tree::flush_worker_req>().leaf_groups),
     std::span<const tree::flush_leaf_group>>,
@@ -553,19 +553,19 @@ static void
 in_child_provoke_null_base_guard() {
     pump::core::this_core_id = 0;
     tree::tree_sched ts;
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = nullptr,
             .sealed_gens       = { make_dummy_sealed_gen(1) },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) {
+        .cb = [](tree::flush_fold_result&&) {
             std::fprintf(stderr,
                 "child(null base_guard): cb fired but should have panicked\n");
             std::_Exit(2);
         },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();  // expected: panic_inconsistency → abort()
     std::fprintf(stderr,
         "child(null base_guard): advance() returned but should have panicked\n");
@@ -580,22 +580,22 @@ test_empty_sealed_gens_ok() {
     tree::tree_sched ts;
     auto guard = make_empty_guard();
     bool fired = false;
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = {},
             .recovery_safe_lsn = 0,
         },
-        .cb = [&](tree::tree_flush_result&& res) {
+        .cb = [&](tree::flush_fold_result&& res) {
             CHECK(res.st == tree::flush_stage_status::ok);
-            // M-1: new_manifest populated even on empty sealed_gens path.
-            CHECK(res.new_manifest == guard->manifest);
-            CHECK(res.flushed_gens_by_front.empty());
-            CHECK(res.flushed_max_lsn == 0);
+            // Phase 5: fold returns base_manifest, not new_manifest.
+            CHECK(res.base_manifest == guard->manifest.get());
+            CHECK(res.partitions.empty());
+            CHECK(res.round_id.v == 0);
             fired = true;
         },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     bool prog = ts.advance();
     CHECK(prog);
     CHECK(fired);
@@ -613,19 +613,19 @@ in_child_provoke_null_inner_manifest() {
     tree::tree_sched ts;
     auto bad_guard = std::make_shared<const core::checkpoint_guard>(
         core::checkpoint_guard{ .manifest = nullptr });
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = bad_guard,
             .sealed_gens       = { make_dummy_sealed_gen(1) },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) {
+        .cb = [](tree::flush_fold_result&&) {
             std::fprintf(stderr,
                 "child(null inner manifest): cb fired but should have panicked\n");
             std::_Exit(2);
         },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();  // expected: panic_inconsistency → abort()
     std::fprintf(stderr,
         "child(null inner manifest): advance() returned but should have panicked\n");
@@ -681,15 +681,15 @@ in_child_provoke_non_sealed_gen() {
     g->gen_id            = 1;
     g->st                = core::memtable_gen::state::active;  // NOT sealed
     g->front_owner_index = 0;
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = make_empty_guard(),
             .sealed_gens       = { g },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+        .cb = [](tree::flush_fold_result&&) { std::_Exit(2); },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();
     std::_Exit(3);
 }
@@ -701,15 +701,15 @@ in_child_provoke_duplicate_gen_id() {
     tree::tree_sched ts;
     auto g0 = make_dummy_sealed_gen(42, 0);
     auto g1 = make_dummy_sealed_gen(42, 0);  // same gen_id!
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = make_empty_guard(),
             .sealed_gens       = { g0, g1 },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+        .cb = [](tree::flush_fold_result&&) { std::_Exit(2); },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();
     std::_Exit(3);
 }
@@ -719,22 +719,22 @@ static void
 in_child_provoke_null_gen() {
     pump::core::this_core_id = 0;
     tree::tree_sched ts;
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = make_empty_guard(),
             .sealed_gens       = { nullptr },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+        .cb = [](tree::flush_fold_result&&) { std::_Exit(2); },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();
     std::_Exit(3);
 }
 
-// Phase 4 D12: tree_lookup_count() == 0 with non-empty workset → panic.
+// Phase 4 D12: tree_worker_count() == 0 with non-empty workset → panic.
 // Construct a gen with a real key+entry so fold produces a non-empty
-// workset, but do NOT register any lookup sched.
+// workset, but do NOT register any worker sched.
 static void
 in_child_provoke_zero_lookup_count() {
     pump::core::this_core_id = 0;
@@ -750,15 +750,15 @@ in_child_provoke_zero_lookup_count() {
         .vh       = {},
     });
 
-    auto* r = new tree::_tree_flush::req{
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = make_empty_guard(),
             .sealed_gens       = { g },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
+        .cb = [](tree::flush_fold_result&&) { std::_Exit(2); },
     };
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     ts.advance();
     std::_Exit(3);
 }
@@ -780,16 +780,32 @@ in_child_provoke_sentinel_front_owner_index() {
     g->max_lsn = 1;
     // front_owner_index stays UINT32_MAX (invalid sentinel)
 
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold parks round without checking front_owner_index.
+    // build_flushed_gens_by_front is called in merge.
+    tree::flush_round_id captured_round_id{};
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = make_empty_guard(),
             .sealed_gens       = { g },
             .recovery_safe_lsn = 0,
         },
+        .cb = [&](tree::flush_fold_result&& fr) {
+            captured_round_id = fr.round_id;
+        },
+    };
+    ts.schedule_fold(r);
+    ts.advance();
+
+    // Merge → build_flushed_gens_by_front → panic on UINT32_MAX.
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
+        },
         .cb = [](tree::tree_flush_result&&) { std::_Exit(2); },
     };
-    ts.schedule_flush(r);
-    ts.advance();  // expected: build_flushed_gens_by_front → panic
+    ts.schedule_merge(mr);
+    ts.advance();  // expected: panic
     std::_Exit(3);
 }
 
@@ -831,34 +847,29 @@ test_advance_drain_cap() {
     pump::core::this_core_id = 0;
     tree::tree_sched ts;
 
-    constexpr uint32_t cap   = tree::tree_sched::kMaxFlushOpsPerAdvance;
+    constexpr uint32_t cap   = tree::tree_sched::kMaxFoldOpsPerAdvance;
     constexpr uint32_t total = cap + 1;
 
     auto guard = make_empty_guard();
     auto gen   = make_dummy_sealed_gen(99);
 
+    // Phase 5: fold parks rounds. Capture round_ids for merge cleanup.
+    std::vector<tree::flush_round_id> round_ids;
     std::atomic<uint32_t> fired{0};
     for (uint32_t i = 0; i < total; ++i) {
-        auto* r = new tree::_tree_flush::req{
+        auto* r = new tree::_flush_fold::req{
             .args = tree::tree_flush_request{
                 .base_guard        = guard,
                 .sealed_gens       = { gen },
                 .recovery_safe_lsn = i,
             },
-            .cb = [&fired, &guard](tree::tree_flush_result&& res) {
-                // Phase 4: empty table gens → ok (empty workset fast path).
+            .cb = [&fired, &round_ids](tree::flush_fold_result&& res) {
                 CHECK(res.st == tree::flush_stage_status::ok);
-                // D19: new_manifest == base manifest.
-                CHECK(res.new_manifest == guard->manifest);
-                CHECK(res.flushed_max_lsn == 0);
-                CHECK(res.retired.old_slots.empty());
-                // D18: flushed_gens_by_front is populated.
-                CHECK(!res.flushed_gens_by_front.empty());
-                CHECK(res.memtable_losers.empty());
+                round_ids.push_back(res.round_id);
                 fired.fetch_add(1, std::memory_order_release);
             },
         };
-        ts.schedule_flush(r);
+        ts.schedule_fold(r);
     }
 
     bool prog1 = ts.advance();
@@ -870,10 +881,21 @@ test_advance_drain_cap() {
     CHECK(fired.load() == total);
 
     bool prog3 = ts.advance();
-    CHECK(!prog3);  // queue empty
+    CHECK(!prog3);  // fold_q empty
 
-    // After every cb fired and every req was deleted, the only pins
-    // left on guard / gen are the test scope's originals.
+    // Rounds are parked → refs still held. Merge to unpark all.
+    for (auto& rid : round_ids) {
+        auto* mr = new tree::_flush_merge::req{
+            .args = tree::flush_merge_request{
+                .round_id        = rid,
+                .mapping_results = {},
+            },
+            .cb = [](tree::tree_flush_result&&) {},
+        };
+        ts.schedule_merge(mr);
+    }
+    while (ts.advance()) {}
+
     CHECK(guard.use_count() == 1);
     CHECK(gen.use_count()   == 1);
     printf("  advance() drain cap (cap=%u, total=%u): OK\n", cap, total);
@@ -897,32 +919,46 @@ test_handle_pin_release_value_path() {
     CHECK(guard.use_count() == 1);
     CHECK(gen.use_count()   == 1);
 
-    bool fired = false;
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold parks round → merge unparks → refs released.
+    tree::flush_round_id captured_round_id{};
+    bool fold_fired = false;
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = { gen },
             .recovery_safe_lsn = 0,
         },
-        .cb = [&fired](tree::tree_flush_result&& res) {
-            // Phase 4: empty table gen → ok (empty workset fast path).
+        .cb = [&](tree::flush_fold_result&& res) {
             CHECK(res.st == tree::flush_stage_status::ok);
-            fired = true;
+            captured_round_id = res.round_id;
+            fold_fired = true;
         },
     };
-    // The req now holds a copy of guard and a copy of gen.
     CHECK(guard.use_count() == 2);
     CHECK(gen.use_count()   == 2);
 
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
     bool prog = ts.advance();
     CHECK(prog);
-    CHECK(fired);
-    // tree_sched::advance() deletes r after firing the cb, so both
-    // pins drop back to the test scope only.
+    CHECK(fold_fired);
+    // Fold deleted the req, but round is parked → refs still held.
+    CHECK(guard.use_count() == 2);
+    CHECK(gen.use_count()   == 2);
+
+    // Merge unparks the round.
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
+        },
+        .cb = [](tree::tree_flush_result&&) {},
+    };
+    ts.schedule_merge(mr);
+    ts.advance();
+
     CHECK(guard.use_count() == 1);
     CHECK(gen.use_count()   == 1);
-    printf("  handle pin release after value-path cb: OK\n");
+    printf("  handle pin release after fold+merge: OK\n");
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1366,11 +1402,11 @@ test_partitions_all() {
 // Handle lifecycle tests (need tree_sched + registry)
 // ────────────────────────────────────────────────────────────────────────
 
-// Helper: push a lookup sched entry into registry so
-// tree_lookup_count() > 0. Uses a raw reinterpret_cast
+// Helper: push a worker sched entry into registry so
+// tree_worker_count() > 0. Uses a raw reinterpret_cast
 // placeholder — advance() is never called through this pointer.
-static tree::tree_lookup_sched_base* fake_lookup_ptr =
-    reinterpret_cast<tree::tree_lookup_sched_base*>(0xDEAD'BEEF'0000'0001ULL);
+static tree::tree_worker_sched* fake_worker_ptr =
+    reinterpret_cast<tree::tree_worker_sched*>(0xDEAD'BEEF'0000'0001ULL);
 
 // Handle case 1: sealed_gens empty → ok, empty flushed_gens_by_front.
 // (Already covered by test_empty_sealed_gens_ok above.)
@@ -1385,18 +1421,33 @@ test_handle_empty_tables_ok() {
     auto g0 = make_dummy_sealed_gen(1, 0);
     auto g1 = make_dummy_sealed_gen(2, 1);
 
-    bool fired = false;
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold parks round, merge unparks and returns
+    // flushed_gens_by_front.
+    tree::flush_round_id captured_round_id{};
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = { g0, g1 },
             .recovery_safe_lsn = 0,
         },
-        .cb = [&](tree::tree_flush_result&& res) {
+        .cb = [&](tree::flush_fold_result&& res) {
             CHECK(res.st == tree::flush_stage_status::ok);
-            // D19: new_manifest == base manifest.
-            CHECK(res.new_manifest == guard->manifest);
-            // D18: flushed_gens_by_front populated.
+            CHECK(res.partitions.empty());
+            captured_round_id = res.round_id;
+        },
+    };
+    ts.schedule_fold(r);
+    ts.advance();
+    CHECK(!ts.state.active_rounds.empty());  // round parked
+
+    bool fired = false;
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
+        },
+        .cb = [&](tree::tree_flush_result&& res) {
+            // D18: flushed_gens_by_front populated by merge.
             CHECK(res.flushed_gens_by_front.size() == 2);
             CHECK(res.flushed_gens_by_front.count(0) == 1);
             CHECK(res.flushed_gens_by_front.count(1) == 1);
@@ -1406,12 +1457,11 @@ test_handle_empty_tables_ok() {
             fired = true;
         },
     };
-    ts.schedule_flush(r);
-    bool prog = ts.advance();
-    CHECK(prog);
+    ts.schedule_merge(mr);
+    ts.advance();
     CHECK(fired);
-    CHECK(ts.state.active_rounds.empty());
-    printf("  handle: empty tables → ok + flushed_gens_by_front: OK\n");
+    CHECK(ts.state.active_rounds.empty());  // merge unparked
+    printf("  handle: empty tables → fold+merge ok: OK\n");
 }
 
 // Handle case 3: non-empty gens, non-empty workset → unsupported.
@@ -1420,7 +1470,7 @@ test_handle_nonempty_workset_unsupported() {
     pump::core::this_core_id = 0;
 
     // Need at least one lookup sched in registry.
-    core::registry::tree_lookup_scheds.list.push_back(fake_lookup_ptr);
+    core::registry::tree_worker_scheds.list.push_back(fake_worker_ptr);
 
     tree::tree_sched ts;
 
@@ -1428,28 +1478,45 @@ test_handle_nonempty_workset_unsupported() {
     auto g = make_dummy_sealed_gen(1, 0);
     add_value_entry(*g, "key", 10);
 
-    bool fired = false;
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold returns ok with partitions, merge returns
+    // unsupported_unimplemented.
+    tree::flush_round_id captured_round_id{};
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = { g },
             .recovery_safe_lsn = 0,
+        },
+        .cb = [&](tree::flush_fold_result&& res) {
+            CHECK(res.st == tree::flush_stage_status::ok);
+            CHECK(!res.partitions.empty());
+            captured_round_id = res.round_id;
+        },
+    };
+    ts.schedule_fold(r);
+    ts.advance();
+    CHECK(!ts.state.active_rounds.empty());  // round parked
+
+    bool fired = false;
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
         },
         .cb = [&](tree::tree_flush_result&& res) {
             CHECK(res.st == tree::flush_stage_status::unsupported_unimplemented);
             fired = true;
         },
     };
-    ts.schedule_flush(r);
-    bool prog = ts.advance();
-    CHECK(prog);
+    ts.schedule_merge(mr);
+    ts.advance();
     CHECK(fired);
-    CHECK(ts.state.active_rounds.empty());
+    CHECK(ts.state.active_rounds.empty());  // merge unparked
     // Single gen, single key → no losers.
     CHECK(g->loser_durable_refs.size() == 0);
 
-    core::registry::tree_lookup_scheds.list.clear();
-    printf("  handle: non-empty workset → unsupported: OK\n");
+    core::registry::tree_worker_scheds.list.clear();
+    printf("  handle: non-empty workset → fold+merge unsupported: OK\n");
 }
 
 // Handle case 4: round-id monotonicity.
@@ -1463,15 +1530,15 @@ test_handle_round_id_monotonicity() {
     for (int i = 0; i < 3; ++i) {
         auto g = make_dummy_sealed_gen(static_cast<uint64_t>(i + 1), 0);
         bool fired = false;
-        auto* r = new tree::_tree_flush::req{
+        auto* r = new tree::_flush_fold::req{
             .args = tree::tree_flush_request{
                 .base_guard        = guard,
                 .sealed_gens       = { g },
                 .recovery_safe_lsn = 0,
             },
-            .cb = [&](tree::tree_flush_result&&) { fired = true; },
+            .cb = [&](tree::flush_fold_result&&) { fired = true; },
         };
-        ts.schedule_flush(r);
+        ts.schedule_fold(r);
         ts.advance();
         CHECK(fired);
         CHECK(ts.state.next_round_id > prev_id + 1);
@@ -1491,23 +1558,42 @@ test_handle_pin_chain_release() {
     CHECK(guard.use_count() == 1);
     CHECK(g.use_count() == 1);
 
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold parks round (holds refs), merge unparks (releases).
+    tree::flush_round_id captured_round_id{};
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = { g },
             .recovery_safe_lsn = 0,
         },
-        .cb = [](tree::tree_flush_result&&) {},
+        .cb = [&](tree::flush_fold_result&& fr) {
+            captured_round_id = fr.round_id;
+        },
     };
     CHECK(guard.use_count() == 2);
     CHECK(g.use_count() == 2);
 
-    ts.schedule_flush(r);
+    ts.schedule_fold(r);
+    ts.advance();
+
+    // After fold: round is parked → refs still held by round_state.
+    CHECK(guard.use_count() == 2);
+    CHECK(g.use_count() == 2);
+
+    // Merge unparks the round, releasing refs.
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
+        },
+        .cb = [](tree::tree_flush_result&&) {},
+    };
+    ts.schedule_merge(mr);
     ts.advance();
 
     CHECK(guard.use_count() == 1);
     CHECK(g.use_count() == 1);
-    printf("  handle: pin chain release: OK\n");
+    printf("  handle: pin chain release (fold+merge): OK\n");
 }
 
 // Handle case 6: flushed_gens_by_front multi-front.
@@ -1521,25 +1607,40 @@ test_handle_gens_by_front_multi() {
     auto g1 = make_dummy_sealed_gen(2, 1);
     auto g2 = make_dummy_sealed_gen(3, 0);
 
-    bool fired = false;
-    auto* r = new tree::_tree_flush::req{
+    // Phase 5: fold parks round, merge unparks and returns
+    // flushed_gens_by_front.
+    tree::flush_round_id captured_round_id{};
+    auto* r = new tree::_flush_fold::req{
         .args = tree::tree_flush_request{
             .base_guard        = guard,
             .sealed_gens       = { g0, g1, g2 },
             .recovery_safe_lsn = 0,
         },
+        .cb = [&](tree::flush_fold_result&& fr) {
+            captured_round_id = fr.round_id;
+        },
+    };
+    ts.schedule_fold(r);
+    ts.advance();
+
+    bool fired = false;
+    auto* mr = new tree::_flush_merge::req{
+        .args = tree::flush_merge_request{
+            .round_id        = captured_round_id,
+            .mapping_results = {},
+        },
         .cb = [&](tree::tree_flush_result&& res) {
-            CHECK(res.st == tree::flush_stage_status::ok);
+            // merge with empty mapping_results on empty-workset round.
             CHECK(res.flushed_gens_by_front.size() == 2);
             CHECK(res.flushed_gens_by_front.at(0).size() == 2);  // g0, g2
             CHECK(res.flushed_gens_by_front.at(1).size() == 1);  // g1
             fired = true;
         },
     };
-    ts.schedule_flush(r);
+    ts.schedule_merge(mr);
     ts.advance();
     CHECK(fired);
-    printf("  handle: flushed_gens_by_front multi-front: OK\n");
+    printf("  handle: flushed_gens_by_front multi-front (fold+merge): OK\n");
 }
 
 static void

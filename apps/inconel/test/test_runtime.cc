@@ -185,7 +185,7 @@ static void test_registry_population(const char* label) {
     for (uint32_t c : cores) {
         auto* nvme_p = rt->template get_by_core<mock_nvme::scheduler>(c);
         auto* tlookup_p = rt->template get_by_core<tree_lookup_sched<Cache>>(c);
-        auto* tworker_p = rt->template get_by_core<tree_worker_sched>(c);
+        auto* tworker_p = rt->template get_by_core<tree_worker_sched<Cache>>(c);
         CHECK(nvme_p == core::registry::nvme_for_core(c));
         // tree_lookup is registered as base in the application registry,
         // but PUMP holds the full derived type. Compare via base upcast.

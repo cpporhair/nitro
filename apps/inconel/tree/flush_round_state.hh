@@ -124,10 +124,10 @@ namespace apps::inconel::tree {
 
         // ── populated by Phase 6 (worker fanout) ──
         //
-        // One entry per leaf group; concatenated back on `tree_sched`
-        // after the worker fan-in reduces each candidate batch.
-        // Phase 3 leaves this empty.
-        std::vector<flush_leaf_candidate> candidates;
+        // One entry per worker; collected on `tree_sched` after the
+        // worker fan-in. Each result is a manifest overlay with
+        // changed_nodes. Phase 7 plan consumes these.
+        std::vector<flush_worker_result> worker_results;
 
         // ── populated by Phase 7 (writer + finish_flush_round) ──
         //

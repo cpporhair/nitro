@@ -189,7 +189,7 @@ namespace apps::inconel::tree {
                                 }
                             })
                             >> all()
-                            >> then([&state](bool) -> flush_candidate_batch {
+                            >> then([&state](bool) -> flush_worker_result {
                                 return std::move(state.result);
                             });
                     });

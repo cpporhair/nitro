@@ -492,7 +492,7 @@ test_flush_round_state_defaults() {
     CHECK(s.recovery_safe_lsn == 0);
     CHECK(s.workset.empty());
     CHECK(s.leaf_groups.empty());
-    CHECK(s.candidates.empty());
+    CHECK(s.worker_results.empty());
     // 023 review H-1: round_state must mirror tree_flush_result.
     // Verify the two newly added mirror fields exist with the same
     // defaults the tree_flush_result default ctor uses.
@@ -1405,8 +1405,9 @@ test_partitions_all() {
 // Helper: push a worker sched entry into registry so
 // tree_worker_count() > 0. Uses a raw reinterpret_cast
 // placeholder — advance() is never called through this pointer.
-static tree::tree_worker_sched* fake_worker_ptr =
-    reinterpret_cast<tree::tree_worker_sched*>(0xDEAD'BEEF'0000'0001ULL);
+// Registry stores the non-templated base pointer.
+static tree::tree_worker_sched_base* fake_worker_ptr =
+    reinterpret_cast<tree::tree_worker_sched_base*>(0xDEAD'BEEF'0000'0001ULL);
 
 // Handle case 1: sealed_gens empty → ok, empty flushed_gens_by_front.
 // (Already covered by test_empty_sealed_gens_ok above.)

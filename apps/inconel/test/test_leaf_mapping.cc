@@ -449,11 +449,13 @@ test_merge_single_partition() {
     r0.leaf_groups.push_back({
         .leaf_range_base = {0, 1000},
         .old_slot_paddr  = {0, 1000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[0], 1),
     });
     r0.leaf_groups.push_back({
         .leaf_range_base = {0, 3000},
         .old_slot_paddr  = {0, 3000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[1], 1),
     });
 
@@ -501,11 +503,13 @@ test_merge_cross_boundary_dedupe() {
     r0.leaf_groups.push_back({
         .leaf_range_base = {0, 1000},
         .old_slot_paddr  = {0, 1000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[0], 3),  // aaa, bbb, ccc
     });
     r0.leaf_groups.push_back({
         .leaf_range_base = {0, 2000},
         .old_slot_paddr  = {0, 2000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[3], 2),  // kkk, lll
     });
 
@@ -517,11 +521,13 @@ test_merge_cross_boundary_dedupe() {
     r1.leaf_groups.push_back({
         .leaf_range_base = {0, 2000},
         .old_slot_paddr  = {0, 2000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[5], 2),  // mmm, nnn
     });
     r1.leaf_groups.push_back({
         .leaf_range_base = {0, 3000},
         .old_slot_paddr  = {0, 3000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[7], 2),  // rrr, zzz
     });
 
@@ -593,6 +599,7 @@ test_merge_no_overlap() {
     r0.leaf_groups.push_back({
         .leaf_range_base = {0, 1000},
         .old_slot_paddr  = {0, 1000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[0], 1),
     });
 
@@ -603,6 +610,7 @@ test_merge_no_overlap() {
     r1.leaf_groups.push_back({
         .leaf_range_base = {0, 3000},
         .old_slot_paddr  = {0, 3000},
+        .leaf_span_idx   = 0,
         .keys = std::span(&workset[1], 1),
     });
 

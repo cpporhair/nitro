@@ -19,6 +19,7 @@
 #include "./leaf_order.hh"
 #include "./panic.hh"
 #include "./tree_geometry.hh"
+#include "./tree_reverse_topology.hh"
 
 namespace apps::inconel::core {
 
@@ -50,7 +51,9 @@ namespace apps::inconel::core {
         paddr root_slot;
         absl::flat_hash_map<paddr, uint32_t> slot_map;
         const tree_geometry* geom;
-        leaf_order_index     leaf_order;  // step 023 §2, Phase 3 G1
+        leaf_order_index     leaf_order;         // step 023 §2
+        paddr                root_range_base;    // step 026A
+        tree_reverse_topology reverse_topology;  // step 026A: leaf→root climb
 
         bool
         has_root() const {
@@ -96,6 +99,38 @@ namespace apps::inconel::core {
             return geom->page_lbas();
         }
 
+        uint32_t
+        slot_index(paddr range_base) const {
+            auto it = slot_map.find(range_base);
+            if (it == slot_map.end()) {
+                panic_inconsistency("tree_manifest::slot_index",
+                    "missing range_base dev=%u lba=%lu",
+                    static_cast<unsigned>(range_base.device_id),
+                    static_cast<unsigned long>(range_base.lba));
+            }
+            uint32_t idx = it->second;
+            // Same invariant as resolve(): an out-of-range slot index
+            // is unrecoverable manifest corruption. Without this check
+            // slot_exhausted() below would silently interpret
+            // corruption as "shadow slots exhausted" and trigger a
+            // spurious cascade / new-range allocation.
+            if (idx >= geom->shadow_slots_per_range) {
+                panic_inconsistency("tree_manifest::slot_index",
+                    "slot_index out of range dev=%u lba=%lu idx=%u shadow_slots=%u",
+                    static_cast<unsigned>(range_base.device_id),
+                    static_cast<unsigned long>(range_base.lba),
+                    static_cast<unsigned>(idx),
+                    static_cast<unsigned>(geom->shadow_slots_per_range));
+            }
+            return idx;
+        }
+
+        bool
+        slot_exhausted(paddr range_base) const {
+            return slot_index(range_base) + 1
+                >= geom->shadow_slots_per_range;
+        }
+
         static tree_manifest
         empty(const tree_geometry* g) {
             // M-2 (review round 2): `tree_manifest::geom` is a
@@ -114,10 +149,12 @@ namespace apps::inconel::core {
             // `fence_pool` empty. Readers short-circuit on
             // `!has_root()` before ever consulting `leaf_order`,
             // so the empty index is correct by construction.
-            return { .root_slot  = {0, 0},
-                     .slot_map   = {},
-                     .geom       = g,
-                     .leaf_order = {} };
+            return { .root_slot        = {0, 0},
+                     .slot_map         = {},
+                     .geom             = g,
+                     .leaf_order       = {},
+                     .root_range_base  = {0, 0},
+                     .reverse_topology = {} };
         }
     };
 

@@ -101,6 +101,7 @@ namespace apps::inconel::tree {
                     .leaf_range_base = span.leaf_range_base,
                     .old_slot_paddr  = req.base_manifest->resolve(
                                            span.leaf_range_base),
+                    .leaf_span_idx   = static_cast<uint32_t>(li),
                     .keys            = groups.subspan(key_start,
                                                       ki - key_start),
                 });

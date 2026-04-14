@@ -1,20 +1,26 @@
 #ifndef APPS_INCONEL_TREE_CANDIDATE_BUILD_HH
 #define APPS_INCONEL_TREE_CANDIDATE_BUILD_HH
 
-// ── candidate_build.hh ── Phase 6 merge algorithm + state (step 026) ──
+// ── candidate_build.hh ── Phase 6 merge + cascade (step 026 / 026A) ──
 //
-// Two concerns:
+// Three concerns:
 //
 //   1. `candidate_build_state` — per-worker-arm multi-round state that
-//      lives on the PUMP context stack. Tracks which leaf groups have
-//      been processed, holds temporary page buffers for NVMe-read
-//      pages (not cached — see 026 D5), and accumulates the output
-//      `flush_candidate_batch`.
+//      lives on the PUMP context stack. Tracks leaf merge progress,
+//      cascade progress, holds temporary page buffers for NVMe-read
+//      pages, and accumulates the output `flush_worker_result`.
 //
 //   2. `merge_and_build_leaf()` — sorted merge of old leaf records
 //      with memtable winners, tombstone compact, and candidate page
 //      construction via `leaf_page_builder`. Pure function, no
 //      scheduler / PUMP dependency.
+//
+//   3. Consolidation cascade — after leaf merge, check if shadow slot
+//      is exhausted. If yes, climb the manifest's tree_reverse_topology
+//      (leaf → parent → grandparent → ...), copy each ancestor's old
+//      internal page into changed_nodes, and stop at the first
+//      non-exhausted level or root. All I/O through the same
+//      multi-round async protocol (candidate_need_read).
 //
 // Marked `inline` for ODR safety — both worker_scheduler.hh and test
 // translation units include this header.
@@ -25,6 +31,8 @@
 #include <string_view>
 #include <vector>
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/inlined_vector.h>
 
 #include "../core/memtable.hh"
@@ -42,18 +50,27 @@ namespace apps::inconel::tree {
     // ── candidate_build_state ──────────────────────────────────────
     //
     // Lives on the PUMP context stack (`with_context`). One instance
-    // per worker arm in the flush fanout. The multi-round protocol:
+    // per worker arm in the flush fanout. Worklist state machine:
     //
-    //   Round N:
-    //     pass 1 — scan all groups: cache-hit or page_bufs[i] present
-    //              → merge+build → processed[i] = true, page_bufs[i].reset()
-    //     if all done → return candidate_done
-    //     pass 2 — scan remaining, allocate buffers up to
-    //              max_reads_per_round, return candidate_need_read
+    //   Leaf queues:
+    //     leaf_ready     — page data available, ready to merge
+    //     leaf_need_read — cache miss, buffer not yet allocated
+    //     leaf_inflight  — buffer allocated, NVMe read in flight
     //
-    //   Pipeline does NVMe read into page_bufs → re-enter worker.
+    //   Cascade queues:
+    //     cascade_ready   — ready to climb reverse_topology
+    //     cascade_waiting — waiting on internal page; key = slot_paddr
     //
-    // At most ceil(miss_count / max_reads_per_round) + 1 rounds.
+    //   Each round:
+    //     1. Promote completions: leaf_inflight → leaf_ready;
+    //        cascade_waiting entries whose page is loaded → cascade_ready
+    //     2. Drain leaf_ready (merge → changed_nodes → maybe cascade_ready)
+    //     3. Drain cascade_ready (climb → materialize ancestors / add to cascade_waiting)
+    //     4. If no pending work → candidate_done
+    //     5. Allocate buffers for leaf_need_read / cascade_waiting,
+    //        bounded by budget → candidate_need_read
+    //
+    // No full scans of leaf_groups — work flows through queues.
 
     struct candidate_build_state {
         // ── inputs (set at construction, immutable) ──
@@ -64,13 +81,36 @@ namespace apps::inconel::tree {
         uint32_t                          page_lbas;
         uint32_t                          max_reads_per_round;
 
-        // ── per-group state ──
-        std::vector<bool>                          processed;
-        std::vector<std::unique_ptr<char[]>>       page_bufs;
-        bool                                       all_done = false;
+        // ── first-entry classification flag ──
+        bool initialized = false;
 
-        // ── output ──
-        flush_candidate_batch                      result;
+        // ── leaf worklists ──
+        std::vector<uint32_t> leaf_ready;
+        std::vector<uint32_t> leaf_need_read;
+        std::vector<uint32_t> leaf_inflight;
+
+        // Per-leaf temp buffer (sparse; indexed by leaf_idx).
+        std::vector<std::unique_ptr<char[]>> page_bufs;
+
+        // ── cascade worklists ──
+        std::vector<uint32_t> cascade_ready;
+
+        // slot_paddr → leaves waiting on this internal page.
+        // The read is "in flight" iff internal_page_bufs contains the
+        // same paddr. If not in internal_page_bufs, still need to
+        // allocate a buffer in pass-5.
+        absl::flat_hash_map<paddr, std::vector<uint32_t>>
+            cascade_waiting;
+
+        // Internal page buffers; persists once allocated. Existence of
+        // an entry at round-entry implies the NVMe read has completed.
+        absl::flat_hash_map<paddr, std::unique_ptr<char[]>>
+            internal_page_bufs;
+
+        bool all_done = false;
+
+        // ── output (026A: manifest overlay) ──
+        flush_worker_result result;
     };
 
     inline candidate_build_state
@@ -92,14 +132,20 @@ namespace apps::inconel::tree {
             .page_size           = page_size,
             .page_lbas           = page_lbas,
             .max_reads_per_round = max_reads_per_round,
-            .processed           = std::vector<bool>(n, false),
+            .initialized         = false,
+            .leaf_ready          = {},
+            .leaf_need_read      = {},
+            .leaf_inflight       = {},
             .page_bufs           = {},
+            .cascade_ready       = {},
+            .cascade_waiting     = {},
+            .internal_page_bufs  = {},
             .all_done            = (n == 0),
             .result              = {
                 .round_id          = round_id,
                 .read_domain_index = read_domain_index,
                 .st                = flush_stage_status::ok,
-                .leaves            = {},
+                .base              = base_manifest,
             },
         };
         s.page_bufs.resize(n);
@@ -259,23 +305,119 @@ namespace apps::inconel::tree {
         return (scaled > 0) ? scaled : 1;
     }
 
+    // ── cascade helpers (026A) ─────────────────────────────────────
+    //
+    // Cascade walks leaf → parent → grandparent → ... using the
+    // per-manifest tree_reverse_topology. No root-down descent.
+    //
+    // Each climb step is O(1) table lookups for the parent's
+    // range_base, plus one page fetch (cache hit / internal_page_buf
+    // hit / async read). Only nodes that become part of changed_nodes
+    // get their pages read — no transit reads.
+
+    enum class cascade_step_result : uint8_t {
+        complete,       // leaf's climb fully done
+        need_read,      // an ancestor page is missing → waiting
+    };
+
+    struct cascade_step_outcome {
+        cascade_step_result status;
+        paddr missing_slot_paddr = {0, 0};  // valid iff status==need_read
+    };
+
+    template <core::cache_concept Cache>
+    inline cascade_step_outcome
+    cascade_climb_one_leaf(uint32_t leaf_idx,
+                           candidate_build_state& state,
+                           Cache* cache)
+    {
+        const auto* manifest = state.base_manifest;
+        const auto& topo = manifest->reverse_topology;
+        const auto& lg = state.leaf_groups[leaf_idx];
+
+        if (lg.leaf_span_idx >= topo.leaf_parent_idx.size()) {
+            core::panic_inconsistency(
+                "cascade_climb_one_leaf",
+                "leaf_span_idx %u out of range (reverse_topology "
+                "leaf_parent_idx size=%zu)",
+                static_cast<unsigned>(lg.leaf_span_idx),
+                topo.leaf_parent_idx.size());
+        }
+
+        core::internal_idx pidx = topo.leaf_parent_idx[lg.leaf_span_idx];
+        uint32_t level = 1;  // leaf's direct parent is level 1
+
+        while (pidx != core::kInvalidInternalIdx) {
+            if (pidx >= topo.internal_nodes.size()) {
+                core::panic_inconsistency(
+                    "cascade_climb_one_leaf",
+                    "internal_idx %u out of range (internal_nodes "
+                    "size=%zu)",
+                    static_cast<unsigned>(pidx),
+                    topo.internal_nodes.size());
+            }
+            const auto& node = topo.internal_nodes[pidx];
+
+            auto existing = state.result.changed_nodes.find(node.range_base);
+            if (existing != state.result.changed_nodes.end()) {
+                // Another leaf's cascade (or this leaf's prior climb)
+                // already materialized this level. Use its stored
+                // needs_new_range to decide whether cascade continues.
+                if (!existing->second.needs_new_range)
+                    return {cascade_step_result::complete, {}};
+                pidx = node.parent_idx;
+                ++level;
+                continue;
+            }
+
+            // Need to materialize this level. Fetch the page.
+            paddr parent_slot = manifest->resolve(node.range_base);
+            const char* page_data = nullptr;
+
+            if (cache) {
+                auto fid = make_tree_frame_id(parent_slot, state.page_lbas);
+                auto pin = cache->pin(fid);
+                if (pin.frame)
+                    page_data = pin.frame->buf;
+            }
+            if (!page_data) {
+                auto it = state.internal_page_bufs.find(parent_slot);
+                if (it != state.internal_page_bufs.end())
+                    page_data = it->second.get();
+            }
+
+            if (!page_data)
+                return {cascade_step_result::need_read, parent_slot};
+
+            bool exhausted = manifest->slot_exhausted(node.range_base);
+            state.result.changed_nodes[node.range_base] = flush_changed_node{
+                .range_base      = node.range_base,
+                .level           = level,
+                .needs_new_range = exhausted,
+                .page_content    = std::vector<char>(
+                    page_data, page_data + state.page_size),
+            };
+
+            if (!exhausted)
+                return {cascade_step_result::complete, {}};
+
+            pidx = node.parent_idx;
+            ++level;
+        }
+
+        // Reached the sentinel (past root) — cascade complete.
+        return {cascade_step_result::complete, {}};
+    }
+
     // ── process_candidate_groups ──────────────────────────────────
     //
-    // Two-pass algorithm called by worker's advance().
+    // Worklist state machine called by worker's advance().
     //
-    // Pass 1: process all groups where page data is available
-    //         (page_bufs[i] present from a previous round's NVMe read).
-    // Pass 2: allocate temp buffers and collect read_descs for groups
-    //         that still need their old leaf page, up to
-    //         max_reads_per_round.
-    //
-    // Cache check is intentionally absent in Phase 6. The worker
-    // cannot access the paired lookup sched's templated cache without
-    // either templating the worker or introducing a type-erased cache
-    // interface — both belong to the cache ownership migration step.
-    // For now every old leaf is read via NVMe. The optimization
-    // (skip NVMe for cache-hot pages) will be added when read_domain
-    // unification lands.
+    //   Phase 1: first-entry classification OR completion promotion
+    //   Phase 2: drain leaf_ready (merge → maybe cascade_ready)
+    //   Phase 3: drain cascade_ready (climb → materialize / add to waiting)
+    //   Phase 4: check done
+    //   Phase 5: allocate reads (bounded) for need_read / waiting
 
     template <core::cache_concept Cache>
     inline candidate_decision
@@ -285,27 +427,66 @@ namespace apps::inconel::tree {
     {
         const auto n = state.leaf_groups.size();
 
-        // ── pass 1: process all groups with page data ready ──
-        for (std::size_t i = 0; i < n; ++i) {
-            if (state.processed[i]) continue;
+        // ── Phase 1: classify (first entry) or promote completions ──
+        if (!state.initialized) {
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto& lg = state.leaf_groups[i];
+                bool cache_hit = false;
+                if (cache) {
+                    auto fid = make_tree_frame_id(
+                        lg.old_slot_paddr, state.page_lbas);
+                    auto pin = cache->pin(fid);
+                    if (pin.frame) cache_hit = true;
+                }
+                if (cache_hit)
+                    state.leaf_ready.push_back(i);
+                else
+                    state.leaf_need_read.push_back(i);
+            }
+            state.initialized = true;
+        } else {
+            // Inflight leaf reads have completed.
+            for (auto i : state.leaf_inflight)
+                state.leaf_ready.push_back(i);
+            state.leaf_inflight.clear();
 
+            // cascade_waiting entries whose page is now loaded →
+            // cascade_ready. A paddr present in internal_page_bufs at
+            // entry time implies its read has completed.
+            for (auto it = state.cascade_waiting.begin();
+                 it != state.cascade_waiting.end();) {
+                if (state.internal_page_bufs.contains(it->first)) {
+                    for (auto leaf_idx : it->second)
+                        state.cascade_ready.push_back(leaf_idx);
+                    state.cascade_waiting.erase(it++);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // ── Phase 2: drain leaf_ready (merge) ──
+        for (auto i : state.leaf_ready) {
             const auto& lg = state.leaf_groups[i];
             const char* page_data = nullptr;
 
-            // Priority 1: shared read_domain cache. Same cache that
-            // lookup uses — same call, same syntax: cache->pin(fid).
             if (cache) {
-                auto fid = make_tree_frame_id(lg.old_slot_paddr, state.page_lbas);
+                auto fid = make_tree_frame_id(
+                    lg.old_slot_paddr, state.page_lbas);
                 auto pin = cache->pin(fid);
-                if (pin.frame)
-                    page_data = pin.frame->buf;
+                if (pin.frame) page_data = pin.frame->buf;
             }
-
-            // Priority 2: temp buffer from previous round's NVMe read.
             if (!page_data && state.page_bufs[i])
                 page_data = state.page_bufs[i].get();
 
-            if (!page_data) continue;  // miss — wait for pass 2
+            if (!page_data) {
+                // Invariant: a leaf in leaf_ready must have page data
+                // available (from cache or a completed read).
+                core::panic_inconsistency(
+                    "process_candidate_groups",
+                    "leaf_ready entry without page data (idx=%u)",
+                    static_cast<unsigned>(i));
+            }
 
             flush_leaf_candidate candidate{
                 .leaf_range_base = lg.leaf_range_base,
@@ -324,26 +505,44 @@ namespace apps::inconel::tree {
                 return candidate_done{};
             }
 
-            state.result.leaves.push_back(std::move(candidate));
-            state.processed[i] = true;
-            state.page_bufs[i].reset();  // free temp buffer immediately
-        }
+            bool exhausted = state.base_manifest->slot_exhausted(
+                lg.leaf_range_base);
 
-        // ── check: all done? ──
-        bool all = true;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!state.processed[i]) { all = false; break; }
+            state.result.changed_nodes[lg.leaf_range_base] = flush_changed_node{
+                .range_base      = lg.leaf_range_base,
+                .level           = 0,
+                .needs_new_range = exhausted,
+                .page_content    = std::move(candidate.candidate_page),
+            };
+            for (auto& rv : candidate.retired_old_values)
+                state.result.retired_old_values.push_back(rv);
+
+            state.page_bufs[i].reset();
+
+            if (exhausted)
+                state.cascade_ready.push_back(i);
         }
-        if (all) {
+        state.leaf_ready.clear();
+
+        // ── Phase 3: drain cascade_ready (climb reverse topology) ──
+        for (auto i : state.cascade_ready) {
+            auto outcome = cascade_climb_one_leaf(i, state, cache);
+            if (outcome.status == cascade_step_result::need_read) {
+                state.cascade_waiting[outcome.missing_slot_paddr]
+                    .push_back(i);
+            }
+        }
+        state.cascade_ready.clear();
+
+        // ── Phase 4: done? ──
+        if (state.leaf_need_read.empty()
+            && state.leaf_inflight.empty()
+            && state.cascade_waiting.empty()) {
             state.all_done = true;
             return candidate_done{};
         }
 
-        // ── pass 2: collect pages to read (throttled + bounded) ──
-        //
-        // Query the paired lookup sched's pending count to compute
-        // this round's read budget. Budget is at most
-        // max_reads_per_round and may be 0 if lookup is very busy.
+        // ── Phase 5: allocate reads (bounded) ──
         uint32_t pending = paired_lookup
             ? paired_lookup->pending_lookups
             : 0;
@@ -351,22 +550,38 @@ namespace apps::inconel::tree {
             pending, state.max_reads_per_round);
 
         candidate_need_read need;
-        uint32_t reads_this_round = 0;
+        uint32_t reads = 0;
 
-        for (std::size_t i = 0; i < n; ++i) {
-            if (state.processed[i]) continue;
-            if (state.page_bufs[i]) continue;  // has buffer from a prior pass 2
-            if (reads_this_round >= budget) break;
+        // Leaf reads: pull from leaf_need_read → leaf_inflight.
+        while (reads < budget && !state.leaf_need_read.empty()) {
+            auto i = state.leaf_need_read.back();
+            state.leaf_need_read.pop_back();
 
             state.page_bufs[i] = std::make_unique<char[]>(state.page_size);
-
             const auto& lg = state.leaf_groups[i];
             need.read_descs.push_back(format::read_desc{
                 .lba      = lg.old_slot_paddr.lba,
                 .buf      = state.page_bufs[i].get(),
                 .num_lbas = state.page_lbas,
             });
-            ++reads_this_round;
+            state.leaf_inflight.push_back(i);
+            ++reads;
+        }
+
+        // Internal page reads: for each cascade_waiting paddr without
+        // a buffer yet, allocate and issue.
+        for (auto& kv : state.cascade_waiting) {
+            if (reads >= budget) break;
+            if (state.internal_page_bufs.contains(kv.first)) continue;
+
+            auto buf = std::make_unique<char[]>(state.page_size);
+            need.read_descs.push_back(format::read_desc{
+                .lba      = kv.first.lba,
+                .buf      = buf.get(),
+                .num_lbas = state.page_lbas,
+            });
+            state.internal_page_bufs[kv.first] = std::move(buf);
+            ++reads;
         }
 
         return need;

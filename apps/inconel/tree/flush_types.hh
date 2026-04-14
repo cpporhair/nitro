@@ -131,6 +131,9 @@ namespace apps::inconel::tree {
     struct flush_leaf_group {
         paddr leaf_range_base;
         paddr old_slot_paddr;
+        uint32_t leaf_span_idx;  // step 026A: index into
+                                 // base_manifest->leaf_order.spans,
+                                 // used to look up reverse_topology
         std::span<const flush_key_group> keys;  // borrows from flush_round_state.workset
     };
 
@@ -217,6 +220,39 @@ namespace apps::inconel::tree {
         uint32_t                                     read_domain_index;
         flush_stage_status                           st;
         absl::InlinedVector<flush_leaf_candidate, 8> leaves;
+    };
+
+    // ── worker manifest overlay (step 026A) ────────────────────
+    //
+    // Worker returns a sparse overlay on base_manifest: only the
+    // nodes that changed are present (leaf candidates + internal
+    // pages hit by consolidation cascade). Unchanged nodes are
+    // implicitly provided by base_manifest.
+    //
+    // plan (Phase 7) consumes these by overlaying all workers'
+    // changed_nodes, allocating ranges/slots, patching internal
+    // child_base entries, and constructing the new manifest.
+
+    struct flush_changed_node {
+        paddr              range_base;
+        uint32_t           level;           // 0 = leaf, 1 = leaf's parent, ...
+        bool               needs_new_range; // shadow slot exhausted
+        std::vector<char>  page_content;    // leaf: merged candidate
+                                            // internal: old page copy
+    };
+
+    struct flush_worker_result {
+        flush_round_id                     round_id;
+        uint32_t                           read_domain_index;
+        flush_stage_status                 st;
+
+        const core::tree_manifest*         base = nullptr;
+
+        absl::flat_hash_map<paddr, flush_changed_node>
+                                           changed_nodes;
+
+        absl::InlinedVector<core::retired_value_ref, 64>
+                                           retired_old_values;
     };
 
     // ── owner-level flush request / result ──────────────────────

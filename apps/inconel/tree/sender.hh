@@ -1,27 +1,29 @@
 #ifndef APPS_INCONEL_TREE_SENDER_HH
 #define APPS_INCONEL_TREE_SENDER_HH
 
-// ── tree/sender.hh ── module-facing facade (step 022 §9, D12;
-//                       extended by step 023 §10, step 025 §5) ──
+// ── tree/sender.hh ── module-facing facade ──
 //
-// This header is the single entry point external modules use to talk
-// to the tree domain. It #includes the split sub-headers so every
-// public PUMP sender and its `op_pusher` / `compute_sender_type`
-// specializations become visible in any translation unit:
+// Single entry point external modules use to talk to the tree
+// domain. #includes the split sub-headers so every public PUMP
+// sender and its `op_pusher` / `compute_sender_type` specializations
+// become visible in any translation unit:
 //
 //   - `lookup_scheduler.hh` — point-read `process(state)` sender.
-//   - `worker_scheduler.hh` — Phase 5 `_leaf_mapping` sender,
-//     Phase 2 `_build_leaf_candidates` stub.
-//   - `owner_scheduler.hh` — Phase 5 `_flush_fold` + `_flush_merge`
-//     sender pair, replacing the old monolithic `_tree_flush`.
+//   - `worker_scheduler.hh` — Phase 7 single per-round
+//     `_flush_round` handle.
+//   - `owner_scheduler.hh`  — `_flush_fold` + `_flush_merge`
+//     sender pair driving the round owner.
 //
-// `tree_local_flush()` PUMP pipeline is NOT implemented yet: the
-// three individual sender surfaces (fold / leaf_mapping / merge) are
-// each tested and exercised in isolation, but the composed pipeline
-// has no caller to instantiate it. Implementing an uninstantiated
-// template pipeline risks hiding type errors (as demonstrated by
-// PUMP's lazy connect<ctx_t>() semantics). The pipeline will be
-// implemented when a real caller exists to force full instantiation.
+// Phase 7 (step 027) free helpers exposed here:
+//
+//   - `submit_flush_work(worker, req)` — multi-round wrapper that
+//     drives the worker's flush_round handle until the proposal
+//     is built. Replaces `build_candidates_for_partition` from
+//     Phase 6.
+//
+// The composed `tree_local_flush(...)` pipeline is still NOT
+// implemented here — Phase 9 will add it once the merge handle
+// produces a real `tree_flush_result`.
 
 #include "pump/core/meta.hh"
 #include "pump/coro/coro.hh"
@@ -42,6 +44,8 @@
 namespace apps::inconel::tree {
 
     using namespace pump::sender;
+
+    // ── point lookup pipeline (unchanged) ────────────────────────
 
     inline pump::coro::return_yields<bool>
     check_not_done(const lookup_state& state) {
@@ -109,39 +113,37 @@ namespace apps::inconel::tree {
         );
     }
 
-    // ── build_leaf_candidates (Phase 2 worker skeleton surface) ──
-    inline auto
-    build_leaf_candidates(tree_worker_sched_base* worker, flush_worker_req req) {
-        return worker->submit_build(req);
-    }
-
-    // ── Phase 6: candidate build multi-round pipeline ────────────
+    // ── Phase 7: worker flush_work multi-round driver ────────────
     //
-    // Encapsulates the worker arm's multi-round loop:
-    //   1. worker->process_candidates(state) → candidate_decision
+    // Encapsulates one worker arm's loop:
+    //   1. worker->submit_flush_round(state) → flush_round_decision
     //   2. if need_read: NVMe read (no cache submit) → loop
-    //   3. if done: extract result from state
+    //   3. if done: extract worker_tree_proposal from state.result
     //
-    // The pipeline creates candidate_build_state on the PUMP context
-    // stack. Each round the worker processes all groups with available
-    // page data, then collects a bounded batch of miss reads.
+    // The pipeline creates worker_state on the PUMP context stack
+    // via `with_context`. Each round the worker processes as much
+    // as it can with available pages, then emits a bounded batch of
+    // miss reads. Reads are issued through `core::registry::local_nvme`
+    // and do NOT submit results into the tree_lookup cache (flush
+    // pages are about to be retired, so caching them would waste
+    // capacity).
 
     inline pump::coro::return_yields<bool>
-    check_candidates_not_done(const candidate_build_state& state) {
+    check_flush_round_not_done(const worker_state& state) {
         while (!state.all_done)
             co_yield true;
         co_return false;
     }
 
     inline auto
-    on_candidate_need_read(candidate_need_read&& dec) {
+    on_flush_round_need_read(flush_round_need_read&& dec) {
         auto n = dec.read_descs.size();
         return just()
             >> with_context(__fwd__(dec))([n]() {
                 return loop(n)
                     >> concurrent()
-                    >> get_context<candidate_need_read>()
-                    >> flat_map([](candidate_need_read& ctx, size_t i) {
+                    >> get_context<flush_round_need_read>()
+                    >> flat_map([](flush_round_need_read& ctx, size_t i) {
                         auto* nvme = core::registry::local_nvme();
                         return nvme->read(ctx.read_descs[i].lba,
                                           ctx.read_descs[i].buf,
@@ -153,43 +155,35 @@ namespace apps::inconel::tree {
     }
 
     inline auto
-    build_candidates_for_partition(
-        tree_worker_sched_base*           worker,
-        std::span<const flush_leaf_group> leaf_groups,
-        const core::tree_manifest*        base_manifest,
-        uint64_t                          recovery_safe_lsn,
-        flush_round_id                    round_id,
-        uint32_t                          read_domain_index,
-        uint32_t                          page_size,
-        uint32_t                          page_lbas)
+    submit_flush_work(tree_worker_sched_base* worker,
+                      flush_worker_req        req)
     {
-        auto state = make_candidate_build_state(
-            leaf_groups, base_manifest, recovery_safe_lsn,
-            page_size, page_lbas, round_id, read_domain_index);
+        auto state = make_worker_state(req);
 
         return with_context(std::move(state))(
             [worker]() {
-                return get_context<candidate_build_state>()
-                    >> flat_map([worker](candidate_build_state& state) {
+                return get_context<worker_state>()
+                    >> flat_map([worker](worker_state& state) {
                         return just()
-                            >> for_each(pump::coro::make_view_able(check_candidates_not_done(state)))
+                            >> for_each(pump::coro::make_view_able(
+                                   check_flush_round_not_done(state)))
                             >> flat_map([worker, &state](bool) {
-                                return worker->submit_process_candidates(&state);
+                                return worker->submit_flush_round(&state);
                             })
                             >> visit()
                             >> flat_map([]<typename D>(D&& d) {
                                 if constexpr (std::is_same_v<std::decay_t<D>,
-                                              candidate_need_read>) {
-                                    return on_candidate_need_read(__fwd__(d));
+                                              flush_round_need_read>) {
+                                    return on_flush_round_need_read(__fwd__(d));
                                 } else {
                                     static_assert(
                                         std::is_same_v<std::decay_t<D>,
-                                        candidate_done>);
+                                        flush_round_done>);
                                     return just(true);
                                 }
                             })
                             >> all()
-                            >> then([&state](bool) -> flush_worker_result {
+                            >> then([&state](bool) -> worker_tree_proposal {
                                 return std::move(state.result);
                             });
                     });
@@ -199,12 +193,29 @@ namespace apps::inconel::tree {
 
     // ── tree_local_flush — NOT YET IMPLEMENTED ────────────────────
     //
-    // The composed pipeline (fold → fanout → merge) requires a real
-    // caller to force full template instantiation. Phase 6 adds
-    // build_candidates_for_partition but the top-level pipeline that
-    // connects fold → worker fanout → merge is deferred until a
-    // coordinator caller exists. Individual sender surfaces are
-    // tested via their scheduler advance() handles.
+    // Phase 9 will compose:
+    //
+    //   tree_sched->submit_flush_fold(req)
+    //     >> flat_map([](flush_fold_result&& fr) {
+    //         return loop(fr.partitions.size())
+    //             >> concurrent()
+    //             >> flat_map([fr](size_t i) {
+    //                 auto& part = fr.partitions[i];
+    //                 auto* w = core::registry::tree_worker_at(part.read_domain_index);
+    //                 return submit_flush_work(w, flush_worker_req{...});
+    //             })
+    //             >> to_vector<worker_tree_proposal>()
+    //             >> flat_map([fr](auto&& proposals) {
+    //                 return tree_sched->submit_flush_merge({fr.round_id,
+    //                                                        std::move(proposals)});
+    //             });
+    //     })
+    //
+    // Phase 7 leaves the composed pipeline absent because the merge
+    // handle still returns unsupported_unimplemented; instantiating
+    // a real top-level pipeline before merge can produce a
+    // tree_flush_result risks PUMP lazy-connect type errors slipping
+    // by unnoticed.
 
 }
 

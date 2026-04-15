@@ -27,6 +27,7 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
+| INC-040 | front→tree_lookup 的路由 spec 和实现都写成 hash-based (`home_tree_lookup(front_owner)`)，与设计意图不符。正确意图是 key-range based：同一 leaf page 的所有 key 路到同一 `read_domain`，保证一张 page 在系统里只 cache 一次。hash-based 会让同 leaf 的不同 key 走到不同 read_domain，在多核重复 cache 同一 page | 用户澄清（2026-04-15）；当前写在 RSM §4.7、design_overview read 伪码、registry.hh L209-217 注释 stub、audit/tree.md F7；plan/027 Gap 3 讨论副产出 | `normal` (做完 step 027 后必须改) | 把 front→lookup 路由从 `front_owner % tree_lookup_count` 换成 `route_tree_lookup_for_key(manifest, key) = key_range_index_from_leaf_order(manifest.leaf_order, key) % tree_lookup_count`；同步修 RSM §4.7 / design_overview 读路径伪码 / registry.hh stub / read_api_and_pipeline.md；INC-003 的 sender API shape 问题也一起收（改成内部按 manifest+key 解析，不要求 caller 传 front_owner） |
 
 ### 未来功能的基础，建议提前设计 + 实现
 
@@ -63,7 +64,7 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-003 | `home_tree_lookup_for_front` 路由缺失，sender 让 caller 自由传 sched | audit/tree.md F7 | `blocked` (apps/inconel/front/) | sender API 改成接收 `(keys, manifest, front_owner)`，内部用 stub routing `front_owner % count` |
+| INC-003 | tree lookup sender 让 caller 自由传 sched 指针，没有内部路由解析 | audit/tree.md F7 | `blocked` (apps/inconel/front/) | sender API 改成内部按 `(keys, manifest)` 解析路由，由 runtime 自己决定 read_domain。路由 spec 本身按 INC-040 走 key-range 路由，**不要**按 `front_owner % count` 做 stub（那是和设计意图冲突的方向） |
 
 ### 最好等 Runtime Format / Recovery 模块
 

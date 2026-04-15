@@ -3,24 +3,31 @@
 
 // ── tree_sched — tree-domain flush round owner ──
 //
-// Phase 5 (step 025) replaces the Phase 4 monolithic `_tree_flush`
-// handle with two stage handles:
+// Phase 5 split the prior monolithic `_tree_flush` handle into the
+// fold/merge stage pair. Phase 7 (step 027) keeps the same two-handle
+// shape but updates the contract:
 //
-//   `_flush_fold`  — validate + park round + fold + partition →
-//                    cb(flush_fold_result)
-//   `_flush_merge` — lookup round + merge mapping results + unpark →
-//                    cb(tree_flush_result)
+//   `_flush_fold`  — validate + park round + fold + leaf-aligned
+//                    partition → cb(flush_fold_result).
+//                    The partition step now consults
+//                    `base_manifest->leaf_order` (027 §4.3 corrected
+//                    to range-based assignment); empty trees and
+//                    out-of-range keys propagate as
+//                    unsupported_shape_change.
+//   `_flush_merge` — receive the fanout's collected
+//                    `vector<worker_tree_proposal>`, unpark round,
+//                    return tree_flush_result. Phase 9 will replace
+//                    the body with the actual hybrid-tree merge,
+//                    paddr allocation, write dispatch, and new
+//                    manifest construction. Phase 7 only validates
+//                    the input shape and returns
+//                    `unsupported_unimplemented`.
 //
-// The PUMP pipeline in sender.hh connects the two via a worker
-// fanout: fold → loop(P) >> concurrent >> worker->submit_leaf_mapping
-// >> to_vector >> merge.
-//
-// The round_state stays parked in `tree_state.active_rounds` across
-// the async fanout (multiple advance ticks). `_flush_fold` parks it;
-// `_flush_merge` unparks it.
+// The PUMP pipeline in sender.hh connects the two via the single
+// worker fanout (`worker.submit_flush_work`).
 //
 // `reclaim_q` exists on `tree_state` for structural fidelity to RSM
-// §4.1, but has no producer and no consumer yet.
+// §4.1, but has no producer and no consumer yet (Phase 9 territory).
 
 #include <cstddef>
 #include <cstdint>
@@ -42,7 +49,6 @@
 #include "../format/types.hh"
 #include "./flush_round_state.hh"
 #include "./flush_types.hh"
-#include "./leaf_mapping.hh"
 #include "./memtable_fold.hh"
 
 // Forward declaration to break include cycle:
@@ -53,10 +59,10 @@ namespace apps::inconel::core::registry {
 
 namespace apps::inconel::tree {
 
-    // ── reclaim_task forward declaration (023 §7, 约束 4) ─────────
+    // ── reclaim_task forward declaration (Phase 9 producer) ──────
     struct reclaim_task;
 
-    // ── tree_allocator (Phase 3 placeholder, 023 D20) ─────────────
+    // ── tree_allocator (Phase 9 placeholder) ─────────────────────
     struct tree_allocator {
         format::paddr                       head{};
         std::vector<format::range_ref>      free_ranges{};
@@ -71,13 +77,12 @@ namespace apps::inconel::tree {
 
         pump::core::per_core::queue<reclaim_task*> reclaim_q{256};
 
-        // ── Phase 4: active flush rounds (D1/D2) ─────────────────
         absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
             active_rounds;
         uint64_t next_round_id = 1;
     };
 
-    // ── build_flushed_gens_by_front (D18) ──────────────────────────
+    // ── build_flushed_gens_by_front ──────────────────────────────
     static inline auto
     build_flushed_gens_by_front(
         const absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>& gens)
@@ -95,14 +100,14 @@ namespace apps::inconel::tree {
         return result;
     }
 
-    // ── PUMP req / op / sender for flush_fold (Phase 5) ──────────
+    // ── PUMP req / op / sender for flush_fold ────────────────────
 
     struct tree_sched;
 
     namespace _flush_fold {
 
         struct req {
-            tree_flush_request args;
+            tree_flush_request                                args;
             std::move_only_function<void(flush_fold_result&&)> cb;
         };
 
@@ -135,28 +140,28 @@ namespace apps::inconel::tree {
 
     }  // namespace _flush_fold
 
-    // ── PUMP req / op / sender for flush_merge (Phase 5) ─────────
+    // ── PUMP req / op / sender for flush_merge ───────────────────
 
     namespace _flush_merge {
 
         struct req {
-            flush_merge_request args;
-            std::move_only_function<void(tree_flush_result&&)> cb;
+            flush_merge_request                                 args;
+            std::move_only_function<void(tree_flush_result&&)>  cb;
         };
 
         struct op {
             constexpr static bool flush_merge_op = true;
 
-            tree_sched*          sched;
-            flush_merge_request  args;
+            tree_sched*         sched;
+            flush_merge_request args;
 
             template <uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            tree_sched*          sched;
-            flush_merge_request  args;
+            tree_sched*         sched;
+            flush_merge_request args;
 
             auto
             make_op() {
@@ -218,7 +223,6 @@ namespace apps::inconel::tree {
                 auto* r = *item;
 
                 // ── Stage 1: input validation ──
-
                 if (r->args.base_guard == nullptr) {
                     core::panic_inconsistency(
                         "tree::tree_sched::advance(fold)",
@@ -230,7 +234,7 @@ namespace apps::inconel::tree {
                         "tree_flush_request.base_guard->manifest is null");
                 }
 
-                // Empty sealed_gens → fast-path success (D8).
+                // Empty sealed_gens → fast-path success.
                 if (r->args.sealed_gens.empty()) {
                     flush_fold_result res{
                         .round_id      = flush_round_id{0},
@@ -244,7 +248,7 @@ namespace apps::inconel::tree {
                     continue;
                 }
 
-                // Per-gen validation (D9/D10/D11).
+                // Per-gen validation.
                 {
                     absl::flat_hash_set<uint64_t> seen_ids;
                     for (const auto& g : r->args.sealed_gens) {
@@ -264,27 +268,37 @@ namespace apps::inconel::tree {
                 }
 
                 // ── Stage 2: allocate round_state and park ──
-
                 auto rs = std::make_unique<flush_round_state>();
-                rs->round_id = flush_round_id{ state.next_round_id++ };
+                rs->round_id          = flush_round_id{ state.next_round_id++ };
                 rs->pinned_base_guard = std::move(r->args.base_guard);
-                rs->pinned_gens = std::move(r->args.sealed_gens);
+                rs->pinned_gens       = std::move(r->args.sealed_gens);
                 rs->recovery_safe_lsn = r->args.recovery_safe_lsn;
+
+                // Gap 2 decision (flush_development_plan §2.2):
+                // flushed_max_lsn = max(pinned_gens[*].max_lsn).
+                // Computed once at round allocation so every consumer
+                // (merge empty-path, merge success-path, future
+                // coord-side update_flush_max_lsn) reads a single
+                // authoritative value. For empty pinned_gens the max
+                // is 0 (case 1); for fresh sealed gens the max is
+                // their greatest max_lsn.
+                rs->flushed_max_lsn = 0;
+                for (auto& g : rs->pinned_gens) {
+                    if (g->max_lsn > rs->flushed_max_lsn) {
+                        rs->flushed_max_lsn = g->max_lsn;
+                    }
+                }
 
                 auto round_id_v = rs->round_id.v;
                 state.active_rounds.emplace(round_id_v, std::move(rs));
                 auto& round = *state.active_rounds[round_id_v];
 
                 // ── Stage 3: fold ──
-
                 fold_pinned_gens(round);
 
                 // ── Stage 4: empty workset fast path ──
                 //
-                // Non-empty sealed_gens but all gen tables are empty.
                 // Round stays parked — merge handle will unpark it.
-                // Fold never unparks; all unpark is merge's job.
-
                 if (round.workset.empty()) {
                     flush_fold_result res{
                         .round_id      = flush_round_id{round_id_v},
@@ -298,20 +312,38 @@ namespace apps::inconel::tree {
                     continue;
                 }
 
-                // ── Stage 5: build partitions ──
-
+                // ── Stage 5: build leaf-aligned partitions ──
                 auto worker_count = core::registry::tree_worker_count();
                 if (worker_count == 0)
                     core::panic_inconsistency(
                         "tree::tree_sched::advance(fold)",
                         "registry::tree_worker_count() is 0");
-                build_key_partitions(round, worker_count);
+
+                auto partition_st = build_key_partitions(
+                    round,
+                    round.pinned_base_guard->manifest.get(),
+                    worker_count);
+
+                if (partition_st != flush_stage_status::ok) {
+                    // Empty tree / out-of-range key — propagate as a
+                    // fold result with empty partitions and the
+                    // unsupported status. Round stays parked; merge
+                    // handle will unpark and return the same status
+                    // up to the caller.
+                    round.st = partition_st;
+                    flush_fold_result res{
+                        .round_id      = flush_round_id{round_id_v},
+                        .st            = partition_st,
+                        .partitions    = {},
+                        .base_manifest = round.pinned_base_guard->manifest.get(),
+                    };
+                    r->cb(std::move(res));
+                    delete r;
+                    progress = true;
+                    continue;
+                }
 
                 // ── Stage 6: return fold result, round stays parked ──
-                //
-                // The round_state remains in active_rounds across the
-                // async worker fanout. _flush_merge will unpark it.
-
                 flush_fold_result res{
                     .round_id      = flush_round_id{round_id_v},
                     .st            = flush_stage_status::ok,
@@ -331,14 +363,9 @@ namespace apps::inconel::tree {
 
                 auto round_id_v = r->args.round_id.v;
 
-                // D14: empty mapping_results (from empty partitions
-                // or error) → check if round exists (non-empty round
-                // was parked) or not (empty round already unparked).
-                // If round_id == 0, it was an empty-gens fast path
-                // where no round was ever created.
+                // Empty-gens fast path: no round was created.
+                // Gap 2 case 1: flushed_max_lsn = max(∅) = 0.
                 if (round_id_v == 0) {
-                    // Empty-gens path: fold returned without creating
-                    // a round_state. Return ok with empty result.
                     tree_flush_result res{
                         .st              = flush_stage_status::ok,
                         .flushed_max_lsn = 0,
@@ -358,33 +385,50 @@ namespace apps::inconel::tree {
                 }
                 auto& round = *it->second;
 
-                // Merge mapping results into round_state.leaf_groups.
-                flush_stage_status merge_st = flush_stage_status::ok;
-                if (!r->args.mapping_results.empty()) {
-                    merge_st = merge_lookup_leaf_groups(
-                        r->args.mapping_results,
-                        round.leaf_groups);
+                // Defensive: each proposal carries its own round_id;
+                // mismatch is a plumbing bug.
+                for (auto& wp : r->args.worker_proposals) {
+                    if (wp.round_id.v != round_id_v) {
+                        core::panic_inconsistency(
+                            "tree::tree_sched::advance(merge)",
+                            "worker_proposal round_id %lu != merge "
+                            "round_id %lu",
+                            static_cast<unsigned long>(wp.round_id.v),
+                            static_cast<unsigned long>(round_id_v));
+                    }
                 }
 
-                // ── Unpark round, build result ──
+                // Determine result status (Gap 2 case dispatch):
                 //
-                // Phase 6-7 downstream not implemented yet. Return
-                // unsupported_unimplemented so the caller pipeline
-                // knows the flush did not produce tree writes.
+                //   - fold failed (round.st != ok): propagate the
+                //     fold error (unsupported_shape_change for empty
+                //     tree / out-of-range key).
+                //   - case 2 (sealed gens non-empty but tables all
+                //     empty → round.workset empty): legitimate no-op
+                //     flush. Return ok. flushed_max_lsn = max(gens)
+                //     which is 0 for fresh empty gens.
+                //   - case 3 (non-empty workset): Phase 9 is what
+                //     lands the real merge; Phase 7 returns
+                //     unsupported_unimplemented. flushed_max_lsn is
+                //     still the authoritative round value.
+                flush_stage_status result_st;
+                if (round.st != flush_stage_status::ok) {
+                    result_st = round.st;
+                } else if (round.workset.empty()) {
+                    result_st = flush_stage_status::ok;
+                } else {
+                    result_st = flush_stage_status::unsupported_unimplemented;
+                }
 
                 auto gens_by_front =
                     build_flushed_gens_by_front(round.pinned_gens);
+                auto flushed_max_lsn_v = round.flushed_max_lsn;
                 state.active_rounds.erase(round_id_v);  // unpark
-
-                flush_stage_status result_st =
-                    (merge_st != flush_stage_status::ok)
-                        ? merge_st
-                        : flush_stage_status::unsupported_unimplemented;
 
                 tree_flush_result res{
                     .st                    = result_st,
                     .flushed_gens_by_front = std::move(gens_by_front),
-                    .flushed_max_lsn       = 0,
+                    .flushed_max_lsn       = flushed_max_lsn_v,
                 };
                 r->cb(std::move(res));
                 delete r;

@@ -6,7 +6,7 @@
 >
 > 1. `flush_module_guide.md` 负责说明 flush 模块的目标、边界、sender 组合形状和 planning seam
 > 2. **本文**负责说明"先做什么、后做什么、每一阶段做到什么算完成"
-> 3. `027_worker_inmemory_tree_proposal.md` 是 worker 侧重构的详细设计文档；其余 step（Phase 8 / Phase 9）的详细设计由本文在架构冻结状态下直接生成
+> 3. `027_worker_inmemory_tree_proposal.md` 是 worker 侧重构的详细设计文档；其余 step（Phase 9）的详细设计由本文在架构冻结状态下直接生成（Phase 8 已取消，见 §3.Phase 8）
 >
 > 本文是临时开发文档，放在 `ai_context/inconel/plan/`。等 flush 模块开发完成、正式设计回写到 `design_doc/` 之后，本文连同 `027_worker_inmemory_tree_proposal.md` / `flush_module_guide.md` 统一删除。
 
@@ -55,7 +55,7 @@ capture base / pin input
 
 **修正**：Phase 7 / 8 合并为新 **Phase 9（Owner 侧闭环）**，一次做完 root-stable + shape-changing + paddr 分配 + writer + new manifest 构造。
 
-与此配套，worker 侧的重构（新数据结构、删 cascade、删 Phase 5 残留）独立为新 **Phase 7（Worker 侧输出模型重构）**；中间加一步 **Phase 8（Dead code / 死注释 / 旧测试 sweep）** 保证 Phase 9 在干净代码库上开工。
+与此配套，worker 侧的重构（新数据结构、删 cascade、删 Phase 5 残留）独立为新 **Phase 7（Worker 侧输出模型重构）**。原计划在 Phase 7 和 Phase 9 之间加一步 Phase 8 做 dead code / 死注释 / 旧测试 sweep，**2026-04-15 追加决议取消 Phase 8**——dead code 清理与旧测试处理留到所有 phase 完成后的端到端测试 step 一并做，届时以端到端测试是否编译通过作为"是否删错"的硬门槛，比事前用 symbol 清单分类测试失败简单得多。
 
 ### 1.4 每个阶段必须保留 sender seam
 
@@ -445,111 +445,11 @@ for each mem_tree_node n (post-order):
 
 Worker 能对 root-stable + leaf split + leaf merge + root split 路径产出正确的 `worker_tree_proposal`。Phase 9 以此为输入。
 
-### Phase 8 — Dead Code / 死注释 / 旧测试 Sweep
+### Phase 8 — 取消（2026-04-15 决议）
 
-#### 目标
+原计划在 Phase 7 和 Phase 9 之间加一步独立的 dead code / 死注释 / 旧测试 sweep。Phase 7 commit 已经把大部分 production symbol 直接删掉，剩余的死注释和旧测试引用不值得单开一个 step 并为"测试失败分类"设计硬门槛——把简单事情搞复杂。
 
-Phase 7 完成后，把架构切换期间失效的 production 代码和注释**物理删除**。不碰测试代码（测试编译失败留到 Phase 9 之后的新测试 step 统一清理）。
-
-#### 主要产物
-
-- 所有 §2.Gap 2 / 2.Gap 3 决议 + Phase 7 重构宣告死的 production symbol 从 production 代码里删除干净
-- 死注释、过时 phase 展望记号全部清扫
-- Production 代码编译通过
-- 测试代码**允许编译失败**，且失败点全部落在本 step 删的死 symbol 上
-
-#### Scope：要删的 production 代码
-
-**Type / struct 层面**（如果 Phase 7 没删干净）：
-
-- `flush_changed_node`
-- `flush_worker_result`（如果还有残余 `changed_nodes` 字段引用）
-- `flush_mapping_req`
-- `flush_leaf_group_result`
-- `flush_merge_request.mapping_results`
-- `tree_flush_result.memtable_losers`（Gap 1 决议删的字段）
-- `flush_round_state.memtable_losers`（同上）
-- `candidate_build_state`
-- `candidate_need_read` / `candidate_done` / `candidate_decision`
-- `flush_leaf_candidate` / `flush_candidate_batch`（如果 Phase 7 重构后已不再使用）
-
-**Handle / sender / op**：
-
-- `_leaf_mapping::*`（sender / op / req / schedule / submit）
-- `_process_candidates::*`
-- `_build_leaf_candidates::*`
-- `tree_worker_sched_base` 上的 `schedule_leaf_mapping` / `schedule_process_candidates` / `submit_leaf_mapping` / `submit_process_candidates` / `submit_build` 方法
-- `tree_worker_sched_base` 上的 `leaf_mapping_q` / `candidates_q` / `build_q` queue 字段
-
-**Function / helper**：
-
-- `keys_to_leaf_groups()`（`tree/leaf_mapping.hh` 整文件可能全删）
-- `merge_lookup_leaf_groups()`
-- `cascade_climb_one_leaf()` + `cascade_step_result` / `cascade_step_outcome`
-- `process_candidate_groups()`
-- `flush_read_budget()`
-- `make_candidate_build_state()`
-
-**Sender pipeline 组合**（`tree/sender.hh`）：
-
-- `build_candidates_for_partition()`
-- `build_leaf_candidates()`（旧包装）
-- `on_candidate_need_read()`
-- `check_candidates_not_done()`
-
-以上不是完整清单，实施时以"Phase 7 未引用 + 新架构不需要 = 删"为准则。
-
-#### Scope：要删 / 更新的注释
-
-**整段删除**：
-
-- `tree/candidate_build.hh` 顶部注释（描述旧 cascade 协议）
-- `tree/leaf_mapping.hh` 顶部注释（整文件删）
-- `tree/owner_scheduler.hh` 的 Phase 5 fanout 描述
-- `tree/worker_scheduler.hh` 的 Phase 2/5/6 三个 handle 描述
-- 任何 `// Phase 6 will do X` / `// stub for Phase 7` / `// 待 Phase 8 扩展` 之类的 phase 展望注释
-
-**更新**：
-
-- 任何引用 `step 022` / `step 023` / `step 025` / `step 026` / `step 026A` 的实现注释——如果仍适用于新架构，改成"Historical landing: step xxx"；不适用则整段删
-- `tree/flush_types.hh` / `tree/flush_round_state.hh` 顶部注释里的 Phase 标号
-
-**保留**：
-
-- 描述"为什么当前形态这样"的设计理由注释（如 `tree_manifest::resolve` 的 panic 理由）
-- 红线注释（memory / lifetime / ownership）
-
-#### 测试代码的处理（不主动删）
-
-本 step 不删测试文件。测试的命运分两种：
-
-**A. 因为 sweep 删了死 production 代码而编译失败的测试**：
-
-- **保持失败**，不修、不删。留到 Phase 9 之后的新测试重写 step 统一清理。
-- 失败症状：`error: 'flush_changed_node' was not declared in this scope` 等，指向本 step 删的 symbol。
-
-**B. 其他原因失败的测试**：
-
-- 说明 sweep 意外破坏了某个**活代码**的路径，或暴露了**原本就潜伏的问题**。
-- 必须正查——如果是"本 step 删了不该删的东西"则修正删除范围；如果是"暴露原本就有的 bug"则作为独立问题记录，留到 Phase 9 或专项 step。
-
-**允许读测试代码的范围**：仅为区分 A / B 两类失败、定位失败来自哪一行。**不允许**基于测试 assertion 反推新架构 spec。实施者在读测试前必须显式声明"我要读测试文件"。
-
-#### 明确不做
-
-- 不主动删测试文件
-- 不重写 / 不新增测试
-- 不保证 test target 编译通过
-- 不删 `plan/` 目录
-- 不改 `design_doc/`（Gap 1 / 2 的文档同步等 Phase 9 landing 时一起回写）
-- 不改 `known_issues.md`
-
-#### 退出条件
-
-1. Production 代码编译通过（`cmake --build build -j$(nproc)` 对 production target）
-2. `grep -rn '<死 symbol>' apps/inconel/` 在 production `.hh` / `.cc` 里零命中
-3. 测试编译失败点**都**指向本 step 删的死 symbol（验证 sweep 没误伤活代码）
-4. 无"Phase N will do X" / "TODO: Phase Y" 的死注释残留
+**决议**：Phase 8 取消。Phase 9 完成后做端到端测试 step，对着端到端测试程序跑 sweep——测试程序是 surface 合同的正面口径，删错了端到端测试会编译失败，直接可判。原 Phase 8 Scope 全部作废。
 
 ### Phase 9 — Owner 侧闭环（原 Phase 7 + 8 合并）
 
@@ -654,7 +554,7 @@ tree_sched.submit_flush_fold(req)
 
 - **INC-040**（normal，阻塞解除）：把 `front → tree_lookup` 的路由从 hash-based（`front_owner % count`）换成 key-range based（`route_tree_lookup_for_key(manifest, key)`）。当前 spec（RSM §4.7）和代码 stub 都按 hash 写，与"同一 leaf page 只在一个 read_domain cache"的设计意图冲突。在 Phase 9 把 `tree_local_flush` 闭环、manifest / leaf_order 作为权威 key → leaf 映射源之后，即可把读路径路由切到 `manifest.leaf_order` 查询。配套改 RSM §4.7 / design_overview 读路径伪码 / registry.hh stub / read_api_and_pipeline.md。INC-003 的 sender API shape 问题跟着一起收敛（改成内部按 manifest+key 解析）。
 
-另外，Phase 9 完成后需要独立的"新测试重写 step"——把 Phase 8 遗留的失败测试全量清理并按新架构重写。
+另外，Phase 9 完成后需要独立的"端到端测试 step"——写新架构下的端到端测试程序，对着它把 Phase 7 以来遗留的失败测试（`test_candidate_build` / `test_flush_carriers` / `test_leaf_mapping` 引用已删 symbol）以及任何仍在 production 代码里的死注释一并清理。端到端测试程序作为 surface 合同的正面口径——删错了测试会编译失败，判"是否删错"直接可见。
 
 ---
 
@@ -720,25 +620,23 @@ tree_sched.submit_flush_fold(req)
 ### 5.1 本计划当前状态
 
 - Phase 0-6：已完成（landed as step 020-026A）
-- Phase 7：详细设计已冻结在 `027_worker_inmemory_tree_proposal.md`，可直接开工
-- Phase 8：详细设计在本文 §3.Phase 8，可直接开工
+- Phase 7：已 landed（commit 1c5f853；详细设计见 `027_worker_inmemory_tree_proposal.md`）
+- Phase 8：已取消（见 §3.Phase 8）
 - Phase 9：架构决议 + 算法骨架冻结在本文 §2.Gap 3 + §3.Phase 9；进入实现前可以由下一会话基于本文和 `flush_module_guide.md` + `design_doc/` 生成更细的 C++ 级设计（如合并算法的具体 pseudo-code、tree_allocator signature、new manifest rebuild 的增量遍历算法等）
 
 ### 5.2 推进顺序
 
 ```
-Phase 7 (027 设计 → 实装)
-  ↓
-Phase 8 (按本文 §3.Phase 8 执行 sweep)
+Phase 7 (027 设计 → 实装)  [已完成]
   ↓
 Phase 9 (基于本文 §2.Gap + §3.Phase 9 进一步生成详细设计 → 实装)
   ↓
-新测试重写 step (Phase 9 外)
+端到端测试 step (Phase 9 外；对着新测试 sweep 清理死代码 / 死注释 / 旧测试)
   ↓
 INC-040 read-routing 切 key-range (Phase 9 外)
 ```
 
-Phase 7 和 Phase 8 可以同一 dev cycle 推进（Phase 7 landing → Phase 8 sweep 是一个顺序性 pair）；Phase 9 是独立的大 step。
+分支当前处于"production target 编译通过 + 三个 flush 测试 target 因引用已删 symbol 而编译失败"的状态。此状态直接带入 Phase 9；端到端测试 step 一并清理。
 
 ### 5.3 文档回写
 

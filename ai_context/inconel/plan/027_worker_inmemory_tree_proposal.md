@@ -1,6 +1,6 @@
 # Step 027 — Worker 侧 flush 输出模型重构（内存混合图）
 
-> 本 step 对应 `flush_development_plan.md` 的 **Phase 7**。**Phase 8**（Dead code sweep）和 **Phase 9**（Owner 侧闭环）的详细设计直接在 `flush_development_plan.md` §3.Phase 8 / §3.Phase 9 里；本文只作为 Phase 7 的独立详细设计文档。Phase 9 消费本 step 产出的数据结构。
+> 本 step 对应 `flush_development_plan.md` 的 **Phase 7**。**Phase 9**（Owner 侧闭环）的详细设计直接在 `flush_development_plan.md` §3.Phase 9 里；本文只作为 Phase 7 的独立详细设计文档。Phase 9 消费本 step 产出的数据结构。原计划的 Phase 8（dead code sweep）已取消，死代码 / 死注释 / 旧测试清理留到 Phase 9 完成后的端到端测试 step 一并做（见 `flush_development_plan.md` §3.Phase 8）。
 >
 > 核心变更：worker 从"按 old_paddr 产 `flush_changed_node`"（step 026A 的 manifest overlay 模型）改为"产一棵内存混合图（`mem_tree_node` + old_paddr 引用）"。Worker 在自己视角下独立完成**所有结构决策**（leaf rewrite / leaf merge / leaf split / internal rewrite / internal split / consolidation / root split 并增层），完全**不触及** `tree_allocator`——新 page 只存在于内存，paddr 分配统一归 owner 侧（Phase 9）做。
 >
@@ -296,5 +296,5 @@ Phase 9 **依赖本 step 已落地**（worker 产新形态）才能动手。
 | 日期 | 内容 |
 |---|---|
 | 2026-04-15 | 本文创建 (原名 026B)。从 flush_development_plan 的 Phase 9 讨论里把 worker-side 决议拆出独立成 step。Gap 3 worker-side 决议完整记录。 |
-| 2026-04-15 | Phase 7 实装 landed。Production code 全绿 (`cmake --build build` 对所有非 flush 测试目标和 main `inconel` binary 0 warning / 0 error)。`test_candidate_build` / `test_flush_carriers` / `test_leaf_mapping` 因引用已删 symbol 编译失败,留待 Phase 8 sweep。partition 算法按用户决议改为 range-based (worker N 拿 leaves `[N*L/P, (N+1)*L/P)`),§4.3 正文已同步改写。 |
+| 2026-04-15 | Phase 7 实装 landed。Production code 全绿 (`cmake --build build` 对所有非 flush 测试目标和 main `inconel` binary 0 warning / 0 error)。`test_candidate_build` / `test_flush_carriers` / `test_leaf_mapping` 因引用已删 symbol 编译失败,留到 Phase 9 完成后的端到端测试 step 一并清理（原计划的 Phase 8 独立 sweep 已取消）。partition 算法按用户决议改为 range-based (worker N 拿 leaves `[N*L/P, (N+1)*L/P)`),§4.3 正文已同步改写。 |
 | 2026-04-15 | Review fixes (P0 + 三条 P1)：(a) internal cascade 加 `affected_child_internals` child-ready 门控，防止 ancestor cache-hit + child 仍在 NVMe 路上时 `build_one_internal` 误解 child 已 built 的 panic；(b) `_flush_fold` 在 round_state 分配时 `flushed_max_lsn = max(pinned_gens.max_lsn)`（Gap 2），`_flush_merge` empty-workset 返 `ok`、`unsupported_unimplemented` 只留给 non-empty Phase 9 入口、result 始终带 `round.flushed_max_lsn`；(c) 按 Gap 1A 删掉 `tree_flush_result.memtable_losers` 与 `flush_round_state.memtable_losers` 两个悬挂字段；(d) §4.3 正文替换为 range-based 并补说明为什么 `% worker_count` 不合法。 |

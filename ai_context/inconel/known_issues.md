@@ -93,6 +93,14 @@
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
 
+### 最好等 PUMP 框架 / Sender Contract 修正
+
+这些项本质上不是 Inconel 业务逻辑 bug，而是当前 `pump/` sender contract 或实现边界不够清楚；Inconel 侧可以先绕开，但最终要回框架层拍板。
+
+| ID | Issue | 来源 | Priority | 方向 |
+|----|-------|------|----------|------|
+| INC-041 | `PUMP` 的 `concurrent() >> reduce(...)` / `to_vector()` 对共享 accumulator 的 contract 不明确且当前实现不安全：`reduce` 回调直接原地改同一个 result，对 `vector<worker_tree_proposal>` 这类非线程安全容器会 data race；同时 `reduce_sender` 构造还把初值按拷贝路径放进 `result`，move-only accumulator 无法实例化 | 2026-04-16 `029_owner_closure` owner pipeline 调试；`pump/sender/reduce.hh` + `pump/sender/concurrent.hh` | `blocked` (pump/) | 在 `pump` 层明确并收紧 contract：要么禁止 `concurrent` 后直接接共享 `reduce`/`to_vector`，要么提供 per-branch local reduce + final combine 的安全 collector；同时修 `reduce_sender` 对 move-only 初值的构造语义并补文档。在框架修好前，Inconel 侧不要再用 `concurrent() >> reduce(...)` 收集 `worker_tree_proposal` 这类 move-only / 非线程安全结果 |
+
 ## Resolved
 
 | ID | Issue | 来源 | 解决 |

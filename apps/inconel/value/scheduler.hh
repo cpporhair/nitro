@@ -23,6 +23,7 @@
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
 
+#include "../core/data_area_heads.hh"
 #include "../core/page_cache.hh"
 #include "../core/panic.hh"
 #include "../memory/frame.hh"
@@ -398,10 +399,12 @@ namespace apps::inconel::value {
                           uint32_t                  lba_size,
                           paddr                     data_area_base,
                           paddr                     data_area_end,
+                          core::data_area_heads*    shared_heads,
                           Cache                     cache,
                           size_t                    queue_depth = 2048)
             : value_alloc_sched_base(queue_depth)
-            , alloc_(class_sizes, lba_size, data_area_base, data_area_end)
+            , alloc_(class_sizes, lba_size, data_area_base, data_area_end,
+                     shared_heads)
             , open_frames_(class_sizes.size(), nullptr)
             , allocatable_frames_(class_sizes.size())
             , readonly_cache_(std::move(cache))

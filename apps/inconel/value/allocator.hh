@@ -9,6 +9,7 @@
 
 #include <absl/container/inlined_vector.h>
 
+#include "../core/data_area_heads.hh"
 #include "../format/types.hh"
 #include "../format/value_object.hh"
 
@@ -58,14 +59,22 @@ namespace apps::inconel::value {
         uint16_t device_id;
         uint64_t bump_head_lba;     // next allocation site (decreases)
         uint64_t data_area_base_lba;
+        core::data_area_heads* shared_heads = nullptr;
 
-        per_device_value_state(paddr data_area_base, paddr data_area_end) noexcept
+        per_device_value_state(paddr data_area_base,
+                               paddr data_area_end,
+                               core::data_area_heads* heads) noexcept
             : device_id(data_area_end.device_id)
             , bump_head_lba(data_area_end.lba)
             , data_area_base_lba(data_area_base.lba)
+            , shared_heads(heads)
         {
             assert(data_area_base.device_id == data_area_end.device_id);
             assert(data_area_base.lba <= data_area_end.lba);
+            if (shared_heads) {
+                shared_heads->value_head_lba.store(
+                    bump_head_lba, std::memory_order_relaxed);
+            }
         }
 
         std::optional<paddr>
@@ -74,6 +83,10 @@ namespace apps::inconel::value {
             uint64_t next = bump_head_lba - span_lbas;
             if (next < data_area_base_lba) return std::nullopt;
             bump_head_lba = next;
+            if (shared_heads) {
+                shared_heads->value_head_lba.store(
+                    bump_head_lba, std::memory_order_relaxed);
+            }
             return paddr{device_id, bump_head_lba};
         }
 
@@ -107,8 +120,9 @@ namespace apps::inconel::value {
         value_allocator(std::span<const uint32_t> class_sizes,
                         uint32_t                  lba_size,
                         paddr                     data_area_base,
-                        paddr                     data_area_end) noexcept
-            : dev_(data_area_base, data_area_end)
+                        paddr                     data_area_end,
+                        core::data_area_heads*    shared_heads = nullptr) noexcept
+            : dev_(data_area_base, data_area_end, shared_heads)
             , lba_size_(lba_size)
         {
             classes_.reserve(class_sizes.size());
@@ -200,6 +214,10 @@ namespace apps::inconel::value {
             assert(page_base.device_id == dev_.device_id);
             assert(page_base.lba == dev_.bump_head_lba);
             dev_.bump_head_lba += span_lbas;
+            if (dev_.shared_heads) {
+                dev_.shared_heads->value_head_lba.store(
+                    dev_.bump_head_lba, std::memory_order_relaxed);
+            }
         }
 
         // ── inspectors ──

@@ -3,10 +3,12 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "pump/core/lock_free_queue.hh"  // for pump::core::this_core_id
 
+#include "./data_area_heads.hh"
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::tree_lookup_sched_base
 #include "../value/scheduler.hh" // for value::value_alloc_sched_base
@@ -58,6 +60,7 @@ namespace apps::inconel::core::registry {
     // non-templated base pointer; the Cache template parameter stays inside
     // the builder.
     inline value::value_alloc_sched_base* value_alloc_sched = nullptr;
+    inline std::shared_ptr<data_area_heads> data_area_heads_ptr;
 
     // tree::tree_sched is a global singleton introduced in step 023
     // (Phase 3 G5, D17/D18/D24). It owns the tree-local flush round
@@ -109,6 +112,7 @@ namespace apps::inconel::core::registry {
         tree_worker_scheds.list.clear();
         tree_worker_scheds.by_core.clear();
         value_alloc_sched = nullptr;
+        data_area_heads_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
     }
 
@@ -122,6 +126,12 @@ namespace apps::inconel::core::registry {
     value_sched() {
         assert(value_alloc_sched && "value::value_alloc_sched not registered");
         return value_alloc_sched;
+    }
+
+    inline data_area_heads*
+    data_area_heads_singleton() {
+        assert(data_area_heads_ptr && "core::data_area_heads not registered");
+        return data_area_heads_ptr.get();
     }
 
     // tree_sched_singleton() follows the same pattern as value_sched()

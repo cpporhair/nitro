@@ -36,6 +36,7 @@
 
 #include <memory>
 
+#include "./retired_objects.hh"
 #include "./tree_manifest.hh"
 
 namespace apps::inconel::core {
@@ -46,6 +47,7 @@ namespace apps::inconel::core {
         // factory helpers, so each production construction site
         // validates its own pointer before wrapping it in a guard.
         std::shared_ptr<const tree_manifest> manifest;
+        retired_objects                      retired;
     };
 
 }  // namespace apps::inconel::core

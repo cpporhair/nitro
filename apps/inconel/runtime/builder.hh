@@ -12,6 +12,7 @@
 
 #include "../core/page_cache.hh"
 #include "../core/registry.hh"
+#include "../core/data_area_heads.hh"
 #include "../core/tree_geometry.hh"
 #include "../format/format_profile.hh"
 #include "../format/types.hh"
@@ -286,6 +287,8 @@ namespace apps::inconel::runtime {
         core::registry::init_capacity(max_cores);
 
         auto* rt = new inconel_runtime_t<TreeCache, ValueCache>();
+        auto shared_heads = std::make_shared<core::data_area_heads>();
+        core::registry::data_area_heads_ptr = shared_heads;
 
         bool first = true;
         // Step 022 §3 / §7 / §8: the read-domain pairing seam is
@@ -328,6 +331,7 @@ namespace apps::inconel::runtime {
                     profile.lba_size,
                     profile.value_data_area_base,
                     profile.value_data_area_end,
+                    shared_heads.get(),
                     ValueCache(opts.value_cache_capacity));
                 core::registry::value_alloc_sched = value_sched;
             }
@@ -341,8 +345,16 @@ namespace apps::inconel::runtime {
             // every subsequent core's tuple gets nullptr.
             tree::tree_sched* tsched = nullptr;
             if (first) {
-                tsched = new tree::tree_sched();
+                tsched = new tree::tree_sched(
+                    &kBootstrapTreeGeometry,
+                    profile.value_data_area_base,
+                    shared_heads.get());
                 core::registry::tree_sched_singleton_ptr = tsched;
+                shared_heads->tree_head_lba.store(
+                    tsched->state.alloc.head.lba, std::memory_order_relaxed);
+                shared_heads->value_head_lba.store(
+                    value_sched->alloc_.bump_head().lba,
+                    std::memory_order_relaxed);
             }
 
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:

@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -55,6 +56,8 @@ namespace apps::inconel::tree {
     struct flush_round_id {
         uint64_t v = 0;
     };
+
+    enum class superblock_slot : uint8_t { A, B };
 
     enum class flush_stage_status : uint8_t {
         ok,
@@ -107,6 +110,7 @@ namespace apps::inconel::tree {
         flush_stage_status                 st;
         std::vector<flush_key_partition>   partitions;
         const core::tree_manifest*         base_manifest;
+        uint64_t                           recovery_safe_lsn;
     };
 
     // ── worker request (Phase 7) ────────────────────────────────
@@ -187,6 +191,11 @@ namespace apps::inconel::tree {
         // worker-read old internal page bytes which are about to be
         // dropped, so we copy them once.
         std::vector<std::string> separators;
+
+        // Phase 9 owner side writes these after paddr planning.
+        paddr    new_range_base{};
+        uint32_t new_slot_index = 0;
+        paddr    new_paddr{};
     };
 
     // ── worker_tree_proposal (Phase 7 / step 027 §2.2) ──────────
@@ -260,20 +269,6 @@ namespace apps::inconel::tree {
         std::vector<worker_tree_proposal> worker_proposals;
     };
 
-    // ── owner-level flush request / result ──────────────────────
-    //
-    // `tree_flush_request` is the envelope coord_sched eventually
-    // hands to `tree_sched`. Field layout frozen in Phase 3 (023
-    // Δ-1 / Δ-2). The Phase 3 stub returned `unsupported_unimplemented`;
-    // Phase 4-7 progressively replaced that with real content
-    // without changing the field layout.
-
-    struct tree_flush_request {
-        std::shared_ptr<const core::checkpoint_guard>                base_guard;
-        absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>  sealed_gens;
-        uint64_t                                                     recovery_safe_lsn;
-    };
-
     // Gap 1A decision (flush_development_plan §2.1.1): memtable-only
     // losers live solely on `core::memtable_gen.loser_durable_refs`;
     // they are never carried on `tree_flush_result`. The prior
@@ -288,6 +283,55 @@ namespace apps::inconel::tree {
             absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>>
                                                     flushed_gens_by_front;
         uint64_t                                    flushed_max_lsn = 0;
+    };
+
+    struct update_superblock_request {
+        flush_round_id  round_id;
+        paddr           new_root_base_paddr{};
+    };
+
+    struct update_superblock_result {
+        flush_round_id   round_id;
+        bool             ok = false;
+        superblock_slot  committed_slot = superblock_slot::A;
+    };
+
+    struct finalize_flush_request {
+        flush_round_id                      round_id;
+        bool                                ok = false;
+        std::optional<superblock_slot>      committed_slot;
+    };
+
+    struct flush_merge_done {
+        tree_flush_result  result;
+    };
+
+    struct flush_merge_root_stable {
+        finalize_flush_request  finalize_req;
+    };
+
+    struct flush_merge_root_change {
+        update_superblock_request  update_req;
+    };
+
+    using flush_merge_result =
+        std::variant<
+            flush_merge_done,
+            flush_merge_root_stable,
+            flush_merge_root_change>;
+
+    // ── owner-level flush request / result ──────────────────────
+    //
+    // `tree_flush_request` is the envelope coord_sched eventually
+    // hands to `tree_sched`. Field layout frozen in Phase 3 (023
+    // Δ-1 / Δ-2). The Phase 3 stub returned `unsupported_unimplemented`;
+    // Phase 4-7 progressively replaced that with real content
+    // without changing the field layout.
+
+    struct tree_flush_request {
+        std::shared_ptr<const core::checkpoint_guard>                base_guard;
+        absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>  sealed_gens;
+        uint64_t                                                     recovery_safe_lsn;
     };
 
 }  // namespace apps::inconel::tree

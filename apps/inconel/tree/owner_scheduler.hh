@@ -50,7 +50,6 @@ namespace apps::inconel::tree {
 }  // namespace apps::inconel::tree
 
 namespace apps::inconel::core::registry {
-    inline uint32_t tree_worker_count();
     inline mock_nvme::scheduler* local_nvme();
 }
 
@@ -1869,17 +1868,14 @@ namespace apps::inconel::tree {
                     continue;
                 }
 
-                auto worker_count = core::registry::tree_worker_count();
-                if (worker_count == 0) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance(fold)",
-                        "registry::tree_worker_count() is 0");
-                }
-
+                // Step 030: partition count is determined by the
+                // installed `shard_partition_map`; the old
+                // registry-driven worker_count read is gone (030
+                // §6.4 F2). `build_key_partitions` panics internally
+                // if the map is not installed.
                 auto partition_st = build_key_partitions(
                     round,
-                    round.pinned_base_guard->manifest.get(),
-                    worker_count);
+                    round.pinned_base_guard->manifest.get());
 
                 if (partition_st != flush_stage_status::ok) {
                     round.st = partition_st;

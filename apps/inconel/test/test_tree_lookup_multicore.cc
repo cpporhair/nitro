@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -21,6 +22,8 @@
 
 #include "pump/core/lock_free_queue.hh"
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
+#include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/tree/sender.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "pump/sender/just.hh"
@@ -74,6 +77,32 @@ static void write_internal(mock_device& dev, uint64_t lba,
     [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
+// Leaf order for the shared 3-level/8-leaf fixture. Required by
+// `tree::lookup`'s key-range router (INC-040): without the index every
+// routed key would panic as "outside leaf_order coverage". Fence bytes
+// match the internal-page separators exactly.
+static leaf_order_index
+build_leaf_order_8leaves() {
+    leaf_order_index idx;
+    idx.fence_pool = "cegjmps";
+    static const uint64_t bases[]     = {3000, 3004, 3012, 3016,
+                                          3020, 3024, 3028, 3032};
+    static const uint32_t lower_off[] = {0, 0, 1, 2, 3, 4, 5, 6};
+    static const uint16_t lower_len[] = {0, 1, 1, 1, 1, 1, 1, 1};
+    static const uint32_t upper_off[] = {0, 1, 2, 3, 4, 5, 6, 0};
+    static const uint16_t upper_len[] = {1, 1, 1, 1, 1, 1, 1, 0};
+    for (int i = 0; i < 8; ++i) {
+        idx.spans.push_back({
+            .fence_lower_off = lower_off[i],
+            .fence_upper_off = upper_off[i],
+            .fence_lower_len = lower_len[i],
+            .fence_upper_len = upper_len[i],
+            .leaf_range_base = paddr{0, bases[i]},
+        });
+    }
+    return idx;
+}
+
 struct tree_data {
     mock_device dev;
     std::mutex dev_mtx;
@@ -112,15 +141,24 @@ private:
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
             manifest.slot_map[{0, lba}] = 0;
+        manifest.leaf_order = build_leaf_order_8leaves();
     }
 };
 
 struct core_schedulers {
-    scheduler nvme_sched;
-    tree_lookup_sched<clock_cache> tree_sched;
-    core_schedulers(mock_device* dev, uint32_t read_domain_index)
-        : nvme_sched(dev), tree_sched(read_domain_index, &kTreeGeom, clock_cache(32)) {}
-    void advance() { tree_sched.advance(); nvme_sched.advance(); }
+    scheduler                     nvme_sched;
+    tree_read_domain<clock_cache> read_domain;
+
+    core_schedulers(mock_device*                               dev,
+                    uint32_t                                   read_domain_index,
+                    std::shared_ptr<const shard_partition_map> partitions)
+        : nvme_sched(dev)
+        , read_domain(read_domain_index,
+                      std::move(partitions),
+                      clock_cache(32),
+                      &kTreeGeom) {}
+
+    void advance() { read_domain.advance(); nvme_sched.advance(); }
 };
 
 int main() {
@@ -130,21 +168,30 @@ int main() {
     const size_t N = td.all_records.size();  // 400
     printf("  built 3-level tree: %zu keys\n", N);
 
-    core_schedulers core2(&td.dev, 0);
-    core_schedulers core4(&td.dev, 1);
+    // Build the shard_partition_map from the manifest's leaf_order.
+    // With K = 2 read_domains, `build_initial_shard_partition_map`
+    // produces a 2-shard map whose fence_upper splits the 8 leaves
+    // into contiguous halves — shard 0 covers leaves 0..3 (a,c,e,g =
+    // 200 keys), shard 1 covers leaves 4..7 (j,m,p,s = 200 keys).
+    auto partitions = std::make_shared<const shard_partition_map>(
+        build_initial_shard_partition_map(td.manifest.leaf_order, 2));
+
+    core_schedulers core2(&td.dev, 0, partitions);
+    core_schedulers core4(&td.dev, 1, partitions);
 
     // Register both core's schedulers — sender::lookup() uses
     // registry::local_nvme() which indexes by this_core_id.
     registry::clear();
     registry::init_capacity(8);
+    registry::install_shard_partitions(partitions);
     registry::nvme_scheds.list.push_back(&core2.nvme_sched);
     registry::nvme_scheds.list.push_back(&core4.nvme_sched);
     registry::nvme_scheds.by_core[2] = &core2.nvme_sched;
     registry::nvme_scheds.by_core[4] = &core4.nvme_sched;
-    registry::tree_lookup_scheds.list.push_back(&core2.tree_sched);
-    registry::tree_lookup_scheds.list.push_back(&core4.tree_sched);
-    registry::tree_lookup_scheds.by_core[2] = &core2.tree_sched;
-    registry::tree_lookup_scheds.by_core[4] = &core4.tree_sched;
+    registry::tree_read_domains.list.push_back(&core2.read_domain);
+    registry::tree_read_domains.list.push_back(&core4.read_domain);
+    registry::tree_read_domains.by_core[2] = &core2.read_domain;
+    registry::tree_read_domains.by_core[4] = &core4.read_domain;
 
     std::atomic<bool> running{true};
 
@@ -175,14 +222,20 @@ int main() {
     pump::core::this_core_id = 0;
 
     for (size_t i = 0; i < N; ++i) {
-        // Route: even → core 2, odd → core 4
-        auto* ts = (i % 2 == 0) ? &core2.tree_sched : &core4.tree_sched;
-
+        // Routing is now resolved internally by `tree::lookup` via
+        // `current_shard_partitions()->route(key)` — the caller no
+        // longer picks a shard pointer (INC-040 / INC-003 / step 030).
+        // With 8 leaves range-partitioned into 2 shards the first
+        // 4 leaves (a,c,e,g = 200 keys) land on shard 0 (core 2)
+        // and the last 4 leaves (j,m,p,s = 200 keys) on shard 1
+        // (core 4), so both worker cores carry balanced work and
+        // `tree_node` cache hits stay partitioned by key range —
+        // the invariant the read_domain design is built around.
         std::vector<std::string_view> single_key = { keys_owned[i] };
         auto ctx = pump::core::make_root_context();
 
         pump::sender::just()
-            >> lookup(ts, single_key, &td.manifest)
+            >> lookup(single_key, &td.manifest)
             >> pump::sender::then([&results, &completed, i](std::vector<lookup_result>&& r) {
                 results[i] = std::move(r[0]);
                 completed.fetch_add(1, std::memory_order_release);
@@ -234,11 +287,10 @@ int main() {
 
         pump::core::this_core_id = 0;
         for (int i = 0; i < M; ++i) {
-            auto* ts = (i % 2 == 0) ? &core2.tree_sched : &core4.tree_sched;
             std::vector<std::string_view> k = { miss_keys_owned[i] };
             auto ctx = pump::core::make_root_context();
             pump::sender::just()
-                >> lookup(ts, k, &td.manifest)
+                >> lookup(k, &td.manifest)
                 >> pump::sender::then([&miss_results, &miss_completed, i](std::vector<lookup_result>&& r) {
                     miss_results[i] = std::move(r[0]);
                     miss_completed.fetch_add(1, std::memory_order_release);

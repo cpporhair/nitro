@@ -10,12 +10,15 @@
 |-----------|--------|-----------|---------|
 | `coord_sched` | 1 | `next_lsn`、`publish_gate`、`current_publish_catalog` | 固定单点 |
 | `front_sched` | N（运行时参数） | WAL stream、active/sealed memtable gens | `key_hash % N` |
-| `tree_lookup_sched` | K（运行时参数，通常 `< front_sched_count`） | `tree_node` `readonly_frame_cache`、可选 miss-coalescing 表 | `front_owner -> stable home lookup shard` |
-| `tree_worker_sched` | K（运行时参数，与 `tree_lookup_sched` 成对） | `read_domain` 引用、candidate-build 临时状态 | `read_domain_index` 对应同 shard `tree_lookup_sched` |
+| `tree_read_domain` | K（运行时参数，通常 `< front_sched_count`） | own lookup / worker scheduler；持 `tree_node` `readonly_frame_cache` shard、路由用 `shard_partition_map` snapshot | `current_shard_partitions()->route(key)` 一次二分得 `shard_idx`（step 030 §2.7） |
+| ↳ `tree_lookup_sched` | 与 `tree_read_domain` 1:1 | miss-coalescing 表、lookup-local frame pool | 继承 `tree_read_domain_index`；cache 访问走 `read_domain_->node_cache` |
+| ↳ `tree_worker_sched` | 与 `tree_read_domain` 1:1 | candidate-build 临时状态 | 继承 `tree_read_domain_index`；cache / paired_lookup 均通过 `read_domain_->...` 间接拿 |
 | `tree_sched` | 1 | tree allocator、flush 状态、retire 队列 | 固定单点 |
 | `wal_space_sched` | 1 | segment free pool、alloc head | 固定单点 |
 | `value_alloc_sched` | 1 | bump head、per-class pools、per-class open_frames、dirty_pages、deferred_freed、value_page `readonly_frame_cache` | 固定单点 |
 | `nvme_sched` | 每核心 × 每设备（v1 单盘 = 每核心 1 个） | SPDK qpair | 各 scheduler 使用本核心的实例 |
+
+**路由层提醒（step 030 §2.7）**：`shard_partition_map` 是读路径（`tree::lookup`）和 flush fold 路径（`memtable_fold.build_key_partitions`）唯一共享的路由决策源，确保"同 key → 同 shard" 不变量在两条路径上同时成立。map 由 builder 在启动时装入一个单 shard 占位（空树 → `{ upper=+∞, idx=0 }`），每次 flush 完成由 tree_sched 重建并 `install_shard_partitions()` 原子替换（B1 目标设计；step 030 不触发 rebuild，仅建立占位 + API）。
 
 所有 scheduler 遵循 PUMP 单线程模型：内部状态无锁，跨 scheduler 通过 `per_core::queue` 投递请求。
 
@@ -608,32 +611,41 @@ struct wal_stream_state {
 4. sealed_segs.push_back(active_seg)
 ```
 
-## 4. Tree Domain（`tree_sched` / `tree_lookup_sched` / `tree_worker_sched`）
+## 4. Tree Domain（`tree_sched` + `tree_read_domain × K`）
 
-tree 域拆成三类角色：
+tree 域拆成两类 runtime 对象：
 
 1. `tree_sched`
    - 单实例
    - 负责 flush round owner 状态、tree allocator、manifest delta、bounded writes、reclaim
-2. `tree_lookup_sched`
-   - `K` 实例
-   - 负责普通读路径 tree traversal，以及 flush 中的 `keys_to_leaf_groups()`
-3. `tree_worker_sched`
-   - `K` 实例
-   - 负责 flush 中的 old leaf read / decode / candidate materialization
-
-启动期按 read-domain 成对部署：
+2. `tree_read_domain<Cache>`（step 030 §2.3 / §6.5 decision G1）
+   - `K` 实例，每 core 一个
+   - 持 routing snapshot (`shared_ptr<const shard_partition_map>`)、tree-node cache shard、owned lookup/worker schedulers
+   - 向 PUMP runtime tuple 暴露 `advance()` 代驱两个 scheduler；tuple 不再单独注册 lookup / worker
 
 ```cpp
-struct tree_read_domain {
-    uint32_t read_domain_index;
-    readonly_frame_cache node_cache;                // tree_node domain clean frames
-    tree_lookup_sched* lookup;
-    tree_worker_sched* worker;
+template <cache_concept Cache>
+struct tree_read_domain : tree_read_domain_base {
+    uint32_t                                    read_domain_index;
+    std::shared_ptr<const shard_partition_map>  partitions;     // routing snapshot
+    Cache                                       node_cache;     // tree_node domain clean frames
+    std::unique_ptr<tree_lookup_sched<Cache>>   lookup;
+    std::unique_ptr<tree_worker_sched<Cache>>   worker;
+
+    bool advance();                                              // drives lookup + worker
+};
+
+struct tree_read_domain_base {
+    uint32_t                       read_domain_index;
+    tree_lookup_sched_base*        lookup_sched;                 // set by derived ctor
+    tree_worker_sched_base*        worker_sched;                 // set by derived ctor
+    virtual bool advance() = 0;
 };
 ```
 
-`tree_lookup_sched` 与 `tree_worker_sched` 共享各自 `tree_read_domain` 的 `node_cache` shard；`tree_sched` 不再持有 tree-node read cache。
+两个 scheduler 都模板化 on `Cache`，持 `tree_read_domain<Cache>*` back-reference；对 `node_cache` 的所有 pin/put/contains 调用走 `read_domain_->node_cache.*` 直接内联，零虚调用（030 §6.1 decision A）。基类 `tree_read_domain_base` 上的 `lookup_sched` / `worker_sched` 非模板指针允许 registry (`tree_read_domain_at(idx)->lookup_sched`) 和 `tree::lookup` fan-out 在不知道 `Cache` 的情况下访问两个 arm。
+
+`read_domain_index` 字段只存在 `tree_read_domain_base` 上（step 030 §6.6 decision I1）；scheduler base 通过 `virtual uint32_t read_domain_index() const` 反向读取，仅诊断/panic 路径使用。`tree_sched` 不持有 tree-node read cache。
 
 ### 4.1 Owner 状态
 
@@ -800,44 +812,53 @@ struct checkpoint_guard {
 
 ### 4.7 `tree_lookup_sched` 与 Tree Lookup
 
-为避免把 `tree_node` read cache 在每个 `front_sched` 上重复一份，同时又不把共享锁带进 front hot path，读侧引入少量 `tree_lookup_sched`。它们是 tree traversal 的执行者，并访问所属 `tree_read_domain` 的 read-only cache shard。
+为避免把 `tree_node` read cache 在每个 `front_sched` 上重复一份，同时又不把共享锁带进 front hot path，读侧引入少量 `tree_read_domain`；每个 read_domain 拥有一个 `tree_lookup_sched` 作为 tree traversal 的执行者，并访问所属 read_domain 的 `node_cache` shard。
 
 ```cpp
 struct tree_lookup_state {
     uint32_t lookup_id;
-    tree_read_domain* read_domain;                  // node_cache 位于 read-domain shard 上
+    tree_read_domain<Cache>* read_domain;           // 模板化 back-ref；
+                                                    // node_cache 位于 read_domain
 
     // 可选：对同一 slot 的并发 miss 做 single-flight 合并
     flat_hash_map<frame_id, pending_read*> inflight_reads;
 };
 ```
 
-路由规则：
+路由规则（step 030 §2.6 / §2.7 / §6.4 F2）：
 
-1. 启动期建立稳定映射 `home_tree_lookup(front_owner)`。
-2. point GET / MultiGet 的 tree miss 路由到 owner `front_sched` 对应的 home `tree_lookup_sched`。
-3. `same key -> same front_sched` 因而也推出 `same key -> same tree_lookup_sched`（在同一次运行期间）。
-4. `tree_lookup_sched` 的实例数 `K` 通常小于 `front_sched_count`，并优先按 NUMA 分组放置；默认优先选择与 owner `front_sched` 同 NUMA 的 shard。
-5. range scan 的 tree-side 遍历整体路由到一个选定的 `tree_lookup_sched` shard；默认选择调用方 NUMA 上的本地 shard，而不是把 leaf frames 借回多个 `front_sched`。
+1. 每个 key 的 home shard 由**全局安装的 `shard_partition_map`** 决定：
+   ```
+   shard_idx = core::registry::current_shard_partitions()->route(key)
+   home       = core::registry::tree_read_domain_at(shard_idx)
+   ```
+   `shard_partition_map` 的 `shards` 按 fence_upper 升序排列，`route(key)` 是一次二分查找（成本 `log2(shard_count)`）。最后一个 partition 必须是 +∞ sentinel (`fence_upper_len == 0`)，由 builder 负责；不满足时 `route()` 直接 panic。
+2. 读路径与 flush fold 路径（`memtable_fold::build_key_partitions`）**共享同一个 `shard_partition_map`**。由此推出 "同一个 leaf 的所有 key 永远路由到同一个 read_domain"，所以一张 leaf / internal / root page 在整个读 + flush 链路里最多只在一个 read_domain 的 `node_cache` 中驻留一份。Hash-based `front_owner % K` 路由会让同 leaf 的不同 key 落到不同 shard，在每个 shard 复制一份同一张 page，是明确禁止的反例。
+3. 空树（`!manifest->has_root()`）由调用方短路成 `lookup_absent`，永远不进入 routing；bootstrap 装的 placeholder map（`shards=[{upper=+∞, idx=0}]`）使 "map 总是安装" 不变量在空树过渡期仍然成立，但读路径在短路后不会真正调 `route()`。
+4. `front_sched` 在 memtable miss 时，用 `current_shard_partitions()->route(key)` 把一批 miss 按 home shard 预先分组，再把每组独立投递到对应 read_domain 的 `lookup`；**跨 shard 分组在 front 侧完成**，`tree::lookup(keys, manifest)` sender 内部自动做这件事，调用方不传 sched 指针（INC-003 / INC-040 一并收敛）。
+5. `tree_read_domain` 实例数 `K` 通常小于 `front_sched_count`，并优先按 NUMA 分组放置；NUMA 仍然影响 read_domain 实例物理安放的核心选择，但**不改变路由算法**——同 shard 的 key 仍然只会落到一个 read_domain。
+6. range scan 的 tree-side 遍历整体路由到一个选定的 read_domain（目前选调用方 NUMA 上的本地 shard），而不是把 leaf frames 借回多个 `front_sched`。
 
-tree_lookup **不在 tree_sched 上执行**。它在路由得到的 `tree_lookup_sched` 上执行，通过该 scheduler 本核的 `nvme_sched` 异步读 page。
+`shard_partition_map` 由 `tree_sched` 在每次 frontier switch 后调 `build_initial_shard_partition_map(new_leaf_order, K)` + `install_shard_partitions()` 原子替换（B1 目标设计；step 030 仅在 builder 启动时装一次占位 map，rebuild trigger 与 freeze 语义留给 coord_sched 完成）。flush pipeline 在 step 030 直接使用 `current_shard_partitions()` 实时读，与 future rebuild snapshot 等价（map 从 bootstrap install 起直至 rebuild 落地始终稳定）。
 
-原因：tree_lookup 的依赖（immutable manifest、NVMe read、`tree_read_domain.node_cache`）全部不需要 tree_sched 的可变状态；但如果仍把 tree traversal 留在 `front_sched`，又会引入跨 scheduler 借 frame / 归还 frame 的生命周期问题。把 tree traversal 与 tree-node cache 一起放进 `tree_lookup_sched`，可以保持 owner-local、无锁、无借页。
+tree_lookup **不在 tree_sched 上执行**。它在路由得到的 read_domain 的 `lookup` scheduler 上执行，通过该 scheduler 本核的 `nvme_sched` 异步读 page。
+
+原因：tree_lookup 的依赖（immutable manifest、NVMe read、`tree_read_domain.node_cache`）全部不需要 tree_sched 的可变状态；但如果仍把 tree traversal 留在 `front_sched`，又会引入跨 scheduler 借 frame / 归还 frame 的生命周期问题。把 tree traversal 与 tree-node cache 一起放进 `tree_read_domain`，可以保持 owner-local、无锁、无借页。
 
 ```text
-// 在 home tree_lookup_sched 上执行
+// 在路由得到的 read_domain.lookup 上执行
 tree_lookup(key, manifest):
 1. if manifest->root_slot == null:
        return absent
 2. slot_paddr = manifest->root_slot
-3. root_page = read_domain->node_cache.get_or_read(slot_paddr)
+3. root_page = read_domain_->node_cache.get_or_read(slot_paddr)
    // cache miss → 本核 nvme_sched->read → 回填 cache
 4. page = root_page
 5. 从 root 开始 B+ tree 下降：
    for each internal level:
        child_range_base = find_child(page, key)
        child_slot_paddr = manifest->resolve(child_range_base)
-       page = read_domain->node_cache.get_or_read(child_slot_paddr)
+       page = read_domain_->node_cache.get_or_read(child_slot_paddr)
 6. leaf_page = page
 7. record = leaf_page.find(key)
 8. if record 不存在:
@@ -876,7 +897,9 @@ keys_to_leaf_groups(sorted_flush_key_groups, manifest):
 ```cpp
 struct tree_worker_state {
     uint32_t worker_id;
-    tree_read_domain* read_domain;                  // 与 lookup shard 共享 node_cache
+    tree_read_domain<Cache>* read_domain_;          // 与 lookup shard 共享 node_cache；
+                                                    // `&read_domain_->node_cache`
+                                                    // 直接传给 `process_flush_round<Cache>`
 };
 ```
 
@@ -1530,11 +1553,14 @@ tree_sched ── fold memtables into sorted key groups ────────
   │  生成 memtable winners / losers                           │
   │                                                           │
   ▼                                                           │
-tree_lookup_scheds ── keys_to_leaf_groups ── reduce ─────────┤
-  │  基于 manifest.leaf_order 做 affected leaf mapping         │
+tree_read_domains ── keys_to_leaf_groups ── reduce ──────────┤
+  │  (routed via current_shard_partitions()->route(key);        │
+  │   executed on each read_domain.lookup)                      │
   │                                                           │
   ▼                                                           │
-tree_worker_scheds ── build_leaf_candidates ── reduce ───────┤
+tree_read_domains ── build_leaf_candidates ── reduce ────────┤
+  │  (executed on each read_domain.worker; cache shared with   │
+  │   paired lookup on the same read_domain)                   │
   │  读 old leaf / merge / compact                            │
   │                                                           │
   ▼                                                           │
@@ -1577,8 +1603,8 @@ tree_sched ── maybe update superblock
 1. `tree_sched` 上的 tree allocator 不需要锁。
 2. `tree_sched` 上的 `tree_manifest` 构造不需要并发保护。
 3. `tree_sched` 上的 `recovery_safe_lsn` 推进不会并发。
-4. 每个 `tree_lookup_sched` 的 node cache / miss-coalescing 状态也都是 owner-local，不需要锁。
-5. 每个 `tree_worker_sched` 的 candidate build 临时状态与 read-domain 访问同样是 owner-local，不需要锁。
+4. 每个 `tree_read_domain` 的 `node_cache` 和所属 `tree_lookup_sched` / `tree_worker_sched` 都绑定在同一 core、单线程驱动（read_domain.advance() 代驱两个 arm），owner-local 无锁访问。
+5. `shard_partition_map` 是 `shared_ptr<const ...>`：一旦装入即 immutable，多 read_domain 并发读同一对象；rebuild 通过 `install_shard_partitions()` 原子替换指针实现（B1 目标设计，step 030 尚未触发）。
 
 ### 10.4 跨 scheduler 的 read_handle 安全
 

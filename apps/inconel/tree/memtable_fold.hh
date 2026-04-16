@@ -1,7 +1,7 @@
 #ifndef APPS_INCONEL_TREE_MEMTABLE_FOLD_HH
 #define APPS_INCONEL_TREE_MEMTABLE_FOLD_HH
 
-// ── memtable_fold.hh ── fold + leaf-aligned partition free functions ──
+// ── memtable_fold.hh ── fold + shard-partition partition free functions ──
 //
 // Two inline free functions for the fold + partition stage:
 //
@@ -11,31 +11,47 @@
 //     loser_durable_refs.
 //
 //   build_key_partitions(flush_round_state& rs,
-//                        const core::tree_manifest* base_manifest,
-//                        uint32_t worker_count)
-//     Step 027 §4.3: leaf-align partitions. Every key is mapped to
-//     its base_manifest leaf via `leaf_order.find_leaf_for_key()`,
-//     then assigned to partition `leaf_idx % worker_count`. The
-//     workset is rewritten so each partition occupies a contiguous
-//     slice; `flush_key_partition.groups` is a span over that
-//     slice. Within a partition, keys remain in sorted key order.
+//                        const core::tree_manifest* base_manifest)
+//     Step 030 §2.5: every key is routed to a read_domain via the
+//     globally installed `shard_partition_map`
+//     (`core::registry::current_shard_partitions()->route(key)`).
+//     Both the read path (`tree::lookup`) and the flush path (this
+//     function) route through the same map, so a given key always
+//     lands on the same `tree_read_domain` — this is the
+//     precondition for the "one tree_node cache shard per leaf
+//     range" invariant (RSM §4.7). The map's `+∞` sentinel
+//     guarantees every key lands on some shard; no coverage-gap
+//     panic is needed.
 //
-// Neither function depends on tree_sched, registry, or any PUMP
-// runtime type. They operate purely on flush carrier data structures.
+// `build_key_partitions` depends on `core::registry::current_shard_partitions()`;
+// otherwise the fold path stays free of PUMP runtime types.
 //
 // Marked `inline` for ODR safety.
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include "../core/memtable.hh"
+#include "../core/panic.hh"
+#include "../core/shard_partition.hh"
 #include "../core/tree_manifest.hh"
 #include "./flush_round_state.hh"
 #include "./flush_types.hh"
+
+// Forward-declare `current_shard_partitions()` instead of #including
+// `core/registry.hh` — that header also includes `tree/scheduler.hh`,
+// which re-enters this file through `owner_scheduler.hh` and would
+// hit a dependency cycle where the registry namespace is not yet
+// defined at the point we try to call into it.
+namespace apps::inconel::core::registry {
+    std::shared_ptr<const apps::inconel::core::shard_partition_map>
+    current_shard_partitions();
+}
 
 namespace apps::inconel::tree {
 
@@ -170,79 +186,83 @@ namespace apps::inconel::tree {
         }
     }
 
-    // ── build_key_partitions (Phase 7 / step 027 §4.3) ──────────
+    // ── build_key_partitions (step 030 §2.5) ─────────────────────
     //
-    // Leaf-aligned key-range partitioning: every key is mapped to
-    // its base_manifest leaf, then assigned to partition
-    // `(leaf_idx * P) / leaf_count`. This gives worker N a
-    // contiguous range of leaves `[N*L/P, (N+1)*L/P)`, which is
-    // what step 027 §3.3's pairwise leaf-merge pass requires —
-    // adjacent leaves in a worker's slice are also tree-adjacent,
-    // so a pairwise-merged page covers a contiguous key range
-    // without colliding with other workers' coverage.
+    // Routes every key in the workset through the globally installed
+    // `shard_partition_map`, which is the SAME decision surface the
+    // read path uses. Keys go into per-shard buckets keyed by
+    // `shard_partition.shard_idx`; the workset is rewritten as the
+    // concatenation of buckets so each partition's slice is
+    // contiguous, and `flush_key_partition.groups` is a span over
+    // that slice.
     //
-    // (Step 027 §4.3 originally wrote `leaf_idx % worker_count`
-    // round-robin. Range partitioning is the only assignment that
-    // makes §3.3 semantically sound; that doc text is a typo and
-    // is being corrected when 027 is folded into design_doc/.)
+    // Empty-tree narrowing (Phase 7 scope): when `base_manifest`
+    // has no leaves yet, bootstrap has not built the tree. The
+    // worker fanout path in Phase 7 does not absorb bootstrap keys
+    // (that is Phase 9 territory), so we short-circuit with
+    // `unsupported_shape_change` and let the caller propagate the
+    // status. The shard_partition_map installed at startup is a
+    // single-shard placeholder (030 §6.7 decision P) that would
+    // happily route every key to shard 0, but the workers would
+    // still not know how to grow a root node — so the narrowing
+    // lives at the partition-builder level, NOT at the map level.
     //
-    // Workset is rewritten so each partition occupies a contiguous
-    // slice; `flush_key_partition.groups` is a span over that
-    // slice. Within a partition keys remain in sorted order
-    // because grouping preserves relative order from a sorted
-    // source.
+    // Key coverage: the map's `+∞` sentinel guarantees every key
+    // falls into some shard; no "outside tree coverage" panic is
+    // needed (compare `shard_partition_map::route` vs the old
+    // `leaf_order.find_leaf_for_key` path).
     //
     // Returns:
     //   - flush_stage_status::ok                       — all keys mapped
-    //   - flush_stage_status::unsupported_shape_change — any key falls
-    //     outside the tree's covered range, OR the tree has no root
-    //     yet (bootstrap is Phase 9 territory)
+    //   - flush_stage_status::unsupported_shape_change — empty tree
+    //     (bootstrap, Phase 9 territory)
     //
     // Precondition: workset is fully populated (fold has run) and
     // is not mutated after this call returns a partition span.
 
     inline flush_stage_status
     build_key_partitions(flush_round_state& rs,
-                         const core::tree_manifest* base_manifest,
-                         uint32_t worker_count)
+                         const core::tree_manifest* base_manifest)
     {
         const auto N = static_cast<uint32_t>(rs.workset.size());
         if (N == 0) return flush_stage_status::ok;
 
-        if (worker_count == 0) {
+        // Empty tree = bootstrap = Phase 9 territory. Explicit
+        // narrowing per CLAUDE.md constraint A: declare the
+        // limitation, fail-fast, no silent fallback to a
+        // placeholder-map route that the worker cannot absorb.
+        if (!base_manifest->has_root() ||
+            base_manifest->leaf_order.empty()) {
             return flush_stage_status::unsupported_shape_change;
         }
 
-        // Empty tree (no root yet) — bootstrap is not in Phase 7
-        // scope. Constraint A: declare narrowing explicitly via the
-        // unsupported_shape_change return; the worker fanout is
-        // skipped for this round and the merge step propagates the
-        // status upward.
-        const auto& lo = base_manifest->leaf_order;
-        if (lo.empty()) {
-            return flush_stage_status::unsupported_shape_change;
+        auto partitions = core::registry::current_shard_partitions();
+        if (!partitions || partitions->empty()) {
+            core::panic_inconsistency(
+                "tree::build_key_partitions",
+                "shard_partition_map not installed — builder must "
+                "call install_shard_partitions at startup");
         }
 
-        const auto leaf_count = static_cast<uint32_t>(lo.size());
-        const uint32_t P = std::min(worker_count, leaf_count);
+        const uint32_t K = partitions->shard_count();
 
-        std::vector<std::vector<flush_key_group>> buckets(P);
+        std::vector<std::vector<flush_key_group>> buckets(K);
 
         for (const auto& k : rs.workset) {
-            auto leaf_idx = lo.find_leaf_for_key(k.key);
-            if (leaf_idx >= leaf_count) {
-                // Key beyond tree's covered key range. v1 spec
-                // requires the writer to grow the tree to absorb
-                // such keys; that is shape-changing on the boot /
-                // bound side and lives in Phase 9.
-                return flush_stage_status::unsupported_shape_change;
+            const uint32_t shard = partitions->route(k.key);
+            if (shard >= K) {
+                // `shard_count()` is the highest `shard_idx + 1`,
+                // so `route()` never returns a larger value. Trip
+                // a structural assertion anyway — a mismatch is an
+                // invariant violation worth panicking on, not a
+                // silent bucket overflow.
+                core::panic_inconsistency(
+                    "tree::build_key_partitions",
+                    "route() returned shard=%u >= shard_count=%u",
+                    static_cast<unsigned>(shard),
+                    static_cast<unsigned>(K));
             }
-            // Range assignment: partition_idx = leaf_idx * P / leaf_count.
-            // The 64-bit promotion avoids overflow even at 10 billion
-            // keys / 4 KB-page (~15.6 M leaves) × P up to a few hundred.
-            const uint32_t p = static_cast<uint32_t>(
-                (static_cast<uint64_t>(leaf_idx) * P) / leaf_count);
-            buckets[p].push_back(k);
+            buckets[shard].push_back(k);
         }
 
         // Rewrite workset as the concatenation of buckets so each
@@ -250,16 +270,16 @@ namespace apps::inconel::tree {
         rs.workset.clear();
         rs.workset.reserve(N);
 
-        std::vector<uint32_t> bucket_offsets(P);
-        for (uint32_t p = 0; p < P; ++p) {
+        std::vector<uint32_t> bucket_offsets(K);
+        for (uint32_t p = 0; p < K; ++p) {
             bucket_offsets[p] = static_cast<uint32_t>(rs.workset.size());
             for (auto& k : buckets[p]) {
                 rs.workset.push_back(k);
             }
         }
 
-        rs.partitions.reserve(P);
-        for (uint32_t p = 0; p < P; ++p) {
+        rs.partitions.reserve(K);
+        for (uint32_t p = 0; p < K; ++p) {
             const auto offset = bucket_offsets[p];
             const auto count  = static_cast<uint32_t>(buckets[p].size());
             if (count == 0) continue;

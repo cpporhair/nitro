@@ -26,8 +26,12 @@
 | `seal_active` | `()` → `front_read_set` | RSM §3.6, OV §9.2 |
 | `release_gens` | `(gen_id_list)` → `void` | RSM §3.8, FF §4.3 |
 | `tree_flush` | `(tree_flush_request)` → `tree_flush_result` | RSM §4.2, FF §3.1/§8.1, CM tree |
-| `keys_to_leaf_groups` | `(flush_lookup_req)` → `flush_leaf_group_result[]` | RSM §4.2/§4.7, FF §3.2/§3.4, CM tree |
-| `build_leaf_candidates` | `(flush_worker_req)` → `flush_candidate_batch` | RSM §4.2/§4.8, FF §3.2/§3.4, CM tree |
+| `keys_to_leaf_groups` | `(flush_lookup_req)` → `flush_leaf_group_result[]`（在 `tree_read_domain.lookup` 上执行） | RSM §4.2/§4.7, FF §3.2/§3.4, CM tree |
+| `build_leaf_candidates` | `(flush_worker_req)` → `flush_candidate_batch`（在 `tree_read_domain.worker` 上执行） | RSM §4.2/§4.8, FF §3.2/§3.4, CM tree |
+| `current_shard_partitions` | `()` → `shared_ptr<const shard_partition_map>` | CM registry, RSM §1/§4.7 |
+| `install_shard_partitions` | `(shared_ptr<const shard_partition_map>)` → `void` | CM registry, RSM §1/§4.7 |
+| `shard_partition_map::route` | `(key)` → `shard_idx` via 一次二分 | RSM §4.7, OV §8.1/§14.2, RAP §4/§5/§5.4 |
+| `tree_read_domain::advance` | `()` → `bool` 代驱 lookup + worker arms | RSM §4, CM tree |
 | `persist_put_values` | `(batch PUT entries)` → `durable value_refs` | RSM §6.2, WP §2.1/5.4 |
 | `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
 | `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
@@ -67,6 +71,10 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `value_page_frame` | `class_idx, slots_per_page, free_bitmap, free_count, mode` | RMC §5.5 | RSM §6.3 (open_frames) |
 | `frame_id` | `base, span_lbas, dom` | RMC §5.2 | — |
 | `hole_page_descriptor` | `page_base, class_idx, free_mask` | RMC §6.4 | RSM §6.7 |
+| `shard_partition` | `fence_upper_off (u32), fence_upper_len (u16), _pad0 (u16), shard_idx (u32)`；POD 12B | core/shard_partition.hh (step 030 §2.1) | RSM §4.7, OV §8.1 |
+| `shard_partition_map` | `fence_pool: string, shards: vector<shard_partition>`；最后一个 shard 必须是 +∞ sentinel（`fence_upper_len == 0`） | core/shard_partition.hh (step 030 §2.1) | RSM §4.7, OV §1.7/§8.1 |
+| `tree_read_domain<Cache>` | `read_domain_index (u32), partitions: shared_ptr<const shard_partition_map>, node_cache: Cache, lookup: unique_ptr<tree_lookup_sched<Cache>>, worker: unique_ptr<tree_worker_sched<Cache>>`；继承 `tree_read_domain_base` 并填充其 `lookup_sched` / `worker_sched` base pointers | core/tree_read_domain.hh (step 030 §2.3) | RSM §1/§4, OV §1.7, CM tree |
+| `tree_read_domain_base` | `read_domain_index (u32), lookup_sched: tree_lookup_sched_base*, worker_sched: tree_worker_sched_base*, virtual advance()` | core/tree_read_domain.hh (step 030 §2.3) | core/registry.hh `tree_read_domains` |
 
 ## 3. Owner 归属
 
@@ -95,7 +103,8 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `lookup_memtable` | active, imms | 请求携带的 `read_handle.cat->prs->fronts[owner]` (snapshot) | `front_sched` 当前 active/imms |
 | `scan_memtable` | active, imms | 同上 | 同上 |
 | `tree_lookup` | manifest | 请求携带的 `read_handle.cat->prs->tree_guard->manifest` (snapshot) | `tree_sched` 当前 manifest |
-| `read_value` | value_ref | `tree_lookup` 返回的 `leaf_value_record.vr` | 不是 front_sched / tree_lookup_sched 本地读取 |
+| `tree_lookup` 路由 | shard_idx | `current_shard_partitions()->route(key)`（全局 `shard_partition_map` snapshot） | 不是 `leaf_order.find_leaf_for_key(key) % K`，也不是 `front_owner % K` |
+| `read_value` | value_ref | `tree_lookup` 返回的 `leaf_value_record.vr` | 不是 front_sched / tree_read_domain 本地读取 |
 | `read_page_values` | value_read_group | 调用方对 tree-sourced `value_ref`s 做 request-local page grouping 后得到 | 不是逐条 `read_value()` fan-out |
 
 ## 5. Pipeline 跳转路径
@@ -110,7 +119,11 @@ coord_sched(assign_lsn) → value_alloc_sched(persist_put_values) → fan-out fr
 
 ### 读路径 (Point GET)
 ```
-coord_sched(acquire_read_handle) → front_sched(lookup_memtable with PRS snapshot) → [miss] → tree_lookup_sched(tree_lookup with read_handle manifest) → [hit value] → value_alloc_sched(read_value)
+coord_sched(acquire_read_handle)
+  → front_sched(lookup_memtable with PRS snapshot)
+  → [miss] → shard_idx = current_shard_partitions()->route(key)
+    → tree_read_domain_at(shard_idx)->lookup_sched.tree_lookup(with read_handle manifest)
+  → [hit value] → value_alloc_sched(read_value)
 ```
 出现点：OV §8.1/14.2, RAP §4.1/4.2/4.5
 

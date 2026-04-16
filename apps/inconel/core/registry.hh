@@ -4,14 +4,26 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "pump/core/lock_free_queue.hh"  // for pump::core::this_core_id
 
 #include "./data_area_heads.hh"
+#include "./panic.hh"
+#include "./shard_partition.hh"
+#include "./tree_manifest.hh"
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::tree_lookup_sched_base
 #include "../value/scheduler.hh" // for value::value_alloc_sched_base
+
+// Forward-declare tree_read_domain_base so the registry can store a
+// non-templated list of read_domains. The full struct lives in
+// `core/tree_read_domain.hh`; only the base pointer is needed here.
+namespace apps::inconel::core {
+    struct tree_read_domain_base;
+}
 
 namespace apps::inconel::core::registry {
 
@@ -37,22 +49,17 @@ namespace apps::inconel::core::registry {
     };
     inline nvme_list nvme_scheds;
 
-    struct tree_lookup_list {
-        std::vector<tree::tree_lookup_sched_base*> list;
-        std::vector<tree::tree_lookup_sched_base*> by_core;
+    // Step 030 (§2.7 / §6.4 decision F2) replaces the old
+    // `tree_lookup_scheds` / `tree_worker_scheds` double-registry
+    // with a single `tree_read_domains` list. The individual
+    // schedulers are reached through `tree_read_domain_at(idx)->lookup`
+    // / `->worker`. This is the canonical registry dimension for
+    // tree read access — no double maintenance.
+    struct tree_read_domain_list {
+        std::vector<tree_read_domain_base*> list;
+        std::vector<tree_read_domain_base*> by_core;
     };
-    inline tree_lookup_list tree_lookup_scheds;
-
-    // tree_worker_sched is non-templated in Phase 2 (step 022 §5, L-14).
-    // Phase 2's pairing seam between a lookup shard and its worker shard
-    // is expressed by "same core of installation" plus a shared
-    // read_domain_index, so a dedicated named tree_read_domain runtime
-    // object is deliberately absent (022 D5, §3, §7).
-    struct tree_worker_list {
-        std::vector<tree::tree_worker_sched_base*> list;
-        std::vector<tree::tree_worker_sched_base*> by_core;
-    };
-    inline tree_worker_list tree_worker_scheds;
+    inline tree_read_domain_list tree_read_domains;
 
     // value::value_alloc_sched is a global singleton — only one instance
     // exists, pinned to a specific core (cores[0] in the v6 builder). All
@@ -73,6 +80,16 @@ namespace apps::inconel::core::registry {
     // `tree_sched`) so it does not collide with the `tree::`
     // namespace inside this file.
     inline tree::tree_sched* tree_sched_singleton_ptr = nullptr;
+
+    // Globally installed `shard_partition_map` (step 030 §2.7). A
+    // `shared_ptr<const>` lets a future heat-driven rebuild
+    // (issue 2 decision B1, out of scope in step 030) swap the map
+    // atomically without coordinating with every read_domain.
+    // Accessor / installer live further down the file after the
+    // `clear()` helper so the initialization order stays grouped
+    // with the other global state.
+    inline std::shared_ptr<const shard_partition_map>
+        current_shard_partitions_ptr;
 
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
@@ -99,21 +116,19 @@ namespace apps::inconel::core::registry {
     inline void
     init_capacity(uint32_t max_cores) {
         nvme_scheds.by_core.assign(max_cores, nullptr);
-        tree_lookup_scheds.by_core.assign(max_cores, nullptr);
-        tree_worker_scheds.by_core.assign(max_cores, nullptr);
+        tree_read_domains.by_core.assign(max_cores, nullptr);
     }
 
     inline void
     clear() {
         nvme_scheds.list.clear();
         nvme_scheds.by_core.clear();
-        tree_lookup_scheds.list.clear();
-        tree_lookup_scheds.by_core.clear();
-        tree_worker_scheds.list.clear();
-        tree_worker_scheds.by_core.clear();
+        tree_read_domains.list.clear();
+        tree_read_domains.by_core.clear();
         value_alloc_sched = nullptr;
         data_area_heads_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
+        current_shard_partitions_ptr.reset();
     }
 
     // ── Singleton access ──
@@ -155,17 +170,10 @@ namespace apps::inconel::core::registry {
         return s;
     }
 
-    inline tree::tree_lookup_sched_base*
-    local_tree_lookup() {
-        auto* s = tree_lookup_scheds.by_core[pump::core::this_core_id];
-        assert(s && "current core has no tree_lookup scheduler");
-        return s;
-    }
-
-    inline tree::tree_worker_sched_base*
-    local_tree_worker() {
-        auto* s = tree_worker_scheds.by_core[pump::core::this_core_id];
-        assert(s && "current core has no tree_worker scheduler");
+    inline tree_read_domain_base*
+    local_tree_read_domain() {
+        auto* s = tree_read_domains.by_core[pump::core::this_core_id];
+        assert(s && "current core has no tree_read_domain");
         return s;
     }
 
@@ -176,36 +184,27 @@ namespace apps::inconel::core::registry {
         return nvme_scheds.by_core[core];
     }
 
-    inline tree::tree_lookup_sched_base*
-    tree_lookup_for_core(uint32_t core) {
-        return tree_lookup_scheds.by_core[core];
-    }
-
-    inline tree::tree_worker_sched_base*
-    tree_worker_for_core(uint32_t core) {
-        return tree_worker_scheds.by_core[core];
+    inline tree_read_domain_base*
+    tree_read_domain_for_core(uint32_t core) {
+        return tree_read_domains.by_core[core];
     }
 
     // ── Cross-shard access by index ──
+    //
+    // Step 030 (§6.4 decision F2): the only registry dimension for
+    // tree read access is `tree_read_domains`. Lookup and worker
+    // schedulers are reached through the returned read_domain struct
+    // (casting `tree_read_domain_base*` to
+    // `tree_read_domain<Cache>*` where the Cache type is known).
 
-    inline tree::tree_lookup_sched_base*
-    tree_lookup_at(uint32_t idx) {
-        return tree_lookup_scheds.list[idx % tree_lookup_scheds.list.size()];
-    }
-
-    inline tree::tree_worker_sched_base*
-    tree_worker_at(uint32_t idx) {
-        return tree_worker_scheds.list[idx % tree_worker_scheds.list.size()];
-    }
-
-    inline uint32_t
-    tree_lookup_count() {
-        return static_cast<uint32_t>(tree_lookup_scheds.list.size());
+    inline tree_read_domain_base*
+    tree_read_domain_at(uint32_t idx) {
+        return tree_read_domains.list[idx % tree_read_domains.list.size()];
     }
 
     inline uint32_t
-    tree_worker_count() {
-        return static_cast<uint32_t>(tree_worker_scheds.list.size());
+    tree_read_domain_count() {
+        return static_cast<uint32_t>(tree_read_domains.list.size());
     }
 
     inline uint32_t
@@ -213,18 +212,45 @@ namespace apps::inconel::core::registry {
         return static_cast<uint32_t>(nvme_scheds.list.size());
     }
 
-    // ── Future routing helpers (uncomment when corresponding scheduler exists) ──
+    // ── Key-range routing for tree read access ────────────────────────
     //
-    // inline front::scheduler*
-    // route_to_front(uint64_t key_hash) {
-    //     return front_scheds.list[key_hash % front_scheds.list.size()];
-    // }
+    // Step 030 (§2.7 / §6.4 decision F2) replaces the old
+    // `route_tree_lookup_for_key(manifest, key)` wrapper — which
+    // computed `leaf_order.find_leaf_for_key(key) % K` — with a
+    // single globally installed `shard_partition_map`. The routing
+    // decision is therefore:
     //
-    // inline tree::tree_lookup_sched_base*
-    // home_tree_lookup_for_front(uint32_t front_owner) {
-    //     // Stable mapping established at startup; for now a simple modulo.
-    //     return tree_lookup_scheds.list[front_owner % tree_lookup_scheds.list.size()];
-    // }
+    //   shard_idx = current_shard_partitions()->route(key)
+    //   read_domain = tree_read_domains.list[shard_idx]
+    //
+    // Both the read path (`tree::lookup`) and the flush fold path
+    // (`memtable_fold`) route through the same map so that every
+    // key always lands on the same `tree_read_domain` shard —
+    // this is the precondition for the "one tree_node cache shard
+    // per leaf range" invariant (RSM §4.7).
+    //
+    // The map is a `shared_ptr<const shard_partition_map>` so the
+    // future heat-driven rebuild (issue 2 decision B1, not in step
+    // 030 scope) can swap it atomically without coordinating with
+    // every read_domain. Step 030 only calls `install_shard_partitions`
+    // once from the builder (bootstrap placeholder map); the install
+    // path will be called again from `tree_sched` at frontier switch
+    // when rebuild lands.
+    //
+    // `current_shard_partitions()` returns a fresh `shared_ptr` copy;
+    // the caller can keep it alive for the duration of a routing
+    // decision without racing against a future rebuild.
+
+    inline std::shared_ptr<const shard_partition_map>
+    current_shard_partitions() {
+        return current_shard_partitions_ptr;
+    }
+
+    inline void
+    install_shard_partitions(
+        std::shared_ptr<const shard_partition_map> m) {
+        current_shard_partitions_ptr = std::move(m);
+    }
 
 }
 

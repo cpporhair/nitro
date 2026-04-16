@@ -7,17 +7,18 @@
 // semantics are unchanged: `tree_lookup_sched_base::process(state)`
 // still drives a multi-level B+ tree descent, single-flights
 // in-flight NVMe reads, and cooperates with the `readonly_frame_cache`
-// it owns locally. Phase 2 *intentionally does not* migrate the cache,
-// the frame pool, or the single-flight map to a shared
-// `tree_read_domain` object (022 D5, §3) — that is deferred to the
-// cache ownership migration step before Phase 5/6.
+// that the surrounding `tree_read_domain<Cache>` owns. Step 030
+// physicalized the `tree_read_domain` struct and moved cache
+// ownership one level up (RSM §4.7 / RMC §6.1): the cache is now a
+// member of `core::tree_read_domain<Cache>` and this scheduler
+// accesses it via `read_domain_->node_cache` — still a direct
+// templated call, zero virtual dispatch (030 §6.1 decision A).
 //
-// The only lookup-scheduler change Phase 2 actually introduces is a
-// new `uint32_t read_domain_index` member on
-// `tree_lookup_sched_base`, set at construction time. Pairing with a
-// worker on the same core is entirely carried by `registry::by_core`
-// plus the matching `read_domain_index` value, not by any named
-// runtime object (022 §3 / §7).
+// Step 030 also removes `read_domain_index` from the scheduler base
+// (030 §6.6 decision I1): the field lives on `tree_read_domain_base`
+// now. Diagnostics that need the index reach it via the derived
+// scheduler's virtual `read_domain_index()` getter, which resolves
+// to `read_domain_->read_domain_index`.
 //
 // File split (022 D12, §9): the op/sender/op_pusher/compute_sender_type
 // specializations for both `_tree_lookup` and `_cache_pages` live in
@@ -47,6 +48,17 @@
 #include "../format/tree_page.hh"
 #include "./lookup.hh"
 #include "./page_reader.hh"
+
+// Forward-declare `tree_read_domain` / `tree_read_domain_base` so the
+// scheduler definitions can hold a typed back-reference without
+// pulling in `core/tree_read_domain.hh`. The full definition is
+// needed only at scheduler template instantiation time, by which
+// point whoever constructs a `tree_lookup_sched<Cache>` has already
+// included `core/tree_read_domain.hh` (step 030 §7 include contract).
+namespace apps::inconel::core {
+    struct tree_read_domain_base;
+    template <cache_concept Cache> struct tree_read_domain;
+}
 
 namespace apps::inconel::tree {
 
@@ -129,11 +141,6 @@ namespace apps::inconel::tree {
     namespace _cache_pages { struct req; }
 
     struct tree_lookup_sched_base {
-        // Phase 2 (022 §3): pairing seam is expressed through
-        // `read_domain_index` + same-core installation. There is no
-        // named `tree_read_domain` runtime object.
-        uint32_t read_domain_index;
-
         // H-1 (review rounds 1+2): every manifest handed to
         // `process()` must carry a geometry whose numeric fields
         // agree with the one this scheduler was constructed with,
@@ -163,13 +170,21 @@ namespace apps::inconel::tree {
         uint32_t pending_lookups = 0;
 
         explicit
-        tree_lookup_sched_base(uint32_t rdi,
-                               const core::tree_geometry* geom,
+        tree_lookup_sched_base(const core::tree_geometry* geom,
                                size_t depth)
-            : read_domain_index(rdi)
-            , expected_geom(geom)
+            : expected_geom(geom)
             , lookup_queue_(depth)
             , cache_queue_(depth) {}
+
+        virtual ~tree_lookup_sched_base() = default;
+
+        // read_domain_index lives on `tree_read_domain_base` (030 §6.6
+        // decision I1). The base exposes it via this virtual getter
+        // so non-templated diagnostic code inside `process()` can log
+        // the shard number without knowing the concrete `Cache`
+        // type. The call is on the panic path only — zero cost on
+        // the hot path.
+        virtual uint32_t read_domain_index() const noexcept = 0;
 
         void schedule_lookup(_tree_lookup::req* r) {
             ++pending_lookups;
@@ -262,7 +277,15 @@ namespace apps::inconel::tree {
             std::vector<wait_token> waiters;
         };
 
-        Cache page_cache_;
+        // Non-owning back-reference to the owning read_domain. The
+        // shared `tree_node` page cache lives at
+        // `read_domain_->node_cache`; the scheduler reaches through
+        // for every pin/put/contains call. Template-specialized on
+        // the same `Cache` as the read_domain, so the cache access
+        // inlines at every call site with no virtual dispatch
+        // (030 §6.1 decision A / §2.4).
+        core::tree_read_domain<Cache>* read_domain_ = nullptr;
+
         absl::flat_hash_map<paddr, pending_read> inflight_reads_;
 
         // Frame ownership pool. Every page_frame created by this scheduler
@@ -278,19 +301,27 @@ namespace apps::inconel::tree {
         static constexpr uint32_t kMaxCacheOpsPerAdvance  = 64;
         static constexpr uint32_t kMaxLookupOpsPerAdvance = 64;
 
+        // Constructed by `core::tree_read_domain<Cache>::ctor` with
+        // `this` pointing back at the enclosing read_domain (030 §2.8
+        // step 5a). The read_domain must outlive the scheduler; both
+        // sit in the same `unique_ptr` tree so lifetime is structural.
         explicit
-        tree_lookup_sched(uint32_t rdi,
+        tree_lookup_sched(core::tree_read_domain<Cache>* rd,
                           const core::tree_geometry* geom,
-                          Cache cache,
                           size_t depth = 2048)
-            : tree_lookup_sched_base(rdi, geom, depth)
-            , page_cache_(std::move(cache)) {}
+            : tree_lookup_sched_base(geom, depth)
+            , read_domain_(rd) {}
 
-        ~tree_lookup_sched() {
+        ~tree_lookup_sched() override {
             for (auto* f : all_frames_) {
                 delete[] f->buf;
                 delete f;
             }
+        }
+
+        uint32_t
+        read_domain_index() const noexcept override {
+            return read_domain_->read_domain_index;
         }
 
         bool advance() {
@@ -304,7 +335,7 @@ namespace apps::inconel::tree {
                 for (auto* pf : r->frames) {
                     paddr addr = pf->id.base;
 
-                    if (auto evicted = page_cache_.put(pf)) {
+                    if (auto evicted = read_domain_->node_cache.put(pf)) {
                         free_frames_.push_back(*evicted);
                     }
 
@@ -375,7 +406,7 @@ namespace apps::inconel::tree {
             absl::flat_hash_set<paddr> wait_pages;
             for (auto& e : s.entries) {
                 if (e.resolved) continue;
-                if (page_cache_.contains(make_tree_frame_id(e.next_page, s.page_lbas))) continue;
+                if (read_domain_->node_cache.contains(make_tree_frame_id(e.next_page, s.page_lbas))) continue;
                 wait_pages.insert(e.next_page);
             }
 
@@ -403,7 +434,7 @@ namespace apps::inconel::tree {
                 if (e.resolved) continue;
 
                 while (true) {
-                    auto pin = page_cache_.pin(
+                    auto pin = read_domain_->node_cache.pin(
                         make_tree_frame_id(e.next_page, s.page_lbas));
                     if (!pin.frame) break;
 
@@ -449,7 +480,7 @@ namespace apps::inconel::tree {
         void prepare_reads(lookup_state& s, decision_need_read& decision) {
             for (auto& e : s.entries) {
                 if (e.resolved) continue;
-                if (page_cache_.contains(make_tree_frame_id(e.next_page, s.page_lbas))) continue;
+                if (read_domain_->node_cache.contains(make_tree_frame_id(e.next_page, s.page_lbas))) continue;
                 if (inflight_reads_.contains(e.next_page)) continue;
 
                 memory::page_frame* pf;
@@ -503,7 +534,7 @@ namespace apps::inconel::tree {
                 "manifest geometry disagrees with scheduler expected_geom "
                 "(rdi=%u, manifest={lba=%u,page=%u,slots=%u}, "
                 "expected={lba=%u,page=%u,slots=%u})",
-                static_cast<unsigned>(read_domain_index),
+                static_cast<unsigned>(read_domain_index()),
                 static_cast<unsigned>(state.manifest->geom->lba_size),
                 static_cast<unsigned>(state.manifest->geom->tree_page_size),
                 static_cast<unsigned>(state.manifest->geom->shadow_slots_per_range),

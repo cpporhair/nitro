@@ -161,7 +161,8 @@ coord: canonicalize → assign_lsn
 ```
 coord: acquire_read_handle → (cat, read_lsn)
  → front[owner]: lookup_memtable (PRS 快照的 active+imms)
- → miss → tree_lookup_sched: tree_lookup (manifest 快照)
+ → miss → tree_read_domain[shard_idx].lookup: tree_lookup (manifest 快照)
+       shard_idx = core::registry::current_shard_partitions()->route(key)
  → tree hit → value_alloc: read_value → copy-out
 ```
 
@@ -185,8 +186,8 @@ coord: acquire_read_handle → (cat, read_lsn)
 
 **Tree-Local Flush 4 段 owner seam：**
 1. `tree_sched.fold`: 对所有 sealed gens 做 per-key winner 裁决
-2. `tree_lookup_sched.keys_to_leaf_groups`: 用 `manifest.leaf_order` 把 sorted keys 映射到 affected leaves
-3. `tree_worker_sched.build_leaf_candidates`: 读 old leaf、merge、compact 出 candidate image
+2. `tree_read_domain[shard_idx].lookup.keys_to_leaf_groups`: 用 `manifest.leaf_order` 把 sorted keys 映射到 affected leaves（同一 `shard_partition_map` 作为 read / flush 共享决策源）
+3. `tree_read_domain[shard_idx].worker.build_leaf_candidates`: 读 old leaf、merge、compact 出 candidate image（与 lookup 共享 read_domain 的 `node_cache`）
 4. `tree_sched.plan_tree_delta_from_candidates`: 写 tree slots + NVMe FLUSH
 
 **回收链：** CAT2 安装 → old CAT1 refs→0 → PRS1 refs→0 → fronts refs→0 → gen refs-- → loser_refs 可回收 → G0 refs→0 → retired dispatch (TRIM + value reclaim)
@@ -239,7 +240,7 @@ hole 复用: clean_allocatable → dirty_hole_fill → writeback_inflight → cl
 |------|-----------|---------------|
 | §2 coord_sched | 协调器：LSN 分配、publish_gate、durable_lsn 推进、seal 触发 | 写/读/seal 协调 |
 | §3 front_sched | 前端：memtable、WAL stream、seal/lookup/collect | 前端操作实现 |
-| §4 tree domain | `tree_sched / tree_lookup_sched / tree_worker_sched`、allocator、manifest、checkpoint_guard | tree 操作实现 |
+| §4 tree domain | `tree_sched` 单点 + K 个 `tree_read_domain<Cache>`（own lookup/worker + `node_cache` + `partitions` snapshot）；allocator、manifest、checkpoint_guard、shard_partition rebuild | tree 操作实现 |
 | §5 wal_space_sched | WAL 空间：segment 分配/回收 | WAL 管理 |
 | §6 value_alloc_sched | 值分配/读取：bump head、class pools、dirty pages、frame cache | value I/O 实现 |
 | §7 nvme_sched | NVMe I/O：FUA write、FLUSH、TRIM | 底层 I/O |
@@ -253,9 +254,10 @@ hole 复用: clean_allocatable → dirty_hole_fill → writeback_inflight → cl
 |-----------|--------|------|---------|
 | coord_sched | 1 | 固定 | LSN、durable_lsn、seal、frontier switch |
 | front_sched | N (分片) | key_hash % N | memtable、WAL stream |
-| tree_sched | 1 | 固定 | tree allocator、tree-local flush、reclaim |
-| tree_lookup_sched | M | key_hash % M | tree 查询、leaf mapping |
-| tree_worker_sched | M | read-domain % M | old leaf read、candidate build |
+| tree_sched | 1 | 固定 | tree allocator、tree-local flush、reclaim、shard_partition_map rebuild |
+| tree_read_domain | M | `current_shard_partitions()->route(key)`（shard-partition binary search，INC-040 / step 030 §2.7） | own lookup + worker；持 `node_cache` shard、路由 snapshot |
+| ↳ lookup | 与 read_domain 1:1 | 继承 | tree 查询、leaf mapping |
+| ↳ worker | 与 read_domain 1:1 | 继承 | old leaf read、candidate build |
 | wal_space_sched | 1 | 固定 | WAL segment 池 |
 | value_alloc_sched | 1 | 固定 | value 分配/读取/缓存 |
 | nvme_sched | K | 轮询/指定 | NVMe I/O |

@@ -9,9 +9,11 @@
 //   tree_worker_sched_base  — single per-round queue + schedule /
 //                             submit methods. Registry stores base
 //                             pointers.
-//   tree_worker_sched<Cache> — holds Cache* (shared read_domain
-//                              cache); advance() invokes
-//                              process_flush_round<Cache>().
+//   tree_worker_sched<Cache> — holds a typed back-reference to the
+//                              owning `tree_read_domain<Cache>` and
+//                              drives `process_flush_round<Cache>`
+//                              against that read_domain's
+//                              `node_cache`.
 //
 // Step 027 collapses the prior two-handle worker surface
 // (`_leaf_mapping` + `_process_candidates`) into a single handle
@@ -20,9 +22,22 @@
 // `submit_flush_work` (this file, free helper) loops the per-round
 // handle with NVMe-read dispatch until the proposal is complete.
 //
-// The shared Cache instance is owned by whoever constructs the
-// read_domain (currently tree_lookup_sched<Cache> owns it). The
-// worker holds a non-owning pointer set at construction time.
+// Step 030 cache-ownership move: the shared `Cache` instance lives
+// on `core::tree_read_domain<Cache>` (RSM §4.7). The worker reaches
+// it via `read_domain_->node_cache` — template-specialized on the
+// same `Cache`, so `process_flush_round` still receives a raw
+// `Cache*` and inlines cache access with no virtual dispatch
+// (030 §6.1 decision A). The previous `tree_lookup_sched_base*
+// paired_lookup` field is dropped (030 §2.4): it was only a
+// placeholder for a future read-throttle hook, never consulted; a
+// future caller that needs the paired lookup reaches it through
+// `read_domain_->lookup.get()`.
+//
+// Step 030 `read_domain_index` move (§6.6 decision I1): the field
+// lives on `tree_read_domain_base` now. The base's
+// `read_domain_index()` virtual getter returns the value from the
+// owning read_domain, used only on the diagnostic path in
+// `advance()`.
 
 #include <cstddef>
 #include <cstdint>
@@ -36,10 +51,20 @@
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
 
+#include "../core/page_cache.hh"
 #include "../core/panic.hh"
 #include "./candidate_build.hh"
 #include "./flush_types.hh"
 #include "./lookup_scheduler.hh"
+
+// Forward-declare the owning read_domain so the worker can hold a
+// typed back-reference. The full `core::tree_read_domain<Cache>`
+// definition is pulled in by any TU that constructs a
+// `tree_worker_sched<Cache>` (step 030 §7 include contract).
+namespace apps::inconel::core {
+    struct tree_read_domain_base;
+    template <cache_concept Cache> struct tree_read_domain;
+}
 
 namespace apps::inconel::tree {
 
@@ -92,18 +117,20 @@ namespace apps::inconel::tree {
     struct tree_worker_sched_base {
         static constexpr uint32_t kMaxFlushRoundOpsPerAdvance = 16;
 
-        uint32_t                read_domain_index;
-        tree_lookup_sched_base* paired_lookup = nullptr;
-
         pump::core::per_core::queue<_flush_round::req*> flush_round_q;
 
         explicit
-        tree_worker_sched_base(uint32_t                rdi,
-                               tree_lookup_sched_base* lookup = nullptr,
-                               std::size_t             depth  = 2048)
-            : read_domain_index(rdi)
-            , paired_lookup(lookup)
-            , flush_round_q(depth) {}
+        tree_worker_sched_base(std::size_t depth = 2048)
+            : flush_round_q(depth) {}
+
+        virtual ~tree_worker_sched_base() = default;
+
+        // Mirror of `tree_lookup_sched_base::read_domain_index()`
+        // (030 §6.6 decision I1): the field lives on
+        // `tree_read_domain_base`, reached through the derived
+        // scheduler's back-reference. Used only on the diagnostic
+        // panic path in `advance()`.
+        virtual uint32_t read_domain_index() const noexcept = 0;
 
         void
         schedule_flush_round(_flush_round::req* r) {
@@ -121,21 +148,31 @@ namespace apps::inconel::tree {
 
     // ── tree_worker_sched<Cache> (templated) ─────────────────────
     //
-    // Holds a non-owning Cache* — the same read_domain cache that
-    // tree_lookup_sched<Cache> uses. advance() invokes the cache-
-    // aware per-round driver from candidate_build.hh.
+    // Holds a typed back-reference to the owning
+    // `core::tree_read_domain<Cache>`; the shared `node_cache` lives
+    // there. `advance()` invokes `process_flush_round<Cache>` with
+    // `&read_domain_->node_cache` — same compile-time cache type as
+    // the paired lookup scheduler, so the cache access inlines at
+    // every call site (030 §6.1 decision A / §2.4).
 
     template <core::cache_concept Cache>
     struct tree_worker_sched : tree_worker_sched_base {
-        Cache* cache_;
+        core::tree_read_domain<Cache>* read_domain_ = nullptr;
 
+        // Constructed by `core::tree_read_domain<Cache>::ctor` with
+        // `this` pointing back at the enclosing read_domain (030 §2.8
+        // step 5a). The read_domain outlives the scheduler — both
+        // sit in the same `unique_ptr` tree.
         explicit
-        tree_worker_sched(uint32_t                rdi,
-                          Cache*                  cache,
-                          tree_lookup_sched_base* lookup = nullptr,
-                          std::size_t             depth  = 2048)
-            : tree_worker_sched_base(rdi, lookup, depth)
-            , cache_(cache) {}
+        tree_worker_sched(core::tree_read_domain<Cache>* rd,
+                          std::size_t                    depth = 2048)
+            : tree_worker_sched_base(depth)
+            , read_domain_(rd) {}
+
+        uint32_t
+        read_domain_index() const noexcept override {
+            return read_domain_->read_domain_index;
+        }
 
         bool
         advance() {
@@ -151,18 +188,18 @@ namespace apps::inconel::tree {
                         "tree::tree_worker_sched::advance",
                         "_flush_round::req with null worker_state "
                         "(rdi=%u)",
-                        static_cast<unsigned>(read_domain_index));
+                        static_cast<unsigned>(read_domain_->read_domain_index));
                 }
-                if (r->state->read_domain_index != read_domain_index) {
+                if (r->state->read_domain_index != read_domain_->read_domain_index) {
                     core::panic_inconsistency(
                         "tree::tree_worker_sched::advance",
                         "worker_state routed to wrong worker: "
                         "state.rdi=%u self.rdi=%u",
                         static_cast<unsigned>(r->state->read_domain_index),
-                        static_cast<unsigned>(read_domain_index));
+                        static_cast<unsigned>(read_domain_->read_domain_index));
                 }
 
-                auto decision = process_flush_round(*r->state, cache_);
+                auto decision = process_flush_round(*r->state, &read_domain_->node_cache);
                 r->cb(std::move(decision));
                 delete r;
                 progress = true;

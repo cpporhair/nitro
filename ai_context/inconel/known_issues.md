@@ -27,7 +27,6 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-040 | front→tree_lookup 的路由 spec 和实现都写成 hash-based (`home_tree_lookup(front_owner)`)，与设计意图不符。正确意图是 key-range based：同一 leaf page 的所有 key 路到同一 `read_domain`，保证一张 page 在系统里只 cache 一次。hash-based 会让同 leaf 的不同 key 走到不同 read_domain，在多核重复 cache 同一 page | 用户澄清（2026-04-15）；当前写在 RSM §4.7、design_overview read 伪码、registry.hh L209-217 注释 stub、audit/tree.md F7；plan/027 Gap 3 讨论副产出 | `normal` (做完 step 027 后必须改) | 把 front→lookup 路由从 `front_owner % tree_lookup_count` 换成 `route_tree_lookup_for_key(manifest, key) = key_range_index_from_leaf_order(manifest.leaf_order, key) % tree_lookup_count`；同步修 RSM §4.7 / design_overview 读路径伪码 / registry.hh stub / read_api_and_pipeline.md；INC-003 的 sender API shape 问题也一起收（改成内部按 manifest+key 解析，不要求 caller 传 front_owner） |
 
 ### 未来功能的基础，建议提前设计 + 实现
 
@@ -64,7 +63,6 @@
 
 | ID | Issue | 来源 | Priority | 方向 |
 |----|-------|------|----------|------|
-| INC-003 | tree lookup sender 让 caller 自由传 sched 指针，没有内部路由解析 | audit/tree.md F7 | `blocked` (apps/inconel/front/) | sender API 改成内部按 `(keys, manifest)` 解析路由，由 runtime 自己决定 read_domain。路由 spec 本身按 INC-040 走 key-range 路由，**不要**按 `front_owner % count` 做 stub（那是和设计意图冲突的方向） |
 
 ### 最好等 Runtime Format / Recovery 模块
 
@@ -105,6 +103,8 @@
 
 | ID | Issue | 来源 | 解决 |
 |----|-------|------|------|
+| INC-003 | tree lookup sender 让 caller 自由传 sched 指针，没有内部路由解析 | audit/tree.md F7 | 2026-04-16 step 030 最终形态：公开 API 稳定为 `tree::lookup(keys, manifest)`（无 sched 指针）；sender 内部 `build_route_plan` 改用 `current_shard_partitions()->route(key)` 分组，fan-out 目标从 `tree_lookup_at(idx)` 换成 `tree_read_domain_at(idx)->lookup_sched`。与 INC-040 一并收敛 |
+| INC-040 | front→tree_lookup 的路由 spec 和实现都写成 hash-based (`home_tree_lookup(front_owner)`)，与设计意图不符。正确意图是 key-range based：同一 leaf page 的所有 key 路到同一 read_domain，保证一张 page 在系统里只 cache 一次 | 用户澄清（2026-04-15）；当时写在 RSM §4.7、design_overview read 伪码、registry.hh L209-217 注释 stub、audit/tree.md F7；plan/027 Gap 3 讨论副产出 | 2026-04-16 step 030 最终形态：(1) routing carrier 从 `leaf_order.find_leaf_for_key(key) % K`（前一轮 INC-040 修过的 ordinal modulo）彻底换成**全局 `shard_partition_map`**：`current_shard_partitions()->route(key)` 一次二分拿 `shard_idx`，lookup / flush fold 两条路径**共用同一张 map**（`memtable_fold::build_key_partitions` 同步切换），保证 "同 key → 同 shard" 不变量。(2) 立起 `core::tree_read_domain<Cache>`，own `tree_lookup_sched` / `tree_worker_sched` + `node_cache` + routing snapshot；PUMP runtime tuple 折成单 read_domain 槽位；registry 只留 `tree_read_domains.list`，旧 `tree_lookup_scheds` / `tree_worker_scheds` / `tree_lookup_at` / `tree_worker_at` / `route_tree_lookup_for_key` 全删。(3) `inconel_test_tree_lookup` / `inconel_test_tree_lookup_multicore` / `inconel_test_runtime` 三个验收测试 pass；spec 同步覆盖 RSM §1/§4/§4.7/§4.8/§9.3/§10.3、design_overview §1.7/§1.8/§8.1/§14、read_api §4/§5/§5.4/§9.2、code_modules、INDEX；audit/tree.md F7 标记 resolved |
 | INC-004 | tree + value 检测到 corruption 时走 silent fallback 或 throw 而不是 panic：tree::process_entries 把 CRC/magic/zero 失败映射成 `lookup_absent`；value::scheduler `handle_fill` / `serve_hit_or_fail` 走 cb/fail dual callback 抛异常进 PUMP exception path | audit/tree.md F1 + audit/value.md V1 + V7 | step 009 已完成：新增 `core/panic.hh::panic_inconsistency`，tree page corruption 与 value decode corruption 统一改为 fail-fast panic，并携带 `tree_page_status` / `value_decode_status` 具体 reason |
 | INC-005 | `tree_manifest::resolve` 用 assert，Release 退化 UB | audit/tree.md F2 | step 009 已完成：`tree_manifest::resolve()` 在 miss 时改为 `panic_inconsistency(...)`，不再依赖 Release 会消失的 `assert` |
 | INC-007 | `tree_manifest` 模块归属 core/ vs tree/ 不明，spec 没明说 | audit/tree.md F6 | step 011 已完成：在 `core/tree_manifest.hh` 文件头明确记录归属决策，拍板继续留在 `core/`，不做文件迁移 |

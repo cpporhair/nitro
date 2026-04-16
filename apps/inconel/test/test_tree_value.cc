@@ -31,6 +31,8 @@
 #include "pump/sender/submit.hh"
 
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
+#include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/format/types.hh"
 #include "apps/inconel/format/value_object.hh"
 #include "apps/inconel/tree/page_builder.hh"
@@ -93,11 +95,13 @@ void build_subLba_page_image(std::vector<char>& page,
 // (no share_nothing worker thread, so no leak surface from worker shutdown).
 
 struct test_env {
-    mock_device                          dev;
-    scheduler                            nvme_sched;
-    tree_lookup_sched<clock_cache>        tree_sched;
-    value::value_alloc_sched<clock_cache> value_sched;
-    tree_manifest                        manifest;
+    mock_device                                 dev;
+    scheduler                                   nvme_sched;
+    leaf_order_index                            leaf_order;
+    std::shared_ptr<const shard_partition_map>  partitions;
+    tree_read_domain<clock_cache>               read_domain;
+    value::value_alloc_sched<clock_cache>       value_sched;
+    tree_manifest                               manifest;
 
     std::vector<std::string> keys;
     std::vector<std::string> bodies;
@@ -106,7 +110,10 @@ struct test_env {
     explicit test_env(uint32_t value_cache_cap = 32)
         : dev(LBA_SIZE * TOTAL_LBAS, LBA_SIZE)
         , nvme_sched(&dev)
-        , tree_sched(0, &kTreeGeom, clock_cache(32))
+        , leaf_order(build_single_leaf_order())
+        , partitions(std::make_shared<const shard_partition_map>(
+              build_initial_shard_partition_map(leaf_order, 1)))
+        , read_domain(/*rdi=*/0, partitions, clock_cache(32), &kTreeGeom)
         , value_sched(std::span<const uint32_t>(CLASS_SIZES),
                       LBA_SIZE,
                       paddr{0, DATA_AREA_BASE_LBA},
@@ -117,15 +124,29 @@ struct test_env {
 
         registry::clear();
         registry::init_capacity(8);
+        registry::install_shard_partitions(partitions);
         registry::nvme_scheds.list.push_back(&nvme_sched);
         registry::nvme_scheds.by_core[0] = &nvme_sched;
-        registry::tree_lookup_scheds.list.push_back(&tree_sched);
-        registry::tree_lookup_scheds.by_core[0] = &tree_sched;
+        registry::tree_read_domains.list.push_back(&read_domain);
+        registry::tree_read_domains.by_core[0] = &read_domain;
         registry::value_alloc_sched = &value_sched;
 
         seed_value_page();
         seed_leaf_page();
         configure_manifest();
+    }
+
+    static leaf_order_index build_single_leaf_order() {
+        leaf_order_index idx;
+        idx.fence_pool = "";
+        idx.spans.push_back({
+            .fence_lower_off = 0,
+            .fence_upper_off = 0,
+            .fence_lower_len = 0,
+            .fence_upper_len = 0,
+            .leaf_range_base = paddr{0, LEAF_LBA},
+        });
+        return idx;
     }
 
     ~test_env() {
@@ -178,13 +199,16 @@ private:
         manifest.geom           = &kTreeGeom;
         manifest.root_slot      = paddr{0, LEAF_LBA};
         manifest.slot_map[paddr{0, LEAF_LBA}] = 0;
+        // Single-leaf-root tree: leaf_order is the same single-span
+        // index used when constructing the shard_partition_map above.
+        manifest.leaf_order = leaf_order;
     }
 };
 
 // drive all schedulers manually until `done` flips to true
 void advance_until(test_env& env, bool& done, int max_iters = 500) {
     for (int i = 0; i < max_iters && !done; ++i) {
-        env.tree_sched.advance();
+        env.read_domain.advance();   // drives lookup + worker arms
         env.nvme_sched.advance();
         env.value_sched.advance();
     }
@@ -220,7 +244,7 @@ void case_1_lookup_then_read() {
     std::vector<std::string> got;
 
     ps::just()
-        >> lookup(&env.tree_sched, key_views, &env.manifest)
+        >> lookup(key_views, &env.manifest)
         >> ps::flat_map([sched = &env.value_sched]
                         (std::vector<lookup_result>&& results) {
             return ps::just()
@@ -272,7 +296,7 @@ void case_2_missing_key() {
     std::vector<lookup_result> looked_up;
     bool tree_done = false;
     pump::sender::just()
-        >> lookup(&env.tree_sched, key_views, &env.manifest)
+        >> lookup(key_views, &env.manifest)
         >> pump::sender::then([&](std::vector<lookup_result>&& r) {
             looked_up = std::move(r);
             tree_done = true;

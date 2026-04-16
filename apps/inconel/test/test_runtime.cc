@@ -3,10 +3,11 @@
 //
 // Verifies that:
 //   1. build_runtime<Cache>() correctly populates core::runtime registry
-//      with both nvme + tree_lookup per core, and the PUMP global_runtime_t
-//      tuple in parallel
-//   2. core::registry::local_nvme() / local_tree_lookup() return the right
-//      instance based on pump::core::this_core_id (per-core fast path)
+//      with nvme + tree_read_domain per core, and the PUMP global_runtime_t
+//      tuple in parallel (step 030: one tuple slot per read_domain drives
+//      both lookup and worker arms)
+//   2. core::registry::local_nvme() / local_tree_read_domain() return the
+//      right instance based on pump::core::this_core_id (per-core fast path)
 //   3. PUMP share_nothing::run() advance loops on multiple cores correctly
 //      drive the schedulers exposed via the registry
 //   4. Tree lookups go through the registry end-to-end and produce correct
@@ -29,6 +30,8 @@
 #include "pump/sender/submit.hh"
 
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
+#include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/runtime/start.hh"
@@ -111,6 +114,29 @@ static void write_internal(mock_device& dev, uint64_t lba,
     [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
+// leaf_order for the shared 3-level/8-leaf fixture (INC-040).
+static core::leaf_order_index
+build_leaf_order_8leaves() {
+    core::leaf_order_index idx;
+    idx.fence_pool = "cegjmps";
+    static const uint64_t bases[]     = {3000, 3004, 3012, 3016,
+                                          3020, 3024, 3028, 3032};
+    static const uint32_t lower_off[] = {0, 0, 1, 2, 3, 4, 5, 6};
+    static const uint16_t lower_len[] = {0, 1, 1, 1, 1, 1, 1, 1};
+    static const uint32_t upper_off[] = {0, 1, 2, 3, 4, 5, 6, 0};
+    static const uint16_t upper_len[] = {1, 1, 1, 1, 1, 1, 1, 0};
+    for (int i = 0; i < 8; ++i) {
+        idx.spans.push_back({
+            .fence_lower_off = lower_off[i],
+            .fence_upper_off = upper_off[i],
+            .fence_lower_len = lower_len[i],
+            .fence_upper_len = upper_len[i],
+            .leaf_range_base = paddr{0, bases[i]},
+        });
+    }
+    return idx;
+}
+
 struct tree_data {
     mock_device dev;
     std::mutex dev_mtx;
@@ -149,6 +175,7 @@ private:
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
             manifest.slot_map[{0, lba}] = 0;
+        manifest.leaf_order = build_leaf_order_8leaves();
     }
 };
 
@@ -169,29 +196,31 @@ static void test_registry_population(const char* label) {
 
     // 1. List counts match the number of populated cores.
     CHECK(core::registry::nvme_count() == cores.size());
-    CHECK(core::registry::tree_lookup_count() == cores.size());
-    CHECK(core::registry::tree_worker_count() == cores.size());
+    CHECK(core::registry::tree_read_domain_count() == cores.size());
 
     // 2. by_core is filled exactly for the listed cores, nullptr elsewhere.
     for (uint32_t c = 0; c < std::thread::hardware_concurrency(); ++c) {
         bool expected = std::find(cores.begin(), cores.end(), c) != cores.end();
         bool got_nvme = core::registry::nvme_for_core(c) != nullptr;
-        bool got_tlookup = core::registry::tree_lookup_for_core(c) != nullptr;
+        bool got_rd = core::registry::tree_read_domain_for_core(c) != nullptr;
         CHECK(got_nvme == expected);
-        CHECK(got_tlookup == expected);
+        CHECK(got_rd == expected);
     }
 
     // 3. PUMP runtime tuple has the same instances we registered.
+    //    Step 030: a single `tree_read_domain<Cache>` slot replaces
+    //    the former `tree_lookup_sched<Cache>` + `tree_worker_sched<Cache>`
+    //    pair; the read_domain's `lookup_sched` / `worker_sched` base
+    //    pointers give non-templated registry consumers access to the
+    //    individual arms.
     for (uint32_t c : cores) {
         auto* nvme_p = rt->template get_by_core<mock_nvme::scheduler>(c);
-        auto* tlookup_p = rt->template get_by_core<tree_lookup_sched<Cache>>(c);
-        auto* tworker_p = rt->template get_by_core<tree_worker_sched<Cache>>(c);
+        auto* rd_p   = rt->template get_by_core<core::tree_read_domain<Cache>>(c);
         CHECK(nvme_p == core::registry::nvme_for_core(c));
-        // tree_lookup is registered as base in the application registry,
-        // but PUMP holds the full derived type. Compare via base upcast.
-        CHECK(static_cast<tree_lookup_sched_base*>(tlookup_p) ==
-               core::registry::tree_lookup_for_core(c));
-        CHECK(tworker_p == core::registry::tree_worker_for_core(c));
+        CHECK(static_cast<core::tree_read_domain_base*>(rd_p) ==
+              core::registry::tree_read_domain_for_core(c));
+        CHECK(rd_p->lookup_sched == rd_p->lookup.get());
+        CHECK(rd_p->worker_sched == rd_p->worker.get());
     }
 
     // 4. Standard runtime construction always installs the value singleton
@@ -255,8 +284,10 @@ static void test_bootstrap_profile_validation_fail_fast(const char* label) {
 // ── Test 2: end-to-end multi-core lookup via registry ──
 //
 // Workers run pump::env::runtime::run() with the registry already populated.
-// Main thread submits lookups, splits across the tree_lookup shards via the
-// registry's tree_lookup_at() function, and verifies all 400 keys resolve.
+// Main thread submits lookups, splits across the tree_read_domains via
+// `current_shard_partitions()->route(key)` and
+// `core::registry::tree_read_domain_at(shard_idx)->lookup_sched`
+// (step 030 §2.6 / §6.4 F2), and verifies all 400 keys resolve.
 
 template <core::cache_concept Cache>
 static void test_e2e_multicore_via_runtime(const char* label) {
@@ -270,8 +301,29 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     };
     auto* rt = runtime::build_runtime<Cache, Cache>(opts);
 
-    const uint32_t shards = core::registry::tree_lookup_count();
+    const uint32_t shards = core::registry::tree_read_domain_count();
     CHECK(shards == cores.size());
+
+    // Replace the bootstrap placeholder shard_partition_map (single
+    // shard → everything routes to core 2) with one derived from the
+    // test's 8-leaf manifest. Step 030 builder installs a placeholder
+    // at startup because the tree is empty at boot; this test seeds a
+    // populated manifest and expects routing to split across cores.
+    {
+        auto partitions = std::make_shared<const core::shard_partition_map>(
+            core::build_initial_shard_partition_map(
+                td.manifest.leaf_order, shards));
+        core::registry::install_shard_partitions(partitions);
+        // Propagate the new map into each read_domain's `partitions`
+        // snapshot so a future rebuild that prefers per-domain reads
+        // also sees it. Step 030 does not implement rebuild — this is
+        // a defensive sync so the test state matches what a real
+        // rebuild would produce.
+        for (auto* rd : core::registry::tree_read_domains.list) {
+            static_cast<core::tree_read_domain<Cache>*>(rd)->partitions =
+                partitions;
+        }
+    }
 
     // Spawn worker threads using PUMP's run() — each thread sets its own
     // this_core_id and drives the per-core advance loop. Stop them later by
@@ -297,14 +349,16 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     for (auto& [k, v] : td.all_records) keys_owned.push_back(k);
 
     for (size_t i = 0; i < N; ++i) {
-        // Stable shard selection — replace with proper key hash routing once
-        // route_to_front exists. For now, even/odd split.
-        auto* tlookup = core::registry::tree_lookup_at(i % shards);
-
+        // Routing is resolved inside `tree::lookup` by
+        // `current_shard_partitions()->route(key)` (INC-040 / INC-003 /
+        // step 030). With 8 leaves range-partitioned into 2 shards,
+        // leaves 0..3 (a,c,e,g) → shard 0 (core 2), leaves 4..7
+        // (j,m,p,s) → shard 1 (core 4), keeping both worker cores
+        // engaged without a caller-side split.
         std::vector<std::string_view> single = { keys_owned[i] };
         auto ctx = pump::core::make_root_context();
         pump::sender::just()
-            >> tree::lookup(tlookup, single, &td.manifest)
+            >> tree::lookup(single, &td.manifest)
             >> pump::sender::then([&results, &completed, i](std::vector<lookup_result>&& r) {
                 results[i] = std::move(r[0]);
                 completed.fetch_add(1, std::memory_order_release);

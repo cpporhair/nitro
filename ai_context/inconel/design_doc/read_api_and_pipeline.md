@@ -155,11 +155,18 @@ point_get(key)
            // memtable miss → 继续查 tree
            goto step 6
 
-6. 路由到 owner front 的 home `tree_lookup_sched`
-   tree_owner = route_tree_lookup(owner)
+6. 确定该 key 的 home `tree_read_domain`（shard-partition routing，INC-040 / step 030）：
+       shard_idx = core::registry::current_shard_partitions()->route(key)
+       home      = core::registry::tree_read_domain_at(shard_idx)
+   取 manifest 来自 cat->prs->tree_guard->manifest。说明：
+   - `shard_partition_map` 是**全局单例 snapshot**，读路径和 flush fold 路径共用同一张 map；map 由 `tree_sched` 在每次 flush 完成后基于新 `leaf_order` 重建并原子替换。
+   - `route(key)` 是单次二分（成本 `log2(shard_count)`），不触碰 leaf。map 的 `+∞` sentinel 由 builder 保证，coverage gap 直接 panic。
+   - 由此推出"一张 tree page 最多只在一个 read_domain 的 `node_cache` 驻留一份"：同 shard 的所有 key 永远路由到同一个 read_domain。
 
-7. 查 tree（on tree_lookup_sched[tree_owner]，使用 cat->prs->tree_guard.manifest）
+7. 查 tree（on 路由得到的 read_domain.lookup，使用同一 manifest）
    tree_result = tree_lookup(key, cat->prs->tree_guard->manifest)
+   注：`tree::lookup(keys, manifest)` sender 内部自动做 route + fan-out +
+   scatter，调用方不传 sched 指针（INC-003 / INC-040 一并收敛）。
 
 8. 处理 tree 结果：
    match tree_result:
@@ -199,13 +206,12 @@ point_get(key)
          } else if constexpr (std::is_same_v<T, tombstone_tag>) {
              return just(not_found_result{});
          } else {
-             // miss → tree_lookup_sched 查 tree → value_alloc_sched 读 value
+             // miss → tree::lookup sender 内部按 shard_partition_map 路由到
+             // 对应 tree_read_domain.lookup → value_alloc_sched 读 value（INC-040 / step 030）
              return get_context<read_handle>()
-                 >> then([key](read_handle& rh) {
-                        uint32_t owner = key_hash(key) % front_sched_count;
-                        uint32_t tree_owner = route_tree_lookup(owner);
-                        return tree_lookup_sched[tree_owner]->tree_lookup(
-                            key, rh.cat->prs->tree_guard->manifest);
+                 >> flat_map([key](read_handle& rh) {
+                        return tree::lookup({key},
+                            rh.cat->prs->tree_guard->manifest);
                     })
                  >> flat()
                  >> visit()         // variant<leaf_value, leaf_tombstone, absent>
@@ -322,10 +328,13 @@ multi_get(keys[])
 
 4. 收集 memtable miss 的 keys → tree_miss_keys
 
-5. 按 `route_tree_lookup(owner_front(key))` 对 tree_miss_keys 分组
+5. 按 `current_shard_partitions()->route(key)` 对 tree_miss_keys 分组
+   （INC-040 / step 030）。同 shard 的 key 必然落到同一 read_domain，
+   保证一张 tree page 在整个读路径里最多只在一个 read_domain cache 驻留一份。
 
-6. Fan-out 到各 `tree_lookup_scheds` 做 tree batch lookup
-   tree_results = parallel tree_batch_lookup(group.keys, manifest, group.tree_owner)
+6. Fan-out 到各 `tree_read_domain.lookup` 做 tree batch lookup
+   `tree::lookup(group.keys, manifest)` sender 内部按 key 再次做 shard-partition
+   routing + scatter，调用方不需要显式传 sched 指针。
 
 7. 从 tree results 中提取 value refs，按 value page 分组
    value_groups = group_value_refs_by_page(tree_results)
@@ -372,17 +381,15 @@ multi_get(keys)
          auto miss_keys = extract_miss_keys(memtable_results);
          if (miss_keys.empty())
              return just(std::move(memtable_results));
-         auto groups = group_keys_by_tree_lookup_owner(miss_keys);
          return get_context<read_handle>()
-             >> then([groups = std::move(groups), mr = std::move(memtable_results)]
-                     (read_handle& rh) mutable {
-                    auto manifest = rh.cat->prs->tree_guard->manifest;
-                    return for_each(groups)
-                        >> concurrent(tree_lookup_sched_count)
-                        >> flat_map([manifest](auto&& group) {
-                               return tree_lookup_sched[group.tree_owner]->tree_batch_lookup(
-                                   group.keys, manifest);
-                           })
+             >> flat_map([miss_keys = std::move(miss_keys),
+                          mr = std::move(memtable_results)]
+                         (read_handle& rh) mutable {
+                    // tree::lookup sender does ordinal routing + shard
+                    // fan-out + scatter internally (INC-040 / INC-003).
+                    return tree::lookup(miss_keys,
+                                        rh.cat->prs->tree_guard->manifest);
+                })
                         >> reduce(merged_tree_results, merge)
                         // ── Phase 2b: value read for tree hit values ──
                         >> then([](auto&& tree_results) {
@@ -432,21 +439,36 @@ batch_lookup(keys[], read_lsn, front_read_set):
 
 ### 5.4 Tree Batch Lookup
 
-```text
-tree_batch_lookup(keys[], manifest, tree_owner):
-    // 按 key 排序（利用 B+ tree 的顺序访问局部性）
-    sorted_keys = sort(keys)
+`tree::lookup(keys, manifest)` 是外层公开的 sender：它内部按
+`shard_idx = current_shard_partitions()->route(key)`
+把整批 key 拆成**每个 shard 一组**，再并发地在各自的
+`tree_read_domain_at(shard_idx)->lookup_sched`
+上执行 shard-local 批量下降；最后把每组 shard 返回的 `lookup_result[]`
+scatter 回输入顺序（INC-040 / step 030）。
 
-    results = []
-    for key in sorted_keys:
-        result = tree_lookup(key, manifest)         // 在同一个 tree_lookup_sched 上顺序执行
-        results.push({ key, result })
-    return results
+每个 shard-local 下降的核心循环仍是顺序的（共享同一 read_domain 的
+`tree_node` readonly_frame_cache）：
+
+```text
+shard_lookup(sched, keys_in_shard[], manifest):
+    state = make_lookup_state(keys_in_shard, manifest)
+    while not state.all_done:
+        decision = sched->process(state)     // 在 read_domain.lookup 的核心执行
+        match decision:
+            need_read(descs, frames):
+                parallel NVMe reads → submit frames into read_domain's node_cache
+            done:
+                break
+    return [ entry.result for entry in state.entries ]    // 按 keys_in_shard 顺序
 ```
 
-优化方向：
-- 排序后顺序遍历，叶子节点有缓存局部性
-- 可以按 leaf range 分组，批量读取相邻 leaf pages
+注意：
+- 调用方**不**传 sched 指针，也不显式做 group_by_tree_lookup_owner；
+  sender 内部处理（INC-003 / INC-040 收敛）。
+- 同一 leaf 的所有 key 永远落到同一个 shard，因此一张 tree page 在整个
+  读路径里最多只在一个 read_domain 的 tree_node cache 驻留一份。
+- 排序后顺序遍历仍然保留叶子节点的缓存局部性；可以按 leaf range
+  进一步分组，批量读取相邻 leaf pages。
 
 ### 5.5 全局合并规则
 
@@ -472,7 +494,7 @@ range_scan(begin, end)
 
 2. 并发执行：
    a. 各 front_sched 的 memtable scan
-   b. on one `tree_lookup_sched` 执行 tree range scan
+   b. on one `tree_read_domain.lookup` 执行 tree range scan
 
 3. Merge：memtable results overlay on tree results
 
@@ -498,11 +520,12 @@ range_scan(begin, end)
                   return item.fs->scan_memtable(begin, end, read_lsn, item.frs);
               })
            >> reduce(merged_memtable_scan, merge_sorted),
-         // tree scan（在选定的 tree_lookup_sched 上执行，不经过 tree_sched）
+         // tree scan（在选定的 tree_read_domain.lookup 上执行，不经过 tree_sched）
          get_context<read_handle>()
            >> then([begin, end](read_handle& rh) {
                   uint32_t tree_owner = route_tree_scan(begin, end);
-                  return tree_lookup_sched[tree_owner]->tree_scan(
+                  return core::registry::tree_read_domain_at(tree_owner)
+                             ->lookup_sched->tree_scan(
                       begin, end, rh.cat->prs->tree_guard->manifest);
               })
            >> flat()
@@ -714,7 +737,7 @@ v1 先实现策略 3（内存反压）和策略 2（作为观测/告警手段）
 
 ### 9.2 Tree Node Frame Cache
 
-`tree_lookup_sched` 使用自己持有的 `readonly_frame_cache` 获取 tree page frame：
+每个 `tree_read_domain` 持有一个 `readonly_frame_cache` shard（`Cache node_cache`），lookup / worker 两个 arm 通过 `read_domain_->node_cache` 共享访问（step 030 §2.3 / §6.1 A）。`tree_lookup_sched` 和 `tree_worker_sched` 都在同一 `Cache` 类型上模板化，调用点内联，零虚调用。
 
 ```cpp
 // 概念接口（返回 frame_pin，RAII 自动 pin/unpin）
@@ -731,7 +754,7 @@ frame_pin get_or_read_tree_node(paddr slot_paddr, uint16_t span_lbas) {
 }
 ```
 
-这里仍然用裸 `frame_id` 命中 tree page cache。v1 的正确性前提不是“地址永不复用”，而是 tree old range 在进入 `tree_allocator.free_ranges` 前已经完成 `tree_node` invalidate barrier（见 `runtime_memory_and_cache.md` §10.2）。`front_sched` 本身不拥有 tree-node cache；它只把 memtable miss 路由到 home `tree_lookup_sched`。
+这里仍然用裸 `frame_id` 命中 tree page cache。v1 的正确性前提不是“地址永不复用”，而是 tree old range 在进入 `tree_allocator.free_ranges` 前已经完成 `tree_node` invalidate barrier（见 `runtime_memory_and_cache.md` §10.2）。`front_sched` 本身不拥有 tree-node cache；它只通过 `current_shard_partitions()->route(key)` 把 memtable miss 路由到 home `tree_read_domain` 的 `lookup` arm。
 
 **pin 语义**：tree 遍历是多步异步操作（root → internal → leaf）。每步获取 `frame_pin`（RAII），pin 析构时自动 `pin_count--`。pin_count > 0 的 frame 不可驱逐。frame 由 cache 持有，消费者不持有 ownership（见 `runtime_memory_and_cache.md` §5.4）。
 
@@ -775,8 +798,8 @@ memtable hit 的语义不受 frame cache 影响：
 point_get(key):
   memtable hit value → value_view → kv_arena 切片（零拷贝，不经 frame cache）
   memtable hit tombstone → not found
-  memtable miss → route to home tree_lookup_sched:
-    tree traversal: get_or_read_tree_node() × depth 次（在 tree_lookup_sched 上执行）
+  memtable miss → route to home tree_read_domain (via current_shard_partitions()->route(key)):
+    tree traversal: get_or_read_tree_node() × depth 次（在 read_domain.lookup 上执行，共享 read_domain.node_cache）
     leaf hit value → route to value_alloc_sched:
       read_value(vr) → owning bytes（cache hit 含 dirty frame / miss 时 NVMe read）
     leaf hit tombstone → not found

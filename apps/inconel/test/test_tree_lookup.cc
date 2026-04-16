@@ -9,11 +9,14 @@
 #include "apps/inconel/test/check.hh"
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
+#include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/tree/sender.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "pump/sender/just.hh"
@@ -69,6 +72,49 @@ static void write_internal(mock_device& dev, uint64_t lba,
     [[maybe_unused]] bool wrote = dev.do_write(lba, page, 1); CHECK(wrote);
 }
 
+// Build the leaf_order for the 3-level/8-leaf fixture shared by the
+// lookup tests. Fences match the internal-page separators exactly:
+//   leaf 0 (a*, lba 3000) : [-,  "c")
+//   leaf 1 (c*, lba 3004) : ["c","e")
+//   leaf 2 (e*, lba 3012) : ["e","g")
+//   leaf 3 (g*, lba 3016) : ["g","j")
+//   leaf 4 (j*, lba 3020) : ["j","m")
+//   leaf 5 (m*, lba 3024) : ["m","p")
+//   leaf 6 (p*, lba 3028) : ["p","s")
+//   leaf 7 (s*, lba 3032) : ["s", -)
+// Step 030 routes through `shard_partition_map::route(key)`, built
+// from the manifest's `leaf_order` via
+// `build_initial_shard_partition_map(leaf_order, K)`. With K=1 for
+// the single-core test the map collapses to "(-∞, +∞) → shard 0";
+// multi-core tests build their own K-shard map.
+static leaf_order_index
+build_leaf_order_8leaves() {
+    leaf_order_index idx;
+    idx.fence_pool = "cegjmps";  // 7 unique separator bytes
+    static const uint64_t bases[]  = {3000, 3004, 3012, 3016,
+                                       3020, 3024, 3028, 3032};
+    static const uint32_t lower_off[] = {0, 0, 1, 2, 3, 4, 5, 6};
+    static const uint16_t lower_len[] = {0, 1, 1, 1, 1, 1, 1, 1};
+    static const uint32_t upper_off[] = {0, 1, 2, 3, 4, 5, 6, 0};
+    static const uint16_t upper_len[] = {1, 1, 1, 1, 1, 1, 1, 0};
+    for (int i = 0; i < 8; ++i) {
+        idx.spans.push_back({
+            .fence_lower_off = lower_off[i],
+            .fence_upper_off = upper_off[i],
+            .fence_lower_len = lower_len[i],
+            .fence_upper_len = upper_len[i],
+            .leaf_range_base = paddr{0, bases[i]},
+        });
+    }
+    return idx;
+}
+
+static std::shared_ptr<const shard_partition_map>
+make_partitions_for(const leaf_order_index& lo, uint32_t K) {
+    return std::make_shared<const shard_partition_map>(
+        build_initial_shard_partition_map(lo, K));
+}
+
 // ── Test environment ──
 //
 // 3-level tree:
@@ -84,25 +130,30 @@ static void write_internal(mock_device& dev, uint64_t lba,
 //                               → [Leaf @ 3032] s001..s050
 
 struct test_env {
-    mock_device dev;
-    scheduler nvme_sched;
-    tree_lookup_sched<clock_cache> tree_sched;
-    tree_manifest manifest;
+    mock_device                                dev;
+    scheduler                                  nvme_sched;
+    leaf_order_index                           leaf_order;
+    std::shared_ptr<const shard_partition_map> partitions;
+    tree_read_domain<clock_cache>              read_domain;
+    tree_manifest                              manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
     test_env()
         : dev(PS * 8192, LBS)
         , nvme_sched(&dev)
-        , tree_sched(0, &kTreeGeom, clock_cache(32)) {
+        , leaf_order(build_leaf_order_8leaves())
+        , partitions(make_partitions_for(leaf_order, 1))
+        , read_domain(/*rdi=*/0, partitions, clock_cache(32), &kTreeGeom) {
         build();
         // Single-thread test runs everything on this_core_id == 0; register
-        // both schedulers there so the sender's local_nvme() lookup works.
+        // schedulers there so the sender's local_nvme() lookup works.
         registry::clear();
         registry::init_capacity(8);
+        registry::install_shard_partitions(partitions);
         registry::nvme_scheds.list.push_back(&nvme_sched);
         registry::nvme_scheds.by_core[0] = &nvme_sched;
-        registry::tree_lookup_scheds.list.push_back(&tree_sched);
-        registry::tree_lookup_scheds.by_core[0] = &tree_sched;
+        registry::tree_read_domains.list.push_back(&read_domain);
+        registry::tree_read_domains.by_core[0] = &read_domain;
     }
 
     ~test_env() {
@@ -144,6 +195,7 @@ private:
         for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                               3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
             manifest.slot_map[{0, lba}] = 0;
+        manifest.leaf_order = leaf_order;
     }
 };
 
@@ -153,13 +205,13 @@ do_lookup(test_env& env, std::vector<std::string_view> keys) {
     std::vector<lookup_result> out;
     bool done = false;
     pump::sender::just()
-        >> lookup(&env.tree_sched, keys, &env.manifest)
+        >> lookup(keys, &env.manifest)
         >> pump::sender::then([&](std::vector<lookup_result>&& r) {
             out = std::move(r); done = true;
         })
         >> pump::sender::submit(ctx);
     for (int i = 0; i < 200 && !done; ++i) {
-        env.tree_sched.advance();
+        env.read_domain.advance();   // drives lookup + worker arms
         env.nvme_sched.advance();
     }
     CHECK(done);
@@ -238,7 +290,10 @@ static void test_cache_eviction(Cache cache, const char* label) {
     // Build a fresh tree env (isolated from other tests' global env).
     mock_device dev(PS * 8192, LBS);
     scheduler nvme_sched(&dev);
-    tree_lookup_sched<Cache> tree_sched(0, &kTreeGeom, std::move(cache));
+    auto leaf_order = build_leaf_order_8leaves();
+    auto partitions = make_partitions_for(leaf_order, 1);
+    tree_read_domain<Cache> read_domain(
+        /*rdi=*/0, partitions, std::move(cache), &kTreeGeom);
     tree_manifest manifest;
     std::vector<std::pair<std::string, uint64_t>> all_records;
 
@@ -271,6 +326,7 @@ static void test_cache_eviction(Cache cache, const char* label) {
     for (uint64_t lba : {1000, 2000, 2004, 2008, 2012,
                           3000, 3004, 3012, 3016, 3020, 3024, 3028, 3032})
         manifest.slot_map[{0, lba}] = 0;
+    manifest.leaf_order = leaf_order;
 
     // Shuffle the access order so consecutive lookups touch DIFFERENT leaves —
     // this is what actually forces eviction with a small cache. Without
@@ -284,10 +340,11 @@ static void test_cache_eviction(Cache cache, const char* label) {
     // Register schedulers for the sender's local_nvme() resolution.
     registry::clear();
     registry::init_capacity(8);
+    registry::install_shard_partitions(partitions);
     registry::nvme_scheds.list.push_back(&nvme_sched);
     registry::nvme_scheds.by_core[0] = &nvme_sched;
-    registry::tree_lookup_scheds.list.push_back(&tree_sched);
-    registry::tree_lookup_scheds.by_core[0] = &tree_sched;
+    registry::tree_read_domains.list.push_back(&read_domain);
+    registry::tree_read_domains.by_core[0] = &read_domain;
 
     // Reset counter — only count reads from the lookup phase, not the writes
     // we just did to set up the tree.
@@ -303,13 +360,13 @@ static void test_cache_eviction(Cache cache, const char* label) {
         bool done = false;
         std::vector<std::string_view> single = { key };
         pump::sender::just()
-            >> lookup(&tree_sched, single, &manifest)
+            >> lookup(single, &manifest)
             >> pump::sender::then([&](std::vector<lookup_result>&& r) {
                 out = std::move(r); done = true;
             })
             >> pump::sender::submit(ctx);
         for (int i = 0; i < 200 && !done; ++i) {
-            tree_sched.advance();
+            read_domain.advance();
             nvme_sched.advance();
         }
         CHECK(done);
@@ -338,29 +395,37 @@ static void test_cache_eviction(Cache cache, const char* label) {
 static void test_empty_tree() {
     mock_device dev(PS * 1024, LBS);
     scheduler ns(&dev);
-    tree_lookup_sched<clock_cache> ts(0, &kTreeGeom, clock_cache(8));
+    leaf_order_index empty_lo;
+    auto partitions = make_partitions_for(empty_lo, 1);
+    tree_read_domain<clock_cache> read_domain(
+        /*rdi=*/0, partitions, clock_cache(8), &kTreeGeom);
     auto m = tree_manifest::empty(&kTreeGeom);
 
     registry::clear();
     registry::init_capacity(8);
+    registry::install_shard_partitions(partitions);
     registry::nvme_scheds.list.push_back(&ns);
     registry::nvme_scheds.by_core[0] = &ns;
-    registry::tree_lookup_scheds.list.push_back(&ts);
-    registry::tree_lookup_scheds.by_core[0] = &ts;
+    registry::tree_read_domains.list.push_back(&read_domain);
+    registry::tree_read_domains.by_core[0] = &read_domain;
 
     auto ctx = pump::core::make_root_context();
     std::vector<lookup_result> out;
     bool done = false;
     std::vector<std::string_view> keys = {"a", "b", "c"};
     pump::sender::just()
-        >> lookup(&ts, keys, &m)
+        >> lookup(keys, &m)
         >> pump::sender::then([&](std::vector<lookup_result>&& r) {
             out = std::move(r); done = true;
         })
         >> pump::sender::submit(ctx);
-    for (int i = 0; i < 50 && !done; ++i) { ts.advance(); ns.advance(); }
+    for (int i = 0; i < 50 && !done; ++i) {
+        read_domain.advance();
+        ns.advance();
+    }
     CHECK(done && out.size() == 3);
     for (auto& r : out) CHECK(std::holds_alternative<lookup_absent>(r));
+    registry::clear();
     printf("  empty tree: OK\n");
 }
 

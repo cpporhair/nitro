@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -13,7 +14,10 @@
 #include "../core/page_cache.hh"
 #include "../core/registry.hh"
 #include "../core/data_area_heads.hh"
+#include "../core/leaf_order.hh"
+#include "../core/shard_partition_builder.hh"
 #include "../core/tree_geometry.hh"
+#include "../core/tree_read_domain.hh"
 #include "../format/format_profile.hh"
 #include "../format/types.hh"
 #include "../mock_nvme/scheduler.hh"
@@ -31,30 +35,27 @@ namespace apps::inconel::runtime {
     // cache parameters appear at the runtime level — application code
     // interacts with schedulers via the non-templated core::runtime registry.
     //
-    // Step 022 Phase 2 extended the tuple from 3 to 4 scheduler types by
-    // adding `tree::tree_worker_sched` between `tree_lookup_sched` and
-    // `value_alloc_sched`. Worker is non-templated in Phase 2 (cache /
-    // frame pool / inflight still lookup-local, see 022 §3, L-14); when
-    // the cache ownership migration step before Phase 5/6 lands, the
-    // worker will be templated on the same `TreeCache` as the lookup
-    // shard it pairs with.
+    // Step 030 (§6.5 decision G1) collapses the former pair of tuple
+    // entries `tree_lookup_sched<TreeCache>` + `tree_worker_sched<TreeCache>`
+    // into a single `core::tree_read_domain<TreeCache>` entry. The
+    // read_domain owns both schedulers via unique_ptr and exposes
+    // `advance()` that drives both arms in one round — the PUMP runtime
+    // now schedules one unit per core instead of two (030 §2.3 / §2.8
+    // step 6). The ownership chain flattens to:
     //
-    // Step 023 Phase 3 (§9, D25) extends the tuple from 4 to 5 scheduler
-    // types by appending `tree::tree_sched` at the tail. `tree_sched`
-    // is a singleton and is pinned to cores[0] alongside
-    // `value::value_alloc_sched`; every other core's PUMP per-core
-    // tuple carries a nullptr in this slot (same pattern as the value
-    // singleton). Tuple tail is the chosen position because a tail
-    // singleton does not disturb the existing per-core advance order
-    // for the other schedulers, and `tree_sched` is an owner-level
-    // round driver whose work is always entered through its own queue
-    // rather than through advance-order coupling with peers.
+    //   PUMP tuple
+    //     └── tree_read_domain<TreeCache>
+    //           ├── tree_lookup_sched<TreeCache>
+    //           └── tree_worker_sched<TreeCache>
+    //
+    // which lines up with the "one cache shard per read_domain"
+    // invariant (RSM §4.7) and matches the singleton-at-tail pattern
+    // already in place for `tree::tree_sched`.
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
         mock_nvme::scheduler,
-        tree::tree_lookup_sched<TreeCache>,
-        tree::tree_worker_sched<TreeCache>,
+        core::tree_read_domain<TreeCache>,
         value::value_alloc_sched<ValueCache>,
         tree::tree_sched
     >;
@@ -251,28 +252,32 @@ namespace apps::inconel::runtime {
         }
     }
 
-    // ── build_runtime: construct schedulers + double-register ──
+    // ── build_runtime: construct schedulers + register ──
     //
-    // 1. Validate opts + kBootstrapFormatProfile upfront (fail-fast).
-    // 2. Create one mock_nvme::scheduler and one tree_lookup_sched<Cache>
-    //    per core.
-    // 3. Create the singleton value_alloc_sched<Cache> on cores[0] using the
-    //    bootstrap profile; every other core carries a nullptr slot in the
-    //    PUMP typed tuple.
-    // 4. Register each pair to PUMP runtime via add_core_schedulers (per-core
-    //    tuple).
-    // 5. Register the same pointers to core::registry::nvme_scheds,
-    //    core::registry::tree_lookup_scheds, and
-    //    core::registry::value_alloc_sched (upcast to the non-templated base).
+    // Startup sequence (030 §2.8):
+    //   1. Validate `opts` + `kBootstrapFormatProfile` (fail-fast).
+    //   2. Install the bootstrap `shard_partition_map` — a single-shard
+    //      placeholder covering (-∞, +∞) → shard 0 (030 §6.7 decision P).
+    //      The tree is empty at boot (leaf_order = {}) and
+    //      `manifest->has_root()` short-circuits reads before they ever
+    //      route; the placeholder is present so the routing invariant
+    //      ("map is always installed") holds during the bootstrap
+    //      window between first tree_read_domain construction and the
+    //      first flush that populates `leaf_order`.
+    //   3. Per core: construct `tree_read_domain<TreeCache>` which in
+    //      turn owns its `tree_lookup_sched<TreeCache>` and
+    //      `tree_worker_sched<TreeCache>` via `unique_ptr`. The PUMP
+    //      runtime tuple registers the read_domain (not the individual
+    //      schedulers) — one scheduling unit per core.
+    //   4. Construct the global singletons `value_alloc_sched` and
+    //      `tree::tree_sched` on the first core.
+    //   5. Register non-templated base pointers into
+    //      `core::registry::tree_read_domains`. Application code reaches
+    //      schedulers via `tree_read_domain_at(idx)->lookup_sched` /
+    //      `->worker_sched`.
     //
-    // After this returns, application code uses core::registry::local_nvme()
-    // / local_tree_lookup() / value_sched() etc., never touching the runtime
-    // pointer directly. The runtime pointer is only needed by
-    // pump::env::runtime::start/run.
-    //
-    // INC-034: the "empty value_class_sizes → silent disable" half-runtime
-    // that used to live in this function was removed. The standard runtime
-    // now always constructs the value scheduler; tests that want a tree-only
+    // INC-034 (unchanged by 030): the standard runtime always
+    // constructs the value scheduler; tests that want a tree-only
     // harness must route through a dedicated test fixture, not through
     // build_runtime / start_runtime.
 
@@ -290,12 +295,25 @@ namespace apps::inconel::runtime {
         auto shared_heads = std::make_shared<core::data_area_heads>();
         core::registry::data_area_heads_ptr = shared_heads;
 
+        // ── Step 2: bootstrap shard_partition_map ───────────────────
+        // Empty leaf_order at boot; `build_initial_shard_partition_map`
+        // returns a single-shard placeholder map (030 §2.2 decision P).
+        // The placeholder routes every key to shard 0 — K - 1 read
+        // domains sit idle until the first flush populates `leaf_order`
+        // and (future) `tree_sched` triggers a rebuild. Bootstrap-time
+        // reads are short-circuited by `manifest->has_root() == false`,
+        // so the placeholder is not exercised on the read path.
+        {
+            core::leaf_order_index empty_leaf_order;
+            auto map = core::build_initial_shard_partition_map(
+                empty_leaf_order,
+                static_cast<uint32_t>(opts.cores.size()));
+            core::registry::install_shard_partitions(
+                std::make_shared<const core::shard_partition_map>(
+                    std::move(map)));
+        }
+
         bool first = true;
-        // Step 022 §3 / §7 / §8: the read-domain pairing seam is
-        // expressed by "same-core install + shared read_domain_index".
-        // No named tree_read_domain runtime object is materialized;
-        // lookup and worker on the same core simply receive the same
-        // index value.
         uint32_t next_read_domain_index = 0;
         for (uint32_t core : opts.cores) {
             // PUMP per_core::queue routes by this_core_id, so it must be set
@@ -305,20 +323,19 @@ namespace apps::inconel::runtime {
             const uint32_t read_domain_index = next_read_domain_index++;
 
             auto* nvme = new mock_nvme::scheduler(opts.device);
+
             // H-1 (review §1): every tree_lookup_sched is locked to a
             // single tree_geometry instance — namely the bootstrap one
             // owned by this translation unit. Any manifest fed to
             // `process()` later on is asserted to reference the same
-            // pointer, so free-frame reuse cannot cross page sizes.
-            auto* tlookup = new tree::tree_lookup_sched<TreeCache>(
+            // value, so free-frame reuse cannot cross page sizes. The
+            // read_domain transparently propagates that pointer into
+            // its owned lookup scheduler.
+            auto* read_domain = new core::tree_read_domain<TreeCache>(
                 read_domain_index,
-                &kBootstrapTreeGeometry,
-                TreeCache(opts.tree_cache_capacity));
-            auto* tlookup_typed = static_cast<tree::tree_lookup_sched<TreeCache>*>(tlookup);
-            auto* tworker = new tree::tree_worker_sched<TreeCache>(
-                read_domain_index,
-                &tlookup_typed->page_cache_,
-                tlookup);
+                core::registry::current_shard_partitions(),
+                TreeCache(opts.tree_cache_capacity),
+                &kBootstrapTreeGeometry);
 
             // Singleton: value_alloc_sched is pinned to cores[0]. Every other
             // core gets a nullptr placeholder so the PUMP per-core tuple shape
@@ -358,16 +375,14 @@ namespace apps::inconel::runtime {
             }
 
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
-            // nvme, tree_lookup, tree_worker, value_alloc, tree_sched.
-            rt->add_core_schedulers(core, nvme, tlookup, tworker, value_sched, tsched);
+            // nvme, tree_read_domain, value_alloc, tree_sched.
+            rt->add_core_schedulers(core, nvme, read_domain, value_sched, tsched);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme);
             core::registry::nvme_scheds.by_core[core] = nvme;
-            core::registry::tree_lookup_scheds.list.push_back(tlookup);
-            core::registry::tree_lookup_scheds.by_core[core] = tlookup;
-            core::registry::tree_worker_scheds.list.push_back(tworker);
-            core::registry::tree_worker_scheds.by_core[core] = tworker;
+            core::registry::tree_read_domains.list.push_back(read_domain);
+            core::registry::tree_read_domains.by_core[core] = read_domain;
 
             first = false;
         }
@@ -377,16 +392,14 @@ namespace apps::inconel::runtime {
 
     // ── tear_down: free schedulers + clear registry ──
     //
-    // Destroy order follows step 023 §9 / D26:
-    //   tree_sched → tree_worker → tree_lookup → value → nvme.
-    // `tree_sched` is Phase 3's newest addition and its destructor is
-    // trivial (no cache, no frame pool, no inflight state), so we
-    // delete it first to keep the order stable as later phases add
-    // the real reclaim_q plumbing. The worker → lookup → value → nvme
-    // tail matches step 022 §8 and is unchanged: in Phase 3 no cache
-    // ownership has been migrated, so frame destruction still happens
-    // inside `~tree_lookup_sched` (not in the worker, not in a named
-    // tree_read_domain).
+    // Destroy order (030 §2.3 ownership graph): tree_sched →
+    // tree_read_domain → value → nvme. `tree_sched` still goes first
+    // because its destructor is trivial and we want the order stable
+    // across later phases that add real reclaim_q plumbing. Each
+    // `tree_read_domain<TreeCache>` owns its lookup and worker via
+    // unique_ptr, so deleting the read_domain retires both arms —
+    // there are no separate delete loops for the sub-schedulers (030
+    // §2.3 ownership graph / §2.7 registry).
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
@@ -394,10 +407,8 @@ namespace apps::inconel::runtime {
         if (core::registry::tree_sched_singleton_ptr) {
             delete core::registry::tree_sched_singleton_ptr;
         }
-        for (auto* s : core::registry::tree_worker_scheds.list)
-            delete static_cast<tree::tree_worker_sched<TreeCache>*>(s);
-        for (auto* s : core::registry::tree_lookup_scheds.list) {
-            delete static_cast<tree::tree_lookup_sched<TreeCache>*>(s);
+        for (auto* rd : core::registry::tree_read_domains.list) {
+            delete static_cast<core::tree_read_domain<TreeCache>*>(rd);
         }
         if (core::registry::value_alloc_sched) {
             using value_sched_t = value::value_alloc_sched<ValueCache>;

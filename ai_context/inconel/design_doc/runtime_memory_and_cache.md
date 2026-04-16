@@ -660,19 +660,21 @@ struct free_span_descriptor {
    - **不**拥有 value_page cache（tree-path value read 统一由 `value_alloc_sched` 服务）
    - **不**拥有 value open pages 或 placement metadata
 
-3. `tree_read_domain`
-   - 拥有本 shard 的 `readonly_frame_cache`（tree_node domain）
-   - 由同 shard 的 `tree_lookup_sched` / `tree_worker_sched` 共享
+3. `tree_read_domain<Cache>`（step 030 §2.3 / §6.5 G1）
+   - 拥有本 shard 的 `node_cache`（`Cache` 实例，tree_node domain），以及 routing snapshot (`shared_ptr<const shard_partition_map> partitions`)
+   - own 两个 scheduler：`unique_ptr<tree_lookup_sched<Cache>> lookup`、`unique_ptr<tree_worker_sched<Cache>> worker`
+   - 通过 `advance()` 代驱 lookup 和 worker 两个 arm；PUMP runtime tuple 注册 read_domain，不再单独注册 lookup / worker
    - 服务普通读路径的 tree traversal，以及 flush 中的 old-leaf read
 
-4. `tree_lookup_sched`
+4. `tree_lookup_sched<Cache>`（read_domain 的 lookup arm）
    - 执行普通读路径的 tree traversal，以及 flush 中的 `keys_to_leaf_groups()`
-   - 访问所属 `tree_read_domain` 的 `readonly_frame_cache`
+   - 持 `tree_read_domain<Cache>*` back-ref，通过 `read_domain_->node_cache.*` 直接 pin/put/contains（零虚调用）
    - **不**拥有 value_page cache（tree hit value 后路由到 `value_alloc_sched` 读取）
+   - **不**持有独立的 `Cache`；`read_domain_index` 也不再存在于 scheduler base，通过 `virtual read_domain_index()` 回查
 
-5. `tree_worker_sched`
+5. `tree_worker_sched<Cache>`（read_domain 的 worker arm）
    - 执行 flush 中的 old leaf read / decode / candidate materialization
-   - 访问所属 `tree_read_domain` 的 `readonly_frame_cache`
+   - 同样持 `tree_read_domain<Cache>*` back-ref；`process_flush_round(state, &read_domain_->node_cache)` 与 lookup 共用 cache shard
    - **不**拥有 allocator、manifest mutation 或 retire list
 
 6. `tree_sched`
@@ -690,11 +692,11 @@ struct free_span_descriptor {
 
 hole 的 free-slot 分布、页是否已被 writer 打开、写满后需从可分配集合摘除——这些都是写侧 allocator 状态，必须有单一 owner。
 
-新模型下，这些元数据、DMA 写入 ownership 和 value_page 读缓存统一归 `value_alloc_sched`（单线程，天然互斥）。最佳实践是把它部署在独占核心上。`value_alloc_sched` 的 `readonly_frame_cache` 同时服务写侧 hole reuse（免去 device read）和读侧 tree-path value read（`read_value` / `read_page_values` 接口）。`front_sched`、`tree_lookup_sched` 和 `tree_worker_sched` 都不持有 value_page cache。
+新模型下，这些元数据、DMA 写入 ownership 和 value_page 读缓存统一归 `value_alloc_sched`（单线程，天然互斥）。最佳实践是把它部署在独占核心上。`value_alloc_sched` 的 `readonly_frame_cache` 同时服务写侧 hole reuse（免去 device read）和读侧 tree-path value read（`read_value` / `read_page_values` 接口）。`front_sched`、`tree_read_domain` 及其 lookup / worker arms 都不持有 value_page cache。
 
 ### 7.3 允许重复 residency，但不允许重复可写 ownership
 
-**tree_node domain**：同一个 tree node page 可以在多个 `tree_read_domain` shards 的 `readonly_frame_cache` 中各自驻留。这只是空间换性能。同一个 shard 内由 `tree_lookup_sched` / `tree_worker_sched` 共享该 cache。
+**tree_node domain**：同一个 tree node page 可以在多个 `tree_read_domain` shards 的 `node_cache` 中各自驻留。这只是空间换性能。同一个 read_domain 内的 lookup / worker arms 共享该 cache（都模板化 on 同一 `Cache`，通过 `read_domain_->node_cache` 直接内联访问）。
 
 **value_page domain**：`value_alloc_sched` 是 value_page cache 的**唯一 owner**。没有跨 shard 重复 residency，因此不存在 value_page 的 stale hit 问题。`value_alloc_sched` 内部 hole-fill writeback 后直接更新本地 cache，不需要跨 shard invalidate。
 
@@ -824,8 +826,8 @@ tree lookup 的固定语义不变：
 
 1. `read_handle` pin `publish_catalog -> prs -> guard -> manifest`
 2. manifest 解析 exact slot
-3. 请求被路由到某个 `tree_lookup_sched`
-4. 该 scheduler 在自己的 tree-node `readonly_frame_cache` 上命中/回填
+3. 请求按 `current_shard_partitions()->route(key)` 路由到某个 `tree_read_domain` 的 `lookup` arm
+4. 该 arm 在所属 read_domain 的 tree-node `node_cache` 上命中/回填
 5. 解析在 frame 上原地进行
 
 因此，tree 侧真正需要的不是“另一套独立对象模型”，而是：
@@ -1013,7 +1015,7 @@ return_partial_page(frame):
 
 | 旧术语 | 在本文中的统一解释 |
 |--------|------------------|
-| `node_cache` | `readonly_frame_cache` 在 tree domain 的逻辑视图；运行时由 `tree_read_domain` 持有，供 `tree_lookup_sched` / `tree_worker_sched` 共享 |
+| `node_cache` | `readonly_frame_cache` 在 tree domain 的逻辑视图；物理上是 `tree_read_domain<Cache>::node_cache` 成员，lookup / worker arms 通过 `read_domain_->node_cache.*` 共享访问（step 030 §2.3 / §6.1 A） |
 | `value_cache` | `value_alloc_sched` 的 `readonly_frame_cache`（value_page domain）；v1 不叠加任何 materialized blob 索引 |
 | `slab_page_buf` | `value_page_frame { st = dirty_append, mode = append }` |
 | hole reuse RMW 临时页 | `value_page_frame { st = dirty_hole_fill, mode = hole_fill }` |

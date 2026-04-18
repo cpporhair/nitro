@@ -34,6 +34,8 @@
 #include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/runtime/builder.hh"
+#include "apps/inconel/runtime/facade.hh"
+#include "apps/inconel/runtime/run.hh"
 #include "apps/inconel/runtime/start.hh"
 #include "apps/inconel/tree/page_builder.hh"
 #include "apps/inconel/tree/sender.hh"
@@ -283,7 +285,8 @@ static void test_bootstrap_profile_validation_fail_fast(const char* label) {
 
 // ── Test 2: end-to-end multi-core lookup via registry ──
 //
-// Workers run pump::env::runtime::run() with the registry already populated.
+// Workers run rt::run() (Inconel's own advance loop) with the registry
+// already populated.
 // Main thread submits lookups, splits across the tree_read_domains via
 // `current_shard_partitions()->route(key)` and
 // `core::registry::tree_read_domain_at(shard_idx)->lookup_sched`
@@ -309,21 +312,17 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     // test's 8-leaf manifest. Step 030 builder installs a placeholder
     // at startup because the tree is empty at boot; this test seeds a
     // populated manifest and expects routing to split across cores.
-    {
-        auto partitions = std::make_shared<const core::shard_partition_map>(
+    //
+    // Goes through `rt::publish_shard_partitions` so the propagation
+    // loop (global install + per-read_domain snapshot refresh) is
+    // exercised end-to-end by the same API the future rebuild site
+    // will call. Previously this test hand-rolled both halves of the
+    // publish, which meant a drift in the facade would not surface
+    // here.
+    rt::publish_shard_partitions(
+        std::make_shared<const core::shard_partition_map>(
             core::build_initial_shard_partition_map(
-                td.manifest.leaf_order, shards));
-        core::registry::install_shard_partitions(partitions);
-        // Propagate the new map into each read_domain's `partitions`
-        // snapshot so a future rebuild that prefers per-domain reads
-        // also sees it. Step 030 does not implement rebuild — this is
-        // a defensive sync so the test state matches what a real
-        // rebuild would produce.
-        for (auto* rd : core::registry::tree_read_domains.list) {
-            static_cast<core::tree_read_domain<Cache>*>(rd)->partitions =
-                partitions;
-        }
-    }
+                td.manifest.leaf_order, shards)));
 
     // Spawn worker threads using PUMP's run() — each thread sets its own
     // this_core_id and drives the per-core advance loop. Stop them later by
@@ -331,7 +330,7 @@ static void test_e2e_multicore_via_runtime(const char* label) {
     std::vector<std::jthread> workers;
     for (uint32_t core : cores) {
         workers.emplace_back([rt, core]() {
-            pump::env::runtime::run(rt, core, [](auto*, uint32_t){});
+            rt::run(rt, core);
         });
     }
 

@@ -96,6 +96,14 @@ add_executable(inconel_test_tree_lookup apps/inconel/test/test_tree_lookup.cc)
 target_include_directories(inconel_test_tree_lookup PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_lookup PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
+# Compile-only instantiation check for tree_local_flush / tree::lookup
+# (step 031). Forces the full sender + coroutine + seam chain through
+# connect<ctx_t>() so template errors that header-only compilation
+# misses surface at build time.
+add_executable(inconel_test_tree_pipeline_compile apps/inconel/test/test_tree_pipeline_compile.cc)
+target_include_directories(inconel_test_tree_pipeline_compile PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_tree_pipeline_compile PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_tree_lookup_multicore apps/inconel/test/test_tree_lookup_multicore.cc)
 target_include_directories(inconel_test_tree_lookup_multicore PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_lookup_multicore PRIVATE pthread ${INCONEL_ABSL_LIBS})
@@ -107,6 +115,10 @@ target_link_libraries(inconel_test_page_cache PRIVATE ${INCONEL_ABSL_LIBS})
 add_executable(inconel_test_runtime apps/inconel/test/test_runtime.cc)
 target_include_directories(inconel_test_runtime PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_runtime PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
+add_executable(inconel_test_runtime_topology apps/inconel/test/test_runtime_topology.cc)
+target_include_directories(inconel_test_runtime_topology PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_runtime_topology PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_value apps/inconel/test/test_value.cc)
 target_include_directories(inconel_test_value PRIVATE ${CMAKE_SOURCE_DIR})

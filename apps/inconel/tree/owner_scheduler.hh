@@ -2,9 +2,11 @@
 #define APPS_INCONEL_TREE_OWNER_SCHEDULER_HH
 
 #include <algorithm>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -12,6 +14,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "pump/core/compute_sender_type.hh"
@@ -115,14 +118,143 @@ namespace apps::inconel::tree {
         }
     };
 
-    struct pending_write_state {
-        flush_round_id                                     round_id;
-        child_ref                                          combined_root;
-        std::shared_ptr<const core::tree_manifest>         new_manifest;
-        bool                                               is_root_change = false;
-        std::vector<format::write_desc>                    writes;
-        std::vector<format::range_ref>                     allocated_ranges;
-        std::move_only_function<void(flush_merge_result&&)> cb;
+    // ── merge coroutine status codes (yielded by run_merge) ──────
+    //
+    // The yield is a pure status tag: the coroutine stages the
+    // actual read/write descriptors into `merge_round_state::pending_*`
+    // before co_yield'ing, and the `submit_merge_step` handler
+    // moves them out into the decision payload. See `run_merge()`.
+    enum class merge_yield : uint8_t {
+        need_io,    // pending_reads / pending_writes staged; outer pipeline must drive them
+        yield_cpu,  // no IO, but CPU has been on-shift too long; let main loop breathe
+        done,       // all CPU done; all emitted writes are in flight/complete
+    };
+
+    // Custom C++20 coroutine type: move-only handle, manual resume.
+    // Not bound to any PUMP sender — the scheduler's `advance()`
+    // drives it synchronously via `resume()`.
+    struct merge_coro {
+        struct promise_type {
+            merge_yield              current_value = merge_yield::done;
+            std::exception_ptr       unhandled{};
+
+            merge_coro
+            get_return_object() {
+                return merge_coro{
+                    std::coroutine_handle<promise_type>::from_promise(*this)
+                };
+            }
+            std::suspend_always initial_suspend() noexcept { return {}; }
+            std::suspend_always final_suspend()  noexcept { return {}; }
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept {
+                unhandled = std::current_exception();
+            }
+            std::suspend_always yield_value(merge_yield v) noexcept {
+                current_value = v;
+                return {};
+            }
+        };
+        using handle_t = std::coroutine_handle<promise_type>;
+
+        explicit merge_coro(handle_t h_) noexcept : h(h_) {}
+        merge_coro(const merge_coro&) = delete;
+        merge_coro& operator=(const merge_coro&) = delete;
+        merge_coro(merge_coro&& o) noexcept
+            : h(std::exchange(o.h, {})) {}
+        merge_coro& operator=(merge_coro&& o) noexcept {
+            if (h) h.destroy();
+            h = std::exchange(o.h, {});
+            return *this;
+        }
+        ~merge_coro() { if (h) h.destroy(); }
+
+        bool done() const noexcept { return h.done(); }
+        void resume() {
+            h.resume();
+            if (h.done() && h.promise().unhandled) {
+                std::rethrow_exception(h.promise().unhandled);
+            }
+        }
+        merge_yield current() const noexcept {
+            return h.promise().current_value;
+        }
+
+    private:
+        handle_t h;
+    };
+
+    namespace _owner { struct merge_context; }
+
+    // Held in `tree_state.active_merge` for the lifetime of one
+    // flush round's merge phase (single-flush invariant — only
+    // one of these exists at a time). The coroutine yields at
+    // io / cpu-budget boundaries; `submit_merge_step` resumes it
+    // and translates the yield into a seam decision.
+    //
+    // Ownership map:
+    //   - `worker_proposals` owns every `mem_tree_node` the workers
+    //     produced; `combined_root` ends up pointing into those
+    //     (via `child_ref::target`) after merge.
+    //   - `fetched_old_pages[rb]` is the landing buffer the outer
+    //     pipeline DMAs into for owner-side reads of shared ancestors;
+    //     the coroutine re-reads them in place on resume.
+    //   - `pending_ios[i]` is either `format::read_desc` whose buf
+    //     points into `fetched_old_pages[rb].data()`, or
+    //     `format::write_desc` whose data points into mem_tree_node
+    //     content owned by `combined_root`. The seam handler moves
+    //     the vector out into a `merge_step_need_io` decision
+    //     unchanged — no per-kind bucketing.
+    //   - `retired_slots_seen` / `retired_ranges_seen` dedupe inserts
+    //     into the linked `flush_round_state.retired` vectors.
+    struct merge_round_state {
+        flush_round_id                                round_id;
+        std::vector<worker_tree_proposal>             worker_proposals;
+
+        // shared_ptr (instead of optional) so `_owner::merge_context`
+        // can be forward-declared here — the full definition lives
+        // deeper in the `_owner` namespace below. Only one holder
+        // exists at a time; not actually shared.
+        std::shared_ptr<_owner::merge_context>        ctx;
+        absl::flat_hash_map<paddr, std::vector<char>> fetched_old_pages;
+
+        child_ref                                     combined_root;
+        std::shared_ptr<const core::tree_manifest>    new_manifest;
+        bool                                          is_root_change = false;
+        paddr                                         new_root_base_paddr{};
+        std::vector<format::range_ref>                allocated_ranges;
+        absl::flat_hash_set<paddr>                    retired_slots_seen;
+        absl::flat_hash_set<paddr>                    retired_ranges_seen;
+
+        // Post-order walk cursor for the assign+emit phase. Pointers
+        // into `combined_root` are stable because we only mutate
+        // node fields in place (new_paddr / content / etc.), never
+        // restructure the tree during walking.
+        struct walk_frame {
+            child_ref*  ref         = nullptr;
+            std::size_t next_child  = 0;
+        };
+        std::vector<walk_frame>                       walk_stack;
+
+        // Coroutine ↔ scheduler handshake slot. A single unified
+        // batch of NVMe ops — reads and writes interleave freely in
+        // one vector so the outer pipeline can fire them all as one
+        // `concurrent` stream instead of serializing by kind. Staged
+        // by the coroutine before co_yield'ing need_io; the seam
+        // handler moves it out into the returned decision.
+        std::vector<merge_io_desc>                    pending_ios;
+
+        // Single-flush / single-core: plain bool, no atomics.
+        // Set to true by the seam handler whenever it emits a batch
+        // that contains at least one read (its buffer gets DMA'd
+        // by the outer pipeline and the next coroutine resume reads
+        // it in place); cleared by `submit_merge_reads_done` after
+        // the outer pipeline awaits the batch.
+        bool                                          waiting_for_reads = false;
+
+        flush_stage_status                            st = flush_stage_status::ok;
+
+        std::optional<merge_coro>                     coro;
     };
 
     struct tree_state {
@@ -136,8 +268,12 @@ namespace apps::inconel::tree {
 
         absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
             active_rounds;
-        absl::flat_hash_map<uint64_t, std::unique_ptr<pending_write_state>>
-            pending_writes;
+
+        // Single-flush invariant: at most one merge phase in flight
+        // at a time. Set by `submit_merge_step(start)`, cleared by
+        // `submit_finalize_merge`.
+        std::optional<merge_round_state> active_merge;
+
         uint64_t next_round_id = 1;
     };
 
@@ -195,26 +331,95 @@ namespace apps::inconel::tree {
 
     }  // namespace _flush_fold
 
-    namespace _flush_merge {
+    namespace _merge_step {
 
         struct req {
-            flush_merge_request                               args;
-            std::move_only_function<void(flush_merge_result&&)> cb;
+            merge_loop_state*                                    ls;
+            std::move_only_function<void(merge_step_decision&&)> cb;
         };
 
         struct op {
-            constexpr static bool flush_merge_op = true;
+            constexpr static bool merge_step_op = true;
 
-            tree_sched*         sched;
-            flush_merge_request args;
+            tree_sched*        sched;
+            merge_loop_state*  ls;
 
             template <uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            tree_sched*         sched;
-            flush_merge_request args;
+            tree_sched*        sched;
+            merge_loop_state*  ls;
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .ls = ls };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _merge_step
+
+    namespace _merge_reads_done {
+
+        struct req {
+            std::move_only_function<void()> cb;
+        };
+
+        struct op {
+            constexpr static bool merge_reads_done_op = true;
+
+            tree_sched* sched;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched;
+
+            auto
+            make_op() {
+                return op{ .sched = sched };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _merge_reads_done
+
+    namespace _finalize_merge {
+
+        struct req {
+            merge_finalize_request                                args;
+            std::move_only_function<void(merge_finalize_result&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool finalize_merge_op = true;
+
+            tree_sched*            sched;
+            merge_finalize_request args;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched*            sched;
+            merge_finalize_request args;
 
             auto
             make_op() {
@@ -229,28 +434,64 @@ namespace apps::inconel::tree {
             }
         };
 
-    }  // namespace _flush_merge
+    }  // namespace _finalize_merge
 
-    namespace _update_superblock {
+    namespace _begin_update_superblock {
 
         struct req {
-            update_superblock_request                                args;
+            update_superblock_request                                       args;
+            std::move_only_function<void(begin_update_superblock_result&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool begin_update_superblock_op = true;
+
+            tree_sched*                sched;
+            update_superblock_request  args;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched*                sched;
+            update_superblock_request  args;
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .args = std::move(args) };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _begin_update_superblock
+
+    namespace _finish_update_superblock {
+
+        struct req {
+            finish_update_superblock_request                         args;
             std::move_only_function<void(update_superblock_result&&)> cb;
         };
 
         struct op {
-            constexpr static bool update_superblock_op = true;
+            constexpr static bool finish_update_superblock_op = true;
 
-            tree_sched*                sched;
-            update_superblock_request  args;
+            tree_sched*                       sched;
+            finish_update_superblock_request  args;
 
             template <uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
         };
 
         struct sender {
-            tree_sched*                sched;
-            update_superblock_request  args;
+            tree_sched*                       sched;
+            finish_update_superblock_request  args;
 
             auto
             make_op() {
@@ -265,7 +506,7 @@ namespace apps::inconel::tree {
             }
         };
 
-    }  // namespace _update_superblock
+    }  // namespace _finish_update_superblock
 
     namespace _finalize_flush_round {
 
@@ -331,6 +572,16 @@ namespace apps::inconel::tree {
             const core::tree_manifest* base_manifest = nullptr;
             const core::tree_geometry* geom = nullptr;
             const std::vector<worker_tree_proposal>* proposals = nullptr;
+
+            // Non-owning view of the owner-side read landing zone
+            // (lives in `merge_round_state::fetched_old_pages`). When
+            // `touched_old_page_for` can't find the shared-ancestor
+            // internal page bytes in any contrib's `touched_old_pages`,
+            // it falls back here before panicking. The pre-scan pass
+            // in `run_merge` populates the buffers up front; the NVMe
+            // read path DMAs bytes directly into them.
+            const absl::flat_hash_map<paddr, std::vector<char>>*
+                fetched_old_pages = nullptr;
 
             std::vector<proposal_group_view> group_storage;
             absl::flat_hash_map<paddr, std::vector<const proposal_group_view*>>
@@ -701,21 +952,45 @@ namespace apps::inconel::tree {
             return ctx;
         }
 
+        // Returns a valid ref to old internal page bytes if any contrib
+        // walked through `rb` (touched_old_pages) or the owner's
+        // pre-scan read it from disk (fetched_old_pages). Returns
+        // nullptr only when the rb is genuinely uncached — callers
+        // that can't tolerate nullptr must panic themselves. Callers
+        // in the pure build phase (after pre-scan reads returned)
+        // should treat nullptr as an invariant violation.
+        static inline const std::vector<char>*
+        try_get_old_page_bytes(const merge_context& ctx, paddr rb,
+                               const std::vector<const proposal_group_view*>& contribs)
+        {
+            for (auto* g : contribs) {
+                auto it = (*ctx.proposals)[g->worker_index].touched_old_pages.find(rb);
+                if (it != (*ctx.proposals)[g->worker_index].touched_old_pages.end()) {
+                    return &it->second;
+                }
+            }
+            if (ctx.fetched_old_pages != nullptr) {
+                auto it = ctx.fetched_old_pages->find(rb);
+                if (it != ctx.fetched_old_pages->end()) {
+                    return &it->second;
+                }
+            }
+            return nullptr;
+        }
+
         static inline const std::vector<char>&
         touched_old_page_for(const merge_context& ctx,
                              paddr                rb,
                              const std::vector<const proposal_group_view*>& contribs)
         {
-            for (auto* g : contribs) {
-                auto it = (*ctx.proposals)[g->worker_index].touched_old_pages.find(rb);
-                if (it != (*ctx.proposals)[g->worker_index].touched_old_pages.end()) {
-                    return it->second;
-                }
+            if (auto* p = try_get_old_page_bytes(ctx, rb, contribs)) {
+                return *p;
             }
             core::panic_inconsistency(
                 "touched_old_page_for",
-                "missing touched_old_pages entry for internal "
-                "(dev=%u lba=%lu)",
+                "missing old internal page bytes after pre-scan reads "
+                "(dev=%u lba=%lu) — build phase must not reach a rb that "
+                "wasn't either touched by a worker or fetched by owner",
                 static_cast<unsigned>(rb.device_id),
                 static_cast<unsigned long>(rb.lba));
         }
@@ -1530,21 +1805,278 @@ namespace apps::inconel::tree {
                      && node->new_range_base == base_manifest->root_range_base);
         }
 
+        // ── Per-node assign + emit (post-order, iterative) ───────
+        //
+        // Mirrors the inner `plan(...)` lambda of the old
+        // `assign_planned_paddrs` AND the old `collect_write_descs`
+        // fused together: when a node's children are all processed,
+        // allocate its new_paddr, reformat/CRC its content, push a
+        // write_desc into `s.pending_writes`.
+        //
+        // Inputs are threaded through the closure by `run_merge`
+        // (base_manifest / alloc / geom / retire_*). The node's
+        // `content` pointer goes into `write_desc.data`; it stays
+        // valid for the lifetime of `combined_root`, which the
+        // merge_round_state owns until `submit_finalize_merge`.
+        template <typename retire_slot_fn, typename retire_range_fn>
+        static inline void
+        assign_and_emit_node(
+            mem_tree_node*             node,
+            const core::tree_manifest* base_manifest,
+            tree_allocator&            alloc,
+            const core::tree_geometry* geom,
+            std::vector<format::range_ref>& allocated_ranges,
+            std::vector<merge_io_desc>&     pending_ios,
+            retire_slot_fn&&           retire_slot,
+            retire_range_fn&&          retire_range)
+        {
+            auto fresh_range = [&]() {
+                auto r = alloc.allocate();
+                allocated_ranges.push_back(r);
+                node->new_range_base = r.base;
+                node->new_slot_index = 0;
+                node->new_paddr      = r.base;
+            };
+
+            if (node->replaces_old_paddrs.empty()) {
+                fresh_range();
+            } else {
+                auto carrier  = node->replaces_old_paddrs[0];
+                auto cur_slot = base_manifest->slot_index(carrier);
+                if (node->replaces_old_paddrs.size() > 1) {
+                    for (std::size_t i = 1;
+                         i < node->replaces_old_paddrs.size(); ++i) {
+                        retire_range(node->replaces_old_paddrs[i]);
+                    }
+                }
+                if (cur_slot + 1 < geom->shadow_slots_per_range) {
+                    node->new_range_base = carrier;
+                    node->new_slot_index = cur_slot + 1;
+                    node->new_paddr = geom->slot_paddr(carrier, cur_slot + 1);
+                    retire_slot(base_manifest->resolve(carrier));
+                } else {
+                    fresh_range();
+                    retire_range(carrier);
+                }
+            }
+
+            if (node->type == format::node_type::internal) {
+                node->content.resize(geom->tree_page_size);
+                reformat_internal_node(node, geom->tree_page_size);
+            } else {
+                auto* hdr = reinterpret_cast<format::tree_slot_header*>(
+                    node->content.data());
+                hdr->page_crc = format::tree_page_compute_crc(
+                    node->content.data(), geom->tree_page_size);
+            }
+
+            pending_ios.push_back(merge_io_desc{
+                format::write_desc{
+                    .lba      = node->new_paddr.lba,
+                    .data     = node->content.data(),
+                    .num_lbas = geom->page_lbas(),
+                    .flags    = 0,
+                }});
+        }
+
+        // ── Resumable merge coroutine ────────────────────────────
+        //
+        // Entry seam for the merge phase. Drives the full sequence
+        // (build merge_context → pre-scan owner reads → build
+        // combined_root → prune → post-order assign+emit walk →
+        // build leaf_order / topology / slot_map → new_manifest)
+        // with `co_yield`s at every read/write boundary and
+        // periodically for CPU cooperation.
+        //
+        // Yields only status codes; all payload staging happens in
+        // `merge_round_state::pending_reads / pending_writes` and
+        // in the per-node `write_desc.data` pointers into
+        // `combined_root`. See `merge_round_state` doc-comment for
+        // the full pointer lifetime story.
+        //
+        // Parameters:
+        //   s             — the coroutine's working state (stable
+        //                   address, lives in tree_state.active_merge)
+        //   base_manifest — pinned via active_rounds[round_id].pinned_base_guard
+        //   alloc         — tree_sched's allocator (for new tree slots)
+        //   geom          — tree geometry (page_size / page_lbas / ...)
+        //   round         — tree_sched's flush_round_state for this
+        //                   round (holds retired_*, st, pinned_gens,
+        //                   flushed_max_lsn — the coroutine appends
+        //                   into round.retired as it goes)
+        static inline merge_coro
+        run_merge(merge_round_state&         s,
+                  const core::tree_manifest* base_manifest,
+                  tree_allocator&            alloc,
+                  const core::tree_geometry* geom,
+                  flush_round_state&         round)
+        {
+            // Budget tuning constants — keep flush responsive so
+            // other schedulers can advance on the same core.
+            constexpr std::size_t kWriteBatchSize  = 32;
+            constexpr std::size_t kCpuYieldBudget  = 64;
+
+            // ── Phase 1: index proposals + pre-scan owner reads ──
+            s.ctx = std::make_shared<merge_context>(
+                make_merge_context(base_manifest, &s.worker_proposals));
+            s.ctx->fetched_old_pages = &s.fetched_old_pages;
+
+            const uint32_t page_size = geom->tree_page_size;
+            const uint32_t page_lbas = geom->page_lbas();
+
+            for (const auto& [rb, contribs] : s.ctx->contrib_index) {
+                if (contribs.size() <= 1) continue;
+                if (try_get_old_page_bytes(*s.ctx, rb, contribs) != nullptr)
+                    continue;
+                auto& buf = s.fetched_old_pages[rb];
+                buf.assign(page_size, '\0');
+                s.pending_ios.push_back(merge_io_desc{
+                    format::read_desc{
+                        .lba      = rb.lba,
+                        .buf      = buf.data(),
+                        .num_lbas = page_lbas,
+                    }});
+            }
+            if (!s.pending_ios.empty()) {
+                co_yield merge_yield::need_io;
+                // On resume: NVMe has DMA'd every buffer; the next
+                // call into merge_internal_old_paddr will see the
+                // fetched bytes via try_get_old_page_bytes.
+            }
+
+            // ── Phase 2: build combined_root (pure CPU, recursive) ──
+            const auto& root_group = merge_old_paddr(
+                *s.ctx, base_manifest->root_range_base);
+            s.combined_root = finalize_root_group(*s.ctx, root_group);
+
+            for (const auto& proposal : s.worker_proposals) {
+                for (const auto& rv : proposal.retired_old_values) {
+                    round.retired.old_tree_values.push_back(rv);
+                }
+            }
+
+            auto retire_slot = [&](paddr slot) {
+                if (s.retired_slots_seen.insert(slot).second) {
+                    round.retired.old_slots.push_back(slot);
+                }
+            };
+            auto retire_range = [&](paddr rb) {
+                if (s.retired_ranges_seen.insert(rb).second) {
+                    round.retired.old_ranges.push_back(
+                        geom->range_ref_from_base(rb));
+                }
+            };
+
+            auto pruned = prune_child_ref(
+                std::move(s.combined_root), page_size, retire_range);
+            if (!pruned.has_value()) {
+                s.combined_root = make_empty_root_leaf(page_size);
+            } else {
+                s.combined_root = std::move(*pruned);
+            }
+
+            // ── Phase 3: iterative post-order walk: assign + emit ──
+            s.walk_stack.push_back(
+                merge_round_state::walk_frame{
+                    .ref = &s.combined_root,
+                    .next_child = 0,
+                });
+
+            std::size_t cpu_budget_counter = 0;
+            while (!s.walk_stack.empty()) {
+                auto& frame = s.walk_stack.back();
+                auto* node_up = std::get_if<std::unique_ptr<mem_tree_node>>(
+                    &frame.ref->target);
+                if (node_up == nullptr) {
+                    // Passthrough paddr child — nothing to do.
+                    s.walk_stack.pop_back();
+                    continue;
+                }
+                auto* node = node_up->get();
+                if (frame.next_child < node->children.size()) {
+                    auto& next = node->children[frame.next_child++];
+                    s.walk_stack.push_back(
+                        merge_round_state::walk_frame{
+                            .ref = &next,
+                            .next_child = 0,
+                        });
+                    continue;
+                }
+
+                // All children processed — post-order visit.
+                assign_and_emit_node(
+                    node, base_manifest, alloc, geom,
+                    s.allocated_ranges, s.pending_ios,
+                    retire_slot, retire_range);
+                s.walk_stack.pop_back();
+
+                if (s.pending_ios.size() >= kWriteBatchSize) {
+                    co_yield merge_yield::need_io;
+                    cpu_budget_counter = 0;
+                    continue;
+                }
+                if (++cpu_budget_counter >= kCpuYieldBudget) {
+                    co_yield merge_yield::yield_cpu;
+                    cpu_budget_counter = 0;
+                }
+            }
+
+            if (!s.pending_ios.empty()) {
+                co_yield merge_yield::need_io;
+            }
+
+            // ── Phase 4: build new_manifest metadata ─────────────
+            std::vector<final_leaf_item> leaf_items;
+            auto new_leaf_order = build_leaf_order_full(
+                *s.ctx, s.combined_root, leaf_items);
+            auto new_topology = build_reverse_topology_full(
+                *s.ctx, s.combined_root, leaf_items);
+            absl::flat_hash_map<paddr, uint32_t> slot_map;
+            rebuild_slot_map(
+                base_manifest, s.combined_root, round.retired, slot_map);
+
+            s.new_manifest = std::make_shared<const core::tree_manifest>(
+                core::tree_manifest{
+                    .root_slot        = root_slot_of(
+                                            base_manifest, s.combined_root),
+                    .slot_map         = std::move(slot_map),
+                    .geom             = base_manifest->geom,
+                    .leaf_order       = std::move(new_leaf_order),
+                    .root_range_base  = root_range_base_of(s.combined_root),
+                    .reverse_topology = std::move(new_topology),
+                });
+            s.is_root_change        = is_root_change(
+                                          base_manifest, s.combined_root);
+            s.new_root_base_paddr   = s.new_manifest->root_range_base;
+
+            co_yield merge_yield::done;
+            co_return;
+        }
+
     }  // namespace _owner
 
     struct tree_sched {
-        static constexpr uint32_t kMaxFoldOpsPerAdvance             = 8;
-        static constexpr uint32_t kMaxMergeOpsPerAdvance            = 8;
-        static constexpr uint32_t kMaxUpdateSuperblockOpsPerAdvance = 1;
-        static constexpr uint32_t kMaxFinalizeOpsPerAdvance         = 8;
-        static constexpr uint32_t kWriteBatchConcurrency            = 32;
+        static constexpr uint32_t kMaxFoldOpsPerAdvance                   = 8;
+        static constexpr uint32_t kMaxMergeStepOpsPerAdvance              = 16;
+        static constexpr uint32_t kMaxMergeReadsDoneOpsPerAdvance         = 4;
+        static constexpr uint32_t kMaxFinalizeMergeOpsPerAdvance          = 4;
+        static constexpr uint32_t kMaxBeginUpdateSuperblockOpsPerAdvance  = 1;
+        static constexpr uint32_t kMaxFinishUpdateSuperblockOpsPerAdvance = 1;
+        static constexpr uint32_t kMaxFinalizeOpsPerAdvance               = 8;
+        static constexpr uint32_t kWriteBatchConcurrency                  = 32;
 
         const core::tree_geometry* geom = nullptr;
         tree_state                 state;
-        pump::core::per_core::queue<_flush_fold::req*>  fold_q;
-        pump::core::per_core::queue<_flush_merge::req*> merge_q;
-        pump::core::per_core::queue<_update_superblock::req*> update_superblock_q;
-        pump::core::per_core::queue<_finalize_flush_round::req*> finalize_q;
+        pump::core::per_core::queue<_flush_fold::req*>               fold_q;
+        pump::core::per_core::queue<_merge_step::req*>               merge_step_q;
+        pump::core::per_core::queue<_merge_reads_done::req*>         merge_reads_done_q;
+        pump::core::per_core::queue<_finalize_merge::req*>           finalize_merge_q;
+        pump::core::per_core::queue<_begin_update_superblock::req*>  begin_update_superblock_q;
+        pump::core::per_core::queue<_finish_update_superblock::req*> finish_update_superblock_q;
+        pump::core::per_core::queue<_finalize_flush_round::req*>     finalize_q;
+        // Serializes the superblock begin→finish pair: begin latches
+        // the flag, finish clears it. The outer pipeline is expected
+        // to issue read/mutate/FUA-write between the two seams.
         bool update_superblock_inflight = false;
 
         explicit
@@ -1554,8 +2086,11 @@ namespace apps::inconel::tree {
                    std::size_t                depth = 256)
             : geom(g)
             , fold_q(depth)
-            , merge_q(depth)
-            , update_superblock_q(depth)
+            , merge_step_q(depth)
+            , merge_reads_done_q(depth)
+            , finalize_merge_q(depth)
+            , begin_update_superblock_q(depth)
+            , finish_update_superblock_q(depth)
             , finalize_q(depth)
         {
             state.alloc.head         = data_area_base;
@@ -1573,13 +2108,28 @@ namespace apps::inconel::tree {
         }
 
         void
-        schedule_merge(_flush_merge::req* r) {
-            merge_q.try_enqueue(r);
+        schedule_merge_step(_merge_step::req* r) {
+            merge_step_q.try_enqueue(r);
         }
 
         void
-        schedule_update_superblock(_update_superblock::req* r) {
-            update_superblock_q.try_enqueue(r);
+        schedule_merge_reads_done(_merge_reads_done::req* r) {
+            merge_reads_done_q.try_enqueue(r);
+        }
+
+        void
+        schedule_finalize_merge(_finalize_merge::req* r) {
+            finalize_merge_q.try_enqueue(r);
+        }
+
+        void
+        schedule_begin_update_superblock(_begin_update_superblock::req* r) {
+            begin_update_superblock_q.try_enqueue(r);
+        }
+
+        void
+        schedule_finish_update_superblock(_finish_update_superblock::req* r) {
+            finish_update_superblock_q.try_enqueue(r);
         }
 
         void
@@ -1593,13 +2143,28 @@ namespace apps::inconel::tree {
         }
 
         auto
-        submit_flush_merge(flush_merge_request args) {
-            return _flush_merge::sender{ this, std::move(args) };
+        submit_merge_step(merge_loop_state* ls) {
+            return _merge_step::sender{ this, ls };
         }
 
         auto
-        submit_update_superblock(update_superblock_request args) {
-            return _update_superblock::sender{ this, std::move(args) };
+        submit_merge_reads_done() {
+            return _merge_reads_done::sender{ this };
+        }
+
+        auto
+        submit_finalize_merge(merge_finalize_request args) {
+            return _finalize_merge::sender{ this, std::move(args) };
+        }
+
+        auto
+        submit_begin_update_superblock(update_superblock_request args) {
+            return _begin_update_superblock::sender{ this, std::move(args) };
+        }
+
+        auto
+        submit_finish_update_superblock(finish_update_superblock_request args) {
+            return _finish_update_superblock::sender{ this, std::move(args) };
         }
 
         auto
@@ -1612,75 +2177,575 @@ namespace apps::inconel::tree {
             return std::min(state.flush_max_lsn, state.superblock_safe_lsn);
         }
 
-        tree_flush_result
-        fail_pending_round(uint64_t round_id, bool rollback_allocated_ranges) {
-            auto pending_it = state.pending_writes.find(round_id);
-            if (pending_it == state.pending_writes.end()) {
-                core::panic_inconsistency(
-                    "tree_sched::fail_pending_round",
-                    "pending round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
+        // Builds the merge_step_decision for the just-yielded state.
+        // Moves staged pending_ios out of `active_merge` into the
+        // returned need_io payload. Scans once to precompute
+        // `has_reads` so the outer pipeline knows whether to ACK
+        // back via `submit_merge_reads_done`.
+        merge_step_decision
+        build_merge_step_decision_after_yield() {
+            auto& active = *state.active_merge;
+            if (active.coro->done()) {
+                return merge_step_decision{ merge_step_done{} };
             }
-            auto round_it = state.active_rounds.find(round_id);
-            if (round_it == state.active_rounds.end()) {
-                core::panic_inconsistency(
-                    "tree_sched::fail_pending_round",
-                    "active round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
-            }
-
-            auto pending = std::move(pending_it->second);
-            auto round   = std::move(round_it->second);
-            state.pending_writes.erase(pending_it);
-            state.active_rounds.erase(round_it);
-
-            if (rollback_allocated_ranges) {
-                for (auto it = pending->allocated_ranges.rbegin();
-                     it != pending->allocated_ranges.rend(); ++it) {
-                    state.alloc.push_back_bump(*it);
+            switch (active.coro->current()) {
+                case merge_yield::need_io: {
+                    bool has_reads = false;
+                    for (const auto& d : active.pending_ios) {
+                        if (std::holds_alternative<format::read_desc>(d)) {
+                            has_reads = true;
+                            break;
+                        }
+                    }
+                    merge_step_need_io io{
+                        .ios       = std::move(active.pending_ios),
+                        .has_reads = has_reads,
+                    };
+                    active.pending_ios.clear();
+                    if (has_reads) active.waiting_for_reads = true;
+                    return merge_step_decision{ std::move(io) };
                 }
+                case merge_yield::yield_cpu:
+                    // No IO this round; outer pipeline will loop back
+                    // and drain other schedulers on the next main-loop tick.
+                    return merge_step_decision{
+                        merge_step_need_io{ {}, false }
+                    };
+                case merge_yield::done:
+                    return merge_step_decision{ merge_step_done{} };
             }
-
-            return tree_flush_result{
-                .st              = flush_stage_status::unsupported_unimplemented,
-                .new_manifest    = nullptr,
-                .retired         = {},
-                .flushed_gens_by_front =
-                    absl::flat_hash_map<
-                        uint32_t,
-                        absl::InlinedVector<
-                            std::shared_ptr<core::memtable_gen>, 8>>{},
-                .flushed_max_lsn = round->flushed_max_lsn,
-            };
+            __builtin_unreachable();
         }
 
-        tree_flush_result
-        succeed_pending_round(uint64_t round_id,
-                              std::optional<superblock_slot> committed_slot =
-                                  std::nullopt)
-        {
-            auto pending_it = state.pending_writes.find(round_id);
-            if (pending_it == state.pending_writes.end()) {
-                core::panic_inconsistency(
-                    "tree_sched::succeed_pending_round",
-                    "pending round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
+        // Rollback path shared by `finalize_merge(flush_ok=false)` and
+        // any future error path that must release allocator ranges
+        // already recorded in `active_merge.allocated_ranges`.
+        void
+        rollback_allocated_ranges_from_merge(merge_round_state& active) {
+            for (auto it = active.allocated_ranges.rbegin();
+                 it != active.allocated_ranges.rend(); ++it) {
+                state.alloc.push_back_bump(*it);
             }
-            auto round_it = state.active_rounds.find(round_id);
+            active.allocated_ranges.clear();
+        }
+
+        // ── fold request validation + round allocation ───────────
+        //
+        // Extracted from the old monolithic advance(). Runs every
+        // fold_q req through input validation, allocates a
+        // `flush_round_state` in `state.active_rounds`, computes
+        // the workset + partitions, and fires the cb with the
+        // appropriate `flush_fold_result`.
+        void
+        handle_fold_req(_flush_fold::req* r) {
+            if (r->args.base_guard == nullptr) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_fold_req",
+                    "tree_flush_request.base_guard is null");
+            }
+            if (r->args.base_guard->manifest == nullptr) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_fold_req",
+                    "tree_flush_request.base_guard->manifest is null");
+            }
+
+            // Zero round — no sealed_gens, nothing to fold. Emit a
+            // trivial ok result with round_id=0; the downstream
+            // merge/finalize seams short-circuit on round_id==0.
+            if (r->args.sealed_gens.empty()) {
+                r->cb(flush_fold_result{
+                    .round_id           = flush_round_id{0},
+                    .st                 = flush_stage_status::ok,
+                    .partitions         = {},
+                    .base_manifest      = r->args.base_guard->manifest.get(),
+                    .recovery_safe_lsn  = 0,
+                });
+                delete r;
+                return;
+            }
+
+            validate_fold_sealed_gens(r->args.sealed_gens);
+
+            auto round_id = flush_round_id{ state.next_round_id++ };
+            auto& round   = allocate_fold_round(std::move(r->args), round_id);
+            fold_pinned_gens(round);
+
+            if (round.workset.empty()) {
+                r->cb(flush_fold_result{
+                    .round_id          = round_id,
+                    .st                = flush_stage_status::ok,
+                    .partitions        = {},
+                    .base_manifest     = round.pinned_base_guard->manifest.get(),
+                    .recovery_safe_lsn = round.recovery_safe_lsn,
+                });
+                delete r;
+                return;
+            }
+
+            // Step 030: partition count is determined by the
+            // installed `shard_partition_map`. `build_key_partitions`
+            // panics internally if the map is not installed.
+            auto partition_st = build_key_partitions(
+                round, round.pinned_base_guard->manifest.get());
+
+            if (partition_st != flush_stage_status::ok) {
+                round.st = partition_st;
+                r->cb(flush_fold_result{
+                    .round_id          = round_id,
+                    .st                = partition_st,
+                    .partitions        = {},
+                    .base_manifest     = round.pinned_base_guard->manifest.get(),
+                    .recovery_safe_lsn = round.recovery_safe_lsn,
+                });
+                delete r;
+                return;
+            }
+
+            r->cb(flush_fold_result{
+                .round_id          = round_id,
+                .st                = flush_stage_status::ok,
+                .partitions        = std::move(round.partitions),
+                .base_manifest     = round.pinned_base_guard->manifest.get(),
+                .recovery_safe_lsn = round.recovery_safe_lsn,
+            });
+            delete r;
+        }
+
+        // Validates that `sealed_gens` are non-null, actually sealed,
+        // and have distinct gen_ids. Panics on violation.
+        static void
+        validate_fold_sealed_gens(
+            const absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>&
+                sealed_gens)
+        {
+            absl::flat_hash_set<uint64_t> seen_ids;
+            for (const auto& g : sealed_gens) {
+                if (g == nullptr) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::handle_fold_req",
+                        "sealed_gens contains null gen");
+                }
+                if (g->st != core::memtable_gen::state::sealed) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::handle_fold_req",
+                        "sealed_gens contains non-sealed gen");
+                }
+                if (!seen_ids.insert(g->gen_id).second) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::handle_fold_req",
+                        "sealed_gens contains duplicate gen_id");
+                }
+            }
+        }
+
+        // Allocates a `flush_round_state` for a fresh fold round,
+        // registers it in `state.active_rounds`, and returns a
+        // reference. The round starts with `flushed_max_lsn` set to
+        // `max(pinned_gens.max_lsn)`; workset + partitions are filled
+        // in by subsequent fold stages.
+        flush_round_state&
+        allocate_fold_round(tree_flush_request args, flush_round_id round_id) {
+            auto rs = std::make_unique<flush_round_state>();
+            rs->round_id          = round_id;
+            rs->pinned_base_guard = std::move(args.base_guard);
+            rs->pinned_gens       = std::move(args.sealed_gens);
+            rs->recovery_safe_lsn = args.recovery_safe_lsn;
+
+            rs->flushed_max_lsn = 0;
+            for (auto& g : rs->pinned_gens) {
+                rs->flushed_max_lsn = std::max(rs->flushed_max_lsn, g->max_lsn);
+            }
+
+            auto [it, _] = state.active_rounds.emplace(
+                round_id.v, std::move(rs));
+            return *it->second;
+        }
+
+        // ── merge_step request ──
+        //
+        // Drives the merge coroutine one resume per call. The caller
+        // passes a `merge_loop_state*` (kept in the outer pipeline's
+        // PUMP context). First call (when `active_merge` is empty)
+        // seeds and starts the coroutine; subsequent calls just
+        // resume past the previous yield.
+        //
+        // `waiting_for_reads` gates concurrent-iter access: while
+        // set, any call returns an empty need_io (iter no-op) so
+        // we don't resume the coroutine before the outer pipeline
+        // has ACK'd the pending reads via `submit_merge_reads_done`.
+        void
+        handle_merge_step_req(_merge_step::req* r) {
+            auto* ls = r->ls;
+            if (ls == nullptr) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_merge_step_req",
+                    "merge_loop_state pointer is null");
+            }
+
+            if (!state.active_merge.has_value()) {
+                handle_merge_step_first_call(r, ls);
+            } else {
+                handle_merge_step_resume_call(r);
+            }
+        }
+
+        // First call for this round: move payload out of the loop
+        // state, seed `active_merge`, and — if the round actually
+        // has work — start the coroutine and return its first yield.
+        void
+        handle_merge_step_first_call(_merge_step::req* r,
+                                     merge_loop_state* ls)
+        {
+            const uint64_t round_id_v = ls->round_id.v;
+            std::vector<worker_tree_proposal> proposals =
+                std::move(ls->worker_proposals);
+
+            // Zero round — no active_rounds entry, no merge to run.
+            if (round_id_v == 0) {
+                r->cb(merge_step_decision{ merge_step_done{} });
+                delete r;
+                return;
+            }
+
+            auto round_it = state.active_rounds.find(round_id_v);
             if (round_it == state.active_rounds.end()) {
                 core::panic_inconsistency(
-                    "tree_sched::succeed_pending_round",
-                    "active round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
+                    "tree::tree_sched::handle_merge_step_first_call",
+                    "round_id %lu not in active_rounds",
+                    static_cast<unsigned long>(round_id_v));
+            }
+            for (const auto& wp : proposals) {
+                if (wp.round_id.v != round_id_v) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::handle_merge_step_first_call",
+                        "worker_proposal round_id mismatch");
+                }
+            }
+            auto& round = *round_it->second;
+
+            merge_round_state ms;
+            ms.round_id         = ls->round_id;
+            ms.worker_proposals = std::move(proposals);
+            ms.st               = round.st;
+            state.active_merge.emplace(std::move(ms));
+
+            // Short-circuit: fold reported unsupported, or workset was
+            // empty → no merge work. Leave `active_merge` seeded but
+            // without a coroutine; finalize_merge will emit a done
+            // variant with the gens_by_front result.
+            if (round.st != flush_stage_status::ok
+                || round.workset.empty())
+            {
+                r->cb(merge_step_decision{ merge_step_done{} });
+                delete r;
+                return;
             }
 
-            auto pending = std::move(pending_it->second);
-            auto round   = std::move(round_it->second);
-            state.pending_writes.erase(pending_it);
+            auto& active = *state.active_merge;
+            active.coro.emplace(_owner::run_merge(
+                active,
+                round.pinned_base_guard->manifest.get(),
+                state.alloc,
+                round.pinned_base_guard->manifest->geom,
+                round));
+            active.coro->resume();
+            r->cb(build_merge_step_decision_after_yield());
+            delete r;
+        }
+
+        // Subsequent call for this round: resume the coroutine past
+        // its last yield and return whatever the new yield emitted.
+        // Short-circuits early-exit paths (no coroutine / done /
+        // waiting-for-reads) before touching the coroutine handle.
+        void
+        handle_merge_step_resume_call(_merge_step::req* r) {
+            auto& active = *state.active_merge;
+
+            if (!active.coro.has_value()) {
+                // Short-circuit path seeded state without a coroutine.
+                r->cb(merge_step_decision{ merge_step_done{} });
+                delete r;
+                return;
+            }
+            if (active.waiting_for_reads) {
+                r->cb(merge_step_decision{
+                    merge_step_need_io{ {}, false } });
+                delete r;
+                return;
+            }
+            if (active.coro->done()) {
+                r->cb(merge_step_decision{ merge_step_done{} });
+                delete r;
+                return;
+            }
+
+            active.coro->resume();
+            r->cb(build_merge_step_decision_after_yield());
+            delete r;
+        }
+
+        // ── merge_reads_done request ──
+        //
+        // Clears `waiting_for_reads` so concurrent merge_step iters
+        // can resume the coroutine. Called by the outer pipeline
+        // after awaiting a batch of reads emitted by the coroutine's
+        // previous yield.
+        void
+        handle_merge_reads_done_req(_merge_reads_done::req* r) {
+            if (state.active_merge.has_value()) {
+                state.active_merge->waiting_for_reads = false;
+            }
+            r->cb();
+            delete r;
+        }
+
+        // ── finalize_merge request ──
+        //
+        // Called once per round after the outer pipeline drained all
+        // merge_step iters AND issued a device FLUSH. Produces the
+        // commit variant (done / root_stable / root_change), transfers
+        // `new_manifest` onto `flush_round_state`, and clears
+        // `active_merge`. On `flush_ok=false` rolls back allocator
+        // ranges before emitting a failure-done variant.
+        void
+        handle_finalize_merge_req(_finalize_merge::req* r) {
+            const uint64_t round_id_v = r->args.round_id.v;
+
+            if (round_id_v == 0) {
+                // Zero round — no active state to commit.
+                r->cb(merge_finalize_result{
+                    flush_merge_done{
+                        .result = tree_flush_result{
+                            .st              = flush_stage_status::ok,
+                            .flushed_max_lsn = 0,
+                        },
+                    },
+                });
+                delete r;
+                return;
+            }
+
+            validate_finalize_merge_round(round_id_v);
+
+            auto& round  = *state.active_rounds.find(round_id_v)->second;
+            auto& active = *state.active_merge;
+
+            if (!r->args.flush_ok) {
+                emit_finalize_merge_failure(r, round, active, round_id_v);
+                return;
+            }
+            emit_finalize_merge_success(r, round, active, round_id_v);
+        }
+
+        // Common precondition check for the flush_ok=true/false paths.
+        void
+        validate_finalize_merge_round(uint64_t round_id_v) {
+            if (!state.active_merge.has_value()) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_finalize_merge_req",
+                    "no active merge for round_id %lu",
+                    static_cast<unsigned long>(round_id_v));
+            }
+            if (state.active_merge->round_id.v != round_id_v) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_finalize_merge_req",
+                    "active_merge round_id mismatch");
+            }
+            if (state.active_rounds.find(round_id_v)
+                == state.active_rounds.end())
+            {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_finalize_merge_req",
+                    "round_id %lu not in active_rounds",
+                    static_cast<unsigned long>(round_id_v));
+            }
+        }
+
+        // flush_ok=false path: rollback allocator, drop active_merge,
+        // erase the active round, emit a failure done variant.
+        void
+        emit_finalize_merge_failure(_finalize_merge::req* r,
+                                    flush_round_state&    round,
+                                    merge_round_state&    active,
+                                    uint64_t              round_id_v)
+        {
+            rollback_allocated_ranges_from_merge(active);
+            state.active_merge.reset();
+
+            auto gens_by_front = build_flushed_gens_by_front(round.pinned_gens);
+            auto flushed_max_lsn_v = round.flushed_max_lsn;
+            state.active_rounds.erase(round_id_v);
+
+            r->cb(merge_finalize_result{
+                flush_merge_done{
+                    .result = tree_flush_result{
+                        .st                    = flush_stage_status::unsupported_unimplemented,
+                        .new_manifest          = nullptr,
+                        .retired               = {},
+                        .flushed_gens_by_front = std::move(gens_by_front),
+                        .flushed_max_lsn       = flushed_max_lsn_v,
+                    },
+                },
+            });
+            delete r;
+        }
+
+        // flush_ok=true path: dispatch across coroutine-ran vs
+        // short-circuit vs root_change / root_stable.
+        void
+        emit_finalize_merge_success(_finalize_merge::req* r,
+                                    flush_round_state&    round,
+                                    merge_round_state&    active,
+                                    uint64_t              round_id_v)
+        {
+            const bool had_coro              = active.coro.has_value();
+            const bool is_root_change        = active.is_root_change;
+            const paddr new_root_base_paddr  = active.new_root_base_paddr;
+            auto       new_manifest_owned   = std::move(active.new_manifest);
+            const flush_stage_status active_st = active.st;
+
+            // Early short-circuit (coroutine never ran / fold failure):
+            // nothing durable was committed; emit done with empty result.
+            if (!had_coro || active_st != flush_stage_status::ok) {
+                state.active_merge.reset();
+                auto gens_by_front = build_flushed_gens_by_front(
+                    round.pinned_gens);
+                auto flushed_max_lsn_v = round.flushed_max_lsn;
+                state.active_rounds.erase(round_id_v);
+                r->cb(merge_finalize_result{
+                    flush_merge_done{
+                        .result = tree_flush_result{
+                            .st                    = active_st,
+                            .new_manifest          = nullptr,
+                            .retired               = {},
+                            .flushed_gens_by_front = std::move(gens_by_front),
+                            .flushed_max_lsn       = flushed_max_lsn_v,
+                        },
+                    },
+                });
+                delete r;
+                return;
+            }
+
+            // Happy path: transfer new_manifest onto the round so
+            // finalize_flush_round can commit it.
+            round.new_manifest = std::move(new_manifest_owned);
+            state.active_merge.reset();
+
+            if (is_root_change) {
+                r->cb(merge_finalize_result{
+                    flush_merge_root_change{
+                        .update_req = update_superblock_request{
+                            .round_id            = flush_round_id{round_id_v},
+                            .new_root_base_paddr = new_root_base_paddr,
+                        },
+                    },
+                });
+            } else {
+                r->cb(merge_finalize_result{
+                    flush_merge_root_stable{
+                        .finalize_req = finalize_flush_request{
+                            .round_id       = flush_round_id{round_id_v},
+                            .ok             = true,
+                            .committed_slot = std::nullopt,
+                        },
+                    },
+                });
+            }
+            delete r;
+        }
+
+        // ── begin_update_superblock request ──
+        //
+        // Latches `update_superblock_inflight=true`, computes the
+        // active/inactive LBA pair, and hands it to the outer pipeline.
+        // The outer pipeline does the NVMe read / mutate / FUA write,
+        // then calls `submit_finish_update_superblock`.
+        void
+        handle_begin_update_superblock_req(_begin_update_superblock::req* r)
+        {
+            if (geom == nullptr) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_begin_update_superblock_req",
+                    "tree geometry is null");
+            }
+
+            const bool a_is_active =
+                state.active_superblock_slot == superblock_slot::A;
+            const uint64_t active_lba    = a_is_active ? 0 : 1;
+            const uint64_t inactive_lba  = a_is_active ? 1 : 0;
+            const superblock_slot inactive_slot =
+                a_is_active ? superblock_slot::B : superblock_slot::A;
+
+            update_superblock_inflight = true;
+
+            r->cb(begin_update_superblock_result{
+                .round_id            = r->args.round_id,
+                .new_root_base_paddr = r->args.new_root_base_paddr,
+                .active_lba          = active_lba,
+                .inactive_lba        = inactive_lba,
+                .inactive_slot       = inactive_slot,
+                .lba_size            = geom->lba_size,
+            });
+            delete r;
+        }
+
+        // ── finish_update_superblock request ──
+        //
+        // Clears `update_superblock_inflight` and surfaces the
+        // outer pipeline's write outcome as an `update_superblock_result`.
+        void
+        handle_finish_update_superblock_req(_finish_update_superblock::req* r)
+        {
+            if (!update_superblock_inflight) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_finish_update_superblock_req",
+                    "finish without an inflight begin for round_id=%lu",
+                    static_cast<unsigned long>(r->args.round_id.v));
+            }
+            update_superblock_inflight = false;
+
+            r->cb(update_superblock_result{
+                .round_id       = r->args.round_id,
+                .ok             = r->args.write_ok,
+                .committed_slot = r->args.inactive_slot,
+            });
+            delete r;
+        }
+
+        // ── finalize_flush_round request ──
+        //
+        // The very last seam of the flush pipeline's commit phase.
+        // Consumes `active_rounds[round_id]`, updates tree_state
+        // counters (flush_max_lsn / superblock_safe_lsn / recovery_safe_lsn)
+        // and optionally flips `active_superblock_slot`, then returns
+        // the final `tree_flush_result`.
+        void
+        handle_finalize_flush_round_req(_finalize_flush_round::req* r) {
+            const uint64_t round_id_v = r->args.round_id.v;
+
+            if (round_id_v == 0) {
+                r->cb(tree_flush_result{
+                    .st              = flush_stage_status::ok,
+                    .flushed_max_lsn = 0,
+                });
+                delete r;
+                return;
+            }
+
+            auto round_it = state.active_rounds.find(round_id_v);
+            if (round_it == state.active_rounds.end()) {
+                core::panic_inconsistency(
+                    "tree_sched::handle_finalize_flush_round_req",
+                    "round_id %lu not in active_rounds",
+                    static_cast<unsigned long>(round_id_v));
+            }
+
+            auto round = std::move(round_it->second);
             state.active_rounds.erase(round_it);
 
-            if (committed_slot.has_value()) {
-                state.active_superblock_slot = *committed_slot;
+            if (r->args.committed_slot.has_value()) {
+                state.active_superblock_slot = *r->args.committed_slot;
             }
             state.flush_max_lsn = std::max(
                 state.flush_max_lsn, round->flushed_max_lsn);
@@ -1688,488 +2753,91 @@ namespace apps::inconel::tree {
                 state.superblock_safe_lsn, round->flushed_max_lsn);
             state.recovery_safe_lsn = recompute_recovery_safe_lsn();
 
-            return tree_flush_result{
-                .st              = flush_stage_status::ok,
-                .new_manifest    = pending->new_manifest,
-                .retired         = std::move(round->retired),
-                .flushed_gens_by_front =
-                    build_flushed_gens_by_front(round->pinned_gens),
-                .flushed_max_lsn = round->flushed_max_lsn,
-            };
-        }
-
-        void
-        complete_pending_tree_writes(uint64_t round_id, bool write_ok) {
-            auto pending_it = state.pending_writes.find(round_id);
-            if (pending_it == state.pending_writes.end()) {
-                core::panic_inconsistency(
-                    "tree_sched::complete_pending_tree_writes",
-                    "pending round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
-            }
-
-            auto cb = std::move(pending_it->second->cb);
-            if (!write_ok) {
-                cb(flush_merge_result{
-                    flush_merge_done{
-                        .result = fail_pending_round(
-                            round_id, /*rollback_allocated_ranges=*/true),
-                    },
-                });
-                return;
-            }
-
-            auto& pending = pending_it->second;
-            if (pending->is_root_change) {
-                cb(flush_merge_result{
-                    flush_merge_root_change{
-                        .update_req = update_superblock_request{
-                            .round_id = flush_round_id{round_id},
-                            .new_root_base_paddr =
-                                pending->new_manifest->root_range_base,
-                        },
-                    },
-                });
-                return;
-            }
-
-            cb(flush_merge_result{
-                flush_merge_root_stable{
-                    .finalize_req = finalize_flush_request{
-                        .round_id       = flush_round_id{round_id},
-                        .ok             = true,
-                        .committed_slot = std::nullopt,
-                    },
-                },
+            r->cb(tree_flush_result{
+                .st                    = flush_stage_status::ok,
+                .new_manifest          = round->new_manifest,
+                .retired               = std::move(round->retired),
+                .flushed_gens_by_front = build_flushed_gens_by_front(
+                                             round->pinned_gens),
+                .flushed_max_lsn       = round->flushed_max_lsn,
             });
+            delete r;
         }
 
-        void
-        start_pending_write(uint64_t round_id) {
-            auto it = state.pending_writes.find(round_id);
-            if (it == state.pending_writes.end()) {
-                core::panic_inconsistency(
-                    "tree_sched::start_pending_write",
-                    "pending round_id %lu not found",
-                    static_cast<unsigned long>(round_id));
+        // Dequeues up to `max_ops` requests from `q` and dispatches
+        // each via the per-req member handler. Returns true iff at
+        // least one request was processed this tick. Stops early on
+        // queue empty. Each handler is responsible for its own
+        // `delete r` after firing the cb.
+        template <typename Q, typename Handler>
+        bool
+        drain_queue(Q& q, uint32_t max_ops, Handler&& handler) {
+            bool progress = false;
+            for (uint32_t i = 0; i < max_ops; ++i) {
+                auto item = q.try_dequeue();
+                if (!item) break;
+                handler(*item);
+                progress = true;
             }
-
-            if (it->second->writes.empty()) {
-                complete_pending_tree_writes(round_id, true);
-                return;
-            }
-
-            auto writes = it->second->writes;
-            auto* nvme = core::registry::local_nvme();
-
-            pump::sender::as_stream(std::move(writes))
-                >> pump::sender::concurrent(kWriteBatchConcurrency)
-                >> pump::sender::flat_map([nvme](format::write_desc d) {
-                    return nvme->write(d.lba, d.data, d.num_lbas, d.flags);
-                })
-                >> pump::sender::all()
-                >> pump::sender::then([this, nvme, round_id](bool ok) {
-                    if (!ok) {
-                        complete_pending_tree_writes(round_id, false);
-                        return;
-                    }
-                    nvme->flush()
-                        >> pump::sender::then([this, round_id](bool flush_ok) {
-                            complete_pending_tree_writes(round_id, flush_ok);
-                        })
-                        >> pump::sender::submit(pump::core::make_root_context());
-                })
-                >> pump::sender::submit(pump::core::make_root_context());
+            return progress;
         }
 
+        // Scheduler main tick. Drains each request queue up to its
+        // per-advance cap and dispatches to the matching per-req
+        // handler. Ordering matters: fold → merge_step → reads_done
+        // → finalize_merge → begin/finish_update_superblock → finalize.
+        // The begin_update_superblock drain is additionally gated on
+        // `update_superblock_inflight` to serialize the begin→finish
+        // pair.
         bool
         advance() {
             bool progress = false;
 
-            for (uint32_t i = 0; i < kMaxFoldOpsPerAdvance; ++i) {
-                auto item = fold_q.try_dequeue();
-                if (!item) break;
-                auto* r = *item;
+            progress |= drain_queue(
+                fold_q, kMaxFoldOpsPerAdvance,
+                [this](_flush_fold::req* r) { handle_fold_req(r); });
 
-                if (r->args.base_guard == nullptr) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance(fold)",
-                        "tree_flush_request.base_guard is null");
-                }
-                if (r->args.base_guard->manifest == nullptr) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance(fold)",
-                        "tree_flush_request.base_guard->manifest is null");
-                }
+            progress |= drain_queue(
+                merge_step_q, kMaxMergeStepOpsPerAdvance,
+                [this](_merge_step::req* r) { handle_merge_step_req(r); });
 
-                if (r->args.sealed_gens.empty()) {
-                    flush_fold_result res{
-                        .round_id           = flush_round_id{0},
-                        .st                 = flush_stage_status::ok,
-                        .partitions         = {},
-                        .base_manifest      = r->args.base_guard->manifest.get(),
-                        .recovery_safe_lsn  = 0,
-                    };
-                    r->cb(std::move(res));
-                    delete r;
-                    progress = true;
-                    continue;
-                }
+            progress |= drain_queue(
+                merge_reads_done_q, kMaxMergeReadsDoneOpsPerAdvance,
+                [this](_merge_reads_done::req* r) {
+                    handle_merge_reads_done_req(r);
+                });
 
-                {
-                    absl::flat_hash_set<uint64_t> seen_ids;
-                    for (const auto& g : r->args.sealed_gens) {
-                        if (g == nullptr) {
-                            core::panic_inconsistency(
-                                "tree::tree_sched::advance(fold)",
-                                "sealed_gens contains null gen");
-                        }
-                        if (g->st != core::memtable_gen::state::sealed) {
-                            core::panic_inconsistency(
-                                "tree::tree_sched::advance(fold)",
-                                "sealed_gens contains non-sealed gen");
-                        }
-                        if (!seen_ids.insert(g->gen_id).second) {
-                            core::panic_inconsistency(
-                                "tree::tree_sched::advance(fold)",
-                                "sealed_gens contains duplicate gen_id");
-                        }
-                    }
-                }
+            progress |= drain_queue(
+                finalize_merge_q, kMaxFinalizeMergeOpsPerAdvance,
+                [this](_finalize_merge::req* r) {
+                    handle_finalize_merge_req(r);
+                });
 
-                auto rs = std::make_unique<flush_round_state>();
-                rs->round_id          = flush_round_id{ state.next_round_id++ };
-                rs->pinned_base_guard = std::move(r->args.base_guard);
-                rs->pinned_gens       = std::move(r->args.sealed_gens);
-                rs->recovery_safe_lsn = r->args.recovery_safe_lsn;
-
-                rs->flushed_max_lsn = 0;
-                for (auto& g : rs->pinned_gens) {
-                    rs->flushed_max_lsn = std::max(rs->flushed_max_lsn, g->max_lsn);
-                }
-
-                auto round_id_v = rs->round_id.v;
-                state.active_rounds.emplace(round_id_v, std::move(rs));
-                auto& round = *state.active_rounds[round_id_v];
-
-                fold_pinned_gens(round);
-
-                if (round.workset.empty()) {
-                    flush_fold_result res{
-                        .round_id           = flush_round_id{round_id_v},
-                        .st                 = flush_stage_status::ok,
-                        .partitions         = {},
-                        .base_manifest      = round.pinned_base_guard->manifest.get(),
-                        .recovery_safe_lsn  = round.recovery_safe_lsn,
-                    };
-                    r->cb(std::move(res));
-                    delete r;
-                    progress = true;
-                    continue;
-                }
-
-                // Step 030: partition count is determined by the
-                // installed `shard_partition_map`; the old
-                // registry-driven worker_count read is gone (030
-                // §6.4 F2). `build_key_partitions` panics internally
-                // if the map is not installed.
-                auto partition_st = build_key_partitions(
-                    round,
-                    round.pinned_base_guard->manifest.get());
-
-                if (partition_st != flush_stage_status::ok) {
-                    round.st = partition_st;
-                    flush_fold_result res{
-                        .round_id           = flush_round_id{round_id_v},
-                        .st                 = partition_st,
-                        .partitions         = {},
-                        .base_manifest      = round.pinned_base_guard->manifest.get(),
-                        .recovery_safe_lsn  = round.recovery_safe_lsn,
-                    };
-                    r->cb(std::move(res));
-                    delete r;
-                    progress = true;
-                    continue;
-                }
-
-                flush_fold_result res{
-                    .round_id           = flush_round_id{round_id_v},
-                    .st                 = flush_stage_status::ok,
-                    .partitions         = std::move(round.partitions),
-                    .base_manifest      = round.pinned_base_guard->manifest.get(),
-                    .recovery_safe_lsn  = round.recovery_safe_lsn,
-                };
-                r->cb(std::move(res));
-                delete r;
-                progress = true;
+            // begin_update_superblock is gated on `!inflight` so the
+            // begin→finish pair stays serialized; cap the drain count
+            // at the lesser of the per-advance limit and the inflight
+            // gate (which effectively makes it at most 1 per tick).
+            if (!update_superblock_inflight) {
+                progress |= drain_queue(
+                    begin_update_superblock_q,
+                    kMaxBeginUpdateSuperblockOpsPerAdvance,
+                    [this](_begin_update_superblock::req* r) {
+                        handle_begin_update_superblock_req(r);
+                    });
             }
 
-            for (uint32_t i = 0; i < kMaxMergeOpsPerAdvance; ++i) {
-                auto item = merge_q.try_dequeue();
-                if (!item) break;
-                auto* r = *item;
-                auto round_id_v = r->args.round_id.v;
+            progress |= drain_queue(
+                finish_update_superblock_q,
+                kMaxFinishUpdateSuperblockOpsPerAdvance,
+                [this](_finish_update_superblock::req* r) {
+                    handle_finish_update_superblock_req(r);
+                });
 
-                if (round_id_v == 0) {
-                    tree_flush_result res{
-                        .st              = flush_stage_status::ok,
-                        .flushed_max_lsn = 0,
-                    };
-                    r->cb(flush_merge_result{
-                        flush_merge_done{ .result = std::move(res) },
-                    });
-                    delete r;
-                    progress = true;
-                    continue;
-                }
-
-                auto it = state.active_rounds.find(round_id_v);
-                if (it == state.active_rounds.end()) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance(merge)",
-                        "round_id %lu not in active_rounds",
-                        static_cast<unsigned long>(round_id_v));
-                }
-                auto& round = *it->second;
-
-                for (const auto& wp : r->args.worker_proposals) {
-                    if (wp.round_id.v != round_id_v) {
-                        core::panic_inconsistency(
-                            "tree::tree_sched::advance(merge)",
-                            "worker_proposal round_id mismatch");
-                    }
-                }
-
-                if (round.st != flush_stage_status::ok) {
-                    auto gens_by_front = build_flushed_gens_by_front(round.pinned_gens);
-                    auto flushed_max_lsn_v = round.flushed_max_lsn;
-                    state.active_rounds.erase(round_id_v);
-                    tree_flush_result res{
-                        .st                    = round.st,
-                        .flushed_gens_by_front = std::move(gens_by_front),
-                        .flushed_max_lsn       = flushed_max_lsn_v,
-                    };
-                    r->cb(flush_merge_result{
-                        flush_merge_done{ .result = std::move(res) },
-                    });
-                    delete r;
-                    progress = true;
-                    continue;
-                }
-
-                if (round.workset.empty()) {
-                    auto gens_by_front = build_flushed_gens_by_front(round.pinned_gens);
-                    auto flushed_max_lsn_v = round.flushed_max_lsn;
-                    state.active_rounds.erase(round_id_v);
-                    tree_flush_result res{
-                        .st                    = flush_stage_status::ok,
-                        .flushed_gens_by_front = std::move(gens_by_front),
-                        .flushed_max_lsn       = flushed_max_lsn_v,
-                    };
-                    r->cb(flush_merge_result{
-                        flush_merge_done{ .result = std::move(res) },
-                    });
-                    delete r;
-                    progress = true;
-                    continue;
-                }
-
-                _owner::merge_context mctx = _owner::make_merge_context(
-                    round.pinned_base_guard->manifest.get(),
-                    &r->args.worker_proposals);
-
-                for (const auto& proposal : r->args.worker_proposals) {
-                    for (const auto& rv : proposal.retired_old_values) {
-                        round.retired.old_tree_values.push_back(rv);
-                    }
-                }
-
-                const auto& root_group = _owner::merge_old_paddr(
-                    mctx, round.pinned_base_guard->manifest->root_range_base);
-                auto combined_root = _owner::finalize_root_group(mctx, root_group);
-
-                absl::flat_hash_set<paddr> retired_slots_seen;
-                absl::flat_hash_set<paddr> retired_ranges_seen;
-                auto retire_slot = [&](paddr slot) {
-                    if (retired_slots_seen.insert(slot).second) {
-                        round.retired.old_slots.push_back(slot);
-                    }
-                };
-                auto retire_range = [&](paddr rb) {
-                    if (retired_ranges_seen.insert(rb).second) {
-                        round.retired.old_ranges.push_back(
-                            round.pinned_base_guard->manifest->geom->range_ref_from_base(rb));
-                    }
-                };
-
-                auto pruned = _owner::prune_child_ref(
-                    std::move(combined_root),
-                    mctx.geom->tree_page_size,
-                    retire_range);
-                if (!pruned.has_value()) {
-                    combined_root = _owner::make_empty_root_leaf(mctx.geom->tree_page_size);
-                } else {
-                    combined_root = std::move(*pruned);
-                }
-
-                std::vector<format::range_ref> allocated_ranges;
-                _owner::assign_planned_paddrs(
-                    combined_root,
-                    round.pinned_base_guard->manifest.get(),
-                    state.alloc,
-                    allocated_ranges,
-                    retire_slot,
-                    retire_range);
-
-                std::vector<format::write_desc> writes;
-                writes.reserve(64);
-                _owner::collect_write_descs(mctx.geom, combined_root, writes);
-
-                std::vector<_owner::final_leaf_item> leaf_items;
-                auto new_leaf_order = _owner::build_leaf_order_full(
-                    mctx, combined_root, leaf_items);
-                auto new_topology = _owner::build_reverse_topology_full(
-                    mctx, combined_root, leaf_items);
-
-                absl::flat_hash_map<paddr, uint32_t> slot_map;
-                _owner::rebuild_slot_map(
-                    round.pinned_base_guard->manifest.get(),
-                    combined_root,
-                    round.retired,
-                    slot_map);
-
-                auto new_manifest = std::make_shared<const core::tree_manifest>(
-                    core::tree_manifest{
-                        .root_slot        =
-                            _owner::root_slot_of(
-                                round.pinned_base_guard->manifest.get(),
-                                combined_root),
-                        .slot_map         = std::move(slot_map),
-                        .geom             = round.pinned_base_guard->manifest->geom,
-                        .leaf_order       = std::move(new_leaf_order),
-                        .root_range_base  = _owner::root_range_base_of(combined_root),
-                        .reverse_topology = std::move(new_topology),
-                    });
-
-                auto pending = std::make_unique<pending_write_state>();
-                pending->round_id         = flush_round_id{round_id_v};
-                pending->combined_root    = std::move(combined_root);
-                pending->new_manifest     = std::move(new_manifest);
-                pending->is_root_change   = _owner::is_root_change(
-                    round.pinned_base_guard->manifest.get(),
-                    pending->combined_root);
-                pending->writes           = std::move(writes);
-                pending->allocated_ranges = std::move(allocated_ranges);
-                pending->cb               = std::move(r->cb);
-
-                state.pending_writes.emplace(round_id_v, std::move(pending));
-                delete r;
-                start_pending_write(round_id_v);
-                progress = true;
-            }
-
-            for (uint32_t i = 0;
-                 i < kMaxUpdateSuperblockOpsPerAdvance && !update_superblock_inflight;
-                 ++i) {
-                auto item = update_superblock_q.try_dequeue();
-                if (!item) break;
-                auto* r = *item;
-
-                if (geom == nullptr) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::advance(update_superblock)",
-                        "tree geometry is null");
-                }
-
-                const uint64_t active_lba =
-                    (state.active_superblock_slot == superblock_slot::A) ? 0 : 1;
-                const uint64_t inactive_lba =
-                    (state.active_superblock_slot == superblock_slot::A) ? 1 : 0;
-                const superblock_slot inactive_slot =
-                    (state.active_superblock_slot == superblock_slot::A)
-                        ? superblock_slot::B
-                        : superblock_slot::A;
-
-                auto read_buf =
-                    std::make_shared<std::vector<char>>(geom->lba_size, '\0');
-                auto write_buf =
-                    std::make_shared<std::vector<char>>(geom->lba_size, '\0');
-                auto* nvme = core::registry::local_nvme();
-                update_superblock_inflight = true;
-
-                pump::sender::just()
-                    >> pump::sender::flat_map([nvme, active_lba, read_buf]() {
-                        return nvme->read(active_lba, read_buf->data(), 1);
-                    })
-                    >> pump::sender::then(
-                        [this, nvme, r, write_buf, read_buf, inactive_lba,
-                         inactive_slot](bool ok) {
-                            if (!ok) {
-                                update_superblock_inflight = false;
-                                r->cb(update_superblock_result{
-                                    .round_id       = r->args.round_id,
-                                    .ok             = false,
-                                    .committed_slot = inactive_slot,
-                                });
-                                delete r;
-                                return;
-                            }
-
-                            format::superblock cur{};
-                            std::memcpy(&cur, read_buf->data(), sizeof(cur));
-                            auto st = format::inspect_superblock(cur);
-                            if (st != format::superblock_status::ok) {
-                                core::panic_inconsistency(
-                                    "tree::tree_sched::advance(update_superblock)",
-                                    "active superblock invalid: %s",
-                                    format::superblock_status_to_string(st));
-                            }
-
-                            cur.root_base_paddr = r->args.new_root_base_paddr;
-                            cur.generation += 1;
-                            cur.crc = 0;
-                            cur.crc = format::superblock_compute_crc(cur);
-
-                            std::fill(write_buf->begin(), write_buf->end(), '\0');
-                            std::memcpy(write_buf->data(), &cur, sizeof(cur));
-                            nvme->write(
-                                inactive_lba,
-                                write_buf->data(),
-                                1,
-                                mock_nvme::IO_FLAGS_FUA)
-                                >> pump::sender::then(
-                                    [this, r, inactive_slot](bool write_ok) {
-                                        update_superblock_inflight = false;
-                                        r->cb(update_superblock_result{
-                                            .round_id       = r->args.round_id,
-                                            .ok             = write_ok,
-                                            .committed_slot = inactive_slot,
-                                        });
-                                        delete r;
-                                    })
-                                >> pump::sender::submit(
-                                    pump::core::make_root_context());
-                        })
-                    >> pump::sender::submit(pump::core::make_root_context());
-                progress = true;
-            }
-
-            for (uint32_t i = 0; i < kMaxFinalizeOpsPerAdvance; ++i) {
-                auto item = finalize_q.try_dequeue();
-                if (!item) break;
-                auto* r = *item;
-
-                tree_flush_result res = r->args.ok
-                    ? succeed_pending_round(
-                          r->args.round_id.v, r->args.committed_slot)
-                    : fail_pending_round(
-                          r->args.round_id.v,
-                          /*rollback_allocated_ranges=*/false);
-
-                r->cb(std::move(res));
-                delete r;
-                progress = true;
-            }
+            progress |= drain_queue(
+                finalize_q, kMaxFinalizeOpsPerAdvance,
+                [this](_finalize_flush_round::req* r) {
+                    handle_finalize_flush_round_req(r);
+                });
 
             return progress;
         }
@@ -2195,10 +2863,10 @@ namespace apps::inconel::tree {
 
     template <uint32_t pos, typename ctx_t, typename scope_t>
     void
-    _flush_merge::op::start(ctx_t& ctx, scope_t& scope) {
-        sched->schedule_merge(new _flush_merge::req{
-            std::move(args),
-            [ctx = ctx, scope = scope](flush_merge_result&& r) mutable {
+    _merge_step::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_merge_step(new _merge_step::req{
+            ls,
+            [ctx = ctx, scope = scope](merge_step_decision&& r) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(
                     ctx, scope, std::move(r));
             },
@@ -2207,8 +2875,43 @@ namespace apps::inconel::tree {
 
     template <uint32_t pos, typename ctx_t, typename scope_t>
     void
-    _update_superblock::op::start(ctx_t& ctx, scope_t& scope) {
-        sched->schedule_update_superblock(new _update_superblock::req{
+    _merge_reads_done::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_merge_reads_done(new _merge_reads_done::req{
+            [ctx = ctx, scope = scope]() mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope);
+            },
+        });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _finalize_merge::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_finalize_merge(new _finalize_merge::req{
+            std::move(args),
+            [ctx = ctx, scope = scope](merge_finalize_result&& r) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(r));
+            },
+        });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _begin_update_superblock::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_begin_update_superblock(new _begin_update_superblock::req{
+            std::move(args),
+            [ctx = ctx, scope = scope](begin_update_superblock_result&& r) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(r));
+            },
+        });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _finish_update_superblock::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_finish_update_superblock(new _finish_update_superblock::req{
             std::move(args),
             [ctx = ctx, scope = scope](update_superblock_result&& r) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(
@@ -2260,7 +2963,7 @@ namespace pump::core {
 
     template <uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-        && (get_current_op_type_t<pos, scope_t>::flush_merge_op)
+        && (get_current_op_type_t<pos, scope_t>::merge_step_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
         template <typename ctx_t>
@@ -2272,20 +2975,21 @@ namespace pump::core {
 
     template <typename ctx_t>
     struct
-    compute_sender_type<ctx_t, apps::inconel::tree::_flush_merge::sender> {
+    compute_sender_type<ctx_t, apps::inconel::tree::_merge_step::sender> {
         consteval static uint32_t
         count_value() {
             return 1;
         }
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<apps::inconel::tree::flush_merge_result>{};
+            return std::type_identity<
+                apps::inconel::tree::merge_step_decision>{};
         }
     };
 
     template <uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-        && (get_current_op_type_t<pos, scope_t>::update_superblock_op)
+        && (get_current_op_type_t<pos, scope_t>::merge_reads_done_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
         template <typename ctx_t>
@@ -2297,7 +3001,84 @@ namespace pump::core {
 
     template <typename ctx_t>
     struct
-    compute_sender_type<ctx_t, apps::inconel::tree::_update_superblock::sender> {
+    compute_sender_type<ctx_t, apps::inconel::tree::_merge_reads_done::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 0;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::finalize_merge_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::tree::_finalize_merge::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::merge_finalize_result>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::begin_update_superblock_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::tree::_begin_update_superblock::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::begin_update_superblock_result>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::finish_update_superblock_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::tree::_finish_update_superblock::sender> {
         consteval static uint32_t
         count_value() {
             return 1;

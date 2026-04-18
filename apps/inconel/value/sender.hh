@@ -18,6 +18,7 @@
 #include "../core/registry.hh"
 #include "../format/types.hh"
 #include "../mock_nvme/scheduler.hh"
+#include "../runtime/facade.hh"
 #include "./scheduler.hh"
 #include "pump/sender/get_context.hh"
 #include "pump/sender/pop_context.hh"
@@ -28,18 +29,19 @@ namespace apps::inconel::value {
     using format::value_ref;
 
     inline auto
-    on_persist_leader(value_alloc_sched_base* sched, persist_leader&& alt) {
+    on_persist_leader(persist_leader&& alt) {
         uint64_t rid = alt.round_id;
         return just()
             >> as_stream(__mov__(alt.writes))
             >> concurrent()
             >> flat_map([](format::write_desc d) {
-                auto *nvme = core::registry::local_nvme();
-                return nvme->write(d.lba, d.data, d.num_lbas, mock_nvme::IO_FLAGS_FUA);
+                return rt::local_nvme()->write(
+                    d.lba, d.data, d.num_lbas, mock_nvme::IO_FLAGS_FUA);
             })
             >> all()
-            >> flat_map([sched, rid](bool nvme_ok) {
-                return sched->finalize_persist(rid, nvme_ok) >> forward_value(nvme_ok);
+            >> flat_map([rid](bool nvme_ok) {
+                return rt::value()->finalize_persist(rid, nvme_ok)
+                    >> forward_value(nvme_ok);
             });
     }
 
@@ -47,7 +49,12 @@ namespace apps::inconel::value {
     //
     // Wraps the prepare/finalize round + NVMe FUA dispatch into a single
     // top-level sender that the caller can pipe straight into a `then`
-    // (`value::persist_values(...) >> then(...) >> submit(ctx)`).
+    // (`value::persist_values(entries) >> then(...) >> submit(ctx)`).
+    //
+    // No scheduler pointer on the API — the value scheduler is a
+    // singleton, resolved internally via `rt::value()`. Every Inconel
+    // runtime constructed by `runtime::build_runtime` installs it, so
+    // application code never has to thread the pointer through.
     //
     // Internally:
     //
@@ -64,12 +71,12 @@ namespace apps::inconel::value {
     // their sender types can differ — flat() accepts arbitrary senders.
 
     inline auto
-    persist_values(value_alloc_sched_base* sched, std::span<put_entry> entries) {
-        return sched->prepare_persist(entries)
+    persist_values(std::span<put_entry> entries) {
+        return rt::value()->prepare_persist(entries)
             >> visit()
-            >> flat_map([sched]<typename T>(T &&alt) {
+            >> flat_map([]<typename T>(T &&alt) {
                 if constexpr (std::is_same_v<T, persist_leader>) {
-                    return on_persist_leader(sched, __fwd__(alt));
+                    return on_persist_leader(__fwd__(alt));
                 } else {
                     return just(static_cast<bool>(alt.ok));
                 }
@@ -77,19 +84,20 @@ namespace apps::inconel::value {
     }
 
     inline auto
-    on_read_miss(value_alloc_sched_base* sched, value_ref vr, read_miss&& alt) {
+    on_read_miss(value_ref vr, read_miss&& alt) {
         return just()
-            >> with_context(__fwd__(alt), vr)([sched]() {
+            >> with_context(__fwd__(alt), vr)([]() {
                 return get_context<read_miss>()
                     >> flat_map([](const read_miss &rm) {
-                        return core::registry::local_nvme()->read(
+                        return rt::local_nvme()->read(
                             rm.base.lba, rm.buf.get(), rm.span_lbas);
                     })
                     >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
                     >> get_context<read_miss, value_ref>()
-                    >> flat_map([sched](read_miss &rm, const value_ref &vr, bool) mutable {
-                        return sched->fill_and_decode(vr, std::move(rm.buf),
-                                                      rm.buf_size, rm.admit_to_cache);
+                    >> flat_map([](read_miss &rm, const value_ref &vr, bool) mutable {
+                        return rt::value()->fill_and_decode(
+                            vr, std::move(rm.buf),
+                            rm.buf_size, rm.admit_to_cache);
                     });
             });
     }
@@ -99,18 +107,18 @@ namespace apps::inconel::value {
     // Wraps prepare_read → (hit/miss) → fill_and_decode into a single
     // top-level sender. Caller pipes:
     //
-    //   value::read_value(sched, vr) >> then(callback) >> submit(ctx);
+    //   value::read_value(vr) >> then(callback) >> submit(ctx);
 
     inline auto
-    read_value(value_alloc_sched_base* sched, value_ref vr) {
-        return sched->prepare_read(vr)
+    read_value(value_ref vr) {
+        return rt::value()->prepare_read(vr)
             >> visit()
-            >> flat_map([sched, vr](auto &&alt) {
+            >> flat_map([vr](auto &&alt) {
                 using T = std::decay_t<decltype(alt)>;
                 if constexpr (std::is_same_v<T, read_hit>) {
                     return just() >> forward_value(__mov__(alt.body));
                 } else {
-                    return on_read_miss(sched, vr, __fwd__(alt));
+                    return on_read_miss(vr, __fwd__(alt));
                 }
             });
     }

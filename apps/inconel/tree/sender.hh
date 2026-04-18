@@ -25,6 +25,7 @@
 // transaction: fold, worker fanout, owner merge/write, optional
 // superblock update, and final round publication.
 
+#include <cstring>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "pump/sender/flat.hh"
 #include "pump/sender/generate.hh"
 #include "pump/sender/get_context.hh"
+#include "pump/sender/just.hh"
 #include "pump/sender/reduce.hh"
 #include "pump/sender/submit.hh"
 #include "pump/sender/then.hh"
@@ -50,7 +52,9 @@
 #include "../core/shard_partition.hh"
 #include "../core/tree_manifest.hh"
 #include "../core/tree_read_domain.hh"
+#include "../format/superblock.hh"
 #include "../mock_nvme/sender.hh"
+#include "../runtime/facade.hh"
 
 namespace apps::inconel::tree {
 
@@ -65,6 +69,12 @@ namespace apps::inconel::tree {
         co_return false;
     }
 
+    // `tree_sched` here is the per-shard `tree_lookup_sched_base*`,
+    // not the owner singleton — there is one such scheduler per
+    // `tree_read_domain`, so the caller (`shard_lookup`) resolves
+    // the right one via routing and threads it down. The facade
+    // only abstracts away singletons; per-shard pointers stay
+    // explicit.
     inline auto
     on_decision_need_read(tree_lookup_sched_base* tree_sched, decision_need_read&& dec) {
         auto n = dec.read_descs.size();
@@ -74,10 +84,10 @@ namespace apps::inconel::tree {
                     >> concurrent()
                     >> get_context<decision_need_read>()
                     >> flat_map([](decision_need_read& ctx, size_t i) {
-                        auto* nvme = core::registry::local_nvme();
-                        return nvme->read(ctx.read_descs[i].lba,
-                                          ctx.read_descs[i].buf,
-                                          ctx.read_descs[i].num_lbas);
+                        return rt::local_nvme()->read(
+                            ctx.read_descs[i].lba,
+                            ctx.read_descs[i].buf,
+                            ctx.read_descs[i].num_lbas);
                     })
                     >> all()
                     >> get_context<decision_need_read>()
@@ -259,43 +269,22 @@ namespace apps::inconel::tree {
             std::forward<key_range_t>(keys), manifest);
         const size_t total_keys = plan.total_keys;
 
-        return with_context(std::move(plan), all_lookup_results(total_keys))(
-            [manifest]() {
-                return get_context<lookup_route_plan>()
-                    >> then([](const lookup_route_plan& p) {
-                        return p.groups.size();
-                    })
-                    >> flat_map([manifest](size_t ngroups) {
-                        // `loop(n) >> concurrent() >> ...` is a bind_back
-                        // chain; `flat_map` requires a sender return.
-                        // Anchor it with `just()` so the chain resolves
-                        // to a concrete sender before leaving the lambda.
+        return with_context(std::move(plan), all_lookup_results(total_keys))([manifest]() {
+                return get_context<lookup_route_plan, all_lookup_results>()
+                    >> flat_map([manifest](const lookup_route_plan& p, all_lookup_results& a) {
                         return just()
-                            >> loop(ngroups)
+                            >> loop(p.groups.size())
                             >> concurrent()
-                            >> get_context<lookup_route_plan>()
-                            >> flat_map([manifest](const lookup_route_plan& plan, size_t i) {
-                                const auto& g = plan.groups[i];
-                                auto* rd =
-                                    core::registry::tree_read_domain_at(g.shard_idx);
+                            >> flat_map([&p, &a, manifest](size_t i) {
+                                const auto& g = p.groups[i];
+                                auto* rd =  core::registry::tree_read_domain_at(g.shard_idx);
                                 auto* sched = rd->lookup_sched;
-                                // Copy input_indices into the per-group
-                                // then-closure: the plan is stable in
-                                // context, but each fan-out branch needs
-                                // its own scatter map to avoid touching
-                                // `plan.groups[i]` from whichever shard
-                                // core runs the scatter step.
                                 auto indices = g.input_indices;
                                 return just()
-                                    >> _lookup_impl::shard_lookup(
-                                           sched, g.keys, manifest)
-                                    >> get_context<all_lookup_results>()
-                                    >> then([idx = std::move(indices)](
-                                             all_lookup_results& alr,
-                                             std::vector<lookup_result>&& r) mutable {
+                                    >> _lookup_impl::shard_lookup(sched, g.keys, manifest)
+                                    >> then([&a, idx = std::move(indices)](std::vector<lookup_result>&& r) mutable {
                                         for (size_t k = 0; k < idx.size(); ++k)
-                                            alr.by_index[idx[k]] =
-                                                std::move(r[k]);
+                                            a.by_index[idx[k]] =  r[k];
                                     });
                             })
                             >> all();
@@ -308,48 +297,47 @@ namespace apps::inconel::tree {
         );
     }
 
-    // ── Phase 7: worker flush_work multi-round driver ────────────
-    //
-    // Encapsulates one worker arm's loop:
-    //   1. worker->submit_flush_round(state) → flush_round_decision
-    //   2. if need_read: NVMe read (no cache submit) → loop
-    //   3. if done: extract worker_tree_proposal from state.result
-    //
-    // The pipeline creates worker_state on the PUMP context stack
-    // via `with_context`. Each round the worker processes as much
-    // as it can with available pages, then emits a bounded batch of
-    // miss reads. Reads are issued through `core::registry::local_nvme`
-    // and do NOT submit results into the tree_lookup cache (flush
-    // pages are about to be retired, so caching them would waste
-    // capacity).
-
-    inline pump::coro::return_yields<bool>
-    check_flush_round_not_done(const worker_state& state) {
-        while (!state.all_done)
-            co_yield true;
-        co_return false;
-    }
-
-    inline auto
-    on_flush_round_need_read(flush_round_need_read&& dec) {
-        auto n = dec.read_descs.size();
-        return just()
-            >> with_context(__fwd__(dec))([n]() {
-                return loop(n)
-                    >> concurrent()
-                    >> get_context<flush_round_need_read>()
-                    >> flat_map([](flush_round_need_read& ctx, size_t i) {
-                        auto* nvme = core::registry::local_nvme();
-                        return nvme->read(ctx.read_descs[i].lba,
-                                          ctx.read_descs[i].buf,
-                                          ctx.read_descs[i].num_lbas);
-                    })
-                    >> all();
-                // No cache submit — flush reads are about to be retired.
-            });
-    }
-
     namespace flush_pipeline {
+        // ── Phase 7: worker flush_work multi-round driver ────────────
+        //
+        // Encapsulates one worker arm's loop:
+        //   1. worker->submit_flush_round(state) → flush_round_decision
+        //   2. if need_read: NVMe read (no cache submit) → loop
+        //   3. if done: extract worker_tree_proposal from state.result
+        //
+        // The pipeline creates worker_state on the PUMP context stack
+        // via `with_context`. Each round the worker processes as much
+        // as it can with available pages, then emits a bounded batch of
+        // miss reads. Reads are issued through `core::registry::local_nvme`
+        // and do NOT submit results into the tree_lookup cache (flush
+        // pages are about to be retired, so caching them would waste
+        // capacity).
+
+        inline pump::coro::return_yields<bool>
+        check_flush_round_not_done(const worker_state& state) {
+            while (!state.all_done)
+                co_yield true;
+            co_return false;
+        }
+
+        inline auto
+        on_flush_round_need_read(flush_round_need_read &&dec) {
+            auto n = dec.read_descs.size();
+            return just()
+                >> with_context(__fwd__(dec))([n]() {
+                    return loop(n)
+                        >> concurrent()
+                        >> get_context<flush_round_need_read>()
+                        >> flat_map([](flush_round_need_read &ctx, size_t i) {
+                            return rt::local_nvme()->read(
+                                ctx.read_descs[i].lba,
+                                ctx.read_descs[i].buf,
+                                ctx.read_descs[i].num_lbas);
+                        })
+                        >> all();
+                    // No cache submit — flush reads are about to be retired.
+                });
+        }
 
         inline void
         panic_update_superblock_failure(const update_superblock_result& r) {
@@ -371,42 +359,237 @@ namespace apps::inconel::tree {
             };
         }
 
+        // Carried on the PUMP context stack across the root-change
+        // superblock update's read → mutate → FUA-write → finish
+        // steps. `tree_sched` no longer owns the NVMe side of this
+        // flow; it only latches `inflight` via begin/finish.
+        struct superblock_update_state {
+            flush_round_id     round_id;
+            paddr              new_root_base_paddr{};
+            uint64_t           active_lba    = 0;
+            uint64_t           inactive_lba  = 0;
+            superblock_slot    inactive_slot = superblock_slot::A;
+            uint32_t           lba_size      = 0;
+            std::vector<char>  read_buf;
+            std::vector<char>  write_buf;
+        };
+
         inline auto
-        finalize_root_change(tree_sched* owner, update_superblock_request req) {
-            return owner->submit_update_superblock(std::move(req))
-                >> then(make_finalize_after_superblock)
-                >> flat_map([owner](finalize_flush_request&& req) {
-                    return owner->submit_finalize_flush_round(std::move(req));
-                });
+        perform_superblock_io(begin_update_superblock_result r) {
+            superblock_update_state st{
+                .round_id            = r.round_id,
+                .new_root_base_paddr = r.new_root_base_paddr,
+                .active_lba          = r.active_lba,
+                .inactive_lba        = r.inactive_lba,
+                .inactive_slot       = r.inactive_slot,
+                .lba_size            = r.lba_size,
+                .read_buf            = std::vector<char>(r.lba_size, '\0'),
+                .write_buf           = std::vector<char>(r.lba_size, '\0'),
+            };
+            // `with_context(v)(body)` is a bind_back — the `flat_map`
+            // inside `finalize_root_change` that consumes us needs a
+            // complete pipeline, so we seed with `just()`.
+            return just()
+                >> with_context(std::move(st))([]() {
+                return get_context<superblock_update_state>()
+                    >> flat_map([](superblock_update_state& s) {
+                        return rt::local_nvme()->read(
+                            s.active_lba, s.read_buf.data(), 1);
+                    })
+                    >> get_context<superblock_update_state>()
+                    >> then([](superblock_update_state& s, bool read_ok) -> bool {
+                        if (!read_ok) return false;
+                        format::superblock cur{};
+                        std::memcpy(&cur, s.read_buf.data(), sizeof(cur));
+                        auto status = format::inspect_superblock(cur);
+                        if (status != format::superblock_status::ok) {
+                            core::panic_inconsistency(
+                                "tree_local_flush::perform_superblock_io",
+                                "active superblock invalid: %s",
+                                format::superblock_status_to_string(status));
+                        }
+                        cur.root_base_paddr = s.new_root_base_paddr;
+                        cur.generation += 1;
+                        cur.crc = 0;
+                        cur.crc = format::superblock_compute_crc(cur);
+                        std::fill(s.write_buf.begin(), s.write_buf.end(), '\0');
+                        std::memcpy(s.write_buf.data(), &cur, sizeof(cur));
+                        return true;
+                    })
+                    >> visit()
+                    >> get_context<superblock_update_state>()
+                    >> flat_map([]<typename Flag>(
+                            superblock_update_state& s, Flag&&) {
+                        if constexpr (std::is_same_v<
+                                std::decay_t<Flag>, std::true_type>) {
+                            return rt::local_nvme()->write(
+                                s.inactive_lba,
+                                s.write_buf.data(),
+                                1,
+                                mock_nvme::IO_FLAGS_FUA);
+                        } else {
+                            return just(false);
+                        }
+                    })
+                    >> get_context<superblock_update_state>()
+                    >> flat_map([](superblock_update_state& s,
+                                   bool write_ok) {
+                        return rt::owner()->submit_finish_update_superblock(
+                            finish_update_superblock_request{
+                                .round_id      = s.round_id,
+                                .inactive_slot = s.inactive_slot,
+                                .write_ok      = write_ok,
+                            });
+                    });
+            });
         }
 
         inline auto
-        continue_after_merge(tree_sched* owner) {
-            return flat_map([owner]<typename merge_result_t>(merge_result_t &&merge_result) {
-                using T = std::remove_cvref_t<merge_result_t>;
+        finalize_root_change(update_superblock_request req) {
+            return rt::owner()->submit_begin_update_superblock(std::move(req))
+                >> flat_map([](begin_update_superblock_result&& r) {
+                    return perform_superblock_io(std::move(r));
+                })
+                >> then(make_finalize_after_superblock)
+                >> flat_map([](finalize_flush_request&& req) {
+                    return rt::owner()->submit_finalize_flush_round(
+                        std::move(req));
+                });
+        }
+
+        // Dispatches the unified io batch staged in a single
+        // `merge_step_need_io` decision. Reads and writes live in
+        // the same `std::vector<merge_io_desc>` and fire through
+        // one `as_stream >> concurrent(N) >> visit() >> flat_map`
+        // chain — the NVMe scheduler sees all N ops as concurrent
+        // in-flight requests, no kind-based serialization.
+        //
+        // Pointer lifetime:
+        //   - read_desc.buf → `merge_round_state::fetched_old_pages[rb].data()`
+        //     (tree_sched-owned; lives until finalize_merge)
+        //   - write_desc.data → `mem_tree_node::content.data()` inside
+        //     `merge_round_state::combined_root` (same lifetime)
+        // NVMe read DMAs directly into the fetched buffers; NVMe
+        // write DMAs from the tree page buffer. After the iter's
+        // all() barrier completes, the next merge_step resume picks
+        // up the fresh bytes in place.
+        //
+        // If `io.has_reads` is set (the seam handler precomputed it
+        // so we don't re-scan), the iter ACKs back via
+        // `submit_merge_reads_done` so the scheduler clears
+        // `waiting_for_reads` and concurrent iters can resume the
+        // coroutine.
+        inline auto
+        handle_merge_step_need_io(merge_step_need_io&& io) {
+            const bool has_reads = io.has_reads;
+            return just()
+                >> as_stream(std::move(io.ios))
+                >> concurrent(tree_sched::kWriteBatchConcurrency)
+                >> visit()
+                >> flat_map([]<typename D>(D&& d) {
+                    using T = std::decay_t<D>;
+                    auto* nvme = rt::local_nvme();
+                    if constexpr (std::is_same_v<T, format::read_desc>) {
+                        return nvme->read(d.lba, d.buf, d.num_lbas);
+                    } else {
+                        static_assert(std::is_same_v<T, format::write_desc>);
+                        return nvme->write(
+                            d.lba, d.data, d.num_lbas, d.flags);
+                    }
+                })
+                >> all()
+                >> then([has_reads](bool) { return has_reads; })
+                >> visit()
+                >> flat_map([]<typename Flag>(Flag&&) {
+                    if constexpr (std::is_same_v<
+                            std::decay_t<Flag>, std::true_type>) {
+                        return rt::owner()->submit_merge_reads_done();
+                    } else {
+                        return just();
+                    }
+                });
+        }
+
+        // Yields a ping each time the scheduler should resume the
+        // merge coroutine. The payload (round_id + worker_proposals)
+        // lives on the `merge_loop_state` in the PUMP context; the
+        // scheduler reads it directly through the `ls` pointer the
+        // iter handler passes into `submit_merge_step`. The loop
+        // terminates when the outer iter handler flips `cpu_done`
+        // in response to a `merge_step_done` decision.
+        inline pump::coro::return_yields<bool>
+        drive_merge(const merge_loop_state& loop_state) {
+            while (!loop_state.cpu_done.load(std::memory_order_acquire)) {
+                co_yield true;
+            }
+            // `return_yields<T>` is built on a `yields_promise` whose
+            // return_value takes T — trailing co_return needs a
+            // sentinel value, never consumed.
+            co_return false;
+        }
+
+        // Dispatches the commit variant returned by `submit_finalize_merge`.
+        //   - done        : propagate the already-built tree_flush_result
+        //   - root_stable : call submit_finalize_flush_round directly
+        //   - root_change : run the superblock update chain
+        //                   (begin → NVMe read/mutate/FUA-write → finish
+        //                    → finalize_flush_round)
+        inline auto
+        continue_after_finalize_merge() {
+            return flat_map([]<typename commit_result_t>(
+                    commit_result_t&& commit_result) {
+                using T = std::remove_cvref_t<commit_result_t>;
                 if constexpr (std::is_same_v<T, flush_merge_done>) {
-                    return just(std::move(merge_result.result));
+                    return just(std::move(commit_result.result));
                 } else if constexpr (std::is_same_v<T, flush_merge_root_stable>) {
-                    return owner->submit_finalize_flush_round(
-                        std::move(merge_result.finalize_req));
+                    return rt::owner()->submit_finalize_flush_round(
+                        std::move(commit_result.finalize_req));
                 } else {
                     static_assert(std::is_same_v<T, flush_merge_root_change>);
                     return finalize_root_change(
-                        owner, std::move(merge_result.update_req));
+                        std::move(commit_result.update_req));
                 }
             });
         }
 
+        // The full merge loop: pump the driver coroutine through
+        // submit_merge_step with `concurrent(kMergeIterConcurrency)`
+        // outer parallelism, handle each yielded decision (dispatch
+        // IO, ACK reads, mark cpu_done when the scheduler reports it),
+        // and await all iters. When the loop returns, every emitted
+        // write for the round is durably queued to NVMe (all() awaited
+        // inside each iter) — the caller must still issue a device
+        // FLUSH before `submit_finalize_merge`.
+        static constexpr uint32_t kMergeIterConcurrency = 8;
+
         inline auto
-        merge_worker_proposals(tree_sched* owner, flush_round_id round_id) {
-            return flat_map([owner, round_id](std::vector<worker_tree_proposal> &&proposals) {
-                return owner->submit_flush_merge(
-                    flush_merge_request{
-                        .round_id = round_id,
-                        .worker_proposals = std::move(proposals),
-                    }
-                );
-            });
+        drive_merge_loop(flush_round_id round_id,
+                         std::vector<worker_tree_proposal>&& proposals)
+        {
+            return just()
+                >> with_context(merge_loop_state{round_id, __mov__(proposals)})([]() {
+                    return get_context<merge_loop_state>()
+                        >> then([](merge_loop_state &ls) { return pump::coro::make_view_able(drive_merge(ls)); })
+                        >> for_each()
+                        >> concurrent(kMergeIterConcurrency)
+                        >> get_context<merge_loop_state>()
+                        >> flat_map([](merge_loop_state &ls, bool) {
+                            return rt::owner()->submit_merge_step(&ls);
+                        })
+                        >> visit()
+                        >> get_context<merge_loop_state>()
+                        >> flat_map([]<typename D>(merge_loop_state& ls, D &&dec) {
+                            using T = std::decay_t<D>;
+                            if constexpr (std::is_same_v<T, merge_step_need_io>) {
+                                return handle_merge_step_need_io(__fwd__(dec));
+                            } else {
+                                static_assert(std::is_same_v<T, merge_step_done>);
+                                ls.cpu_done.store(true, std::memory_order_release);
+                                return just();
+                            }
+                        })
+                        >> all();
+                });
         }
 
         inline auto
@@ -476,7 +659,7 @@ namespace apps::inconel::tree {
         inline auto
         collect_worker_proposals(flush_fold_result&& fr) {
             auto cnt = fr.partitions.size();
-            return with_context(__fwd__(fr), all_worker_tree_proposal(cnt))([cnt]() {
+            return with_context(__mov__(fr), all_worker_tree_proposal(cnt))([cnt]() {
                 return loop(cnt)
                     >> concurrent()
                     >> get_context<flush_fold_result>()
@@ -504,16 +687,34 @@ namespace apps::inconel::tree {
 
     }  // namespace _flush_pipeline
 
+    // Full owner-side flush transaction. Singleton-only — the owner
+    // (`tree_sched`) is resolved internally via `rt::owner()`, so
+    // callers only pass the request payload. See `runtime/facade.hh`.
     inline auto
-    tree_local_flush(tree_sched* owner, tree_flush_request req) {
-        return owner->submit_flush_fold(std::move(req))
-            >> flat_map([owner](flush_fold_result&& fr) {
+    tree_local_flush(tree_flush_request req) {
+        return rt::owner()->submit_flush_fold(std::move(req))
+            >> flat_map([](flush_fold_result&& fr) {
                 auto round_id = fr.round_id;
                 return just()
                     >> flush_pipeline::collect_worker_proposals(std::move(fr))
-                    >> flush_pipeline::merge_worker_proposals(owner, round_id)
+                    >> flat_map([round_id](std::vector<worker_tree_proposal> &&proposals) {
+                        return flush_pipeline::drive_merge_loop(
+                            round_id, __mov__(proposals));
+                    })
+                    >> flat_map([](bool) {
+                        // `drive_merge_loop` ends in `>> all()` which
+                        // yields a single bool; absorb it here.
+                        return rt::local_nvme()->flush();
+                    })
+                    >> flat_map([round_id](bool flush_ok) {
+                        return rt::owner()->submit_finalize_merge(
+                            merge_finalize_request{
+                                .round_id = round_id,
+                                .flush_ok = flush_ok,
+                            });
+                    })
                     >> visit()
-                    >> flush_pipeline::continue_after_merge(owner);
+                    >> flush_pipeline::continue_after_finalize_merge();
             });
     }
 

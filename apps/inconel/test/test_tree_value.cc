@@ -253,7 +253,7 @@ void case_1_lookup_then_read() {
                     // case_1 setup guarantees every key hits a value record;
                     // tombstone/absent are exercised separately in case_2.
                     auto& lv = std::get<lookup_value>(r);
-                    return value::read_value(sched, lv.vr);
+                    return value::read_value(lv.vr);
                 })
                 >> ps::reduce(
                     std::vector<std::string>{},
@@ -372,7 +372,7 @@ void case_3_corrupt_value_page() {
 
         // Drive the read. handle_fill will panic during the second
         // advance pass, before this `then` ever runs.
-        value::read_value(&env.value_sched, env.refs[0])
+        value::read_value(env.refs[0])
             >> ps::then([&done](auto&&) { done = true; })
             >> ps::submit(ctx);
 
@@ -449,7 +449,7 @@ void case_4_nvme_read_failure() {
     };
 
     auto run_one_read = [&](std::string& err_out, bool& done_out) {
-        value::read_value(&env.value_sched, bogus)
+        value::read_value(bogus)
             >> ps::any_exception([&err_out](std::exception_ptr ep) {
                 try { std::rethrow_exception(ep); }
                 catch (const std::exception& e) { err_out = e.what(); }
@@ -550,7 +550,7 @@ void case_5_cache_eviction_isolation() {
     auto ctx = pump::core::make_root_context();
 
     auto read_one = [&](value_ref vr, std::string& got, bool& done) {
-        value::read_value(&env.value_sched, vr)
+        value::read_value(vr)
             >> ps::then([&got, &done](std::string s) {
                 got  = std::move(s);
                 done = true;

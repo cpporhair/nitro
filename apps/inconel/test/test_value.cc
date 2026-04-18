@@ -46,6 +46,7 @@
 #include "apps/inconel/format/value_object.hh"
 #include "apps/inconel/memory/frame.hh"
 #include "apps/inconel/runtime/builder.hh"
+#include "apps/inconel/runtime/run.hh"
 #include "apps/inconel/value/sender.hh"
 
 using namespace apps::inconel;
@@ -126,7 +127,7 @@ void persist_entries(value::value_alloc_sched_base* sched,
                      auto& ctx,
                      std::span<value::put_entry> entries) {
     auto counter = std::make_shared<std::atomic<int>>(0);
-    value::persist_values(sched, entries)
+    value::persist_values(entries)
         >> pump::sender::then([counter](bool ok) {
             CHECK(ok);
             counter->fetch_add(1);
@@ -140,7 +141,7 @@ std::string read_value_sync(value::value_alloc_sched_base* sched,
                             value_ref vr) {
     auto counter = std::make_shared<std::atomic<int>>(0);
     std::string got;
-    value::read_value(sched, vr)
+    value::read_value(vr)
         >> pump::sender::then([&got, counter](std::string s) {
             got = std::move(s);
             counter->fetch_add(1);
@@ -216,7 +217,7 @@ struct test_env {
 
         for (uint32_t core : cores) {
             workers.emplace_back([this, core]() {
-                pump::env::runtime::run(rt, core, [](auto*, uint32_t){});
+                rt::run(rt, core);
             });
         }
 
@@ -259,7 +260,7 @@ void case_1_write_path() {
     auto counter = std::make_shared<std::atomic<int>>(0);
     auto* sched = core::registry::value_sched();
 
-    value::persist_values(sched, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([counter](bool ok) {
             CHECK(ok);
             counter->fetch_add(1);
@@ -313,14 +314,14 @@ void case_2_read_miss() {
     auto* sched = core::registry::value_sched();
     std::string got1, got2;
 
-    value::read_value(sched, vr1)
+    value::read_value(vr1)
         >> pump::sender::then([&got1, counter](std::string s) {
             got1 = std::move(s);
             counter->fetch_add(1);
         })
         >> pump::sender::submit(ctx);
 
-    value::read_value(sched, vr2)
+    value::read_value(vr2)
         >> pump::sender::then([&got2, counter](std::string s) {
             got2 = std::move(s);
             counter->fetch_add(1);
@@ -369,7 +370,7 @@ void case_3_cache_hit() {
     std::string got1, got2;
 
     // First read: miss → fills cache
-    value::read_value(sched, vr)
+    value::read_value(vr)
         >> pump::sender::then([&got1, counter](std::string s) {
             got1 = std::move(s);
             counter->fetch_add(1);
@@ -380,7 +381,7 @@ void case_3_cache_hit() {
     CHECK(reads_after_first == 1);
 
     // Second read: cache hit → no NVMe activity
-    value::read_value(sched, vr)
+    value::read_value(vr)
         >> pump::sender::then([&got2, counter](std::string s) {
             got2 = std::move(s);
             counter->fetch_add(1);
@@ -413,7 +414,7 @@ void case_4_write_then_read() {
     auto counter = std::make_shared<std::atomic<int>>(0);
     auto* sched = core::registry::value_sched();
 
-    value::persist_values(sched, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([counter](bool ok) {
             CHECK(ok);
             counter->fetch_add(1);
@@ -424,7 +425,7 @@ void case_4_write_then_read() {
     // Now read it back. This page is still resident with free slots
     // remaining, so the read should not touch NVMe.
     std::string got;
-    value::read_value(sched, vr)
+    value::read_value(vr)
         >> pump::sender::then([&got, counter](std::string s) {
             got = std::move(s);
             counter->fetch_add(1);
@@ -458,7 +459,7 @@ void case_5_sub_lba_same_page() {
     auto counter = std::make_shared<std::atomic<int>>(0);
     auto* sched = core::registry::value_sched();
 
-    value::persist_values(sched, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([counter](bool ok) {
             CHECK(ok);
             counter->fetch_add(1);
@@ -508,7 +509,7 @@ void case_6_cross_class() {
     auto counter = std::make_shared<std::atomic<int>>(0);
     auto* sched = core::registry::value_sched();
 
-    value::persist_values(sched, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([counter](bool ok) {
             CHECK(ok);
             counter->fetch_add(1);
@@ -571,7 +572,7 @@ void case_7_cache_evict() {
     auto* sched = core::registry::value_sched();
 
     auto wctr = std::make_shared<std::atomic<int>>(0);
-    value::persist_values(sched, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([wctr](bool ok) {
             CHECK(ok);
             wctr->fetch_add(1);
@@ -588,7 +589,7 @@ void case_7_cache_evict() {
 
     auto read_one = [&](value_ref vr, std::string& got) {
         auto c = std::make_shared<std::atomic<int>>(0);
-        value::read_value(sched, vr)
+        value::read_value(vr)
             >> pump::sender::then([&got, c](std::string s) {
                 got = std::move(s);
                 c->fetch_add(1);
@@ -660,7 +661,7 @@ void case_8_multi_lba_bypass() {
     auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
 
     auto wctr = std::make_shared<std::atomic<int>>(0);
-    value::persist_values(sched_base, std::span<value::put_entry>(entries))
+    value::persist_values(std::span<value::put_entry>(entries))
         >> pump::sender::then([wctr](bool ok) {
             CHECK(ok);
             wctr->fetch_add(1);
@@ -681,7 +682,7 @@ void case_8_multi_lba_bypass() {
 
     auto read_one = [&](value_ref vr_in, std::string& got) {
         auto c = std::make_shared<std::atomic<int>>(0);
-        value::read_value(sched_base, vr_in)
+        value::read_value(vr_in)
             >> pump::sender::then([&got, c](std::string s) {
                 got = std::move(s);
                 c->fetch_add(1);

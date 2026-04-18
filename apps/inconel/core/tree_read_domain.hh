@@ -101,6 +101,14 @@ namespace apps::inconel::core {
     struct tree_read_domain_base {
         uint32_t read_domain_index;
 
+        // `partitions` lives on the base so the publish path (see
+        // `runtime/facade.hh::publish_shard_partitions`) can refresh
+        // every read_domain's snapshot without knowing the `Cache`
+        // specialization. It is an immutable `shared_ptr<const ...>`
+        // by construction — swapping the pointer atomically is the
+        // only way to change what a read_domain routes against.
+        std::shared_ptr<const shard_partition_map> partitions;
+
         // Non-templated base pointers to the owned schedulers.
         // `tree_read_domain<Cache>::ctor` fills these in once the
         // unique_ptr<tree_*_sched<Cache>> members are constructed.
@@ -115,8 +123,9 @@ namespace apps::inconel::core {
         tree::tree_lookup_sched_base* lookup_sched = nullptr;
         tree::tree_worker_sched_base* worker_sched = nullptr;
 
-        explicit tree_read_domain_base(uint32_t rdi)
-            : read_domain_index(rdi) {}
+        tree_read_domain_base(uint32_t rdi,
+                              std::shared_ptr<const shard_partition_map> parts)
+            : read_domain_index(rdi), partitions(std::move(parts)) {}
 
         virtual bool advance() = 0;
         virtual ~tree_read_domain_base() = default;
@@ -145,7 +154,6 @@ namespace apps::inconel::core {
 
     template <cache_concept Cache>
     struct tree_read_domain : tree_read_domain_base {
-        std::shared_ptr<const shard_partition_map> partitions;
         Cache                                      node_cache;
         std::unique_ptr<tree::tree_lookup_sched<Cache>> lookup;
         std::unique_ptr<tree::tree_worker_sched<Cache>> worker;
@@ -191,8 +199,7 @@ namespace apps::inconel::core {
         Cache                                       cache,
         const tree_geometry*                        geom,
         std::size_t                                 queue_depth)
-        : tree_read_domain_base(rdi)
-        , partitions(std::move(parts))
+        : tree_read_domain_base(rdi, std::move(parts))
         , node_cache(std::move(cache))
         , lookup(std::make_unique<tree::tree_lookup_sched<Cache>>(
               this, geom, queue_depth))

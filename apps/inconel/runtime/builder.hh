@@ -23,6 +23,7 @@
 #include "../mock_nvme/scheduler.hh"
 #include "../tree/scheduler.hh"
 #include "../value/scheduler.hh"
+#include "./facade.hh"
 
 namespace apps::inconel::runtime {
 
@@ -82,10 +83,20 @@ namespace apps::inconel::runtime {
 
     // ── Build context ──
     //
-    // Hardcoded for now: every listed core hosts both nvme + tree_lookup.
-    // The value scheduler is a singleton pinned to cores[0]; the PUMP typed
-    // tuple on every other core carries a nullptr slot so share_nothing's
-    // advance loop skips the empty slot automatically.
+    // `cores` lists every core that participates in the runtime. Each such
+    // core unconditionally hosts a `mock_nvme::scheduler` so the per-core
+    // advance loop always has an I/O seam available.
+    //
+    // The three per-role fields describe where the remaining schedulers
+    // live. When all of them are left at their sentinel defaults the
+    // builder falls back to the historical symmetric topology — every
+    // listed core hosts a `tree_read_domain`, the value singleton and the
+    // owner singleton both pin to `cores[0]`. Tests that want an
+    // asymmetric layout (e.g. `core 0 = value`, `core 2/4/6 = read_domain`,
+    // `core 8 = owner`) populate the role fields explicitly; the core ids
+    // named there must also appear in `cores`. Every role-core that is
+    // not listed as a read_domain host carries a nullptr slot in the PUMP
+    // per-core tuple so `share_nothing::run()` skips it.
     //
     // Step 017 / INC-034 removed the disk-format fields that used to live
     // here (`value_class_sizes`, `lba_size`, `value_data_area_base`,
@@ -99,6 +110,16 @@ namespace apps::inconel::runtime {
     struct build_options {
         std::span<const uint32_t> cores;             // which cores to populate
         mock_nvme::mock_device*   device;            // nvme backing device
+
+        // Optional per-role topology. Leave default for the symmetric
+        // layout (read_domain on every core, value + owner on cores[0]).
+        // When set, each role-core must be a member of `cores`.
+        //   read_domain_cores — empty means "all cores".
+        //   value_core        — < 0 means cores[0].
+        //   owner_core        — < 0 means cores[0].
+        std::span<const uint32_t> read_domain_cores = {};
+        int32_t                   value_core        = -1;
+        int32_t                   owner_core        = -1;
 
         // tree cache capacity (entries). Applies to tree_lookup_sched<TreeCache>.
         // Minimum legal value depends on the cache impl: clock_cache requires
@@ -250,36 +271,79 @@ namespace apps::inconel::runtime {
                 "runtime::build_runtime: device namespace too small for "
                 "profile value_data_area_end.lba");
         }
+
+        // ── tier 4: role-core membership ──
+        //
+        // Each role core must appear in `cores` and fit the registry's
+        // `by_core` arrays (indexed by hardware core id). Duplicates in
+        // `read_domain_cores` would produce two `tree_read_domain` slots
+        // on the same core and break the "one read_domain per core"
+        // invariant — reject them at build time rather than letting
+        // `add_core_schedulers` trip its assert at run time.
+        auto core_in_set = [&](uint32_t c) {
+            for (uint32_t x : opts.cores) if (x == c) return true;
+            return false;
+        };
+        if (opts.value_core >= 0 &&
+            !core_in_set(static_cast<uint32_t>(opts.value_core))) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.value_core is not a member "
+                "of opts.cores");
+        }
+        if (opts.owner_core >= 0 &&
+            !core_in_set(static_cast<uint32_t>(opts.owner_core))) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.owner_core is not a member "
+                "of opts.cores");
+        }
+        for (size_t i = 0; i < opts.read_domain_cores.size(); ++i) {
+            uint32_t c = opts.read_domain_cores[i];
+            if (!core_in_set(c)) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: opts.read_domain_cores "
+                    "contains a core not in opts.cores");
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (opts.read_domain_cores[j] == c) {
+                    throw std::invalid_argument(
+                        "runtime::build_runtime: opts.read_domain_cores "
+                        "contains a duplicate");
+                }
+            }
+        }
     }
 
     // ── build_runtime: construct schedulers + register ──
     //
-    // Startup sequence (030 §2.8):
+    // Startup sequence (030 §2.8, extended to support asymmetric
+    // topologies):
     //   1. Validate `opts` + `kBootstrapFormatProfile` (fail-fast).
-    //   2. Install the bootstrap `shard_partition_map` — a single-shard
+    //   2. Resolve the role → core map. If `opts.read_domain_cores` is
+    //      empty the symmetric layout is used (every member of
+    //      `opts.cores` hosts a `tree_read_domain`). `value_core` and
+    //      `owner_core` default to `cores[0]` when left at -1.
+    //   3. Install the bootstrap `shard_partition_map` — a single-shard
     //      placeholder covering (-∞, +∞) → shard 0 (030 §6.7 decision P).
-    //      The tree is empty at boot (leaf_order = {}) and
-    //      `manifest->has_root()` short-circuits reads before they ever
-    //      route; the placeholder is present so the routing invariant
-    //      ("map is always installed") holds during the bootstrap
-    //      window between first tree_read_domain construction and the
-    //      first flush that populates `leaf_order`.
-    //   3. Per core: construct `tree_read_domain<TreeCache>` which in
-    //      turn owns its `tree_lookup_sched<TreeCache>` and
-    //      `tree_worker_sched<TreeCache>` via `unique_ptr`. The PUMP
-    //      runtime tuple registers the read_domain (not the individual
-    //      schedulers) — one scheduling unit per core.
-    //   4. Construct the global singletons `value_alloc_sched` and
-    //      `tree::tree_sched` on the first core.
+    //      The shard count tracks the number of read_domain hosts, not
+    //      the total core count.
+    //   4. Per core in `opts.cores`:
+    //        - unconditionally build `mock_nvme::scheduler`;
+    //        - if this core is a read_domain host, build
+    //          `tree_read_domain<TreeCache>` (which owns
+    //          `tree_lookup_sched` / `tree_worker_sched` via unique_ptr);
+    //        - if this core is the value host, build
+    //          `value::value_alloc_sched<ValueCache>`;
+    //        - if this core is the owner host, build `tree::tree_sched`.
+    //      Non-role cores receive a nullptr slot in the PUMP per-core
+    //      tuple and `share_nothing::run()` skips the empty slot.
     //   5. Register non-templated base pointers into
     //      `core::registry::tree_read_domains`. Application code reaches
     //      schedulers via `tree_read_domain_at(idx)->lookup_sched` /
     //      `->worker_sched`.
     //
-    // INC-034 (unchanged by 030): the standard runtime always
-    // constructs the value scheduler; tests that want a tree-only
-    // harness must route through a dedicated test fixture, not through
-    // build_runtime / start_runtime.
+    // INC-034: the standard runtime always constructs the value
+    // scheduler; tests that want a tree-only harness must route through
+    // a dedicated test fixture, not through build_runtime / start_runtime.
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline inconel_runtime_t<TreeCache, ValueCache>*
@@ -295,32 +359,60 @@ namespace apps::inconel::runtime {
         auto shared_heads = std::make_shared<core::data_area_heads>();
         core::registry::data_area_heads_ptr = shared_heads;
 
-        // ── Step 2: bootstrap shard_partition_map ───────────────────
+        // ── Step 2: resolve role → core map ─────────────────────────
+        const uint32_t value_core = opts.value_core < 0
+            ? opts.cores.front()
+            : static_cast<uint32_t>(opts.value_core);
+        const uint32_t owner_core = opts.owner_core < 0
+            ? opts.cores.front()
+            : static_cast<uint32_t>(opts.owner_core);
+        std::vector<uint32_t> read_domain_cores_buf;
+        std::span<const uint32_t> read_domain_cores = opts.read_domain_cores;
+        if (read_domain_cores.empty()) {
+            read_domain_cores_buf.assign(opts.cores.begin(), opts.cores.end());
+            read_domain_cores = read_domain_cores_buf;
+        }
+
+        auto rd_slot_of = [&](uint32_t core) -> int32_t {
+            for (size_t i = 0; i < read_domain_cores.size(); ++i) {
+                if (read_domain_cores[i] == core) {
+                    return static_cast<int32_t>(i);
+                }
+            }
+            return -1;
+        };
+
+        // ── Step 3: bootstrap shard_partition_map ───────────────────
         // Empty leaf_order at boot; `build_initial_shard_partition_map`
         // returns a single-shard placeholder map (030 §2.2 decision P).
-        // The placeholder routes every key to shard 0 — K - 1 read
-        // domains sit idle until the first flush populates `leaf_order`
-        // and (future) `tree_sched` triggers a rebuild. Bootstrap-time
-        // reads are short-circuited by `manifest->has_root() == false`,
-        // so the placeholder is not exercised on the read path.
+        // Shard count tracks the number of read_domain hosts — not
+        // every core is a read_domain in asymmetric topologies.
+        //
+        // install_shard_partitions here (not publish) because the
+        // read_domains do not exist yet: their ctors pull the
+        // shared_ptr via `current_shard_partitions()`. The publish
+        // call at the end of the builder re-syncs the same map into
+        // every read_domain for parity with the rebuild path.
+        std::shared_ptr<const core::shard_partition_map> bootstrap_map;
         {
             core::leaf_order_index empty_leaf_order;
             auto map = core::build_initial_shard_partition_map(
                 empty_leaf_order,
-                static_cast<uint32_t>(opts.cores.size()));
-            core::registry::install_shard_partitions(
-                std::make_shared<const core::shard_partition_map>(
-                    std::move(map)));
+                static_cast<uint32_t>(read_domain_cores.size()));
+            bootstrap_map = std::make_shared<const core::shard_partition_map>(
+                std::move(map));
+            core::registry::install_shard_partitions(bootstrap_map);
         }
 
-        bool first = true;
-        uint32_t next_read_domain_index = 0;
+        // ── Step 4: per-core scheduler construction ─────────────────
+        using value_sched_t = value::value_alloc_sched<ValueCache>;
+        value_sched_t* value_sched_singleton = nullptr;
+        tree::tree_sched* tsched_singleton = nullptr;
+
         for (uint32_t core : opts.cores) {
             // PUMP per_core::queue routes by this_core_id, so it must be set
             // before constructing schedulers that hold such queues.
             pump::core::this_core_id = core;
-
-            const uint32_t read_domain_index = next_read_domain_index++;
 
             auto* nvme = new mock_nvme::scheduler(opts.device);
 
@@ -331,18 +423,18 @@ namespace apps::inconel::runtime {
             // value, so free-frame reuse cannot cross page sizes. The
             // read_domain transparently propagates that pointer into
             // its owned lookup scheduler.
-            auto* read_domain = new core::tree_read_domain<TreeCache>(
-                read_domain_index,
-                core::registry::current_shard_partitions(),
-                TreeCache(opts.tree_cache_capacity),
-                &kBootstrapTreeGeometry);
+            core::tree_read_domain<TreeCache>* read_domain = nullptr;
+            const int32_t rd_index = rd_slot_of(core);
+            if (rd_index >= 0) {
+                read_domain = new core::tree_read_domain<TreeCache>(
+                    static_cast<uint32_t>(rd_index),
+                    core::registry::current_shard_partitions(),
+                    TreeCache(opts.tree_cache_capacity),
+                    &kBootstrapTreeGeometry);
+            }
 
-            // Singleton: value_alloc_sched is pinned to cores[0]. Every other
-            // core gets a nullptr placeholder so the PUMP per-core tuple shape
-            // stays uniform.
-            using value_sched_t = value::value_alloc_sched<ValueCache>;
             value_sched_t* value_sched = nullptr;
-            if (first) {
+            if (core == value_core) {
                 value_sched = new value_sched_t(
                     profile.class_sizes(),
                     profile.lba_size,
@@ -351,27 +443,22 @@ namespace apps::inconel::runtime {
                     shared_heads.get(),
                     ValueCache(opts.value_cache_capacity));
                 core::registry::value_alloc_sched = value_sched;
+                value_sched_singleton = value_sched;
+                shared_heads->value_head_lba.store(
+                    value_sched->alloc_.bump_head().lba,
+                    std::memory_order_relaxed);
             }
 
-            // Singleton: tree::tree_sched is pinned to cores[0] (step
-            // 023 §9, D18/D25). Every other core carries a nullptr
-            // placeholder in the per-core tuple so share_nothing's
-            // `run()` loop skips the empty slot. The singleton is
-            // constructed before the `add_core_schedulers` call below
-            // so the first core's tuple gets the real pointer and
-            // every subsequent core's tuple gets nullptr.
             tree::tree_sched* tsched = nullptr;
-            if (first) {
+            if (core == owner_core) {
                 tsched = new tree::tree_sched(
                     &kBootstrapTreeGeometry,
                     profile.value_data_area_base,
                     shared_heads.get());
                 core::registry::tree_sched_singleton_ptr = tsched;
+                tsched_singleton = tsched;
                 shared_heads->tree_head_lba.store(
                     tsched->state.alloc.head.lba, std::memory_order_relaxed);
-                shared_heads->value_head_lba.store(
-                    value_sched->alloc_.bump_head().lba,
-                    std::memory_order_relaxed);
             }
 
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
@@ -381,11 +468,27 @@ namespace apps::inconel::runtime {
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme);
             core::registry::nvme_scheds.by_core[core] = nvme;
-            core::registry::tree_read_domains.list.push_back(read_domain);
-            core::registry::tree_read_domains.by_core[core] = read_domain;
-
-            first = false;
+            if (read_domain != nullptr) {
+                core::registry::tree_read_domains.list.push_back(read_domain);
+                core::registry::tree_read_domains.by_core[core] = read_domain;
+            }
         }
+
+        // Suppress unused-variable warnings when the helper singletons
+        // are not consulted after construction — they are retained for
+        // readability and future assertions.
+        (void)value_sched_singleton;
+        (void)tsched_singleton;
+
+        // Go through `publish_shard_partitions` even during bootstrap
+        // so every install path (bootstrap + future tree_sched
+        // rebuild) converges on the same 2-step contract: install the
+        // global pointer + refresh every read_domain's snapshot. The
+        // refresh is a no-op in the common case (the read_domains
+        // just had the same `shared_ptr` handed to their ctors) but
+        // keeps the rebuild site from ever being the first code to
+        // exercise the propagation loop.
+        rt::publish_shard_partitions(bootstrap_map);
 
         return rt;
     }

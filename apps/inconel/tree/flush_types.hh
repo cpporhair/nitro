@@ -29,6 +29,7 @@
 // result with `st = unsupported_unimplemented` via the value path; we
 // do not throw for unimplemented phases.
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -314,11 +315,130 @@ namespace apps::inconel::tree {
         update_superblock_request  update_req;
     };
 
-    using flush_merge_result =
-        std::variant<
-            flush_merge_done,
-            flush_merge_root_stable,
-            flush_merge_root_change>;
+    // ── merge loop state (lives in the outer pipeline context) ──
+    //
+    // Replaces the earlier `merge_step_driver` variant: instead of
+    // carrying the round_id / worker_proposals in a variant arm that
+    // the coroutine yields on its first iteration, we keep them in a
+    // pipeline-context struct and hand a `merge_loop_state*` to
+    // `submit_merge_step` every iteration. The scheduler reads the
+    // pointer and, on the first call (when `active_merge` is still
+    // empty), moves `worker_proposals` out to seed the coroutine;
+    // subsequent calls ignore the payload fields.
+    //
+    // `cpu_done` is the loop termination flag:
+    //   - flipped to true by the outer iter handler when the
+    //     scheduler returns `merge_step_done`
+    //   - read by the `drive_merge` coroutine each iteration to
+    //     decide whether to keep yielding
+    // `concurrent(kMergeIterConcurrency)` means multiple iter
+    // handlers can write the flag concurrently from different cores
+    // after the coroutine finishes, so `atomic<bool>` is required.
+    struct merge_loop_state {
+        flush_round_id                    round_id;
+        std::vector<worker_tree_proposal> worker_proposals;
+        std::atomic<bool>                 cpu_done{false};
+
+        merge_loop_state() = default;
+        merge_loop_state(flush_round_id r, std::vector<worker_tree_proposal>&&  p)
+            : round_id(r), worker_proposals(std::move(p)) {}
+
+        // Custom move ctor because `std::atomic<bool>` is neither
+        // copyable nor movable. A snapshot-then-store is safe here —
+        // `merge_loop_state` only moves at construction time (into
+        // the PUMP context), never in a racy window.
+        merge_loop_state(merge_loop_state&& o) noexcept
+            : round_id(o.round_id),
+              worker_proposals(std::move(o.worker_proposals)),
+              cpu_done(o.cpu_done.load(std::memory_order_relaxed)) {}
+        merge_loop_state& operator=(merge_loop_state&&)      = delete;
+        merge_loop_state(const merge_loop_state&)            = delete;
+        merge_loop_state& operator=(const merge_loop_state&) = delete;
+    };
+
+    // ── merge step decision (scheduler → outer pipeline) ─────────
+    //
+    // `merge_io_desc` is the unified NVMe op carrier the coroutine
+    // stages in `merge_round_state::pending_ios`. Read and write
+    // ops live in the same `std::vector<merge_io_desc>` so the
+    // outer pipeline can dispatch them with a single
+    // `as_stream >> concurrent(N) >> visit() >> flat_map(...)`
+    // chain — no artificial serialization between the two.
+    // Pointer lifetime:
+    //   - read_desc.buf   → `merge_round_state::fetched_old_pages[rb].data()`
+    //   - write_desc.data → `mem_tree_node::content.data()` inside
+    //                       `merge_round_state::combined_root`
+    // Both buffers are tree_sched-owned and live until finalize_merge.
+    using merge_io_desc = std::variant<format::read_desc, format::write_desc>;
+
+    // `merge_step_need_io` carries one yield's worth of IOs moved
+    // out of `merge_round_state::pending_ios`. `has_reads` is
+    // precomputed by the seam handler so the outer pipeline doesn't
+    // need to re-scan the vector; it's true iff the coroutine
+    // cannot safely be resumed until every io in this batch
+    // completes (i.e. any `read_desc` present whose buffer the
+    // next resume will read in place). The outer pipeline ACKs
+    // back via `submit_merge_reads_done` when `has_reads` is true.
+    //
+    // `merge_step_done` is returned once the coroutine reaches
+    // `co_return` — all writes are already emitted and in flight
+    // (or completed); the outer pipeline then issues a device
+    // FLUSH and calls `submit_finalize_merge`.
+    struct merge_step_need_io {
+        std::vector<merge_io_desc> ios;
+        bool                       has_reads = false;
+    };
+
+    struct merge_step_done {};
+
+    using merge_step_decision = std::variant<
+        merge_step_need_io,
+        merge_step_done>;
+
+    // ── finalize after flush ─────────────────────────────────────
+    //
+    // Called once per flush round after the outer pipeline's
+    // `merge_step` loop has drained (all emitted writes complete)
+    // AND a device FLUSH has been issued. `flush_ok` carries the
+    // FLUSH outcome. The scheduler inspects `active_merge` to
+    // produce the commit variant:
+    //   - done        : no writes happened (or anything failed)
+    //   - root_stable : CAT-only finalize
+    //   - root_change : needs superblock rewrite
+    // `active_merge` is released here; `active_rounds[round_id]`
+    // is handed to `_finalize_flush_round` via the commit variant.
+    struct merge_finalize_request {
+        flush_round_id  round_id;
+        bool            flush_ok = false;
+    };
+
+    using merge_finalize_result = std::variant<
+        flush_merge_done,
+        flush_merge_root_stable,
+        flush_merge_root_change>;
+
+    // Step 1 of the root-change superblock update: `tree_sched`
+    // atomically picks the active/inactive slot pair and latches
+    // the inflight serialization flag. The outer pipeline is the
+    // one that performs the NVMe read, mutates the superblock
+    // bytes, and issues the inactive-slot FUA write.
+    struct begin_update_superblock_result {
+        flush_round_id   round_id;
+        paddr            new_root_base_paddr{};
+        uint64_t         active_lba       = 0;
+        uint64_t         inactive_lba     = 0;
+        superblock_slot  inactive_slot    = superblock_slot::A;
+        uint32_t         lba_size         = 0;
+    };
+
+    // Step 2 of the root-change superblock update: notifies
+    // `tree_sched` that the inactive-slot write has completed so it
+    // can clear the inflight flag and surface an `update_superblock_result`.
+    struct finish_update_superblock_request {
+        flush_round_id   round_id;
+        superblock_slot  inactive_slot = superblock_slot::A;
+        bool             write_ok      = false;
+    };
 
     // ── owner-level flush request / result ──────────────────────
     //

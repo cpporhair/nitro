@@ -27,9 +27,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "./panic.hh"
@@ -142,6 +144,72 @@ namespace apps::inconel::core {
                     shards.size());
             }
             return shards[lo].shard_idx;
+        }
+
+        // Batch routing for strictly ascending keys.
+        //
+        // For each contiguous run of `sorted_keys` that routes to the
+        // same `shard_idx`, invoke `sink(shard_idx, lo, hi)` exactly
+        // once, where `[lo, hi)` indexes into `sorted_keys`. Empty
+        // input results in zero sink invocations.
+        //
+        // Algorithm: both `sorted_keys` and `shards` are sorted by the
+        // same ordering, so a single linear sweep (one pointer into
+        // each) produces the partitioning in O(N + S) comparisons.
+        // Flush paths (`memtable_fold` → `partition_sorted_keys` →
+        // per-shard worker fan-out) use this to avoid S routing
+        // binary searches plus a post-pass bucket merge — the sweep
+        // hands back the buckets already formed.
+        //
+        // Callers guarantee `sorted_keys` is strictly ascending. The
+        // function does not verify that guarantee because validating
+        // it in the hot flush path would dominate the routing cost.
+        template <typename Sink>
+        void
+        partition_sorted_keys(std::span<const std::string_view> sorted_keys,
+                              Sink&& sink) const {
+            if (sorted_keys.empty()) return;
+            if (shards.empty()) {
+                panic_inconsistency(
+                    "shard_partition_map::partition_sorted_keys",
+                    "invoked on empty shard_partition_map — caller must "
+                    "short-circuit empty-tree via manifest->has_root() "
+                    "before routing");
+            }
+
+            std::size_t i = 0;
+            std::size_t s = 0;
+            const std::size_t n = sorted_keys.size();
+            const std::size_t S = shards.size();
+
+            while (i < n) {
+                // Advance `s` past shards whose fence_upper is <= keys[i].
+                while (s < S) {
+                    auto upper = fence_upper_view(shards[s]);
+                    if (upper.empty() || sorted_keys[i] < upper) break;
+                    ++s;
+                }
+                if (s >= S) {
+                    // Last shard had a finite fence_upper — builder
+                    // contract violation. Panic rather than assigning
+                    // keys to a non-existent shard.
+                    panic_inconsistency(
+                        "shard_partition_map::partition_sorted_keys",
+                        "shard_partition_map has no +∞ sentinel "
+                        "(shards=%zu)",
+                        S);
+                }
+
+                // Absorb all keys that fall into shard `s`.
+                const std::size_t lo = i;
+                auto upper = fence_upper_view(shards[s]);
+                if (upper.empty()) {
+                    i = n;
+                } else {
+                    while (i < n && sorted_keys[i] < upper) ++i;
+                }
+                std::forward<Sink>(sink)(shards[s].shard_idx, lo, i);
+            }
         }
 
       private:

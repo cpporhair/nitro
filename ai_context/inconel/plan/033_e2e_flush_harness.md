@@ -1,6 +1,12 @@
 # Step 033 — Tree-Local Flush 端到端 Harness (`test_flush_e2e`)
 
-> 状态：**harness landed + 首轮端到端 PASS**（2026-04-19）。`./build/inconel_test_flush_e2e` 在目标拓扑（cores 0/2/4/6/8，rd 2/4/6，value 0，owner 8）上对 1000-key 单轮 flush 走通，`st=0 / leaf_order=12 / root_slot.lba=4015 / readback 51 strided samples OK`。首跑暴露的 Phase 9 空树 bootstrap 缺口 INC-042 已在同日后续会话关闭，改动落在 production 侧四处（`memtable_fold` / `candidate_build` / `owner_scheduler` / `sender.hh`）——详见 §12.4。readback 从最初的 5 个 boundary 点扩到均匀步长 ~50 samples（含首尾兜底，1000 keys 实际 51 samples），确保 `leaf_order` 每张 page 都被读回至少一次——详见 §12.6。所有 scope 决策见 §9；实现后观察见 §12。
+> 状态：**harness landed + 多轮 flush 端到端 PASS**（2026-04-19）。`./build/inconel_test_flush_e2e` 在目标拓扑（cores 0/2/4/6/8，rd 2/4/6，value 0，owner 8）上对 1000-key 跑三轮连续 flush（round 1 bootstrap / round 2 mixed overwrite+tombstone+new / round 3 同类 mix 且对 round 2 的覆盖/新增再做覆盖/删除），`st=0 / leaf_order=12→14→16 / root_slot 各异`，51 个 stride sample 通过 `tree::lookup + value::read_value` 全对（43 value / 8 tombstone）。
+>
+> 两个 production 缺口已闭：
+> - **INC-042**（首跑暴露的空树 bootstrap）：2026-04-19 修在 production 四处（`memtable_fold` / `candidate_build` / `owner_scheduler` / `sender.hh`）——见 §12.4。
+> - **INC-043**（多轮 flush 扩展暴露的 owner merge `try_get_old_page_bytes` 段错误）：2026-04-19 修在 `owner_scheduler` 的 `merge_context::group_storage` 指针稳定性 + `materialize_substitution` 切片语义 + `build_leaf_order_full` fail-fast 约束 A——见 §12.7。
+>
+> Readback 从最初的 5 个 boundary 点扩到均匀步长 ~50 samples（含首尾兜底）——见 §12.6。多轮扩展 + 边界场景设计（覆盖 / 删除 / 新增 / 双层覆盖 / 跨边界新增）见 §12.7。所有 scope 决策见 §9；实现后观察见 §12。
 >
 > **定位：033 只交付端到端 test harness，production 代码一律不改。** 跑 harness 发现的 production bug 新起会话修（比如 Phase 9 没闭的 empty-tree bootstrap 路径、merge 对空 base_manifest 的处理、shard_partition rebuild 等等），**不在本 step 内**预先改。
 >
@@ -551,3 +557,67 @@ all passed
 **没做的事（下次扩展）**：
 - `verify_readback_samples` 里对每个 sample 独立 `submit_and_wait<std::string>(read_value(vr))`，51 个 sample 下 mock_nvme 单线程够快，但 N 上到 100K+ 会拖慢。要改成 `for_each(lookup_results) >> concurrent(K) >> flat_map(value::read_value) >> all()` 并发版本。扩到大 N 那一轮再做。
 - 全量 readback（N 个 sample = N keys）目前不做（用户决策）；51 均匀步长是"够验证写入一致性 + 不拖 N=100K 的合理量级"。
+
+### 12.7 多轮 flush 扩展 + INC-043 闭环（2026-04-19，同日）
+
+单轮 harness 走通后把覆盖面扩到**三轮连续 flush**，强制走 step 031 的非-bootstrap merge 路径。结构在 `test_flush_e2e.cc` 内重构（没新文件），把"round"抽象成独立概念：
+
+- `round_op` / `round_spec` / `round_outcome`：一轮的 op 列表（mixed put/tombstone，按 key 排序） + gen_id / lsn_start + 输出的 new_manifest 和 next_base_guard。
+- `run_round(spec, base_guard, label)`：接任意 base_guard（empty 或前一轮的 manifest），persist puts → build sealed gen → `tree::tree_local_flush` → validate → 包装 new_manifest 为下一轮的 base_guard。
+- `expected_state = std::map<string, expected_entry>`：harness 独立跟踪每个 key 的期望状态（kind::value + bytes + data_ver / kind::tombstone + data_ver）；每轮调 `apply_round_to_expected` 按 `lsn_start + op_position` 写入。
+- `pick_verify_samples / verify_against_expected`：从 state 里按 stride 抽 ~50 sample，`tree::lookup` 批量拿 result → 每个 sample 按期望 kind 断言 `lookup_value.data_ver` + value bytes 或 `lookup_tombstone.data_ver`；value 样本额外走 `value::read_value(vr)` 拿字节对等。
+
+**三轮 ops 设计（scale with N = num_keys，N ≥ 1000）**：
+
+| Round | 规模 | 内容 | 目的 |
+|---|---|---|---|
+| 1 | N ops (1000 PUT) | 全 PUT `[0, N)` | bootstrap + 建立 r1 baseline |
+| 2 | 2N/5 ops (400) | 50 overwrite `[N/20, N/10)` (将被 r3 再覆盖) + 50 overwrite `[N/10, 3N/20)` (r2 终值) + 100 tombstone `[3N/10, 4N/10)` + 200 new `[N, 6N/5)` | 验覆盖 + 删除 + 跨边界新增 |
+| 3 | 2N/5 ops (400) | 50 re-overwrite `[N/20, N/10)` (double-overwrite) + 50 overwrite `[N/5, N/5+N/20)` (r1→r3 直接覆盖) + 50 tombstone `[N/2, N/2+N/20)` (r1 origin) + 50 tombstone `[N+N/10, N+3N/20)` (r2 newcomer origin) + 200 new `[3N/2, 3N/2+N/5)` | 验双层覆盖 + 两种 origin 的 tombstone + 又一段跨边界新增 |
+
+**最终 expected state (N=1000)**：1400 keys（1200 value / 200 tombstone），覆盖所有 8 种场景：
+- 纯 r1 unchanged value（700 keys）
+- r2 singly-overwritten value（50 keys）
+- r3 singly-overwritten value（50 keys，r1→r3 直接）
+- r3 doubly-overwritten value（50 keys，r1→r2→r3）
+- r2 tombstoned on r1-origin（100 keys）
+- r3 tombstoned on r1-origin（50 keys）
+- r3 tombstoned on r2-newcomer-origin（50 keys）
+- r2 newcomer survived（150 keys 其中 100 完全未动 + 50 未被 r3 tomb）
+- r3 newcomer（200 keys）
+
+**多轮运行结果（`num_keys=1000`）**：
+
+```
+round 1 flush: st=0, leaf_order.size=12, root_slot.lba=4015
+round 2 flush: st=0, leaf_order.size=14, root_slot.lba=4027
+round 3 flush: st=0, leaf_order.size=16, root_slot.lba=4040
+expected state after 3 rounds: 1400 keys (1200 value, 200 tombstone)
+verify 51 sampled keys: readback OK for 51 samples (43 value / 8 tombstone)
+```
+
+`leaf_order.size` 的增长（12 → 14 → 16）和 `root_slot.lba` 的变化（4015 → 4027 → 4040）反映了 root-change 每轮被触发（新范围分配 + superblock 异步更新 chain）；flushed_max_lsn 按 round 推进（1000 / 1400 / 1800）；`flushed_front_count` 稳定 = 1。
+
+**首次跑 3 轮暴露 INC-043 (同日关闭)**：
+
+Round 1 过（走 INC-042 修的 bootstrap 路径），**round 2 merge 协程里 SIGSEGV 在 `_owner::try_get_old_page_bytes`**。这是 step 031 Phase 9 留下的两层相关缺陷，因为 INC-042 的 bootstrap 路径把两者都掩盖了（bootstrap 跳 `index_root_group`，`group_storage` 全程空）：
+
+| 层 | 问题 | 修复 |
+|---|---|---|
+| (a) 指针失稳 | `merge_context::group_storage` 是 `std::vector<proposal_group_view>`；`add_group_view` 每次 push_back 后立刻把 `&group_storage.back()` 存进 `contrib_index`。下一次 push_back 触发 vector 扩容 → 之前所有指针悉数 dangling → `try_get_old_page_bytes` 解引用时炸 | `std::vector<proposal_group_view>` → `std::deque<proposal_group_view>`（`deque` 保证 push_back 不会失效已有 references/pointers）；include `<deque>` |
+| (b) 切片丢失 | 修完 (a) 后 round 2 跑出非自洽的 `leaf_order`：`merge_internal_old_paddr` 的多-contrib 路径 `materialize_substitution(raw_group)` 直接 `clone_node(*iv.raw_view)` 把整棵 worker root internal 原样灌进 `new_children`，丢掉了 `[j, k)` 切片信息 → combined_root 变成"old_root 层包 3 个 worker root 全量视图"，`build_leaf_order_full` 的 38 spans 里有 3× 重复 leaf + 非首位 `fence_lower` 空，破坏 `build_initial_shard_partition_map` 的 "only last shard carries +∞ sentinel" 不变量 | `substitution_iv` 增 `raw_nodes: vector<const mem_tree_node*>` + `raw_sibling_seps`；iv 构造循环从 `flat_children[j..k)` / `flat_separators[j..k-1)` 现场切片；`materialize_substitution` 改为对每个 `raw_nodes[i]` 调 `clone_node`，不再直接 clone 整棵 `*raw_view`；`raw_view` 保留纯身份用途（dedup check） |
+
+附加 fail-fast（CLAUDE.md 约束 A 硬要求）：`build_leaf_order_full` 扫到非首位 `lowers[i]` 为空时 `panic_inconsistency`，明确点出两条已知触发路径（displaced position-0 base leaf / 未剪的空 new leaf）作为 INC-043 的 follow-up narrowing，防止未来某个 shape-change 路径悄悄复现切片丢失。
+
+**回归检查**：全 15 个 `inconel_test_*` PASS 无回归（包含 INC-042 修好后也通过的 `test_candidate_build` / `test_flush_carriers` / `test_leaf_mapping`）。
+
+**文档同步**：`known_issues.md` INC-043 进 Resolved，记录完整方向（指针失稳 + 切片丢失 + fail-fast 收窄三项）。`-Wsubobject-linkage` 两条 warning（run_merge 协程帧里 lambda）仍在，和 INC-043 修的区域相邻，Release LTO 诊断不影响正确性，留作 follow-up sweep。
+
+### 12.8 Follow-up（累计，待后续 step）
+
+1. `rt::publish_shard_partitions` 跨 core 写 `rd->partitions` 的非 atomic shared_ptr 发布（§12.5）。
+2. `verify_against_expected` 的 per-sample `value::read_value` 并发化（§12.6 "没做的事"）。
+3. `-Wsubobject-linkage` warning 清理（§12.7 末尾）。
+4. 100K+ key 规模跑通（覆盖 value size-class mix / sub-LBA 等）。
+5. Standalone profile binary（`feedback_perf_profile_on_module_e2e`）。
+6. WAL / coord integration（前端 gen 构造改由 WAL 路径驱动，替掉 harness 的手搓 `build_sealed_gen`）。

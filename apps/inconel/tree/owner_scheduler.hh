@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -583,7 +584,27 @@ namespace apps::inconel::tree {
             const absl::flat_hash_map<paddr, std::vector<char>>*
                 fetched_old_pages = nullptr;
 
-            std::vector<proposal_group_view> group_storage;
+            // `std::deque`, not `std::vector`: `add_group_view`
+            // captures `&group_storage.back()` and stashes the
+            // pointer into `contrib_index` on every push; subsequent
+            // pushes must not invalidate those pointers. `std::deque`
+            // guarantees reference stability across `push_back`
+            // (standard: push_back/push_front invalidates iterators
+            // but not references/pointers to existing elements),
+            // whereas `std::vector::push_back` is free to reallocate
+            // and silently dangle every earlier contrib pointer. The
+            // bootstrap path hid the bug because
+            // `make_merge_context_bootstrap` skips `index_root_group`
+            // entirely — `group_storage` stays empty until
+            // destruction. The first non-bootstrap flush round
+            // tripped it (INC-043).
+            //
+            // Deque's per-bucket allocation overhead is negligible
+            // for a round-scoped structure that holds at most one
+            // entry per affected subtree group; access patterns are
+            // `push_back` / `back()` only (no indexing), both of
+            // which deque supports natively.
+            std::deque<proposal_group_view> group_storage;
             absl::flat_hash_map<paddr, std::vector<const proposal_group_view*>>
                 contrib_index;
             absl::flat_hash_map<paddr, std::unique_ptr<merged_group>> merged_cache;
@@ -1195,7 +1216,29 @@ namespace apps::inconel::tree {
 
             enum class source_kind : uint8_t { raw_group, merged_child };
             source_kind             kind = source_kind::raw_group;
+
+            // Source identity for the dedup-check in the main walk
+            // ("two candidates for the same old slot must come from
+            // the same contrib, else panic"). Two ivs compare equal
+            // here iff they originated from the same contrib. Kept
+            // as a lifetime-non-dereferenced identity pointer — the
+            // actual slice of new nodes lives in `raw_nodes` below.
             const proposal_group_view* raw_view = nullptr;
+
+            // For `raw_group`: the sliced `mem_tree_node*` sequence
+            // from the worker's flattened root children that
+            // corresponds to old slots [start_old_slot, end_old_slot].
+            // `raw_view` points at the worker's *top-level* group
+            // (its whole root internal), so materializing it
+            // wholesale would re-insert every unchanged sibling of
+            // the substituted range — the exact bug that produced
+            // 3× duplicated leaves at round 2 in INC-043. Storing
+            // the slice directly keeps the substitution bounded to
+            // the old slots it actually covers. Pointers remain
+            // valid through `merge_round_state::worker_proposals`.
+            std::vector<const mem_tree_node*> raw_nodes;
+            std::vector<std::string_view>     raw_sibling_seps;
+
             paddr                   merged_rb{};
         };
 
@@ -1204,7 +1247,16 @@ namespace apps::inconel::tree {
             if (iv.kind == substitution_iv::source_kind::merged_child) {
                 return clone_group(merge_old_paddr(ctx, iv.merged_rb));
             }
-            return materialize_group_view(*iv.raw_view);
+            merged_group out;
+            out.nodes.reserve(iv.raw_nodes.size());
+            out.sibling_seps.reserve(iv.raw_sibling_seps.size());
+            for (auto* n : iv.raw_nodes) {
+                out.nodes.push_back(clone_node(n));
+            }
+            for (auto sep : iv.raw_sibling_seps) {
+                out.sibling_seps.emplace_back(sep);
+            }
+            return out;
         }
 
         static inline const merged_group&
@@ -1353,6 +1405,19 @@ namespace apps::inconel::tree {
                         .kind           = substitution_iv::source_kind::raw_group,
                         .raw_view       = contrib,
                     };
+                    iv.raw_nodes.reserve(k - j);
+                    for (std::size_t m = j; m < k; ++m) {
+                        iv.raw_nodes.push_back(
+                            std::get<std::unique_ptr<mem_tree_node>>(
+                                flat_children[m]->target).get());
+                    }
+                    if (k > j + 1) {
+                        iv.raw_sibling_seps.reserve(k - j - 1);
+                        for (std::size_t m = j; m + 1 < k; ++m) {
+                            iv.raw_sibling_seps.push_back(
+                                flat_separators[m]);
+                        }
+                    }
                     if (first->type == format::node_type::internal
                         && first->replaces_old_paddrs.size() == 1) {
                         auto child_rb = first->replaces_old_paddrs[0];
@@ -1766,6 +1831,45 @@ namespace apps::inconel::tree {
                 } else {
                     lowers[i] =
                         ctx.base_manifest->leaf_order.fence_lower(*leaf_items[i].base_span);
+                }
+                // CLAUDE.md constraint A: a non-first leaf with an
+                // empty fence_lower would break `find_leaf_for_key`'s
+                // binary search (empty compares as -∞ and makes
+                // every span accept the key) and
+                // `build_initial_shard_partition_map` (panics on
+                // non-last empty fence_upper which back-references
+                // this same value). Two known ways this slot can
+                // go empty:
+                //   (a) an unchanged base leaf that used to sit at
+                //       position 0 in base_manifest (fence_lower=∅)
+                //       gets displaced to position >0 in the new
+                //       manifest — the walker has no ready source
+                //       for a real fence key since the leaf's
+                //       content was not re-read; the correct fix is
+                //       to derive fence_lower from the new tree's
+                //       parent-internal separator rather than
+                //       copying base_manifest's stored value.
+                //   (b) a new leaf with zero records slipped past
+                //       `prune_child_ref` — shouldn't happen, but
+                //       detect here rather than let a silent +∞
+                //       sentinel propagate into the new manifest.
+                // In either case, the merge pipeline handed the
+                // builder data outside its current support surface.
+                // Panic with the offending position so a follow-up
+                // step can triage which case tripped it.
+                if (lowers[i].empty()) {
+                    core::panic_inconsistency(
+                        "build_leaf_order_full",
+                        "non-first leaf %zu has empty fence_lower "
+                        "(is_new=%d) — walker cannot reuse "
+                        "base_manifest's position-0 fence_lower=∅ at "
+                        "a non-zero position, and an empty-content "
+                        "new leaf should have been pruned earlier. "
+                        "See INC-043 follow-up: derive fence_lower "
+                        "from the new tree structure for displaced "
+                        "base leaves.",
+                        i,
+                        leaf_items[i].is_new ? 1 : 0);
                 }
             }
 

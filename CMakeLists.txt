@@ -152,6 +152,10 @@ add_executable(inconel_test_superblock_format apps/inconel/test/test_superblock_
 target_include_directories(inconel_test_superblock_format PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_superblock_format PRIVATE ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_flush_e2e apps/inconel/test/test_flush_e2e.cc)
+target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_flush_e2e PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

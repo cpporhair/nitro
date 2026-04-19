@@ -50,6 +50,7 @@
 #include "../core/panic.hh"
 #include "../core/registry.hh"
 #include "../core/shard_partition.hh"
+#include "../core/shard_partition_builder.hh"
 #include "../core/tree_manifest.hh"
 #include "../core/tree_read_domain.hh"
 #include "../format/superblock.hh"
@@ -687,6 +688,42 @@ namespace apps::inconel::tree {
 
     }  // namespace _flush_pipeline
 
+    // Rebuild the globally installed `shard_partition_map` from the
+    // new manifest's `leaf_order` and re-publish it into every
+    // read_domain. Runs on whichever scheduler fired the callback
+    // the preceding `then(...)` attached to — in the tree_local_flush
+    // pipeline that is `tree_sched` itself (the `finalize_flush_round`
+    // seam callback resumes on tree_sched's core), so the publish
+    // happens single-threaded from the serialized flush commit point.
+    //
+    // Design intent (RSM §4.7): `tree_sched` is responsible for
+    // producing a routing map that matches the committed leaf
+    // layout. Bootstrap starts with a single-shard placeholder
+    // installed by the builder; after the first successful flush
+    // we swap it for a real partition map so subsequent reads and
+    // flushes route through `shard_partition_map::route(key)`
+    // against fences that actually exist in the tree.
+    //
+    // Skipped when `new_manifest == nullptr` (empty-round /
+    // unsupported / flush-ok=false short-circuits): there is no
+    // new layout to publish, so the currently installed map
+    // remains valid.
+    inline void
+    rebuild_and_publish_shard_partitions(const tree_flush_result& r) {
+        if (r.new_manifest == nullptr) return;
+        const uint32_t K = core::registry::tree_read_domain_count();
+        if (K == 0) {
+            core::panic_inconsistency(
+                "tree::rebuild_and_publish_shard_partitions",
+                "no tree_read_domains registered — cannot rebuild "
+                "shard_partition_map");
+        }
+        auto new_map = std::make_shared<const core::shard_partition_map>(
+            core::build_initial_shard_partition_map(
+                r.new_manifest->leaf_order, K));
+        rt::publish_shard_partitions(std::move(new_map));
+    }
+
     // Full owner-side flush transaction. Singleton-only — the owner
     // (`tree_sched`) is resolved internally via `rt::owner()`, so
     // callers only pass the request payload. See `runtime/facade.hh`.
@@ -714,7 +751,25 @@ namespace apps::inconel::tree {
                             });
                     })
                     >> visit()
-                    >> flush_pipeline::continue_after_finalize_merge();
+                    >> flush_pipeline::continue_after_finalize_merge()
+                    >> then([](auto&& r) -> tree_flush_result {
+                        // Keep the routing map in sync with the
+                        // committed leaf layout. Safe here because
+                        // the preceding finalize seam resumes on
+                        // tree_sched's core — the publish runs
+                        // single-threaded from the flush commit
+                        // point. See `rebuild_and_publish_shard_partitions`.
+                        //
+                        // `continue_after_finalize_merge` reaches
+                        // here from three different variant arms
+                        // (done / root_stable / root_change) whose
+                        // `push_value` call sites differ in value
+                        // category (`just(std::move(...))` vs
+                        // scheduler callbacks), so we take a
+                        // universal reference and forward on return.
+                        rebuild_and_publish_shard_partitions(r);
+                        return std::forward<decltype(r)>(r);
+                    });
             });
     }
 

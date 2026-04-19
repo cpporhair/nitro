@@ -839,7 +839,11 @@ struct tree_lookup_state {
 5. `tree_read_domain` 实例数 `K` 通常小于 `front_sched_count`，并优先按 NUMA 分组放置；NUMA 仍然影响 read_domain 实例物理安放的核心选择，但**不改变路由算法**——同 shard 的 key 仍然只会落到一个 read_domain。
 6. range scan 的 tree-side 遍历整体路由到一个选定的 read_domain（目前选调用方 NUMA 上的本地 shard），而不是把 leaf frames 借回多个 `front_sched`。
 
-`shard_partition_map` 由 `tree_sched` 在每次 frontier switch 后调 `build_initial_shard_partition_map(new_leaf_order, K)` + `install_shard_partitions()` 原子替换（B1 目标设计；step 030 仅在 builder 启动时装一次占位 map，rebuild trigger 与 freeze 语义留给 coord_sched 完成）。flush pipeline 在 step 030 直接使用 `current_shard_partitions()` 实时读，与 future rebuild snapshot 等价（map 从 bootstrap install 起直至 rebuild 落地始终稳定）。
+`shard_partition_map` 由 `tree_sched` 在每次成功 flush round 提交新 manifest 后 rebuild：`tree/sender.hh::tree_local_flush` 在 `continue_after_finalize_merge()` 之后 `then(rebuild_and_publish_shard_partitions)` 基于 `tree_flush_result.new_manifest->leaf_order` + `core::registry::tree_read_domain_count()` 调 `build_initial_shard_partition_map` 构造新 map，走 `rt::publish_shard_partitions` 两步安装（`install_shard_partitions` 替换全局指针 + 遍历所有 `tree_read_domain` 刷新各自 `partitions` snapshot）。seam 本身执行时仍在 tree_sched 这个 owner 核心上（`submit_finalize_flush_round` 的回调在 tree_sched 的 advance 上继续推进 pipeline），发布过程单线程、与 flush 提交点串行。
+
+bootstrap 时 builder 预装一张单 shard `+∞` 占位 map（`build_initial_shard_partition_map` 对空 `leaf_order` 的合约），保证第一次 flush 之前 read 路径 / flush fold 路径都能对 empty tree 做 `has_root()==false` 短路 + 合法的 routing。空 round / fold-unsupported / flush_ok=false 三种 short-circuit 下 `new_manifest==nullptr`，此时跳过 rebuild，当前已装的 map 继续有效。
+
+future heat-driven rebuild（非 flush 提交点触发、按访问模式重新切 shard）仍留给 coord_sched 或后续专门 rebuild seam；本条只冻结 "flush 提交 = 必须重建对应 `shard_partition_map`" 这一规则，避免 placeholder map 永远覆盖已有真实 leaf 布局的情况。
 
 tree_lookup **不在 tree_sched 上执行**。它在路由得到的 read_domain 的 `lookup` scheduler 上执行，通过该 scheduler 本核的 `nvme_sched` 异步读 page。
 

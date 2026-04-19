@@ -480,6 +480,153 @@ namespace apps::inconel::tree {
             return result;
         }
 
+        // ── bootstrap leaf build (empty base_manifest) ──
+        //
+        // Chunks a contiguous sorted run of memtable winners into one
+        // or more fresh leaf pages with `replaces_old_paddrs` empty
+        // (so the owner allocates fresh ranges for every page). Used
+        // by the bootstrap path in `initialize_worker` when
+        // `base_manifest->leaf_order.empty()` — there is no old leaf
+        // to merge against, so we emit pages directly from the new
+        // keys.
+        //
+        // Tombstone GC is still applied (data_ver <= recovery_safe_lsn
+        // → drop) so the first flush does not write dead tombstones.
+        //
+        // Sibling separators between consecutive emitted pages are
+        // pushed into `sibling_seps_out`; the owner-side wrapper
+        // internal uses them as separator keys. On overflow each
+        // page's first key becomes the boundary between itself and
+        // the previous page.
+        //
+        // Returns at least one leaf page. Empty `keys` (after
+        // tombstone GC) → single empty leaf page; the owner-side
+        // prune step folds away empty leaves.
+        inline absl::InlinedVector<std::unique_ptr<mem_tree_node>, 1>
+        build_leaves_from_sorted_keys_impl(
+            uint32_t                                 page_size,
+            std::span<const flush_key_group>         keys,
+            uint64_t                                 recovery_safe_lsn,
+            absl::InlinedVector<std::string, 1>&     sibling_seps_out)
+        {
+            sibling_seps_out.clear();
+
+            struct merged_rec {
+                std::string_view              key;
+                uint64_t                      data_ver;
+                core::memtable_entry::kind    kind;
+                format::value_ref             vr;  // valid iff kind==value
+            };
+
+            std::vector<merged_rec> merged;
+            merged.reserve(keys.size());
+            for (const auto& kg : keys) {
+                if (kg.winner_kind == core::memtable_entry::kind::tombstone
+                    && kg.winner_data_ver <= recovery_safe_lsn) {
+                    continue;
+                }
+                merged.push_back({
+                    .key      = kg.key,
+                    .data_ver = kg.winner_data_ver,
+                    .kind     = kg.winner_kind,
+                    .vr       = (kg.winner_kind == core::memtable_entry::kind::value)
+                                    ? kg.winner_value.durable
+                                    : format::value_ref{},
+                });
+            }
+
+            auto emit_chunk_to_node = [&](std::size_t start, std::size_t end)
+                -> std::unique_ptr<mem_tree_node>
+            {
+                auto node = std::make_unique<mem_tree_node>();
+                node->type = format::node_type::leaf;
+                node->content.resize(page_size);
+                leaf_page_builder builder;
+                builder.init(node->content.data(), page_size);
+                for (std::size_t i = start; i < end; ++i) {
+                    auto& m = merged[i];
+                    bool ok = (m.kind == core::memtable_entry::kind::value)
+                                  ? builder.add_value(m.key, m.data_ver, m.vr)
+                                  : builder.add_tombstone(m.key, m.data_ver);
+                    if (!ok) {
+                        core::panic_inconsistency(
+                            "build_leaves_from_sorted_keys",
+                            "record did not fit despite chunk pre-sizing "
+                            "(idx=%zu)",
+                            i);
+                    }
+                }
+                builder.finalize();
+                return node;
+            };
+
+            auto rec_size = [](const merged_rec& m) -> uint32_t {
+                uint16_t key_len = static_cast<uint16_t>(m.key.size());
+                if (m.kind == core::memtable_entry::kind::value) {
+                    return sizeof(format::leaf_record_header) + key_len
+                         + sizeof(format::value_ref);
+                }
+                return sizeof(format::leaf_record_header) + key_len;
+            };
+
+            absl::InlinedVector<std::unique_ptr<mem_tree_node>, 1> result;
+            std::size_t chunk_start = 0;
+            std::size_t i           = 0;
+            uint32_t    used        = sizeof(format::tree_slot_header);
+            uint16_t    chunk_count = 0;
+            while (i < merged.size()) {
+                uint32_t add = rec_size(merged[i]);
+                uint32_t dir_after = sizeof(uint16_t)
+                                   * static_cast<uint32_t>(chunk_count + 1u);
+                if (used + add + dir_after > page_size) {
+                    if (chunk_count == 0) {
+                        core::panic_inconsistency(
+                            "build_leaves_from_sorted_keys",
+                            "single record larger than page "
+                            "(rec_size=%u page_size=%u key_len=%zu)",
+                            add, page_size, merged[i].key.size());
+                    }
+                    auto node = emit_chunk_to_node(chunk_start, i);
+                    if (!result.empty()) {
+                        sibling_seps_out.push_back(
+                            std::string(merged[chunk_start].key));
+                    }
+                    result.push_back(std::move(node));
+                    chunk_start = i;
+                    used        = sizeof(format::tree_slot_header);
+                    chunk_count = 0;
+                    continue;
+                }
+                used += add;
+                chunk_count++;
+                ++i;
+            }
+            if (chunk_count > 0) {
+                auto node = emit_chunk_to_node(chunk_start, merged.size());
+                if (!result.empty()) {
+                    sibling_seps_out.push_back(
+                        std::string(merged[chunk_start].key));
+                }
+                result.push_back(std::move(node));
+            }
+
+            if (result.empty()) {
+                // No live records (all tombstones dropped). Emit a
+                // single empty leaf; owner-side prune will retire
+                // it, but we still need at least one page so the
+                // surrounding cascade has something to wrap.
+                auto node = std::make_unique<mem_tree_node>();
+                node->type = format::node_type::leaf;
+                node->content.resize(page_size);
+                leaf_page_builder builder;
+                builder.init(node->content.data(), page_size);
+                builder.finalize();
+                result.push_back(std::move(node));
+            }
+
+            return result;
+        }
+
         // ── pairwise leaf merge (027 §3.3) ──
         //
         // Combine two adjacent (in this worker's `leaves` vector) leaf
@@ -937,6 +1084,59 @@ namespace apps::inconel::tree {
                 iw.sibling_separators);
         }
 
+        // ── bootstrap init: build fresh leaves directly from keys ──
+        //
+        // Runs when `base_manifest->leaf_order.empty()` — i.e. the
+        // first flush on a freshly formatted disk. There is no old
+        // leaf to read and no cascade to walk, so we emit fresh leaf
+        // pages directly from the sorted winner keys and park them
+        // on a single synthetic `leaf_work`. The downstream pipeline
+        // then short-circuits:
+        //
+        //   - `all_leaves_merged = true` so the leaf read/merge
+        //     loop in `process_flush_round` skips.
+        //   - `pairwise_done = true` (nothing to pair — adjacent
+        //     base leaves don't exist).
+        //   - `cascade_initialized = true` / `all_internals_built = true`
+        //     so the internal cascade never fires. `top_internal_idx`
+        //     stays `kInvalidInternalIdx` and `finalize_root`'s
+        //     "no internals → leaf is root OR wrap into new layer"
+        //     branch lights up uniformly — exactly the shape a
+        //     bootstrap worker needs to hand to the owner side.
+        //
+        // The synthetic `leaf_work` carries `leaf_range_base = {0,0}`
+        // and `parent_idx = kInvalidInternalIdx`. Those fields are
+        // never consulted on the bootstrap path (leaf_range_base_to_idx
+        // stays empty — bootstrap has no old paddrs to index), so
+        // the sentinel values are just placeholders.
+        inline flush_stage_status
+        initialize_worker_bootstrap(worker_state& s)
+        {
+            absl::InlinedVector<std::string, 1> sibling_seps;
+            auto pages = _wb::build_leaves_from_sorted_keys_impl(
+                s.page_size, s.key_groups, s.recovery_safe_lsn,
+                sibling_seps);
+
+            worker_state::leaf_work lw;
+            lw.leaf_idx          = 0;
+            lw.leaf_range_base   = paddr{0, 0};
+            lw.old_slot_paddr    = paddr{0, 0};
+            lw.parent_idx        = core::kInvalidInternalIdx;
+            lw.keys              = s.key_groups;
+            lw.page_loaded       = true;
+            lw.merged            = true;
+            lw.built_leaves      = std::move(pages);
+            lw.sibling_separators = std::move(sibling_seps);
+            s.leaves.push_back(std::move(lw));
+
+            s.all_leaves_merged   = true;
+            s.pairwise_done       = true;
+            s.cascade_initialized = true;
+            s.all_internals_built = true;
+
+            return flush_stage_status::ok;
+        }
+
         // ── cascade init: classify keys + populate leaves & internals ──
 
         inline flush_stage_status
@@ -946,9 +1146,19 @@ namespace apps::inconel::tree {
             const auto& topo = s.base_manifest->reverse_topology;
 
             if (lo.empty()) {
-                // Empty tree (no root). Phase 7 narrowing — bootstrap
-                // is owner-side Phase 9 territory.
-                return flush_stage_status::unsupported_shape_change;
+                // Empty base_manifest — route to the bootstrap path.
+                // The caller in `process_flush_round` selects between
+                // `initialize_worker_bootstrap` and `initialize_worker`
+                // based on `lo.empty()`, so reaching this branch would
+                // indicate the dispatch forgot to special-case
+                // bootstrap. Panic rather than silently returning the
+                // old unsupported status (constraint A: shape-specific
+                // implementations must declare their limitation in the
+                // callsite, not in a fallback).
+                core::panic_inconsistency(
+                    "initialize_worker",
+                    "empty base_manifest reached non-bootstrap init — "
+                    "caller must dispatch to initialize_worker_bootstrap");
             }
 
             // Group keys by leaf_idx (sorted input → contiguous runs).
@@ -1231,13 +1441,36 @@ namespace apps::inconel::tree {
     inline flush_round_decision
     process_flush_round(worker_state& s, Cache* cache)
     {
+        // Some callers (notably the driver coroutine
+        // `check_flush_round_not_done` composed into the pipeline
+        // via `submit_flush_work`) can re-enter this function after
+        // `all_done` is already set — the next yield fires before
+        // the loop re-checks `state.all_done`. Re-running the
+        // per-round state machine would re-run `finalize_root`,
+        // whose wrap path reads `lw->built_leaves` that was moved
+        // out on the first pass. Short-circuit before the init
+        // block so the state machine is invoked exactly once per
+        // round regardless of how many times the driver polls us.
+        if (s.all_done) {
+            return flush_round_done{};
+        }
+
         // ── 1. one-shot init ──
         if (!s.initialized) {
             if (s.all_done) {
                 // Empty key_groups path: nothing to do.
                 return flush_round_done{};
             }
-            auto st = _wb::initialize_worker(s);
+            // Empty base_manifest = bootstrap flush (fresh disk /
+            // recovery-from-empty). Bootstrap path produces leaves
+            // directly from the sorted winner keys without touching
+            // NVMe; cascade / pairwise-merge state is pre-flagged so
+            // finalize_root sees "no internals, one leaf_work" and
+            // emits either a single leaf root or a wrap-internal root
+            // depending on how many pages the keys needed.
+            auto st = s.base_manifest->leaf_order.empty()
+                          ? _wb::initialize_worker_bootstrap(s)
+                          : _wb::initialize_worker(s);
             if (st != flush_stage_status::ok) {
                 s.result.st = st;
                 s.all_done  = true;

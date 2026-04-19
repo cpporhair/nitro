@@ -196,16 +196,19 @@ namespace apps::inconel::tree {
     // contiguous, and `flush_key_partition.groups` is a span over
     // that slice.
     //
-    // Empty-tree narrowing (Phase 7 scope): when `base_manifest`
-    // has no leaves yet, bootstrap has not built the tree. The
-    // worker fanout path in Phase 7 does not absorb bootstrap keys
-    // (that is Phase 9 territory), so we short-circuit with
-    // `unsupported_shape_change` and let the caller propagate the
-    // status. The shard_partition_map installed at startup is a
-    // single-shard placeholder (030 §6.7 decision P) that would
-    // happily route every key to shard 0, but the workers would
-    // still not know how to grow a root node — so the narrowing
-    // lives at the partition-builder level, NOT at the map level.
+    // Empty base_manifest is a legitimate bootstrap case — the
+    // first flush on a freshly formatted disk. Routing still works
+    // through the installed shard_partition_map (bootstrap
+    // placeholder at boot, rebuilt by tree_sched after each
+    // successful flush); every key lands on some read_domain. The
+    // worker (`candidate_build.hh::initialize_worker`) and the
+    // owner merge coroutine (`owner_scheduler.hh::run_merge`) each
+    // carry a matching bootstrap branch that produces fresh leaves
+    // and a fresh root instead of merging against the (nonexistent)
+    // old tree. `base_manifest` is therefore not consulted here —
+    // we keep the parameter so the call site (`handle_fold_req`)
+    // stays stable and future per-manifest validation has an
+    // obvious attachment point.
     //
     // Key coverage: the map's `+∞` sentinel guarantees every key
     // falls into some shard; no "outside tree coverage" panic is
@@ -213,9 +216,7 @@ namespace apps::inconel::tree {
     // `leaf_order.find_leaf_for_key` path).
     //
     // Returns:
-    //   - flush_stage_status::ok                       — all keys mapped
-    //   - flush_stage_status::unsupported_shape_change — empty tree
-    //     (bootstrap, Phase 9 territory)
+    //   - flush_stage_status::ok — all keys mapped to a shard
     //
     // Precondition: workset is fully populated (fold has run) and
     // is not mutated after this call returns a partition span.
@@ -224,17 +225,10 @@ namespace apps::inconel::tree {
     build_key_partitions(flush_round_state& rs,
                          const core::tree_manifest* base_manifest)
     {
+        (void)base_manifest;  // routing source is shard_partition_map, not the manifest
+
         const auto N = static_cast<uint32_t>(rs.workset.size());
         if (N == 0) return flush_stage_status::ok;
-
-        // Empty tree = bootstrap = Phase 9 territory. Explicit
-        // narrowing per CLAUDE.md constraint A: declare the
-        // limitation, fail-fast, no silent fallback to a
-        // placeholder-map route that the worker cannot absorb.
-        if (!base_manifest->has_root() ||
-            base_manifest->leaf_order.empty()) {
-            return flush_stage_status::unsupported_shape_change;
-        }
 
         auto partitions = core::registry::current_shard_partitions();
         if (!partitions || partitions->empty()) {

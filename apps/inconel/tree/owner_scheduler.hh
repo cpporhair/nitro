@@ -937,6 +937,15 @@ namespace apps::inconel::tree {
             index_group_nodes(ctx, worker_index, ctx.group_storage.back());
         }
 
+        // Forward declaration: `make_empty_root_leaf` is defined
+        // further down (alongside the prune helpers) but the
+        // bootstrap combine helper below needs it. Declaration-only
+        // here keeps the bootstrap helpers grouped with the other
+        // merge-context factories without reordering the unrelated
+        // prune code.
+        static inline child_ref
+        make_empty_root_leaf(uint32_t page_size);
+
         static inline merge_context
         make_merge_context(const core::tree_manifest*            base_manifest,
                            const std::vector<worker_tree_proposal>* proposals)
@@ -950,6 +959,182 @@ namespace apps::inconel::tree {
                 index_root_group(ctx, i, (*proposals)[i]);
             }
             return ctx;
+        }
+
+        // Bootstrap-safe ctx factory. `index_root_group` assumes every
+        // worker root either (a) replaces an old paddr recorded in the
+        // base manifest, or (b) is an internal wrapper whose covered
+        // paddr resolves to `base_manifest->root_range_base`. Neither
+        // branch makes sense on an empty base_manifest (there is no
+        // old root, and `root_range_base` is the zero sentinel), so the
+        // bootstrap path SKIPS root-group indexing entirely and falls
+        // back to `combine_worker_roots_for_bootstrap` to stitch the
+        // worker-supplied subtrees together from scratch.
+        //
+        // `build_base_indexes` is still called because the Phase 4
+        // manifest builders (`build_leaf_order_full`,
+        // `build_reverse_topology_full`) rely on a populated ctx even
+        // when all its hash maps end up empty — they only read the
+        // lookup sides to classify paddr-ref children, and bootstrap
+        // has none.
+        static inline merge_context
+        make_merge_context_bootstrap(
+            const core::tree_manifest*               base_manifest,
+            const std::vector<worker_tree_proposal>* proposals)
+        {
+            merge_context ctx;
+            ctx.base_manifest = base_manifest;
+            ctx.geom          = base_manifest->geom;
+            ctx.proposals     = proposals;
+            build_base_indexes(ctx);
+            return ctx;
+        }
+
+        // First key reachable through a worker's root subtree. Used
+        // for ordering worker roots and synthesizing the separator
+        // key when the owner wraps multiple worker roots into a fresh
+        // internal layer on the bootstrap path.
+        //
+        // Walks the leftmost child at each internal level until a
+        // leaf is reached; returns that leaf's first record key.
+        // Panics on internals that already hold a paddr-ref child —
+        // bootstrap worker subtrees are mem_tree_node-only, so any
+        // paddr slot here would indicate the caller mixed a
+        // non-bootstrap subtree into the bootstrap path.
+        static inline std::string_view
+        first_key_of_worker_root(const mem_tree_node* n, uint32_t page_size)
+        {
+            while (n->type == format::node_type::internal) {
+                if (n->children.empty()) {
+                    core::panic_inconsistency(
+                        "first_key_of_worker_root",
+                        "bootstrap internal has zero children");
+                }
+                auto* first_child_up = std::get_if<std::unique_ptr<mem_tree_node>>(
+                    &n->children.front().target);
+                if (first_child_up == nullptr) {
+                    core::panic_inconsistency(
+                        "first_key_of_worker_root",
+                        "bootstrap internal has a paddr-ref child — "
+                        "bootstrap subtrees must be fully in memory");
+                }
+                n = first_child_up->get();
+            }
+            leaf_page_reader reader;
+            if (!reader.parse(n->content.data(), page_size)) {
+                core::panic_inconsistency(
+                    "first_key_of_worker_root",
+                    "bootstrap leaf failed validation");
+            }
+            if (reader.record_count() == 0) {
+                // Empty leaf — the owner prune step will retire it;
+                // callers that need a separator key must not reach
+                // here (all usable leaves carry at least one record
+                // by construction of build_leaves_from_sorted_keys).
+                return std::string_view{};
+            }
+            return reader.get(0).key;
+        }
+
+        // Combine per-worker bootstrap roots (each either a single
+        // leaf or a single-layer internal wrapping leaves) into a
+        // single subtree rooted at the returned `child_ref`.
+        //
+        // Sort worker roots by first-key so the wrapped tree's
+        // in-order traversal matches global key order (workers arrive
+        // in shard_idx order from the fan-in collector, which is
+        // already key-order under the current bootstrap
+        // `shard_partition_map`, but we sort defensively in case a
+        // future rebuild policy reorders shards).
+        //
+        // If only one worker contributed a non-null root, that root
+        // is adopted as-is. Otherwise the worker roots become children
+        // of a fresh internal layer; if the new layer itself overflows
+        // a page (many workers / long separator keys), another fresh
+        // layer is added on top until the layer collapses to a single
+        // page — same structural rule the non-bootstrap
+        // `finalize_root_group` uses.
+        //
+        // On an empty input (all workers produced null proposals, or
+        // there were no workers) an empty leaf root is returned so the
+        // downstream prune step has something to retire.
+        //
+        // Invariants:
+        //   - Every returned subtree has `replaces_old_paddrs.empty()`
+        //     on every mem_tree_node, so `assign_and_emit_node`'s
+        //     fresh-range branch fires uniformly.
+        //   - Mixed-height subtrees (some workers produced a single
+        //     leaf, others an internal wrapping leaves) are accepted
+        //     as-is: the read path stops at `type == leaf` so it
+        //     reaches the right leaf regardless of depth variance.
+        //     Future flushes will rebalance via shape-changing paths.
+        static inline child_ref
+        combine_worker_roots_for_bootstrap(
+            std::vector<worker_tree_proposal>& proposals,
+            const core::tree_geometry*         geom)
+        {
+            const uint32_t page_size = geom->tree_page_size;
+
+            std::vector<std::unique_ptr<mem_tree_node>> roots;
+            roots.reserve(proposals.size());
+            for (auto& p : proposals) {
+                if (p.root != nullptr) roots.push_back(std::move(p.root));
+            }
+
+            if (roots.empty()) {
+                return make_empty_root_leaf(page_size);
+            }
+
+            std::stable_sort(
+                roots.begin(), roots.end(),
+                [page_size](const auto& a, const auto& b) {
+                    return first_key_of_worker_root(a.get(), page_size)
+                         < first_key_of_worker_root(b.get(), page_size);
+                });
+
+            if (roots.size() == 1) {
+                return child_ref{ .target = std::move(roots.front()) };
+            }
+
+            std::vector<child_ref>   children;
+            std::vector<std::string> separators;
+            children.reserve(roots.size());
+            separators.reserve(roots.size() - 1);
+            for (std::size_t i = 0; i < roots.size(); ++i) {
+                if (i > 0) {
+                    auto sep = first_key_of_worker_root(
+                        roots[i].get(), page_size);
+                    if (sep.empty()) {
+                        core::panic_inconsistency(
+                            "combine_worker_roots_for_bootstrap",
+                            "worker root has no first key to synthesize "
+                            "a separator (bootstrap produced an empty "
+                            "subtree — prune step should have removed "
+                            "it before reaching here)");
+                    }
+                    separators.emplace_back(sep);
+                }
+                children.push_back(child_ref{ .target = std::move(roots[i]) });
+            }
+
+            std::vector<std::string> sibling_seps;
+            while (true) {
+                auto layer = build_internal_pages_owner(
+                    std::move(children), std::move(separators),
+                    paddr{0, 0},
+                    /*is_new_layer=*/true,
+                    page_size, sibling_seps);
+                if (layer.size() == 1) {
+                    return child_ref{ .target = std::move(layer.front()) };
+                }
+                children.clear();
+                separators = std::move(sibling_seps);
+                sibling_seps.clear();
+                children.reserve(layer.size());
+                for (auto& node : layer) {
+                    children.push_back(child_ref{ .target = std::move(node) });
+                }
+            }
         }
 
         // Returns a valid ref to old internal page bytes if any contrib
@@ -1916,38 +2101,77 @@ namespace apps::inconel::tree {
             constexpr std::size_t kWriteBatchSize  = 32;
             constexpr std::size_t kCpuYieldBudget  = 64;
 
-            // ── Phase 1: index proposals + pre-scan owner reads ──
-            s.ctx = std::make_shared<merge_context>(
-                make_merge_context(base_manifest, &s.worker_proposals));
-            s.ctx->fetched_old_pages = &s.fetched_old_pages;
-
             const uint32_t page_size = geom->tree_page_size;
             const uint32_t page_lbas = geom->page_lbas();
 
-            for (const auto& [rb, contribs] : s.ctx->contrib_index) {
-                if (contribs.size() <= 1) continue;
-                if (try_get_old_page_bytes(*s.ctx, rb, contribs) != nullptr)
-                    continue;
-                auto& buf = s.fetched_old_pages[rb];
-                buf.assign(page_size, '\0');
-                s.pending_ios.push_back(merge_io_desc{
-                    format::read_desc{
-                        .lba      = rb.lba,
-                        .buf      = buf.data(),
-                        .num_lbas = page_lbas,
-                    }});
-            }
-            if (!s.pending_ios.empty()) {
-                co_yield merge_yield::need_io;
-                // On resume: NVMe has DMA'd every buffer; the next
-                // call into merge_internal_old_paddr will see the
-                // fetched bytes via try_get_old_page_bytes.
+            const bool is_bootstrap = !base_manifest->has_root();
+
+            // ── Phase 1: build merge_context ──
+            //
+            // Non-bootstrap: index proposals against the existing
+            // tree (leaf_order + root-group contribs), then pre-scan
+            // any shared-ancestor internal pages missing from
+            // worker-side `touched_old_pages`.
+            //
+            // Bootstrap (`!has_root()`): no old root → no
+            // `index_root_group` (it would push the `{0,0}` root
+            // sentinel as a contrib and the pre-scan would try to
+            // read LBA 0), no pre-scan reads. The ctx is still
+            // constructed so the Phase 4 manifest builders — which
+            // read ctx unconditionally — have a valid (empty) base
+            // to work against.
+            s.ctx = std::make_shared<merge_context>(
+                is_bootstrap
+                    ? make_merge_context_bootstrap(
+                          base_manifest, &s.worker_proposals)
+                    : make_merge_context(
+                          base_manifest, &s.worker_proposals));
+            s.ctx->fetched_old_pages = &s.fetched_old_pages;
+
+            if (!is_bootstrap) {
+                for (const auto& [rb, contribs] : s.ctx->contrib_index) {
+                    if (contribs.size() <= 1) continue;
+                    if (try_get_old_page_bytes(*s.ctx, rb, contribs) != nullptr)
+                        continue;
+                    auto& buf = s.fetched_old_pages[rb];
+                    buf.assign(page_size, '\0');
+                    s.pending_ios.push_back(merge_io_desc{
+                        format::read_desc{
+                            .lba      = rb.lba,
+                            .buf      = buf.data(),
+                            .num_lbas = page_lbas,
+                        }});
+                }
+                if (!s.pending_ios.empty()) {
+                    co_yield merge_yield::need_io;
+                    // On resume: NVMe has DMA'd every buffer; the next
+                    // call into merge_internal_old_paddr will see the
+                    // fetched bytes via try_get_old_page_bytes.
+                }
             }
 
-            // ── Phase 2: build combined_root (pure CPU, recursive) ──
-            const auto& root_group = merge_old_paddr(
-                *s.ctx, base_manifest->root_range_base);
-            s.combined_root = finalize_root_group(*s.ctx, root_group);
+            // ── Phase 2: build combined_root ─────────────────────
+            //
+            // Non-bootstrap: merge worker contribs against the old
+            // tree, starting at `root_range_base`.
+            //
+            // Bootstrap: stitch the worker-supplied subtrees
+            // together into a fresh tree. `combine_worker_roots_for_bootstrap`
+            // moves each `proposal.root` out and builds a new
+            // internal layer (or layers) if more than one worker
+            // contributed. All resulting mem_tree_nodes carry
+            // `replaces_old_paddrs.empty()` so the post-order
+            // assign+emit walk allocates fresh ranges for every
+            // page.
+            if (is_bootstrap) {
+                s.combined_root =
+                    combine_worker_roots_for_bootstrap(
+                        s.worker_proposals, geom);
+            } else {
+                const auto& root_group = merge_old_paddr(
+                    *s.ctx, base_manifest->root_range_base);
+                s.combined_root = finalize_root_group(*s.ctx, root_group);
+            }
 
             for (const auto& proposal : s.worker_proposals) {
                 for (const auto& rv : proposal.retired_old_values) {

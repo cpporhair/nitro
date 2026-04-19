@@ -128,17 +128,9 @@ add_executable(inconel_test_tree_value apps/inconel/test/test_tree_value.cc)
 target_include_directories(inconel_test_tree_value PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_tree_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
-add_executable(inconel_test_flush_carriers apps/inconel/test/test_flush_carriers.cc)
-target_include_directories(inconel_test_flush_carriers PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_flush_carriers PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
 add_executable(inconel_test_leaf_mapping apps/inconel/test/test_leaf_mapping.cc)
 target_include_directories(inconel_test_leaf_mapping PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_leaf_mapping PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_candidate_build apps/inconel/test/test_candidate_build.cc)
-target_include_directories(inconel_test_candidate_build PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_candidate_build PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_tree_page_format apps/inconel/test/test_tree_page_format.cc)
 target_include_directories(inconel_test_tree_page_format PRIVATE ${CMAKE_SOURCE_DIR})
@@ -155,6 +147,10 @@ target_link_libraries(inconel_test_superblock_format PRIVATE ${INCONEL_ABSL_LIBS
 add_executable(inconel_test_flush_e2e apps/inconel/test/test_flush_e2e.cc)
 target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_flush_e2e PRIVATE pthread ${INCONEL_ABSL_LIBS})
+
+add_executable(inconel_test_inc046_regression apps/inconel/test/test_inc046_regression.cc)
+target_include_directories(inconel_test_inc046_regression PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_inc046_regression PRIVATE pthread ${INCONEL_ABSL_LIBS})
 
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)

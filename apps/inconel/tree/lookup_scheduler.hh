@@ -1,14 +1,15 @@
 #ifndef APPS_INCONEL_TREE_LOOKUP_SCHEDULER_HH
 #define APPS_INCONEL_TREE_LOOKUP_SCHEDULER_HH
 
-// ── tree_lookup_sched — point-read tree traversal (step 022 §4) ──
+// ── tree_lookup_sched — leaf-only point read ────────────────────
 //
-// Split out of the old `tree/scheduler.hh` in Phase 2. The read-path
-// semantics are unchanged: `tree_lookup_sched_base::process(state)`
-// still drives a multi-level B+ tree descent, single-flights
-// in-flight NVMe reads, and cooperates with the `readonly_frame_cache`
-// that the surrounding `tree_read_domain<Cache>` owns. Step 030
-// physicalized the `tree_read_domain` struct and moved cache
+// INC-046 removes non-leaf traversal from the read side. Lookup now:
+//
+//   1. routes `key -> leaf_range_base` through `manifest->leaf_order`
+//   2. resolves `leaf_range_base -> live slot` through `manifest.resolve()`
+//   3. reads only the leaf page from the read-domain cache / NVMe
+//
+// Step 030 physicalized the `tree_read_domain` struct and moved cache
 // ownership one level up (RSM §4.7 / RMC §6.1): the cache is now a
 // member of `core::tree_read_domain<Cache>` and this scheduler
 // accesses it via `read_domain_->node_cache` — still a direct
@@ -121,12 +122,28 @@ namespace apps::inconel::tree {
         s.manifest = manifest;
         s.all_done = !manifest->has_root();
 
-        paddr root = manifest->has_root() ? manifest->root_slot : paddr{0, 0};
-        for (auto&& k : keys)
-            s.entries.push_back({k, false, lookup_absent{}, root});
+        for (auto&& k : keys) {
+            if (!manifest->has_root()) {
+                s.entries.push_back({k, true, lookup_absent{}, {0, 0}});
+                continue;
+            }
 
-        if (!manifest->has_root())
-            for (auto& e : s.entries) e.resolved = true;
+            const auto leaf_idx = manifest->leaf_order.find_leaf_for_key(k);
+            if (leaf_idx >= manifest->leaf_order.size()) {
+                core::panic_inconsistency(
+                    "tree::make_lookup_state",
+                    "leaf_order has no covering leaf for key of len=%zu",
+                    k.size());
+            }
+            const auto leaf_range_base =
+                manifest->leaf_order.spans[leaf_idx].leaf_range_base;
+            s.entries.push_back({
+                k,
+                false,
+                lookup_absent{},
+                manifest->resolve(leaf_range_base),
+            });
+        }
 
         return s;
     }
@@ -433,43 +450,42 @@ namespace apps::inconel::tree {
             for (auto& e : s.entries) {
                 if (e.resolved) continue;
 
-                while (true) {
-                    auto pin = read_domain_->node_cache.pin(
-                        make_tree_frame_id(e.next_page, s.page_lbas));
-                    if (!pin.frame) break;
+                auto pin = read_domain_->node_cache.pin(
+                    make_tree_frame_id(e.next_page, s.page_lbas));
+                if (!pin.frame) continue;
 
-                    const char* page = pin.frame->buf;
-
-                    auto status = inspect_tree_page(page, s.page_size);
-                    if (status != tree_page_status::ok) {
-                        core::panic_inconsistency(
-                            "tree::tree_lookup_sched::process_entries",
-                            "corrupt tree page dev=%u lba=%lu status=%s",
-                            static_cast<unsigned>(e.next_page.device_id),
-                            static_cast<unsigned long>(e.next_page.lba),
-                            tree_page_status_to_string(status));
-                    }
-
-                    auto* hdr = reinterpret_cast<const tree_slot_header*>(page);
-                    if (hdr->type == node_type::leaf) {
-                        leaf_page_reader reader;
-                        reader.parse(page, s.page_size);
-                        auto rec = reader.find(e.key);
-                        if (!rec.has_value())
-                            e.result = lookup_absent{};
-                        else if (rec->kind == record_kind::value)
-                            e.result = lookup_value{rec->data_ver, rec->vr};
-                        else
-                            e.result = lookup_tombstone{rec->data_ver};
-                        e.resolved = true;
-                        break;
-                    }
-
-                    internal_page_reader reader;
-                    reader.parse(page, s.page_size);
-                    paddr child_base = reader.find_child(e.key);
-                    e.next_page = s.manifest->resolve(child_base);
+                const char* page = pin.frame->buf;
+                auto status = inspect_tree_page(page, s.page_size);
+                if (status != tree_page_status::ok) {
+                    core::panic_inconsistency(
+                        "tree::tree_lookup_sched::process_entries",
+                        "corrupt tree page dev=%u lba=%lu status=%s",
+                        static_cast<unsigned>(e.next_page.device_id),
+                        static_cast<unsigned long>(e.next_page.lba),
+                        tree_page_status_to_string(status));
                 }
+
+                auto* hdr = reinterpret_cast<const tree_slot_header*>(page);
+                if (hdr->type != node_type::leaf) {
+                    core::panic_inconsistency(
+                        "tree::tree_lookup_sched::process_entries",
+                        "read_domain lookup expected leaf page, got type=%u "
+                        "(dev=%u lba=%lu)",
+                        static_cast<unsigned>(hdr->type),
+                        static_cast<unsigned>(e.next_page.device_id),
+                        static_cast<unsigned long>(e.next_page.lba));
+                }
+
+                leaf_page_reader reader;
+                reader.parse(page, s.page_size);
+                auto rec = reader.find(e.key);
+                if (!rec.has_value())
+                    e.result = lookup_absent{};
+                else if (rec->kind == record_kind::value)
+                    e.result = lookup_value{rec->data_ver, rec->vr};
+                else
+                    e.result = lookup_tombstone{rec->data_ver};
+                e.resolved = true;
             }
 
             s.all_done = true;

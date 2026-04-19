@@ -5,12 +5,9 @@
 //
 // Cross-scheduler type shells for the tree-local flush pipeline.
 //
-// Phase 7 (step 027) replaced the worker's per-paddr overlay output
-// (`flush_changed_node` / `flush_worker_result`) with an in-memory
-// hybrid tree (`mem_tree_node` + `child_ref` + `worker_tree_proposal`).
-// The Phase 5 leaf-mapping carriers (`flush_mapping_req` /
-// `flush_leaf_group_result` / `flush_leaf_group`) are gone too — the
-// worker now does mapping inline against `base_manifest->leaf_order`.
+// The worker now maps and rewrites only touched leaves. Owner side
+// builds the non-leaf working tree (`mem_tree_node` + `child_ref`),
+// assigns slots / ranges, and writes pages.
 //
 // Carrier ownership rules (Phase 3 §6, still authoritative):
 //
@@ -19,10 +16,8 @@
 //     vector and must not outlive the round_state.
 //   - `flush_worker_req.key_groups` borrows from the same workset
 //     (a sub-span belonging to one partition).
-//   - `worker_tree_proposal` is the worker's output: a self-contained
-//     mem_tree (paddr refs into the base_manifest's old subtree) +
-//     touched old internal pages (for Phase 9 owner-side merge of
-//     shared ancestors) + retired old tree value_refs (Gap 1B).
+//   - `worker_leaf_chain` is the worker's output: a zero-extra-copy
+//     leaf carrier plus retired old tree value_refs.
 //
 // Fail-fast convention (022 D11): every flush result struct carries a
 // `flush_stage_status`. Unimplemented sender surfaces return the
@@ -35,6 +30,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -129,26 +125,19 @@ namespace apps::inconel::tree {
         std::span<const flush_key_group>  key_groups;
     };
 
-    // ── mem_tree_node + child_ref (Phase 7 / step 027 §2.1) ─────
+    // ── owner-side working tree node ─────────────────────────────
     //
-    // Worker output is a self-contained "in-memory hybrid tree":
-    // every node is either a worker-built `mem_tree_node` (in-memory
-    // page bytes — no paddr, no CRC) or a `paddr` reference into the
-    // base_manifest's unchanged subtree. The hybrid is rooted at
-    // `worker_tree_proposal.root`.
+    // The canonical write side is owner-built:
     //
-    // Why hybrid (not full new tree, not pure paddr deltas):
+    //   - leaf pages arrive from workers as `leaf_page_image`
+    //   - owner reverse materializes internal/root pages as
+    //     `mem_tree_node`
+    //   - unchanged subtrees remain `paddr` references into the base
+    //     manifest until a changed ancestor rewrites them
     //
-    //   - A worker only modifies a slice of the tree. The unmodified
-    //     siblings stay where they are; we do not copy them.
-    //   - The owner-side merge (Phase 9) needs a tree shape, not a
-    //     paddr-keyed dictionary, because shape-changing operations
-    //     (split / consolidation / root growth) introduce nodes that
-    //     have no `old_paddr` to key on.
-    //
-    // Forward declaration: `child_ref` and `mem_tree_node` recurse
-    // through `unique_ptr<mem_tree_node>`, which is a complete type
-    // even when `mem_tree_node` is incomplete.
+    // `child_ref` and `mem_tree_node` recurse through
+    // `unique_ptr<mem_tree_node>`, which is complete even when
+    // `mem_tree_node` itself is forward-declared.
 
     struct mem_tree_node;
 
@@ -161,30 +150,23 @@ namespace apps::inconel::tree {
         // tree_slot_header.type.
         format::node_type type;
 
-        // Worker-formatted page bytes (ODF §4). The CRC field is
-        // intentionally NOT filled — Phase 9 owner side recomputes
-        // it after assigning paddrs and patching child_base entries.
+        // Page bytes ready for writeback. Internal content may be
+        // reformatted after child placement to rewrite child range
+        // bases; CRC is filled by the normal page builder/finalize
+        // path before writeback.
         std::vector<char> content;
 
-        // Old paddr(s) this node "replaces" in the base_manifest's
-        // tree. Convention (027 §2.1):
+        // Old range(s) this node logically replaces.
         //
-        //   - 1 element: this is a rewrite / consolidation of one
-        //     old page (also covers the "shadow slot exhausted"
-        //     case — owner side decides whether to allocate a new
-        //     range; worker does not).
-        //   - 2+ elements: a leaf merge (027 §3.3) replaces several
-        //     old leaves with one new node. All old paddrs are
-        //     listed so owner side knows which old slots / ranges
-        //     to retire.
-        //   - 0 elements (empty): a brand new page (split sibling
-        //     or a new layer above the old root). Owner side
-        //     allocates a fresh slot for this node.
+        //   - 1 element: rewrite / same-range next-slot / consolidation
+        //   - 0 elements: brand-new page (split sibling / new layer)
+        //
+        // The owner uses this only for placement/retire planning.
         absl::InlinedVector<paddr, 2> replaces_old_paddrs;
 
         // Internal nodes only: child references (length N).
-        // Each child is either a paddr into the unchanged base_manifest
-        // tree or a unique_ptr to another worker-built mem_tree_node.
+        // Each child is either an unchanged base-manifest range_base
+        // or another owner-built working-tree node.
         std::vector<child_ref> children;
 
         // Internal nodes only: separator keys (length N-1).
@@ -193,58 +175,73 @@ namespace apps::inconel::tree {
         // dropped, so we copy them once.
         std::vector<std::string> separators;
 
-        // Phase 9 owner side writes these after paddr planning.
+        // Owner-side placement result.
         paddr    new_range_base{};
         uint32_t new_slot_index = 0;
         paddr    new_paddr{};
     };
 
-    // ── worker_tree_proposal (Phase 7 / step 027 §2.2) ──────────
+    // ── leaf-only worker carrier (INC-046) ──────────────────────
+    //
+    // The canonical worker/owner contract is now leaf-only:
+    //
+    //   - worker reads / merges / formats only touched leaves
+    //   - owner owns every non-leaf read / cache / reverse / write
+    //
+    // `leaf_page_image.page` is the final on-disk leaf page body.
+    // Worker formats the page once and owner only moves the vector
+    // through the `worker -> owner -> write_desc.data` chain with no
+    // extra page-body copy.
 
-    struct worker_tree_proposal {
+    struct leaf_page_image {
+        std::vector<char> page;
+        uint16_t          first_key_off = 0;
+        uint16_t          first_key_len = 0;
+
+        std::string_view
+        first_key() const noexcept {
+            if (first_key_len == 0 || first_key_off >= page.size()) {
+                return {};
+            }
+            return std::string_view(
+                page.data() + first_key_off,
+                first_key_len);
+        }
+    };
+
+    enum class leaf_chain_shape : uint8_t {
+        rewrite,
+        split,
+    };
+
+    struct leaf_chain_item {
+        uint32_t            old_leaf_idx = UINT32_MAX;
+        paddr               old_range_base{};
+        core::internal_idx  parent_idx = core::kInvalidInternalIdx;
+        leaf_chain_shape    shape = leaf_chain_shape::rewrite;
+        absl::InlinedVector<leaf_page_image, 2> new_pages;
+        absl::InlinedVector<core::retired_value_ref, 64>
+            retired_old_values;
+    };
+
+    struct worker_leaf_chain {
         flush_round_id     round_id;
         uint32_t           read_domain_index;
         flush_stage_status st;
-
-        // The worker's local view of the tree's new root after this
-        // worker's keys are applied.
-        //
-        // - root != nullptr when the worker had keys in scope and
-        //   walked the cascade up to root.
-        // - root == nullptr when the worker received an empty
-        //   key_groups span (the partition system should not produce
-        //   that, but the field is nullable for cleanliness).
-        //
-        // If the worker did not change the level the base_manifest
-        // root sits at, `root` is still a worker-built mem_tree_node
-        // — but most of its `children` are paddr refs. Owner side
-        // (Phase 9) merges the hybrid trees from every worker.
-        std::unique_ptr<mem_tree_node> root;
-
-        // Old internal page bytes that the worker actually read while
-        // walking the cascade. Phase 9 reuses these when merging
-        // shared ancestors across workers (so owner side does not
-        // re-read the same internal). Keyed by old paddr.
-        absl::flat_hash_map<paddr, std::vector<char>> touched_old_pages;
-
-        // Old leaf value_refs that this worker's `merge_and_build_leaf`
-        // identified as "tree-visible winner that the memtable
-        // winner now supersedes" (Gap 1B). Phase 9 aggregates these
-        // across workers into `tree_flush_result.retired.old_tree_values`.
-        absl::InlinedVector<core::retired_value_ref, 64> retired_old_values;
+        std::vector<leaf_chain_item> items;
     };
 
-    // ── per-round worker decision (Phase 7) ─────────────────────
+    // ── per-round worker decision (INC-046 leaf worker) ─────────
     //
     // `submit_flush_work_round` is a per-round handle on the worker
     // scheduler that processes as much as it can with available
     // pages and returns one of:
     //
-    //   - `flush_round_done`: the proposal is fully built; the
+    //   - `flush_round_done`: the leaf chain is fully built; the
     //     wrapper sender extracts it from the worker_state.
-    //   - `flush_round_need_read`: the worker needs old leaf or
-    //     internal pages to make progress; the wrapper sender
-    //     dispatches NVMe reads and re-enters the worker handle.
+    //   - `flush_round_need_read`: the worker needs old leaf pages to
+    //     make progress; the wrapper sender dispatches NVMe reads and
+    //     re-enters the worker handle.
     //
     // This mirrors the Phase 6 `candidate_decision` shape so the
     // multi-round driver sender remains structurally identical.
@@ -257,17 +254,11 @@ namespace apps::inconel::tree {
 
     using flush_round_decision = std::variant<flush_round_done, flush_round_need_read>;
 
-    // ── owner merge request (Phase 7 → Phase 9) ─────────────────
-    //
-    // The single fanout (`worker.submit_flush_work`) emits one
-    // `worker_tree_proposal` per partition. The `to_vector` collector
-    // hands the whole vector to `tree_sched.submit_flush_merge`.
-    // Phase 9 will implement the merge; Phase 7 only validates the
-    // input and returns `unsupported_unimplemented`.
+    // ── owner merge request (leaf fan-in → owner reverse) ───────
 
     struct flush_merge_request {
         flush_round_id                    round_id;
-        std::vector<worker_tree_proposal> worker_proposals;
+        std::vector<worker_leaf_chain>    worker_leaf_chains;
     };
 
     // Gap 1A decision (flush_development_plan §2.1.1): memtable-only
@@ -318,12 +309,12 @@ namespace apps::inconel::tree {
     // ── merge loop state (lives in the outer pipeline context) ──
     //
     // Replaces the earlier `merge_step_driver` variant: instead of
-    // carrying the round_id / worker_proposals in a variant arm that
+    // carrying the round_id / worker leaf chains in a variant arm that
     // the coroutine yields on its first iteration, we keep them in a
     // pipeline-context struct and hand a `merge_loop_state*` to
     // `submit_merge_step` every iteration. The scheduler reads the
     // pointer and, on the first call (when `active_merge` is still
-    // empty), moves `worker_proposals` out to seed the coroutine;
+    // empty), moves `worker_leaf_chains` out to seed the coroutine;
     // subsequent calls ignore the payload fields.
     //
     // `cpu_done` is the loop termination flag:
@@ -335,13 +326,13 @@ namespace apps::inconel::tree {
     // handlers can write the flag concurrently from different cores
     // after the coroutine finishes, so `atomic<bool>` is required.
     struct merge_loop_state {
-        flush_round_id                    round_id;
-        std::vector<worker_tree_proposal> worker_proposals;
-        std::atomic<bool>                 cpu_done{false};
+        flush_round_id                 round_id;
+        std::vector<worker_leaf_chain> worker_leaf_chains;
+        std::atomic<bool>              cpu_done{false};
 
         merge_loop_state() = default;
-        merge_loop_state(flush_round_id r, std::vector<worker_tree_proposal>&&  p)
-            : round_id(r), worker_proposals(std::move(p)) {}
+        merge_loop_state(flush_round_id r, std::vector<worker_leaf_chain>&& p)
+            : round_id(r), worker_leaf_chains(std::move(p)) {}
 
         // Custom move ctor because `std::atomic<bool>` is neither
         // copyable nor movable. A snapshot-then-store is safe here —
@@ -349,7 +340,7 @@ namespace apps::inconel::tree {
         // the PUMP context), never in a racy window.
         merge_loop_state(merge_loop_state&& o) noexcept
             : round_id(o.round_id),
-              worker_proposals(std::move(o.worker_proposals)),
+              worker_leaf_chains(std::move(o.worker_leaf_chains)),
               cpu_done(o.cpu_done.load(std::memory_order_relaxed)) {}
         merge_loop_state& operator=(merge_loop_state&&)      = delete;
         merge_loop_state(const merge_loop_state&)            = delete;

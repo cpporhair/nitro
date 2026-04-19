@@ -1,7 +1,7 @@
 #ifndef APPS_INCONEL_TREE_WORKER_SCHEDULER_HH
 #define APPS_INCONEL_TREE_WORKER_SCHEDULER_HH
 
-// ── tree_worker_sched — Phase 7 cache-aware worker (step 027) ──
+// ── tree_worker_sched — leaf-only flush worker ──────────────────
 //
 // Split into non-templated base + templated derived, mirroring
 // tree_lookup_sched_base / tree_lookup_sched<Cache>:
@@ -15,12 +15,10 @@
 //                              against that read_domain's
 //                              `node_cache`.
 //
-// Step 027 collapses the prior two-handle worker surface
-// (`_leaf_mapping` + `_process_candidates`) into a single handle
-// `_flush_round` that drives one round of the worker's
-// merge / cascade / build state machine. The wrapper
-// `submit_flush_work` (this file, free helper) loops the per-round
-// handle with NVMe-read dispatch until the proposal is complete.
+// INC-046 keeps the single `_flush_round` handle but narrows its job:
+// one round of leaf mapping / old-leaf read / merge / format. The
+// wrapper `submit_flush_work` loops the per-round handle with
+// NVMe-read dispatch until the worker leaf chain is complete.
 //
 // Step 030 cache-ownership move: the shared `Cache` instance lives
 // on `core::tree_read_domain<Cache>` (RSM §4.7). The worker reaches
@@ -137,9 +135,9 @@ namespace apps::inconel::tree {
             flush_round_q.try_enqueue(r);
         }
 
-        // Per-round handle (step 027 §3): submit the worker_state for
-        // one round of merge/cascade/build. The wrapper sender
-        // submit_flush_work() drives the loop.
+        // Per-round handle: submit the worker_state for one round of
+        // leaf-only read/merge/build. The wrapper sender
+        // `submit_flush_work()` drives the loop.
         auto
         submit_flush_round(worker_state* state) {
             return _flush_round::sender{ this, state };

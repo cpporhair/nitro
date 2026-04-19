@@ -25,16 +25,9 @@
 //      `active_rounds`, fires the request callback with a
 //      `tree_flush_result`, then releases the unique_ptr.
 //
-// Phase 7 (step 027) removed the `leaf_groups` and `worker_results`
-// fields:
-//
-//   - `leaf_groups` was the Phase 5 leaf-mapping fan-in target.
-//     Phase 7's leaf-aligned partitioning does the mapping inline
-//     in the worker, so no shared carrier is needed.
-//   - `worker_results` was the Phase 6 worker output target.
-//     Phase 7 worker output (`worker_tree_proposal`) flows through
-//     the PUMP `to_vector` collector straight into the merge
-//     handle's request payload — never touches round_state.
+// Worker output (`worker_leaf_chain`) flows through the sender fan-in
+// directly into the owner merge loop payload; round_state only owns
+// the folded workset / partition plan plus the committed result.
 
 #include <cstdint>
 #include <memory>

@@ -304,7 +304,7 @@ namespace apps::inconel::tree {
         // Encapsulates one worker arm's loop:
         //   1. worker->submit_flush_round(state) → flush_round_decision
         //   2. if need_read: NVMe read (no cache submit) → loop
-        //   3. if done: extract worker_tree_proposal from state.result
+        //   3. if done: extract worker_leaf_chain from state
         //
         // The pipeline creates worker_state on the PUMP context stack
         // via `with_context`. Each round the worker processes as much
@@ -512,7 +512,7 @@ namespace apps::inconel::tree {
         }
 
         // Yields a ping each time the scheduler should resume the
-        // merge coroutine. The payload (round_id + worker_proposals)
+        // merge coroutine. The payload (round_id + worker_leaf_chains)
         // lives on the `merge_loop_state` in the PUMP context; the
         // scheduler reads it directly through the `ls` pointer the
         // iter handler passes into `submit_merge_step`. The loop
@@ -565,10 +565,10 @@ namespace apps::inconel::tree {
 
         inline auto
         drive_merge_loop(flush_round_id round_id,
-                         std::vector<worker_tree_proposal>&& proposals)
+                         std::vector<worker_leaf_chain>&& leaf_chains)
         {
             return just()
-                >> with_context(merge_loop_state{round_id, __mov__(proposals)})([]() {
+                >> with_context(merge_loop_state{round_id, __mov__(leaf_chains)})([]() {
                     return get_context<merge_loop_state>()
                         >> then([](merge_loop_state &ls) { return pump::coro::make_view_able(drive_merge(ls)); })
                         >> for_each()
@@ -627,40 +627,40 @@ namespace apps::inconel::tree {
                     })
                     >> all()
                     >> get_context<worker_state>()
-                    >> then([](worker_state &state, bool) -> worker_tree_proposal {
-                        return std::move(state.result);
+                    >> then([](worker_state &state, bool) -> worker_leaf_chain {
+                        return std::move(state.leaf_result);
                     });
             });
         }
 
         struct
-        all_worker_tree_proposal {
-            std::vector<std::optional<worker_tree_proposal>> proposals_by_core;
-            all_worker_tree_proposal(size_t max) : proposals_by_core(max) {}
-            all_worker_tree_proposal(all_worker_tree_proposal&) = delete;
-            all_worker_tree_proposal(all_worker_tree_proposal&& o)  noexcept : proposals_by_core(std::move(o.proposals_by_core)) {}
+        all_worker_leaf_chain {
+            std::vector<std::optional<worker_leaf_chain>> chains_by_core;
+            all_worker_leaf_chain(size_t max) : chains_by_core(max) {}
+            all_worker_leaf_chain(all_worker_leaf_chain&) = delete;
+            all_worker_leaf_chain(all_worker_leaf_chain&& o)  noexcept : chains_by_core(std::move(o.chains_by_core)) {}
 
             auto
             get_result() {
-                std::vector<worker_tree_proposal> result;
-                result.reserve(proposals_by_core.size());
-                for (auto& proposal : proposals_by_core) {
-                    if (proposal)
-                        result.push_back(std::move(*proposal));
+                std::vector<worker_leaf_chain> result;
+                result.reserve(chains_by_core.size());
+                for (auto& chain : chains_by_core) {
+                    if (chain)
+                        result.push_back(std::move(*chain));
                 }
                 return result;
             }
 
             auto
-            push_result(worker_tree_proposal&& p, size_t i) {
-                proposals_by_core[i].emplace(std::move(p));
+            push_result(worker_leaf_chain&& c, size_t i) {
+                chains_by_core[i].emplace(std::move(c));
             }
         };
 
         inline auto
-        collect_worker_proposals(flush_fold_result&& fr) {
+        collect_worker_leaf_chains(flush_fold_result&& fr) {
             auto cnt = fr.partitions.size();
-            return with_context(__mov__(fr), all_worker_tree_proposal(cnt))([cnt]() {
+            return with_context(__mov__(fr), all_worker_leaf_chain(cnt))([cnt]() {
                 return loop(cnt)
                     >> concurrent()
                     >> get_context<flush_fold_result>()
@@ -671,14 +671,14 @@ namespace apps::inconel::tree {
                                     ctx.partitions[i].read_domain_index)->worker_sched,
                                 make_flush_worker_req(ctx, i)
                             )
-                            >> get_context<all_worker_tree_proposal>()
-                            >> then([i](all_worker_tree_proposal &ps, worker_tree_proposal &&p) {
-                                ps.push_result(__fwd__(p), i);
+                            >> get_context<all_worker_leaf_chain>()
+                            >> then([i](all_worker_leaf_chain &ps, worker_leaf_chain &&c) {
+                                ps.push_result(__fwd__(c), i);
                             });
                     })
                     >> all()
-                    >> get_context<all_worker_tree_proposal>()
-                    >> then([](all_worker_tree_proposal &proposals, const bool ok) {
+                    >> get_context<all_worker_leaf_chain>()
+                    >> then([](all_worker_leaf_chain &proposals, const bool ok) {
                         if (ok) [[likely]]
                             return proposals.get_result();
                         throw std::runtime_error("tree_local_flush: worker round failed");
@@ -729,14 +729,14 @@ namespace apps::inconel::tree {
     // callers only pass the request payload. See `runtime/facade.hh`.
     inline auto
     tree_local_flush(tree_flush_request req) {
-        return rt::owner()->submit_flush_fold(std::move(req))
+            return rt::owner()->submit_flush_fold(std::move(req))
             >> flat_map([](flush_fold_result&& fr) {
                 auto round_id = fr.round_id;
                 return just()
-                    >> flush_pipeline::collect_worker_proposals(std::move(fr))
-                    >> flat_map([round_id](std::vector<worker_tree_proposal> &&proposals) {
+                    >> flush_pipeline::collect_worker_leaf_chains(std::move(fr))
+                    >> flat_map([round_id](std::vector<worker_leaf_chain> &&leaf_chains) {
                         return flush_pipeline::drive_merge_loop(
-                            round_id, __mov__(proposals));
+                            round_id, __mov__(leaf_chains));
                     })
                     >> flat_map([](bool) {
                         // `drive_merge_loop` ends in `>> all()` which

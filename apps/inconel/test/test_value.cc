@@ -61,9 +61,12 @@ using apps::inconel::memory::value_page_frame;
 namespace {
 
 constexpr uint32_t LBA_SIZE = 4096;
-constexpr uint64_t TOTAL_LBAS = 8192;          // 32 MiB device
+// Sized off the profile's Value Area top so build_runtime's tier-3
+// validate_build_inputs gate (device_bytes >= profile.value_data_area_end.lba
+// * lba_size) is always satisfied, regardless of future profile edits.
+constexpr uint64_t TOTAL_LBAS =
+    format::kBootstrapFormatProfile.value_data_area_end.lba;
 constexpr uint64_t DATA_AREA_BASE_LBA = 4000;  // value Data Area lower bound
-constexpr uint64_t DATA_AREA_END_LBA  = 8000;  // bumps from here downward
 constexpr uint64_t SEED_AREA_LBA = 1000;       // test_write_raw seed area
 
 constexpr uint32_t EXPECTED_CLASS_SIZES[] = {
@@ -98,7 +101,10 @@ void check_bootstrap_profile_matches_value_expectations() {
     CHECK(profile.value_data_area_base.device_id == 0);
     CHECK(profile.value_data_area_base.lba == DATA_AREA_BASE_LBA);
     CHECK(profile.value_data_area_end.device_id == 0);
-    CHECK(profile.value_data_area_end.lba == DATA_AREA_END_LBA);
+    // value_data_area_end.lba is sized at profile-edit time; the
+    // profile's static_assert (profile_is_self_consistent) already
+    // enforces base < end. This check no longer pins a specific LBA.
+    CHECK(profile.value_data_area_end.lba > profile.value_data_area_base.lba);
 
     auto classes = profile_class_sizes();
     CHECK(classes.size() == sizeof(EXPECTED_CLASS_SIZES) / sizeof(EXPECTED_CLASS_SIZES[0]));

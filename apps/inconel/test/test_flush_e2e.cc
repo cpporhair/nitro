@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,11 +58,16 @@
 #include "env/runtime/share_nothing.hh"
 #include "pump/core/context.hh"
 #include "pump/core/lock_free_queue.hh"
+#include "pump/sender/concurrent.hh"
+#include "pump/sender/flat.hh"
+#include "pump/sender/for_each.hh"
 #include "pump/sender/just.hh"
+#include "pump/sender/reduce.hh"
 #include "pump/sender/submit.hh"
 #include "pump/sender/then.hh"
 
 #include "apps/inconel/core/checkpoint_guard.hh"
+#include "apps/inconel/core/data_area_heads.hh"
 #include "apps/inconel/core/memtable.hh"
 #include "apps/inconel/core/page_cache.hh"
 #include "apps/inconel/core/registry.hh"
@@ -97,12 +104,15 @@ constexpr int32_t           kOwnerCore       = 8;
 
 // ── Disk size ───────────────────────────────────────────────────────────
 //
-// kBootstrapFormatProfile pins value_data_area_end.lba = 8000, so the
-// device namespace must cover at least 8000 * lba_size bytes for
-// build_runtime's tier-3 validate_build_inputs gate. 8000 * 4096 = 32 MiB.
+// Sized off the profile's Value Area top so the mock device always
+// satisfies build_runtime's tier-3 validate_build_inputs gate
+// (device_bytes >= profile.value_data_area_end.lba * lba_size). Any
+// further scaling happens by editing the profile, not here.
 
 constexpr uint64_t kNamespaceBytes =
-    uint64_t{8000} * format::kBootstrapFormatProfile.lba_size;
+    static_cast<uint64_t>(
+        format::kBootstrapFormatProfile.value_data_area_end.lba) *
+    format::kBootstrapFormatProfile.lba_size;
 
 // ── Multi-round sizing ─────────────────────────────────────────────────
 //
@@ -118,14 +128,37 @@ constexpr uint32_t kMinNumKeysForMultiRound = 1000;
 // ── CLI ─────────────────────────────────────────────────────────────────
 
 struct harness_options {
-    uint32_t num_keys = 1000;
+    uint32_t num_keys           = 1000;
+    uint32_t rounds             = 3;        // ≥ 2 (round 1 bootstrap + round 2 mix); round 3+ reuses round-3 pattern with escalating round_tag/gen_id/lsn
+    uint32_t readback_samples   = 50;       // approximate sample count; stride derived from expected-state size
+    uint32_t concurrent_readers = 2;        // 0 disables; cap 2 (cores 10 + idx must not collide with advance cores 0/2/4/6/8 or main core 0)
+    uint32_t reader_batch       = 16;       // keys per reader lookup batch
 };
 
 void
 print_usage(const char* argv0) {
     std::printf(
-        "usage: %s [--num-keys N]   (default 1000; N must be >= %u)\n",
+        "usage: %s [--num-keys N] [--rounds R] [--readback-samples S]\n"
+        "         [--concurrent-readers N] [--reader-batch K]\n"
+        "  --num-keys N             N >= %u (default 1000)\n"
+        "  --rounds   R             R >= 2   (default 3; extra rounds reuse the round-3 op pattern)\n"
+        "  --readback-samples S     target number of keys to read back after rounds (default 50)\n"
+        "  --concurrent-readers N   0..2 (default 2; 0 disables; readers run on cores 10..10+N-1)\n"
+        "  --reader-batch K         keys per reader lookup batch (default 16)\n",
         argv0, kMinNumKeysForMultiRound);
+}
+
+long
+parse_long_arg(const char* name, const char* arg, long lo, long hi) {
+    char* endp = nullptr;
+    long v = std::strtol(arg, &endp, 10);
+    if (!endp || *endp != '\0' || v < lo || v > hi) {
+        std::fprintf(stderr,
+            "%s must be an integer in [%ld, %ld]\n",
+            name, lo, hi);
+        std::exit(2);
+    }
+    return v;
 }
 
 harness_options
@@ -133,23 +166,38 @@ parse_argv(int argc, char** argv) {
     harness_options o;
     for (int i = 1; i < argc; ++i) {
         std::string_view a{argv[i]};
-        if (a == "--num-keys") {
+        auto want_arg = [&](const char* name) -> const char* {
             if (i + 1 >= argc) {
-                std::fprintf(stderr, "--num-keys requires a value\n");
+                std::fprintf(stderr, "%s requires a value\n", name);
                 print_usage(argv[0]);
                 std::exit(2);
             }
-            char* endp = nullptr;
-            long v = std::strtol(argv[++i], &endp, 10);
-            if (!endp || *endp != '\0' ||
-                v < static_cast<long>(kMinNumKeysForMultiRound) ||
-                v > 100'000'000L) {
-                std::fprintf(stderr,
-                    "--num-keys must be an integer in [%u, 100000000]\n",
-                    kMinNumKeysForMultiRound);
-                std::exit(2);
-            }
-            o.num_keys = static_cast<uint32_t>(v);
+            return argv[++i];
+        };
+        if (a == "--num-keys") {
+            o.num_keys = static_cast<uint32_t>(parse_long_arg(
+                "--num-keys", want_arg("--num-keys"),
+                kMinNumKeysForMultiRound, 100'000'000L));
+        } else if (a == "--rounds") {
+            o.rounds = static_cast<uint32_t>(parse_long_arg(
+                "--rounds", want_arg("--rounds"), 2L, 1000L));
+        } else if (a == "--readback-samples") {
+            o.readback_samples = static_cast<uint32_t>(parse_long_arg(
+                "--readback-samples", want_arg("--readback-samples"),
+                1L, 10'000'000L));
+        } else if (a == "--concurrent-readers") {
+            // Hard cap 2 — plan §4.5.7 picks cores {10, 11} deliberately.
+            // Growing past 2 requires choosing further unused core ids
+            // and reasoning through per_core::queue fan-in again; do that
+            // in a follow-up step, not via CLI surgery.
+            o.concurrent_readers = static_cast<uint32_t>(parse_long_arg(
+                "--concurrent-readers",
+                want_arg("--concurrent-readers"),
+                0L, 2L));
+        } else if (a == "--reader-batch") {
+            o.reader_batch = static_cast<uint32_t>(parse_long_arg(
+                "--reader-batch", want_arg("--reader-batch"),
+                1L, 1024L));
         } else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -161,6 +209,26 @@ parse_argv(int argc, char** argv) {
         }
     }
     return o;
+}
+
+// ── Wall-clock helpers ─────────────────────────────────────────────────
+//
+// Everything in the harness uses steady_clock (monotonic, immune to
+// wall-clock jumps) and reports milliseconds or seconds with one
+// decimal so per-round regressions are visible at a glance without
+// digging through log-noise.
+
+using clock_t_  = std::chrono::steady_clock;
+using tp_t      = clock_t_::time_point;
+
+inline tp_t
+now_tp() {
+    return clock_t_::now();
+}
+
+inline double
+ms_between(tp_t a, tp_t b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
 // ── Key / value format ─────────────────────────────────────────────────
@@ -212,11 +280,19 @@ struct round_spec {
     std::vector<round_op> ops;        // sorted ascending by key
 };
 
+struct round_timing {
+    double persist_ms       = 0.0;
+    double build_sealed_ms  = 0.0;
+    double flush_ms         = 0.0;
+    double total_ms         = 0.0;
+};
+
 struct round_outcome {
     tree::tree_flush_result                       result;
     std::shared_ptr<const core::tree_manifest>    manifest;
     std::shared_ptr<const core::checkpoint_guard> next_base_guard;
     uint64_t                                      next_lsn;
+    round_timing                                  timing;
 };
 
 // ── Round generation ──────────────────────────────────────────────────
@@ -291,20 +367,36 @@ generate_round2_ops(uint32_t N, uint32_t digits) {
 }
 
 std::vector<round_op>
-generate_round3_ops(uint32_t N, uint32_t digits) {
+generate_round3_ops(uint32_t N, uint32_t digits, uint32_t round_tag) {
     std::vector<round_op> ops;
     // 50 re-overwrites on the r2 double-overwrite set.
-    append_puts(ops, N / 20, N / 10, digits, 3);
+    append_puts(ops, N / 20, N / 10, digits, round_tag);
     // 50 overwrites on r1-only keys (r1 → r3, no r2 in between).
-    append_puts(ops, N / 5, (N / 5) + (N / 20), digits, 3);
+    append_puts(ops, N / 5, (N / 5) + (N / 20), digits, round_tag);
     // 50 tombstones on r1-only keys (different region from r2 tombs).
     append_tombs(ops, N / 2, (N / 2) + (N / 20), digits);
     // 50 tombstones on r2 newcomers (must lie inside round 2's new range).
     append_tombs(ops, N + (N / 10), N + ((3 * N) / 20), digits);
     // 200 brand-new keys introduced in r3.
-    append_puts(ops, (3 * N) / 2, ((3 * N) / 2) + (N / 5), digits, 3);
+    append_puts(ops, (3 * N) / 2, ((3 * N) / 2) + (N / 5), digits, round_tag);
     sort_ops_by_key(ops);
     return ops;
+}
+
+// ── Round dispatcher ───────────────────────────────────────────────────
+//
+// Rounds 1 and 2 each have a unique workload; rounds 3+ reuse the
+// round-3 pattern with an escalating `round_tag` (encoded into every
+// PUT value so readback can still tell "written in round R" apart from
+// earlier generations). Re-running the round-3 pattern exercises
+// shadow-CoW slot cycling, tombstone reassertion, and overwrite of
+// already-touched keys — what the plan calls "多轮 cascade 累积效应".
+
+std::vector<round_op>
+generate_round_ops(uint32_t round_id, uint32_t N, uint32_t digits) {
+    if (round_id == 1) return generate_round1_ops(N, digits);
+    if (round_id == 2) return generate_round2_ops(N, digits);
+    return generate_round3_ops(N, digits, round_id);
 }
 
 // ── Expected state ─────────────────────────────────────────────────────
@@ -347,6 +439,142 @@ apply_round_to_expected(const round_spec& spec, expected_state& state) {
             };
         }
     }
+}
+
+// ── Concurrent reader snapshot machinery (plan §4.5) ───────────────────
+//
+// Writer (main thread) publishes one (manifest, expected_state, round_id)
+// triple per round-end via atomic shared_ptr store. Readers hold two
+// slots — current + previous — so a lookup issued against `current` right
+// before a publish swaps is allowed to match either half of the race
+// window before the harness treats it as a real mismatch.
+//
+// The `expected_state` is deep-copied on every publish so readers observe
+// an immutable view. Copy cost lands on the main thread; reader load is
+// a single atomic shared_ptr load per batch. The copy is linear in the
+// state size (~1M entries at N=10^6) which is acceptable for 035 — a
+// future delta-patch scheme is outside Phase 2's scope.
+
+struct published_snapshot_t {
+    std::shared_ptr<const core::tree_manifest> manifest;
+    std::shared_ptr<const expected_state>      expected;
+    uint64_t                                   round_id = 0;
+};
+
+// libstdc++ ≥ 11 implements std::atomic<std::shared_ptr<T>> (C++20). If
+// a future toolchain regresses, plan §7 Q16 authorizes switching to a
+// mutex + shared_ptr fallback — publish is off the write-hot path.
+std::atomic<std::shared_ptr<published_snapshot_t>> g_current_snap;
+
+std::atomic<bool> g_reader_stop{false};
+
+std::shared_ptr<published_snapshot_t>
+make_snapshot(std::shared_ptr<const core::tree_manifest> manifest,
+              std::shared_ptr<const expected_state>      expected,
+              uint64_t                                   round_id) {
+    return std::make_shared<published_snapshot_t>(
+        published_snapshot_t{
+            .manifest = std::move(manifest),
+            .expected = std::move(expected),
+            .round_id = round_id,
+        });
+}
+
+void
+publish_empty_snapshot() {
+    auto empty_manifest = std::make_shared<const core::tree_manifest>(
+        core::tree_manifest::empty(&runtime::kBootstrapTreeGeometry));
+    auto empty_expected = std::make_shared<const expected_state>();
+    g_current_snap.store(
+        make_snapshot(std::move(empty_manifest),
+                      std::move(empty_expected),
+                      /*round_id=*/ 0),
+        std::memory_order_release);
+}
+
+void
+publish_round_snapshot(std::shared_ptr<const core::tree_manifest> manifest,
+                       const expected_state&                      state,
+                       uint64_t                                   round_id) {
+    auto expected_copy = std::make_shared<const expected_state>(state);
+    g_current_snap.store(
+        make_snapshot(std::move(manifest),
+                      std::move(expected_copy),
+                      round_id),
+        std::memory_order_release);
+}
+
+struct reader_counters {
+    uint64_t ok        = 0;   // matched current snapshot on first try
+    uint64_t ok_stale  = 0;   // fell back to previous snapshot's expected
+    uint64_t ok_retry  = 0;   // reloaded snapshot + re-ran lookup to match
+    uint64_t batches   = 0;   // lookup batches issued (not counting retries)
+    uint64_t mismatch  = 0;   // real mismatch after retry — abort path
+};
+
+// match_all_against implements plan §4.5.4: key present in expected →
+// variant + data_ver must match; key absent in expected → lookup must
+// return lookup_absent. value bytes are NOT checked — final static
+// verify (run under a quiesced writer) covers those after readers join.
+bool
+match_all_against(std::span<const std::string_view>      keys,
+                  std::span<const tree::lookup_result>   results,
+                  const expected_state&                  expected) {
+    if (keys.size() != results.size()) return false;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        // std::map<std::string, _> lacks a transparent comparator;
+        // allocating a std::string per key per batch is trivial
+        // overhead at the reader scale Phase 2 runs (16 keys/batch).
+        auto it = expected.find(std::string(keys[i]));
+        if (it == expected.end()) {
+            if (!std::holds_alternative<tree::lookup_absent>(results[i]))
+                return false;
+            continue;
+        }
+        const auto& exp = it->second;
+        if (exp.k == expected_entry::kind::value) {
+            if (!std::holds_alternative<tree::lookup_value>(results[i]))
+                return false;
+            if (std::get<tree::lookup_value>(results[i]).data_ver !=
+                exp.data_ver)
+                return false;
+        } else {
+            if (!std::holds_alternative<tree::lookup_tombstone>(results[i]))
+                return false;
+            if (std::get<tree::lookup_tombstone>(results[i]).data_ver !=
+                exp.data_ver)
+                return false;
+        }
+    }
+    return true;
+}
+
+// Snapshot key-view cache. Populated from `current.expected` every time
+// the reader advances to a new snapshot. string_views are backed by the
+// map keys inside the snapshot's expected_state; because the reader
+// keeps `current` alive by shared_ptr, those views stay valid across
+// picks without extra ownership bookkeeping.
+void
+rebuild_keys_cache(std::vector<std::string_view>& cache,
+                   const expected_state&          expected) {
+    cache.clear();
+    cache.reserve(expected.size());
+    for (const auto& [k, _] : expected)
+        cache.emplace_back(k);
+}
+
+std::vector<std::string_view>
+pick_random_keys(const std::vector<std::string_view>& cache,
+                 std::size_t                          k,
+                 std::mt19937_64&                     rng) {
+    std::vector<std::string_view> out;
+    if (cache.empty()) return out;
+    out.reserve(k);
+    std::uniform_int_distribution<std::size_t>
+        dist(0, cache.size() - 1);
+    for (std::size_t i = 0; i < k; ++i)
+        out.push_back(cache[dist(rng)]);
+    return out;
 }
 
 // ── Shard map ───────────────────────────────────────────────────────────
@@ -436,12 +664,133 @@ submit_and_wait(SenderBuilder&& build_sender) {
     return fut.get();
 }
 
+// ── Concurrent reader main loop (plan §4.5.3) ──────────────────────────
+//
+// Defined after submit_and_wait so it can call into the submit helper
+// directly without a forward declaration. Everything it needs from the
+// snapshot-publish block above is already in scope (the types live in
+// the same anonymous namespace).
+
+void
+reader_main(uint32_t         reader_idx,
+            uint32_t         batch_size,
+            reader_counters* out_counters) {
+    // Claim a non-advance, non-main core id so per_core::queue enqueues
+    // from this reader land in a private SPSC slot. Advance workers
+    // own cores {0, 2, 4, 6, 8}; the main (submit) thread is on core 0;
+    // reader ids {10, 11} are unused and have their own queue slots.
+    // MAX_CORES=128 in pump/core/lock_free_queue.hh, so the slot
+    // exists; no runtime registration is required (readers don't run
+    // rt::run — they just submit and block on the promise).
+    pump::core::this_core_id = 10 + reader_idx;
+
+    std::shared_ptr<const published_snapshot_t> current =
+        g_current_snap.load(std::memory_order_acquire);
+    std::shared_ptr<const published_snapshot_t> previous = current;
+    const published_snapshot_t* cached_key_owner = current.get();
+    std::vector<std::string_view> key_cache;
+    rebuild_keys_cache(key_cache, *current->expected);
+
+    std::mt19937_64 rng(0xBEEF1234ULL ^ reader_idx);
+
+    reader_counters c{};
+
+    while (!g_reader_stop.load(std::memory_order_relaxed)) {
+        auto fresh = g_current_snap.load(std::memory_order_acquire);
+        if (fresh.get() != current.get()) {
+            previous = std::move(current);
+            current  = std::move(fresh);
+        }
+        if (current.get() != cached_key_owner) {
+            rebuild_keys_cache(key_cache, *current->expected);
+            cached_key_owner = current.get();
+        }
+        if (key_cache.empty()) {
+            // Pre-round-1 state: nothing to read yet. Back off with
+            // yield so we don't spin on an empty map rebuild.
+            std::this_thread::yield();
+            continue;
+        }
+
+        auto keys = pick_random_keys(key_cache, batch_size, rng);
+        if (keys.empty()) continue;
+
+        // First attempt — align with current snapshot's manifest.
+        auto results = submit_and_wait<std::vector<tree::lookup_result>>(
+            [&]() {
+                return pump::sender::just()
+                     >> tree::lookup(keys, current->manifest.get());
+            });
+        ++c.batches;
+        CHECK(results.size() == keys.size());
+
+        if (match_all_against(keys, results, *current->expected)) {
+            ++c.ok;
+            continue;
+        }
+        if (previous && previous.get() != current.get() &&
+            match_all_against(keys, results, *previous->expected)) {
+            ++c.ok_stale;
+            continue;
+        }
+
+        // Reload once to soak up benign race windows where the publish
+        // swapped snapshots between our load and our submit.
+        auto reload = g_current_snap.load(std::memory_order_acquire);
+        auto results2 = submit_and_wait<std::vector<tree::lookup_result>>(
+            [&]() {
+                return pump::sender::just()
+                     >> tree::lookup(keys, reload->manifest.get());
+            });
+        ++c.batches;
+        if (match_all_against(keys, results2, *reload->expected)) {
+            ++c.ok_retry;
+            continue;
+        }
+
+        // Real mismatch — retry is exhausted and no historical snapshot
+        // explains the result. Report with enough context to reproduce,
+        // then abort (plan §7: UB/abort is the acceptable outcome, the
+        // known_issues entry + reproducer command is the ship gate).
+        ++c.mismatch;
+        std::fprintf(stderr,
+            "FAIL: reader %u mismatch "
+            "(current.round=%lu reload.round=%lu batch=%u)\n",
+            reader_idx,
+            static_cast<unsigned long>(current->round_id),
+            static_cast<unsigned long>(reload->round_id),
+            batch_size);
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            std::fprintf(stderr,
+                "  key[%zu]=%.*s initial.index=%zu retry.index=%zu\n",
+                i,
+                static_cast<int>(keys[i].size()), keys[i].data(),
+                results[i].index(),
+                results2[i].index());
+        }
+        *out_counters = c;
+        std::abort();
+    }
+
+    *out_counters = c;
+}
+
 // ── Value persist ──────────────────────────────────────────────────────
 //
 // Only ops of kind::put contribute to the persist call. The returned
 // vector is indexed in the same order the put ops appear inside
 // `round_ops`; build_sealed_gen walks the ops span in parallel with a
 // running `put_idx` counter to pair entries with durables.
+
+// Persist in fixed-size chunks so we stay well below mock_nvme's
+// per_core::queue capacity (2048). `value::persist_values` fans out
+// one `nvme->write` per write_desc inside the leader pipeline via an
+// unbounded `concurrent()`, so a single monolithic call with >2k put
+// entries overflows the queue. Chunking at the harness level keeps
+// this bounded without touching production senders; the durables
+// array is filled shard-by-shard through the per-entry `out_vr`
+// pointers, so the caller still sees one contiguous result.
+constexpr std::size_t kPersistChunkPuts = 1024;
 
 std::vector<format::value_ref>
 persist_put_values(std::span<const round_op> round_ops) {
@@ -463,11 +812,18 @@ persist_put_values(std::span<const round_op> round_ops) {
         });
     }
 
-    const bool ok = submit_and_wait<bool>([&]() {
-        return value::persist_values(
-            std::span<value::put_entry>(entries));
-    });
-    CHECK(ok && "value::persist_values returned ok=false");
+    std::size_t issued = 0;
+    while (issued < entries.size()) {
+        const std::size_t remaining  = entries.size() - issued;
+        const std::size_t chunk_size = std::min(kPersistChunkPuts, remaining);
+        std::span<value::put_entry> chunk(
+            entries.data() + issued, chunk_size);
+        const bool ok = submit_and_wait<bool>([chunk]() {
+            return value::persist_values(chunk);
+        });
+        CHECK(ok && "value::persist_values returned ok=false");
+        issued += chunk_size;
+    }
     return durables;
 }
 
@@ -628,18 +984,25 @@ run_round(const round_spec&                             spec,
           const char*                                   round_label) {
     CHECK(!spec.ops.empty());
 
+    round_timing timing{};
+    auto         round_t0 = now_tp();
+
     // 1. Persist every put value; empty-put rounds would skip the call,
     //    but current round generators always include puts so we keep
     //    the CHECK-noisy fall-through.
-    auto durables = persist_put_values(spec.ops);
+    auto persist_t0 = now_tp();
+    auto durables   = persist_put_values(spec.ops);
+    timing.persist_ms = ms_between(persist_t0, now_tp());
 
     // 2. Build a sealed memtable_gen off the sorted ops span.
-    auto gen = build_sealed_gen(
+    auto build_t0 = now_tp();
+    auto gen      = build_sealed_gen(
         spec.gen_id,
         /*front_owner_index=*/ 0,
         spec.lsn_start,
         spec.ops,
         durables);
+    timing.build_sealed_ms = ms_between(build_t0, now_tp());
     const uint64_t gen_max_lsn = gen->max_lsn;
 
     // 3. Submit tree_local_flush.
@@ -652,9 +1015,11 @@ run_round(const round_spec&                             spec,
 
     auto req_holder =
         std::make_shared<tree::tree_flush_request>(std::move(req));
-    auto result = submit_and_wait<tree::tree_flush_result>([req_holder]() {
+    auto flush_t0 = now_tp();
+    auto result   = submit_and_wait<tree::tree_flush_result>([req_holder]() {
         return tree::tree_local_flush(std::move(*req_holder));
     });
+    timing.flush_ms = ms_between(flush_t0, now_tp());
 
     // 4. Validate + wrap the new manifest as the next base_guard.
     validate_flush_result(result,
@@ -666,17 +1031,18 @@ run_round(const round_spec&                             spec,
     auto manifest        = result.new_manifest;
     auto next_base_guard = wrap_manifest_as_guard(manifest);
 
+    timing.total_ms = ms_between(round_t0, now_tp());
+
     return round_outcome{
         .result          = std::move(result),
         .manifest        = std::move(manifest),
         .next_base_guard = std::move(next_base_guard),
         .next_lsn        = spec.lsn_start + spec.ops.size(),
+        .timing          = timing,
     };
 }
 
 // ── Final verification ─────────────────────────────────────────────────
-
-constexpr std::size_t kTargetReadbackSamples = 50;
 
 struct verify_sample {
     std::string    key;
@@ -684,7 +1050,8 @@ struct verify_sample {
 };
 
 std::vector<verify_sample>
-pick_verify_samples(const expected_state& state) {
+pick_verify_samples(const expected_state& state,
+                    std::size_t           target_samples) {
     std::vector<verify_sample> flat;
     flat.reserve(state.size());
     for (const auto& [k, v] : state) flat.push_back({k, v});
@@ -692,8 +1059,10 @@ pick_verify_samples(const expected_state& state) {
     const std::size_t n = flat.size();
     if (n == 0) return {};
 
+    const std::size_t effective_target =
+        std::max<std::size_t>(1, target_samples);
     const std::size_t stride =
-        std::max<std::size_t>(1, n / kTargetReadbackSamples);
+        std::max<std::size_t>(1, n / effective_target);
 
     std::vector<verify_sample> out;
     out.reserve(n / stride + 4);
@@ -706,6 +1075,69 @@ struct verify_report {
     std::size_t value_checks_ok     = 0;
     std::size_t tombstone_checks_ok = 0;
 };
+
+// Concurrency bound for pipeline-internal value readback. Sized so the
+// pipeline keeps enough reads in flight to saturate the single
+// value_alloc_sched + nvme_sched pair on the value core, but not so
+// many that the per-core queue fills up. 32 is a common cap in
+// codebase examples (RPC pipelining, aisaq beam search); no reason to
+// pick a larger number until we have a profile step to tune it.
+constexpr uint32_t kReadbackConcurrency = 32;
+
+// (sample index, value_ref) pair used by the concurrent readback
+// pipeline so results can be correlated back to `samples` even after
+// a parallel `value::read_value` fan-out finishes out of order.
+struct indexed_value_ref {
+    std::size_t       sample_idx;
+    format::value_ref vr;
+};
+
+// Concurrent readback for the live-value subset of `samples`. Returns
+// a vector aligned to `live_samples`: `readbacks[k]` is the body that
+// `live_samples[k].vr` resolves to. Writing to disjoint indices of a
+// pre-sized vector matches the `value::persist_values` codebase
+// pattern (as_stream → concurrent → flat_map → all, with results
+// going to caller-owned state) and sidesteps the INC-041 worry about
+// `concurrent + reduce` accumulator contracts: the accumulator is
+// per-slot, so reduce has no shared state to fight over.
+//
+// Tombstones / absent entries don't need value I/O and are checked
+// synchronously in the caller's lookup-result walk; they never reach
+// this function.
+std::vector<std::string>
+concurrent_readback(std::span<const indexed_value_ref> live_samples) {
+    if (live_samples.empty()) return {};
+
+    // Local copy so the pipeline doesn't depend on caller-owned span
+    // memory staying alive through every concurrent flat_map branch.
+    std::vector<indexed_value_ref> items(
+        live_samples.begin(), live_samples.end());
+    std::vector<std::string> readbacks(items.size());
+
+    auto ok = submit_and_wait<bool>([&]() {
+        using namespace pump::sender;
+        return just()
+            >> for_each(items)
+            >> concurrent(kReadbackConcurrency)
+            >> flat_map([&readbacks, &items](const indexed_value_ref& iv) {
+                // Resolve the slot from the item's position in `items`
+                // — the pipeline might visit items out of order, so we
+                // can't use the iteration index alone. Pointer math on
+                // the captured vector is stable because `items` lives
+                // for the whole submit_and_wait window.
+                const std::size_t slot =
+                    static_cast<std::size_t>(&iv - items.data());
+                return value::read_value(iv.vr)
+                    >> then([&readbacks, slot](std::string&& s) {
+                        readbacks[slot] = std::move(s);
+                        return true;
+                    });
+            })
+            >> all();
+    });
+    CHECK(ok && "concurrent readback pipeline reported failure");
+    return readbacks;
+}
 
 verify_report
 verify_against_expected(const core::tree_manifest*       manifest,
@@ -724,6 +1156,10 @@ verify_against_expected(const core::tree_manifest*       manifest,
         });
     CHECK(lookup_results.size() == samples.size());
 
+    // Phase A: check lookup variant / data_ver synchronously and
+    // collect live values into a to-read list.
+    std::vector<indexed_value_ref> live_samples;
+    live_samples.reserve(samples.size());
     for (std::size_t i = 0; i < samples.size(); ++i) {
         const auto& exp = samples[i].expected;
         if (exp.k == expected_entry::kind::value) {
@@ -748,21 +1184,7 @@ verify_against_expected(const core::tree_manifest*       manifest,
                     static_cast<unsigned long>(exp.data_ver));
                 std::abort();
             }
-            auto got = submit_and_wait<std::string>([vr = lv.vr]() {
-                return value::read_value(vr);
-            });
-            if (got != exp.value) {
-                std::fprintf(stderr,
-                    "FAIL: sample [%zu] key=%s value bytes mismatch: "
-                    "got (len=%zu) '%.*s', expected (len=%zu) '%s'\n",
-                    i, samples[i].key.c_str(),
-                    got.size(),
-                    static_cast<int>(got.size()), got.data(),
-                    exp.value.size(),
-                    exp.value.c_str());
-                std::abort();
-            }
-            ++report.value_checks_ok;
+            live_samples.push_back(indexed_value_ref{i, lv.vr});
         } else {
             if (!std::holds_alternative<tree::lookup_tombstone>(
                     lookup_results[i])) {
@@ -787,6 +1209,31 @@ verify_against_expected(const core::tree_manifest*       manifest,
             }
             ++report.tombstone_checks_ok;
         }
+    }
+
+    // Phase B: fan out value::read_value concurrently via a single
+    // pipeline, then byte-compare results sequentially. The returned
+    // vector is aligned to `live_samples`, so `readbacks[k]` pairs
+    // with `live_samples[k]` regardless of the order the pipeline
+    // finished individual reads.
+    auto readbacks = concurrent_readback(live_samples);
+    CHECK(readbacks.size() == live_samples.size());
+    for (std::size_t k = 0; k < live_samples.size(); ++k) {
+        const auto& iv  = live_samples[k];
+        const auto& got = readbacks[k];
+        const auto& exp = samples[iv.sample_idx].expected;
+        if (got != exp.value) {
+            std::fprintf(stderr,
+                "FAIL: sample [%zu] key=%s value bytes mismatch: "
+                "got (len=%zu) '%.*s', expected (len=%zu) '%s'\n",
+                iv.sample_idx, samples[iv.sample_idx].key.c_str(),
+                got.size(),
+                static_cast<int>(got.size()), got.data(),
+                exp.value.size(),
+                exp.value.c_str());
+            std::abort();
+        }
+        ++report.value_checks_ok;
     }
     return report;
 }
@@ -814,32 +1261,101 @@ print_round_header(const char*       label,
                     spec.lsn_start + spec.ops.size() - 1));
 }
 
-void
-print_round_flush_result(const char*                    label,
-                         const tree::tree_flush_result& r) {
-    std::printf("    %s flush: st=%u, leaf_order.size=%zu, "
-                "root_slot.lba=%lu, flushed_max_lsn=%lu, "
-                "flushed_front_count=%zu\n",
-                label,
-                static_cast<unsigned>(r.st),
-                r.new_manifest ? r.new_manifest->leaf_order.size() : 0UL,
-                r.new_manifest ? static_cast<unsigned long>(
-                    r.new_manifest->root_slot.lba) : 0UL,
-                static_cast<unsigned long>(r.flushed_max_lsn),
-                r.flushed_gens_by_front.size());
+// Allocator usage snapshot, captured after a round finishes.
+//
+// `tree_used_lbas` / `value_used_lbas` are reported relative to the
+// profile's Value Area base/end so they stay interpretable no matter
+// what profile is loaded:
+//
+//   tree area grows UP    from profile.value_data_area_base → tree_head
+//   value area grows DOWN from profile.value_data_area_end  → value_head
+//
+// The gap between heads is the remaining capacity. Exhaustion ==
+// tree_head catching value_head (tree_allocator panics with
+// "data area exhausted" when that happens).
+struct alloc_snapshot {
+    uint64_t tree_head_lba    = 0;
+    uint64_t value_head_lba   = 0;
+    uint64_t tree_used_lbas   = 0;
+    uint64_t value_used_lbas  = 0;
+    uint64_t free_lbas        = 0;
+};
+
+alloc_snapshot
+capture_alloc_snapshot() {
+    const auto& profile = format::kBootstrapFormatProfile;
+    alloc_snapshot s{};
+    if (auto* heads = core::registry::data_area_heads_ptr.get()) {
+        s.tree_head_lba  = heads->tree_head_lba.load(std::memory_order_relaxed);
+        s.value_head_lba = heads->value_head_lba.load(std::memory_order_relaxed);
+    }
+    s.tree_used_lbas =
+        s.tree_head_lba >= profile.value_data_area_base.lba
+            ? s.tree_head_lba - profile.value_data_area_base.lba
+            : 0ULL;
+    s.value_used_lbas =
+        profile.value_data_area_end.lba >= s.value_head_lba
+            ? profile.value_data_area_end.lba - s.value_head_lba
+            : 0ULL;
+    s.free_lbas =
+        s.value_head_lba > s.tree_head_lba
+            ? s.value_head_lba - s.tree_head_lba
+            : 0ULL;
+    return s;
 }
 
 void
-print_expected_state_summary(const expected_state& state) {
+print_round_flush_result(const char*                    label,
+                         const tree::tree_flush_result& r,
+                         const round_timing&            timing,
+                         const alloc_snapshot&          snap) {
+    const std::size_t leaf_count =
+        r.new_manifest ? r.new_manifest->leaf_order.size() : 0UL;
+    const std::size_t slot_map_size =
+        r.new_manifest ? r.new_manifest->slot_map.size() : 0UL;
+    const unsigned long root_lba =
+        r.new_manifest ? static_cast<unsigned long>(
+            r.new_manifest->root_slot.lba) : 0UL;
+
+    std::printf("    %s flush: st=%u, leaf_order.size=%zu, "
+                "slot_map.size=%zu, root_slot.lba=%lu, "
+                "flushed_max_lsn=%lu, flushed_front_count=%zu\n",
+                label,
+                static_cast<unsigned>(r.st),
+                leaf_count,
+                slot_map_size,
+                root_lba,
+                static_cast<unsigned long>(r.flushed_max_lsn),
+                r.flushed_gens_by_front.size());
+    std::printf("    %s timing: persist=%.1fms build_sealed=%.1fms "
+                "flush=%.1fms total=%.1fms\n",
+                label,
+                timing.persist_ms,
+                timing.build_sealed_ms,
+                timing.flush_ms,
+                timing.total_ms);
+    std::printf("    %s alloc: tree_head=%lu (used=%lu LBAs) "
+                "value_head=%lu (used=%lu LBAs) free=%lu LBAs\n",
+                label,
+                static_cast<unsigned long>(snap.tree_head_lba),
+                static_cast<unsigned long>(snap.tree_used_lbas),
+                static_cast<unsigned long>(snap.value_head_lba),
+                static_cast<unsigned long>(snap.value_used_lbas),
+                static_cast<unsigned long>(snap.free_lbas));
+}
+
+void
+print_expected_state_summary(const expected_state& state,
+                             uint32_t              rounds) {
     std::size_t value_count = 0;
     std::size_t tomb_count  = 0;
     for (const auto& [k, v] : state) {
         if (v.k == expected_entry::kind::value) ++value_count;
         else                                    ++tomb_count;
     }
-    std::printf("  expected state after 3 rounds: %zu keys "
+    std::printf("  expected state after %u rounds: %zu keys "
                 "(%zu value, %zu tombstone)\n",
-                state.size(), value_count, tomb_count);
+                rounds, state.size(), value_count, tomb_count);
 }
 
 }  // namespace
@@ -855,9 +1371,12 @@ main(int argc, char** argv) {
 
     auto opts = parse_argv(argc, argv);
 
-    std::printf("test_flush_e2e: num_keys=%u, topology cores=[0,2,4,6,8] "
-                "rd=[2,4,6] value=%d owner=%d\n",
-                opts.num_keys, kValueCore, kOwnerCore);
+    std::printf("test_flush_e2e: num_keys=%u, rounds=%u, readback_samples=%u, "
+                "topology cores=[0,2,4,6,8] rd=[2,4,6] value=%d owner=%d\n",
+                opts.num_keys,
+                opts.rounds,
+                opts.readback_samples,
+                kValueCore, kOwnerCore);
 
     // ── Derive global key width ──
     //
@@ -933,61 +1452,143 @@ main(int argc, char** argv) {
     std::printf("  advance threads up (%u cores)\n",
                 static_cast<unsigned>(kCores.size()));
 
+    // ── Publish the initial (empty) snapshot + spawn concurrent readers ──
+    //
+    // Empty snapshot is published *before* any reader starts so the
+    // first load() cannot observe a null shared_ptr. Readers see an
+    // empty expected map initially and idle-yield until round 1's
+    // publish populates real keys.
+    publish_empty_snapshot();
+
+    std::vector<reader_counters> reader_stats(opts.concurrent_readers);
+    std::vector<std::jthread>    readers;
+    readers.reserve(opts.concurrent_readers);
+    for (uint32_t i = 0; i < opts.concurrent_readers; ++i) {
+        readers.emplace_back([i, &opts, &reader_stats]() {
+            reader_main(i, opts.reader_batch, &reader_stats[i]);
+        });
+    }
+    if (opts.concurrent_readers > 0) {
+        std::printf("  started %u reader(s) on cores 10..%u (batch=%u)\n",
+                    opts.concurrent_readers,
+                    10 + opts.concurrent_readers - 1,
+                    opts.reader_batch);
+    } else {
+        std::printf("  concurrent readers disabled "
+                    "(--concurrent-readers 0)\n");
+    }
+
     expected_state state;
 
-    // ── Round 1 ──
-    round_spec r1{
-        .gen_id    = 1,
-        .lsn_start = 1,
-        .ops       = generate_round1_ops(opts.num_keys, key_digits),
-    };
-    print_round_header("round 1", r1);
-    auto r1_out = run_round(r1, make_empty_base_guard(), "round 1");
-    apply_round_to_expected(r1, state);
-    print_round_flush_result("round 1", r1_out.result);
+    // ── Rounds 1..K ──
+    //
+    // Rounds 1 and 2 are one-shot bootstrap/mix. Rounds 3..K reuse the
+    // round-3 op pattern with escalating gen_id and lsn so the tree
+    // accumulates shadow-slot churn on the same key regions — this is
+    // the "多轮 cascade 累积效应" surface the plan calls out.
+    //
+    // Only the final manifest is pinned through the verify step; every
+    // round's intermediate guard is released as soon as the next round
+    // starts, mirroring how production coord would retire old guards
+    // once a new one is published.
 
-    // ── Round 2 ──
-    round_spec r2{
-        .gen_id    = 2,
-        .lsn_start = r1_out.next_lsn,
-        .ops       = generate_round2_ops(opts.num_keys, key_digits),
-    };
-    print_round_header("round 2", r2);
-    auto r2_out = run_round(r2, r1_out.next_base_guard, "round 2");
-    apply_round_to_expected(r2, state);
-    print_round_flush_result("round 2", r2_out.result);
+    auto                               all_rounds_t0 = now_tp();
+    std::shared_ptr<const core::checkpoint_guard>
+                                       base_guard    = make_empty_base_guard();
+    std::shared_ptr<const core::tree_manifest>
+                                       final_manifest;
+    uint64_t                           next_lsn        = 1;
+    uint64_t                           total_ops_count = 0;
 
-    // ── Round 3 ──
-    round_spec r3{
-        .gen_id    = 3,
-        .lsn_start = r2_out.next_lsn,
-        .ops       = generate_round3_ops(opts.num_keys, key_digits),
-    };
-    print_round_header("round 3", r3);
-    auto r3_out = run_round(r3, r2_out.next_base_guard, "round 3");
-    apply_round_to_expected(r3, state);
-    print_round_flush_result("round 3", r3_out.result);
+    for (uint32_t round_id = 1; round_id <= opts.rounds; ++round_id) {
+        char label[32];
+        std::snprintf(label, sizeof(label), "round %u", round_id);
 
-    // Drop the now-superseded intermediate guard references; the final
-    // manifest is pinned through r3_out.manifest and next_base_guard.
-    r1_out.next_base_guard.reset();
-    r2_out.next_base_guard.reset();
+        round_spec spec{
+            .gen_id    = round_id,
+            .lsn_start = next_lsn,
+            .ops       = generate_round_ops(
+                round_id, opts.num_keys, key_digits),
+        };
+        print_round_header(label, spec);
+
+        auto outcome = run_round(spec, base_guard, label);
+        apply_round_to_expected(spec, state);
+        total_ops_count += spec.ops.size();
+
+        auto snap = capture_alloc_snapshot();
+        print_round_flush_result(label, outcome.result, outcome.timing, snap);
+
+        base_guard     = outcome.next_base_guard;
+        final_manifest = outcome.manifest;
+        next_lsn       = outcome.next_lsn;
+
+        // Publish this round's (manifest, expected, round_id) atomically.
+        // Readers observe the swap on their next g_current_snap.load();
+        // the previous snapshot stays alive as long as some reader keeps
+        // a shared_ptr to it — that's the "previous" slot on their side,
+        // which gives the match_all fallback real history to compare
+        // against during the benign race window.
+        publish_round_snapshot(outcome.manifest, state, round_id);
+    }
+    const double all_rounds_ms = ms_between(all_rounds_t0, now_tp());
+
+    CHECK(final_manifest
+          && "no rounds executed — harness invariant violated");
+
+    // ── Stop readers before the quiesced final verify ──
+    //
+    // Plan §4.5.5 stop order: readers join → final verify → advance
+    // workers stop → runtime destroy. Final verify is a byte-level
+    // byte-wise comparison with no active writer, and it must pass
+    // unconditionally; readers winding down first guarantees no
+    // concurrent publish races against the verify.
+    if (opts.concurrent_readers > 0) {
+        g_reader_stop.store(true, std::memory_order_relaxed);
+        readers.clear();   // jthread dtors join
+
+        for (uint32_t i = 0; i < opts.concurrent_readers; ++i) {
+            const auto& c = reader_stats[i];
+            std::printf("  reader %u: batches=%lu ok=%lu ok_stale=%lu "
+                        "ok_retry=%lu mismatch=%lu\n",
+                        i,
+                        static_cast<unsigned long>(c.batches),
+                        static_cast<unsigned long>(c.ok),
+                        static_cast<unsigned long>(c.ok_stale),
+                        static_cast<unsigned long>(c.ok_retry),
+                        static_cast<unsigned long>(c.mismatch));
+        }
+    }
 
     // ── Final verification ──
-    print_expected_state_summary(state);
-    auto samples = pick_verify_samples(state);
+    print_expected_state_summary(state, opts.rounds);
+    auto verify_t0 = now_tp();
+    auto samples   = pick_verify_samples(state, opts.readback_samples);
     std::printf("  verify %zu sampled keys against expected state "
                 "(first=%s .. last=%s)\n",
                 samples.size(),
                 samples.front().key.c_str(),
                 samples.back().key.c_str());
     auto report = verify_against_expected(
-        r3_out.manifest.get(), samples);
+        final_manifest.get(), samples);
+    const double verify_ms = ms_between(verify_t0, now_tp());
     std::printf("    readback OK for %zu samples "
-                "(%zu value / %zu tombstone)\n",
+                "(%zu value / %zu tombstone), verify wall=%.1fms\n",
                 samples.size(),
                 report.value_checks_ok,
-                report.tombstone_checks_ok);
+                report.tombstone_checks_ok,
+                verify_ms);
+
+    // ── Throughput summary ──
+    const double seconds = all_rounds_ms / 1000.0;
+    const double throughput_ops_per_sec =
+        seconds > 0.0 ? static_cast<double>(total_ops_count) / seconds : 0.0;
+    std::printf("  all %u rounds: total_ops=%lu wall=%.1fms "
+                "(%.0f ops/s)\n",
+                opts.rounds,
+                static_cast<unsigned long>(total_ops_count),
+                all_rounds_ms,
+                throughput_ops_per_sec);
 
     // ── Stop runtime ──
     for (uint32_t core : kCores) rt->is_running_by_core[core].store(false);

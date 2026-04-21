@@ -151,7 +151,14 @@ namespace apps::inconel::format {
     inline constexpr format_profile kBootstrapFormatProfile = {
         .lba_size               = 4096,
         .value_data_area_base   = paddr{0, 4000},
-        .value_data_area_end    = paddr{0, 8000},
+        // ~400 MiB namespace (100 000 LBAs @ 4 KiB). Sized to carry the
+        // mock_nvme e2e harness up to ~10^6 keys with 2× headroom. The
+        // tree allocator grows from `value_data_area_base` downward via
+        // retire-and-replan, so this end LBA is the only knob gating
+        // how many keys the whole tree/value area can fit; nothing in
+        // the profile's self-consistency rules baked in the prior
+        // 8 000-LBA value.
+        .value_data_area_end    = paddr{0, 100000},
         .value_class_count      = 5,
         .value_class_sizes      = { 64, 256, 1024, 4096, 16384 },
         // tree geometry bootstrap template. Both numbers are dev-time

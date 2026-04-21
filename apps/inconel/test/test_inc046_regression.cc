@@ -49,8 +49,12 @@ const std::vector<uint32_t> kReadDomainCores = {2, 4, 6};
 constexpr int32_t           kValueCore       = 0;
 constexpr int32_t           kOwnerCore       = 8;
 
+// Follow the profile's configured Value Area top; sized at profile
+// edit time, not here. build_runtime's validate_build_inputs gate
+// requires device >= profile.value_data_area_end.lba * lba_size.
 constexpr uint64_t kNamespaceBytes =
-    uint64_t{8000} * format::kBootstrapFormatProfile.lba_size;
+    static_cast<uint64_t>(format::kBootstrapFormatProfile.value_data_area_end.lba) *
+    format::kBootstrapFormatProfile.lba_size;
 
 enum class op_kind : uint8_t { put, tombstone };
 

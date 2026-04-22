@@ -10,6 +10,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "../memory/frame.hh"
+#include "./panic.hh"
 
 namespace apps::inconel::core {
 
@@ -100,6 +101,30 @@ namespace apps::inconel::core {
                 promote_to_protected(idx);
             }
             return frame_pin{n.frame};
+        }
+
+        std::optional<page_frame*>
+        take(frame_id id) {
+            auto it = index_.find(id);
+            if (it == index_.end()) return std::nullopt;
+            uint32_t idx = it->second;
+            auto& n = nodes_[idx];
+            if (n.frame && n.frame->pin_count > 0) {
+                panic_inconsistency(
+                    "slru_cache::take",
+                    "attempted to take pinned frame dev=%u lba=%lu span=%u dom=%u pin_count=%u",
+                    static_cast<unsigned>(id.base.device_id),
+                    static_cast<unsigned long>(id.base.lba),
+                    static_cast<unsigned>(id.span_lbas),
+                    static_cast<unsigned>(id.dom),
+                    static_cast<unsigned>(n.frame->pin_count));
+            }
+            page_frame* out = n.frame;
+            if (n.in_protected) unlink_protected(idx);
+            else unlink_probation(idx);
+            index_.erase(it);
+            free_node(idx);
+            return out;
         }
 
         bool

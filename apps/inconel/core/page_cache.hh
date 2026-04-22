@@ -43,6 +43,10 @@ namespace apps::inconel::core {
     //   - `pin(id)` returns an RAII frame_pin. On hit, pin_count is
     //     incremented before the pin is returned. On miss, the pin's
     //     frame pointer is nullptr.
+    //   - `take(id)` removes a clean frame from the cache and returns it
+    //     to the caller. On miss it returns nullopt. If the matching
+    //     frame is still pinned, the cache implementation must fail-fast:
+    //     reclaim / recycle paths are not allowed to race with a live pin.
     //   - Runtime eviction (inside put) must skip entries with
     //     pin_count > 0.
     //   - `drain_one()` is the teardown drain: pulls one entry out
@@ -53,6 +57,7 @@ namespace apps::inconel::core {
                                      memory::frame_id id,
                                      memory::page_frame* f) {
         { c.pin(id) }       -> std::same_as<memory::frame_pin>;
+        { c.take(id) }      -> std::same_as<std::optional<memory::page_frame*>>;
         { c.put(f) }        -> std::same_as<std::optional<memory::page_frame*>>;
         { cc.contains(id) } -> std::same_as<bool>;
         { cc.size() }       -> std::same_as<uint32_t>;

@@ -10,6 +10,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "../memory/frame.hh"
+#include "./panic.hh"
 
 namespace apps::inconel::core {
 
@@ -68,6 +69,30 @@ namespace apps::inconel::core {
             return frame_pin{s.frame};
         }
 
+        std::optional<page_frame*>
+        take(frame_id id) {
+            auto it = index_.find(id);
+            if (it == index_.end()) return std::nullopt;
+            auto& s = slots_[it->second];
+            if (s.frame && s.frame->pin_count > 0) {
+                panic_inconsistency(
+                    "clock_cache::take",
+                    "attempted to take pinned frame dev=%u lba=%lu span=%u dom=%u pin_count=%u",
+                    static_cast<unsigned>(id.base.device_id),
+                    static_cast<unsigned long>(id.base.lba),
+                    static_cast<unsigned>(id.span_lbas),
+                    static_cast<unsigned>(id.dom),
+                    static_cast<unsigned>(s.frame->pin_count));
+            }
+            page_frame* out = s.frame;
+            index_.erase(it);
+            s.frame = nullptr;
+            s.occupied = false;
+            s.ref = false;
+            --size_;
+            return out;
+        }
+
         bool
         contains(frame_id id) const {
             return index_.find(id) != index_.end();
@@ -101,7 +126,15 @@ namespace apps::inconel::core {
 
             // Free slot available — fill it.
             if (size_ < capacity_) {
-                uint32_t idx = size_++;
+                uint32_t idx = capacity_;
+                for (uint32_t i = 0; i < capacity_; ++i) {
+                    if (!slots_[i].occupied) {
+                        idx = i;
+                        break;
+                    }
+                }
+                assert(idx < capacity_ && "clock_cache: size_/occupied mismatch");
+                ++size_;
                 auto& s = slots_[idx];
                 s.key = f->id;
                 s.frame = f;

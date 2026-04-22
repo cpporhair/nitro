@@ -15,7 +15,7 @@
 | ↳ `tree_worker_sched` | 与 `tree_read_domain` 1:1 | candidate-build 临时状态 | 继承 `tree_read_domain_index`；cache / paired_lookup 均通过 `read_domain_->...` 间接拿 |
 | `tree_sched` | 1 | tree allocator、flush 状态、retire 队列 | 固定单点 |
 | `wal_space_sched` | 1 | segment free pool、alloc head | 固定单点 |
-| `value_alloc_sched` | 1 | bump head、per-class pools、per-class open_frames、dirty_pages、deferred_freed、value_page `readonly_frame_cache` | 固定单点 |
+| `value_alloc_sched` | 1 | bump head、per-class pools、per-class open_frames、dirty_pages、deferred_freed、trim_pending_pages、value_page `readonly_frame_cache` | 固定单点 |
 | `nvme_sched` | 每核心 × 每设备（v1 单盘 = 每核心 1 个） | SPDK qpair | 各 scheduler 使用本核心的实例 |
 
 **路由层提醒（step 030 §2.7）**：`shard_partition_map` 是读路径（`tree::lookup`）和 flush fold 路径（`memtable_fold.build_key_partitions`）唯一共享的路由决策源，确保"同 key → 同 shard" 不变量在两条路径上同时成立。map 由 builder 在启动时装入一个单 shard 占位（空树 → `{ upper=+∞, idx=0 }`），每次 flush 完成由 tree_sched 重建并 `install_shard_partitions()` 原子替换（B1 目标设计；step 030 不触发 rebuild，仅建立占位 + API）。
@@ -1089,8 +1089,7 @@ handle_reclaim_check(recovery_safe_lsn):
 | `persist_put_values` | batch PUT entries | durable value_refs | coord_sched（leader-follower：多 batch 合并） |
 | `read_value` | `value_ref` | owning value bytes | 读路径（tree hit value 后） |
 | `read_page_values` | `value_read_group { page_fid, refs[] }` | owning value bytes[] | 读路径（MultiGet / Scan 的 tree hit values） |
-| `freed_slots` | page_base, class_idx, freed_mask | void | tree_sched（sub-LBA value 回收） |
-| `recycle_whole` | class_idx, page_base | void | tree_sched（LBA-aligned value 回收，TRIM 由 tree_sched 先完成） |
+| `reclaim_values` | `dead_value_refs[]` | void | tree_sched（dead value 回收，按 batch 投递） |
 | `install_recovered_state` | `live_extents`, `global_value_head`, `data_area_end_lba`, optional `dead_class_hints` | void | boot recovery（一次性初始化） |
 
 注：
@@ -1147,10 +1146,14 @@ struct value_alloc_state {
 
     // ── Dirty tracking ──
     // 跟踪 value_alloc_sched 当前持有的 active open pages 的地址集合。
-    // 用于在 tree_sched 投递 freed_slots 时判断该页是否正被写入，
-    // 若是则暂存到 deferred_freed，等 return_page 时合并。
+    // tree_sched 投递 reclaim_values 时，如果命中 dirty page，则先
+    // 暂存到 deferred_freed，等 return_page / rollback 时合并。
     flat_hash_set<paddr> dirty_pages;                // 当前 value_alloc_sched 的 active open pages
     flat_hash_map<paddr, bitset> deferred_freed;     // dirty 期间暂存的回收 mask
+
+    // ── TRIM gating ──
+    // 已经逻辑全空，但还没完成 TRIM 的页不能立即回 whole_page_pool。
+    flat_hash_map<paddr, trim_pending_descriptor> trim_pending_pages;
 
     // ── Placement policy ──
     value_placement_config config;                   // hole_reuse_watermark 等
@@ -1166,7 +1169,7 @@ struct value_alloc_state {
    - class 暂不可判定的 `generic_free_spans`
 3. `dead_class_hints` 只用于 class 归桶或 TRIM 优化；没有它也不能泄漏 free 空间。
 
-不变量：`dirty_pages` 中的 page 不会同时出现在 `hole_pages` 中。`deferred_freed` 只在 dirty 期间累积，`return_page` 时一次性合并清空。
+不变量：`dirty_pages` 中的 page 不会同时出现在 `hole_pages` 中。`deferred_freed` 只在 dirty 期间累积，`return_page` / rollback 时一次性合并清空。`trim_pending_pages` 中的页在 TRIM 完成前不会重新进入 any allocatable pool。
 
 ### 6.4 `handle_alloc_page`
 
@@ -1285,8 +1288,9 @@ handle_return_page(page_base, class_idx, free_bitmap):
         // 全满 → value_alloc_sched 不管该页
         pass
     elif free_bitmap.all():
-        // 全空 → 回收整页
-        recycle_whole_page(class_idx, page_base)
+        // 全空 → 进入 trim_pending，TRIM 完成后才能回 whole_page_pool
+        trim_pending_pages.insert(page_base,
+            trim_pending_descriptor { class_idx, span_lbas(class_idx), pending })
     else:
         // 部分空 → 记入 hole_pages
         classes[class_idx].hole_pages.insert(page_base,
@@ -1295,59 +1299,93 @@ handle_return_page(page_base, class_idx, free_bitmap):
 
 `handle_return_page()` 只更新 allocator metadata。writeback completion 后，`value_alloc_sched` 直接把 updated frame 转为 `clean_readonly` 放回本地 cache。无需跨 shard invalidate（`value_alloc_sched` 是 value_page cache 唯一 owner）。
 
-### 6.7 `handle_freed_slots`（sub-LBA 回收核心）
+### 6.7 `handle_reclaim_values`（batch reclaim 核心）
 
 ```text
-handle_freed_slots(page_base, class_idx, freed_mask):
+handle_reclaim_values(dead_value_refs[]):
+    partial_by_page = {}
+    whole_pages = {}
 
-    // ── 情况 1：该页当前是 value_alloc_sched 的 active open page ──
-    if dirty_pages.contains(page_base):
-        // 暂存 freed_mask，等 return_page 时合并
-        deferred_freed[page_base] |= freed_mask
-        return
+    for vr in dead_value_refs:
+        class_idx = class_for_len(vr.len)
+        if is_sub_lba(class_idx):
+            slot_idx = vr.byte_offset / class_size[class_idx]
+            partial_by_page[{class_idx, vr.base}] |= (1 << slot_idx)
+        else:
+            whole_pages.insert({class_idx, vr.base})
 
-    // ── 情况 2：该页在 hole_page_list 中 ──
-    if desc = classes[class_idx].hole_pages.find(page_base):
-        desc->free_mask |= freed_mask
-        if desc->free_mask.all():
-            classes[class_idx].hole_pages.erase(page_base)
-            recycle_whole_page(class_idx, page_base)
-        return
+    for (class_idx, page_base, freed_mask) in partial_by_page:
+        apply_partial_reclaim(class_idx, page_base, freed_mask)
 
-    // ── 情况 3：该页不在任何结构中 ──
-    if freed_mask.all():
-        recycle_whole_page(class_idx, page_base)
-    else:
-        classes[class_idx].hole_pages.insert(page_base,
-            hole_page_descriptor { page_base, class_idx, freed_mask })
+    for (class_idx, page_base) in whole_pages:
+        apply_whole_reclaim(class_idx, page_base)
 ```
 
-**幂等性**：全部用 `|=` + `bitmap.count()`，不用 `++`。
+`apply_partial_reclaim(...)` / `apply_whole_reclaim(...)` 都是 owner-local helper，不再作为跨 scheduler handle 暴露。
 
-### 6.8 `recycle_whole_page` 统一路径
+聚合后的 page-level 处理规则：
+
+1. dirty page
+   - 先累积到 `deferred_freed`
+2. resident open / allocatable frame
+   - 直接更新 resident `free_mask`
+3. readonly cache 命中
+   - `take(frame_id)` 摘出 cache frame
+   - partial free → 转 resident clean_allocatable
+   - all-free → 进入 `trim_pending_pages`
+4. metadata-only hole page
+   - 更新 `hole_pages`
+   - all-free → 移出 `hole_pages`，转 `trim_pending_pages`
+5. completely untracked page
+   - partial free → 新建 `hole_pages`
+   - all-free → 直接转 `trim_pending_pages`
+
+**幂等性**：slot reclaim 一律用 `|=` 聚合，不用计数递增。
+
+### 6.8 `trim_pending` / `complete_trim` 统一路径
 
 ```text
-recycle_whole_page(class_idx, page_base):
-    1. 从本地 readonly_frame_cache 删除该 page 的 frame（如有）
-    2. 放回 classes[class_idx].whole_page_pool
-    // TRIM 由调用方（tree_sched）在投递 recycle 之前完成（等待 TRIM 回调后再投递）
-    // 无需跨 shard invalidate（value_alloc_sched 是 value_page cache 唯一 owner）
+mark_trim_pending(class_idx, page_base):
+    trim_pending_pages[page_base] = { class_idx, span_lbas(class_idx), pending }
+
+prepare_trim_batch():
+    take all trim_pending_pages with state=pending
+    mark as inflight
+    return trim_desc[]
+
+complete_trim_batch(batch_id, ok=true):
+    for page in batch:
+        trim_pending_pages.erase(page)
+        classes[class_idx].whole_page_pool.push(page)
+
+complete_trim_batch(batch_id, ok=false):
+    for page in batch:
+        trim_pending_pages[page].state = pending
 ```
 
-multi-LBA extent 的 `handle_recycle_whole` 同理：从本地 cache 删除覆盖该 extent 的 frames，再放回 `classes[class_idx].extent_free_pool`。
+也就是说 value owner 现在自己保证：
+
+```text
+all-free
+    -> trim_pending
+    -> NVMe trim complete
+    -> whole-page reusable
+```
 
 ### 6.9 TRIM 顺序协议
 
-`recycle_whole_page` 路径中，TRIM 必须在回收之前完成。因为 per-core 模型下 TRIM（tree_sched 核心的 qpair）和后续写入（value_alloc_sched 核心的 qpair）在不同 qpair 上，没有隐式顺序保证：
+整页回收的关键不变量仍然是：**TRIM 必须先于重分配完成。**
+
+当前落地方式是把这个顺序收回到 value owner 自己维护：
 
 ```text
-tree_sched: submit_trim(page_base) → 等待 TRIM 完成回调
-tree_sched: freed_slots / recycle_whole → value_alloc_sched
-// TRIM 已完成 → 页可安全重分配
-// value_alloc_sched 拿到页后写入，不会被迟到的 TRIM 覆盖
+tree_sched: reclaim_values(dead_value_refs[]) -> value_alloc_sched
+value_alloc_sched: whole-free page -> trim_pending
+upper-layer maintenance: drain_trim_pending() -> prepare_trim_batch -> submit_trim(page_base...) -> complete_trim_batch
+// complete_trim_batch 之前，这些页不会进入 whole_page_pool
 ```
 
-TRIM 在回收路径上（非写关键路径），等待完成不影响前台延迟。
+`persist_put_values` finalize 不负责 TRIM drain。dirty page 上的 deferred reclaim 在 commit / rollback 后若把页凑成 all-free，只会进入 `trim_pending`；真正何时发 TRIM 由上层按 reclaim cadence 决定。
 
 ### 6.10 `dirty_pages` / `deferred_freed` 生命周期
 
@@ -1355,7 +1393,7 @@ TRIM 在回收路径上（非写关键路径），等待完成不影响前台延
 |------|------|
 | `persist_put_values` 内部 `alloc_page` | `dirty_pages.insert(page_base)` |
 | `persist_put_values` 完成 FUA 后 `return_page` | `dirty_pages.erase(page_base)` + 合并 `deferred_freed` |
-| `handle_freed_slots` 命中 dirty page | `deferred_freed[page_base] \|= freed_mask`（暂存） |
+| `handle_reclaim_values` 命中 dirty page | `deferred_freed[page_base] \|= freed_mask`（暂存） |
 | value 写入失败 / abort | 归还 → 同 return_page |
 
 ## 7. `nvme_sched`（NVMe Scheduler）

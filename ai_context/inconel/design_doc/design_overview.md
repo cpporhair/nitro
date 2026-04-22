@@ -303,7 +303,7 @@ same key -> same front scheduler (within one runtime)
    - 前台 PUT 的 value 写入采用 leader-follower 模式：advance() 合并当前并发 batch 的 PUT entries，leader 统一分配 slot、填充 DMA frame、提交 FUA 写到本核 nvme_sched；FUA 完成后所有 batch 拿到 `value_ref`，再 fan-out 到各 `front_sched` 先写 WAL、all-WAL barrier 成功后再写 memtable
    - `read_value(value_ref)`：Point GET 的 tree hit value 读取入口；`read_page_values(value_read_group)`：MultiGet / Scan 的批量 value 读取入口
    - 批量查询先在调用方按 value page 分组，再把同页 refs 交给 `value_alloc_sched`
-   - `tree_sched` 完成 TRIM 后通过 `freed_slots` / `recycle_whole` 投递回收
+   - `tree_sched` 把 dead `value_ref` 批量投递给 `value_alloc_sched::reclaim_values(...)`；页内聚合和 whole-free page 的 TRIM 完成态由 value owner 内部处理
    - 最佳实践是把它部署在独占核心上，但这属于部署建议，不是语义前提
 
 8. **nvme scheduler(s)**（`nvme_sched`，每核心 × 每设备各一个实例）

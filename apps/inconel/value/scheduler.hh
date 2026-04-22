@@ -10,12 +10,14 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/inlined_vector.h>
 
 #include "pump/core/compute_sender_type.hh"
@@ -34,6 +36,8 @@
 namespace apps::inconel::value {
 
     using format::paddr;
+    using format::read_desc;
+    using format::trim_desc;
     using format::value_ref;
     using format::write_desc;
 
@@ -58,6 +62,20 @@ namespace apps::inconel::value {
         std::span<write_desc> writes;
     };
 
+    struct persist_prefill {
+        uint64_t             round_id;
+        std::span<read_desc> reads;
+    };
+
+    struct trim_batch {
+        uint64_t             batch_id;
+        std::span<trim_desc> trims;
+    };
+
+    struct trim_idle {};
+
+    using prepare_trim_result = std::variant<trim_idle, trim_batch>;
+
     // Followers piggy-back on the leader's NVMe write. handle_finalize
     // copies the leader's nvme_ok into every follower's `ok` field so the
     // caller can react to a failed round even when it didn't drive the
@@ -68,7 +86,10 @@ namespace apps::inconel::value {
         bool ok;
     };
 
-    using prepare_persist_result = std::variant<persist_leader, persist_follower>;
+    using prepare_persist_result = std::variant<
+        persist_leader,
+        persist_prefill,
+        persist_follower>;
 
     // read sender output (variant). hit branches return immediately with the
     // decoded body. miss branches hand the pipeline a buf + paddr; pipeline
@@ -103,10 +124,14 @@ namespace apps::inconel::value {
 
     // ── Forward declarations of req types (used by sender layer) ──
 
-    namespace _value_persist  { struct req; }
-    namespace _value_finalize { struct req; }
-    namespace _value_read     { struct req; }
-    namespace _value_fill     { struct req; }
+    namespace _value_persist       { struct req; }
+    namespace _value_finalize      { struct req; }
+    namespace _value_continue      { struct req; }
+    namespace _value_read          { struct req; }
+    namespace _value_fill          { struct req; }
+    namespace _value_reclaim       { struct req; }
+    namespace _value_trim_prepare  { struct req; }
+    namespace _value_trim_complete { struct req; }
 
     struct value_alloc_sched_base;
 
@@ -171,6 +196,39 @@ namespace apps::inconel::value {
             bool            ok;
 
             auto make_op() { return op{.sched = sched, .round_id = round_id, .ok = ok}; }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>().push_back(make_op());
+            }
+        };
+    }
+
+    namespace _value_continue {
+
+        struct req {
+            uint64_t                                        round_id;
+            bool                                            read_ok;
+            std::move_only_function<void(persist_leader&&)> cb;
+            std::move_only_function<void(std::exception_ptr)> fail;
+        };
+
+        struct op {
+            constexpr static bool value_continue_op = true;
+            value_alloc_sched_base* sched;
+            uint64_t                round_id;
+            bool                    read_ok;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            value_alloc_sched_base* sched;
+            uint64_t                round_id;
+            bool                    read_ok;
+
+            auto make_op() { return op{.sched = sched, .round_id = round_id, .read_ok = read_ok}; }
 
             template<typename ctx_t>
             auto connect() {
@@ -256,9 +314,110 @@ namespace apps::inconel::value {
         };
     }
 
+    namespace _value_reclaim {
+
+        struct req {
+            std::vector<value_ref>                      dead_values;
+            std::move_only_function<void()>             cb;
+            std::move_only_function<void(std::exception_ptr)> fail;
+        };
+
+        struct op {
+            constexpr static bool value_reclaim_op = true;
+            value_alloc_sched_base* sched;
+            std::span<const value_ref> dead_values;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            value_alloc_sched_base* sched;
+            std::span<const value_ref> dead_values;
+
+            auto make_op() {
+                return op{
+                    .sched       = sched,
+                    .dead_values = dead_values,
+                };
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>().push_back(make_op());
+            }
+        };
+    }
+
+    namespace _value_trim_prepare {
+
+        struct req {
+            std::move_only_function<void(prepare_trim_result&&)> cb;
+            std::move_only_function<void(std::exception_ptr)> fail;
+        };
+
+        struct op {
+            constexpr static bool value_trim_prepare_op = true;
+            value_alloc_sched_base* sched;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            value_alloc_sched_base* sched;
+
+            auto make_op() { return op{.sched = sched}; }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>().push_back(make_op());
+            }
+        };
+    }
+
+    namespace _value_trim_complete {
+
+        struct req {
+            uint64_t                                    batch_id;
+            bool                                        ok;
+            std::move_only_function<void()>             cb;
+            std::move_only_function<void(std::exception_ptr)> fail;
+        };
+
+        struct op {
+            constexpr static bool value_trim_complete_op = true;
+            value_alloc_sched_base* sched;
+            uint64_t                batch_id;
+            bool                    ok;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            value_alloc_sched_base* sched;
+            uint64_t                batch_id;
+            bool                    ok;
+
+            auto make_op() {
+                return op{
+                    .sched    = sched,
+                    .batch_id = batch_id,
+                    .ok       = ok,
+                };
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>().push_back(make_op());
+            }
+        };
+    }
+
     // ── value_alloc_sched_base ──
     //
-    // Non-templated layer holding the four PUMP queues, the schedule_*
+    // Non-templated layer holding the PUMP queues, the schedule_*
     // enqueue helpers, and the sender factory entry points. Senders/ops only
     // need this base — they never see the templated derived class — so the
     // PUMP pipeline machinery (op_pusher / compute_sender_type) doesn't have
@@ -271,22 +430,34 @@ namespace apps::inconel::value {
     struct value_alloc_sched_base {
         pump::core::per_core::queue<_value_persist::req*>  persist_q_;
         pump::core::per_core::queue<_value_finalize::req*> finalize_q_;
+        pump::core::per_core::queue<_value_continue::req*> continue_q_;
         pump::core::per_core::queue<_value_read::req*>     read_q_;
         pump::core::per_core::queue<_value_fill::req*>     fill_q_;
+        pump::core::per_core::queue<_value_reclaim::req*>  reclaim_q_;
+        pump::core::per_core::queue<_value_trim_prepare::req*>  trim_prepare_q_;
+        pump::core::per_core::queue<_value_trim_complete::req*> trim_complete_q_;
 
         explicit
         value_alloc_sched_base(size_t queue_depth = 2048)
             : persist_q_(queue_depth)
             , finalize_q_(queue_depth)
+            , continue_q_(queue_depth)
             , read_q_(queue_depth)
-            , fill_q_(queue_depth) {}
+            , fill_q_(queue_depth)
+            , reclaim_q_(queue_depth)
+            , trim_prepare_q_(queue_depth)
+            , trim_complete_q_(queue_depth) {}
 
         // ── enqueue helpers (called by op::start) ──
 
         void schedule_persist (_value_persist::req*  r) { persist_q_ .try_enqueue(r); }
         void schedule_finalize(_value_finalize::req* r) { finalize_q_.try_enqueue(r); }
+        void schedule_continue(_value_continue::req* r) { continue_q_.try_enqueue(r); }
         void schedule_read    (_value_read::req*     r) { read_q_    .try_enqueue(r); }
         void schedule_fill    (_value_fill::req*     r) { fill_q_    .try_enqueue(r); }
+        void schedule_reclaim      (_value_reclaim::req*      r) { reclaim_q_      .try_enqueue(r); }
+        void schedule_trim_prepare (_value_trim_prepare::req* r) { trim_prepare_q_ .try_enqueue(r); }
+        void schedule_trim_complete(_value_trim_complete::req* r) { trim_complete_q_.try_enqueue(r); }
 
         // ── Sender factories ──
         //
@@ -296,9 +467,13 @@ namespace apps::inconel::value {
 
         auto prepare_persist(std::span<put_entry> entries);
         auto finalize_persist(uint64_t round_id, bool ok);
+        auto continue_persist(uint64_t round_id, bool read_ok);
         auto prepare_read(value_ref vr);
         auto fill_and_decode(value_ref vr, std::unique_ptr<char[]> buf,
                              uint32_t buf_size, bool admit_to_cache);
+        auto reclaim_values(std::span<const value_ref> dead_values);
+        auto prepare_trim_batch();
+        auto complete_trim_batch(uint64_t batch_id, bool ok);
     };
 
     // ── value_alloc_sched<Cache> ──
@@ -314,13 +489,43 @@ namespace apps::inconel::value {
             memory::value_page_frame* frame;
             value_page_source         source;
             uint64_t                  original_free_mask; // for rollback
+            bool                      prefill_loaded;
         };
 
         struct round {
+            enum class stage : uint8_t {
+                prefill_pending,
+                writeback_inflight,
+            };
+
             uint64_t                              id;
+            stage                                 st = stage::prefill_pending;
             std::vector<round_page>               pages;
+            std::vector<read_desc>                reads;
             std::vector<write_desc>               writes;     // built from pages
+            std::vector<std::span<put_entry>>     entry_groups;
             std::vector<_value_persist::req*>     followers;  // not the leader
+        };
+
+        struct hole_page_descriptor {
+            uint64_t free_mask = 0;
+        };
+
+        struct trim_pending_descriptor {
+            enum class state : uint8_t {
+                pending,
+                inflight,
+            };
+
+            uint16_t class_idx = 0;
+            uint32_t span_lbas = 0;
+            state    st        = state::pending;
+        };
+
+        struct trim_batch_state {
+            uint64_t               id = 0;
+            std::vector<paddr>     pages;
+            std::vector<trim_desc> trims;
         };
 
         value_allocator alloc_;
@@ -368,6 +573,10 @@ namespace apps::inconel::value {
         // for rollback purposes.
         std::vector<memory::value_page_frame*>              open_frames_;
         std::vector<std::vector<memory::value_page_frame*>> allocatable_frames_;
+        std::vector<absl::flat_hash_map<paddr, hole_page_descriptor>> hole_pages_;
+        absl::flat_hash_set<paddr>                          dirty_pages_;
+        absl::flat_hash_map<paddr, uint64_t>                deferred_freed_;
+        absl::flat_hash_map<paddr, trim_pending_descriptor> trim_pending_pages_;
 
         // readonly cache: frame_id → page_frame* for 1-LBA pages. The
         // scheduler owns the page_frame descriptors and their backing
@@ -394,6 +603,8 @@ namespace apps::inconel::value {
         // RB-tree std::map originally used.
         absl::flat_hash_map<uint64_t, std::unique_ptr<round>> inflight_rounds_;
         uint64_t                                              next_round_id_ = 1;
+        absl::flat_hash_map<uint64_t, std::unique_ptr<trim_batch_state>> inflight_trim_batches_;
+        uint64_t                                                     next_trim_batch_id_ = 1;
 
         value_alloc_sched(std::span<const uint32_t> class_sizes,
                           uint32_t                  lba_size,
@@ -407,6 +618,7 @@ namespace apps::inconel::value {
                      shared_heads)
             , open_frames_(class_sizes.size(), nullptr)
             , allocatable_frames_(class_sizes.size())
+            , hole_pages_(class_sizes.size())
             , readonly_cache_(std::move(cache))
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
@@ -450,18 +662,21 @@ namespace apps::inconel::value {
         // making them available for subsequent persist rounds). persist
         // next (consumes the freshly available pages). read/fill last.
         //
-        // INC-029 — bounded per-advance work budget. Each of the four queues
-        // gets its own per-advance cap so a hot stream on one queue can't
-        // monopolise this scheduler's CPU and starve the other three (or
-        // other co-resident schedulers). Constants are private on purpose:
-        // these are workload-shaping knobs, not runtime/build configuration
-        // surfaces. Persist is counted in *leader rounds* — handle_persist
-        // is allowed to absorb up to kMaxFollowersPerRound followers
-        // internally, so a single round still represents up to 1 + cap
-        // entries of real work; that is why its per-advance budget is
-        // smaller than the other three.
+        // INC-029 — bounded per-advance work budget. Each queue gets its own
+        // per-advance cap so a hot stream on one queue can't monopolise this
+        // scheduler's CPU and starve the others. Constants are private on
+        // purpose: these are workload-shaping knobs, not runtime/build
+        // configuration surfaces. Persist is counted in *leader rounds* —
+        // handle_persist is allowed to absorb up to kMaxFollowersPerRound
+        // followers internally, so a single round still represents up to
+        // 1 + cap entries of real work; that is why its per-advance budget
+        // is smaller than the single-item queues.
 
         static constexpr uint32_t kMaxFinalizePerAdvance      = 64;
+        static constexpr uint32_t kMaxReclaimPerAdvance       = 64;
+        static constexpr uint32_t kMaxTrimPreparePerAdvance   = 16;
+        static constexpr uint32_t kMaxTrimCompletePerAdvance  = 16;
+        static constexpr uint32_t kMaxContinuePerAdvance      = 32;
         static constexpr uint32_t kMaxPersistRoundsPerAdvance = 32;
         static constexpr uint32_t kMaxReadPerAdvance          = 64;
         static constexpr uint32_t kMaxFillPerAdvance          = 64;
@@ -473,6 +688,27 @@ namespace apps::inconel::value {
                 auto item = finalize_q_.try_dequeue();
                 if (!item) break;
                 handle_finalize(*item);
+                progress = true;
+            }
+
+            for (uint32_t i = 0; i < kMaxReclaimPerAdvance; ++i) {
+                auto item = reclaim_q_.try_dequeue();
+                if (!item) break;
+                handle_reclaim(*item);
+                progress = true;
+            }
+
+            for (uint32_t i = 0; i < kMaxTrimCompletePerAdvance; ++i) {
+                auto item = trim_complete_q_.try_dequeue();
+                if (!item) break;
+                handle_complete_trim_batch(*item);
+                progress = true;
+            }
+
+            for (uint32_t i = 0; i < kMaxContinuePerAdvance; ++i) {
+                auto item = continue_q_.try_dequeue();
+                if (!item) break;
+                handle_continue(*item);
                 progress = true;
             }
 
@@ -503,6 +739,13 @@ namespace apps::inconel::value {
                 progress = true;
             }
 
+            for (uint32_t i = 0; i < kMaxTrimPreparePerAdvance; ++i) {
+                auto item = trim_prepare_q_.try_dequeue();
+                if (!item) break;
+                handle_prepare_trim_batch(*item);
+                progress = true;
+            }
+
             return progress;
         }
 
@@ -514,29 +757,36 @@ namespace apps::inconel::value {
         //  handle_persist  —  leader-follower round assembly
         // ════════════════════════════════════════════════════════════════
         //
-        // Round build is split into four explicit phases (no goto, no
+        // Round build is split into explicit phases (no goto, no
         // exception_ptr smuggling):
         //
         //   1. collect_round_items(leader)        — drain followers up to cap
-        //   2. build_round(round, items)          — encode every entry
-        //   3. finalize_round_writes(round)       — build write_desc list
-        //   4. publish_round(round, items, ldr)   — install + fire leader cb
+        //   2. place_round(round, items)          — assign pages / slots
+        //   3. prefill hole pages if needed       — NVMe read on sender side
+        //   4. encode_round_entries(round)        — materialise page bytes
+        //   5. finalize_round_writes(round)       — build write_desc list
+        //   6. publish_round(round, leader)       — freeze + fire leader cb
         //
-        // build_round returns an explicit `persist_entry_status` so the
-        // caller can route each failure mode without inspecting the round
-        // state. Only `value_too_large` is recoverable (caller sent a body
-        // that doesn't fit any size class — pure caller-driven input).
-        // `out_of_space` and `encode_failure` are invariant breaks: v1 has
-        // no value reclaim, so an empty bump head means the runtime is in a
-        // state we can no longer reason about; an encode failure after a
-        // class has been picked means encode_value_object disagreed with
-        // find_min_class, which is an internal logic bug. Both panic
-        // immediately rather than masquerading as a recoverable exception.
+        // place_round / encode_round_entries return an explicit
+        // `persist_entry_status` so the caller can route each failure mode
+        // without inspecting the round state. Only `value_too_large` is
+        // recoverable (caller sent a body that doesn't fit any size class
+        // — pure caller-driven input). `out_of_space` and `encode_failure`
+        // are invariant breaks: once reclaim exists, "out of space" now
+        // means no bump / whole / hole candidate remained; encode failure
+        // after class selection still means encode_value_object disagreed
+        // with find_min_class. Both panic immediately rather than
+        // masquerading as recoverable exceptions.
+        //
+        // A round that touches a non-resident hole page may stop after
+        // phase 2 and return `persist_prefill{round_id, reads}` to the
+        // sender layer. The sender drives the page reads, then calls
+        // continue_persist(round_id, read_ok) which resumes at phase 4.
 
         enum class persist_entry_status : uint8_t {
             ok = 0,
             value_too_large,   // recoverable — caller body exceeds all classes
-            out_of_space,      // fatal — no Data Area left, no reclaim path
+            out_of_space,      // fatal — no bump/whole/hole candidate remained
             encode_failure,    // fatal — encode disagreed with find_min_class
         };
 
@@ -557,8 +807,12 @@ namespace apps::inconel::value {
 
             auto rnd = std::make_unique<round>();
             rnd->id = next_round_id_++;
+            rnd->followers.reserve(items.size() > 0 ? items.size() - 1 : 0);
+            for (size_t i = 1; i < items.size(); ++i) {
+                rnd->followers.push_back(items[i]);
+            }
 
-            auto status = build_round(*rnd, items);
+            auto status = place_round(*rnd, items);
             if (status == persist_entry_status::value_too_large) {
                 // Recoverable: caller's body doesn't fit any class. Roll
                 // back every page touched this round (reverse-order so
@@ -576,16 +830,26 @@ namespace apps::inconel::value {
             }
             if (status == persist_entry_status::out_of_space) {
                 core::panic_inconsistency("value::value_alloc_sched::handle_persist",
-                    "value Data Area exhausted; v1 has no reclaim path");
+                    "value Data Area exhausted after reclaim-aware placement");
             }
             if (status == persist_entry_status::encode_failure) {
                 core::panic_inconsistency("value::value_alloc_sched::handle_persist",
                     "encode_value_object failed after class selection — internal logic break");
             }
 
-            // status == ok
+            if (!rnd->reads.empty()) {
+                publish_prefill(std::move(rnd), leader_item);
+                return;
+            }
+
+            status = encode_round_entries(*rnd);
+            if (status == persist_entry_status::encode_failure) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_persist",
+                    "encode_value_object failed after placement — internal logic break");
+            }
+
             finalize_round_writes(*rnd);
-            publish_round(std::move(rnd), items, leader_item);
+            publish_round(std::move(rnd), leader_item);
         }
 
         // ── collect_round_items ──
@@ -608,20 +872,69 @@ namespace apps::inconel::value {
             return items;
         }
 
-        // ── build_round ──
+        // ── place_round ──
         //
-        // Walk every entry across every item, encoding value objects into
-        // round pages. Stops on the first non-ok status; the caller is
-        // responsible for rollback.
+        // Walk every entry across every item, assign a durable slot, and
+        // remember the borrowed entry spans for the later encode phase.
+        // Stops on the first non-ok status; the caller is responsible for
+        // rollback.
 
         persist_entry_status
-        build_round(round& rnd, std::span<_value_persist::req* const> items) {
+        place_round(round& rnd, std::span<_value_persist::req* const> items) {
+            rnd.entry_groups.reserve(items.size());
             for (auto* item : items) {
+                rnd.entry_groups.push_back(item->entries);
                 for (auto& entry : item->entries) {
-                    auto status = append_entry_to_round(rnd, entry);
+                    auto status = place_entry_in_round(rnd, entry);
                     if (status != persist_entry_status::ok) return status;
                 }
             }
+            return persist_entry_status::ok;
+        }
+
+        // ── encode_round_entries ──
+        //
+        // After every page in the round is resident (fresh/whole/writable
+        // immediately; hole pages after prefill), encode each borrowed body
+        // into the slot that place_round already reserved via out_vr.
+
+        persist_entry_status
+        encode_round_entries(round& rnd) {
+            absl::flat_hash_map<paddr, memory::value_page_frame*> pages;
+            pages.reserve(rnd.pages.size());
+            for (auto& page : rnd.pages) {
+                if (!page.prefill_loaded) {
+                    core::panic_inconsistency("value::value_alloc_sched::encode_round_entries",
+                        "round %lu page dev=%u lba=%lu encoded before prefill completed",
+                        static_cast<unsigned long>(rnd.id),
+                        static_cast<unsigned>(page.frame->id.base.device_id),
+                        static_cast<unsigned long>(page.frame->id.base.lba));
+                }
+                pages.emplace(page.frame->id.base, page.frame);
+            }
+
+            for (auto entries : rnd.entry_groups) {
+                for (auto& entry : entries) {
+                    auto it = pages.find(entry.out_vr->base);
+                    if (it == pages.end()) {
+                        core::panic_inconsistency("value::value_alloc_sched::encode_round_entries",
+                            "missing round page for encoded value dev=%u lba=%lu",
+                            static_cast<unsigned>(entry.out_vr->base.device_id),
+                            static_cast<unsigned long>(entry.out_vr->base.lba));
+                    }
+                    auto* frame = it->second;
+                    uint32_t cs = alloc_.class_size(frame->class_idx);
+                    std::span<char> slot_span(
+                        frame->buf + entry.out_vr->byte_offset, cs);
+                    std::span<const char> body_span(
+                        entry.body.data(), entry.body.size());
+                    if (!format::encode_value_object(slot_span, body_span)) {
+                        return persist_entry_status::encode_failure;
+                    }
+                }
+            }
+
+            rnd.entry_groups.clear();
             return persist_entry_status::ok;
         }
 
@@ -647,50 +960,78 @@ namespace apps::inconel::value {
             }
         }
 
-        // ── publish_round ──
+        // ── publish_prefill / publish_round ──
         //
-        // Freeze all round pages (dirty → writeback_inflight) so the buf
-        // is safe for NVMe DMA, install the round into inflight_rounds_,
-        // fire the leader's callback with the write list, and stash the
-        // followers on the round so handle_finalize can wake them when the
-        // FUA write completes. Followers do not include the leader itself.
+        // publish_prefill installs the unfinished round so the sender can
+        // drive hole-page reads before calling continue_persist(). Once the
+        // round has encoded bytes and write_descs, publish_round freezes the
+        // frames (dirty → writeback_inflight), installs the round, and fires
+        // the leader callback with the write list. Followers were already
+        // collected during handle_persist and stay on the round until
+        // finalize/abort wakes them.
 
         void
-        publish_round(std::unique_ptr<round> rnd,
-                      std::span<_value_persist::req* const> items,
-                      _value_persist::req* leader_item) {
+        publish_prefill(std::unique_ptr<round> rnd,
+                        _value_persist::req* leader_item) {
+            uint64_t rid = rnd->id;
+            auto [it, inserted] = inflight_rounds_.emplace(rid, std::move(rnd));
+            if (!inserted) {
+                core::panic_inconsistency("value::value_alloc_sched::publish_prefill",
+                    "duplicate round_id %lu",
+                    static_cast<unsigned long>(rid));
+            }
+
+            auto* stored = it->second.get();
+            leader_item->cb(prepare_persist_result{
+                persist_prefill{
+                    rid,
+                    std::span<read_desc>(stored->reads.data(), stored->reads.size()),
+                }
+            });
+            delete leader_item;
+        }
+
+        std::span<write_desc>
+        freeze_round_for_writeback(round& rnd) {
             // Freeze: mark all round pages writeback_inflight so the
             // next acquire_round_page knows not to write into them.
-            for (auto& page : rnd->pages) {
+            for (auto& page : rnd.pages) {
                 page.frame->st   = memory::frame_state::writeback_inflight;
                 page.frame->mode = memory::value_page_frame::open_mode::none;
             }
+            rnd.st = round::stage::writeback_inflight;
+            return std::span<write_desc>(rnd.writes.data(), rnd.writes.size());
+        }
 
+        void
+        publish_round(std::unique_ptr<round> rnd,
+                      _value_persist::req* leader_item) {
             uint64_t rid = rnd->id;
-            std::span<write_desc> writes_span(
-                rnd->writes.data(), rnd->writes.size());
+            auto [it, inserted] = inflight_rounds_.emplace(rid, std::move(rnd));
+            if (!inserted) {
+                core::panic_inconsistency("value::value_alloc_sched::publish_round",
+                    "duplicate round_id %lu",
+                    static_cast<unsigned long>(rid));
+            }
 
-            for (size_t i = 1; i < items.size(); ++i)
-                rnd->followers.push_back(items[i]);
-
-            inflight_rounds_.emplace(rid, std::move(rnd));
-
+            auto* stored = it->second.get();
+            auto writes_span = freeze_round_for_writeback(*stored);
             leader_item->cb(prepare_persist_result{
                 persist_leader{rid, writes_span}
             });
             delete leader_item;
         }
 
-        // ── append_entry_to_round ──
+        // ── place_entry_in_round ──
         //
-        // Allocate a slot for one entry and encode the value object into
-        // the page image. Reuses an existing round_page when one of the
-        // same class still has a free slot; otherwise pulls a fresh page
-        // via acquire_round_page (open_frames → allocatable_frames →
-        // whole_pool → fresh_bump).
+        // Allocate a slot for one entry and fill the caller's value_ref in
+        // place. Reuses an existing round_page when one of the same class
+        // still has a free slot; otherwise pulls a fresh page via
+        // acquire_round_page (open_frames → allocatable_frames → whole_pool
+        // / fresh_bump → hole_pages).
 
         persist_entry_status
-        append_entry_to_round(round& rnd, put_entry& entry) {
+        place_entry_in_round(round& rnd, put_entry& entry) {
             uint32_t total = sizeof(format::value_object_header) + entry.body.size();
             auto ci_opt = format::find_min_class(total, class_sizes_span());
             if (!ci_opt) return persist_entry_status::value_too_large;
@@ -711,17 +1052,6 @@ namespace apps::inconel::value {
             uint16_t off = 0;
             if (alloc_.is_sub_lba(ci)) {
                 off = static_cast<uint16_t>(slot * cs);
-            }
-
-            // Encode value object into the slot. A failure here means
-            // encode_value_object disagreed with find_min_class about
-            // whether the body fits — that is an internal logic break, not
-            // a caller-driven recoverable error, so we surface it via the
-            // fatal status code instead of "restore the bit and pretend".
-            std::span<char> slot_span(page->frame->buf + off, cs);
-            std::span<const char> body_span(entry.body.data(), entry.body.size());
-            if (!format::encode_value_object(slot_span, body_span)) {
-                return persist_entry_status::encode_failure;
             }
 
             // Fill the caller's value_ref.
@@ -764,6 +1094,59 @@ namespace apps::inconel::value {
             }
         }
 
+        memory::value_page_frame*
+        alloc_value_frame(paddr page_base,
+                          uint16_t ci,
+                          uint32_t span_lbas,
+                          uint64_t free_mask,
+                          memory::frame_state st,
+                          memory::value_page_frame::open_mode mode,
+                          bool zero_fill) {
+            uint32_t img_bytes = span_lbas * alloc_.lba_size();
+            auto* frame = new memory::value_page_frame{};
+            frame->id = memory::frame_id{
+                page_base,
+                static_cast<uint16_t>(span_lbas),
+                memory::frame_id::domain::value_page,
+            };
+            frame->st            = st;
+            frame->buf           = zero_fill ? new char[img_bytes]() : new char[img_bytes];
+            frame->byte_len      = img_bytes;
+            frame->pin_count     = 0;
+            frame->crc_valid     = false;
+            frame->class_idx     = ci;
+            frame->slots_per_page = static_cast<uint16_t>(alloc_.slots_per_page(ci));
+            frame->free_mask      = free_mask;
+            frame->free_count     = static_cast<uint16_t>(
+                __builtin_popcountll(free_mask));
+            frame->mode = mode;
+            return frame;
+        }
+
+        memory::value_page_frame*
+        adopt_cache_frame(memory::page_frame* pf,
+                          uint16_t ci,
+                          uint64_t free_mask,
+                          memory::frame_state st,
+                          memory::value_page_frame::open_mode mode) {
+            auto* frame = new memory::value_page_frame{};
+            frame->id            = pf->id;
+            frame->st            = st;
+            frame->buf           = pf->buf;
+            frame->byte_len      = pf->byte_len;
+            frame->pin_count     = 0;
+            frame->crc_valid     = pf->crc_valid;
+            frame->class_idx     = ci;
+            frame->slots_per_page = static_cast<uint16_t>(alloc_.slots_per_page(ci));
+            frame->free_mask      = free_mask;
+            frame->free_count     = static_cast<uint16_t>(
+                __builtin_popcountll(free_mask));
+            frame->mode = mode;
+            pf->buf = nullptr;
+            delete pf;
+            return frame;
+        }
+
         round_page*
         acquire_round_page(round& rnd, uint16_t ci) {
             // Priority 1: open_frames_[ci] — reuse if not inflight and has
@@ -781,7 +1164,9 @@ namespace apps::inconel::value {
                         .frame              = frame,
                         .source             = value_page_source::writable,
                         .original_free_mask = frame->free_mask,
+                        .prefill_loaded     = true,
                     });
+                    dirty_pages_.insert(frame->id.base);
                     return &rnd.pages.back();
                 }
                 // Current open frame is inflight or full — fall through
@@ -803,32 +1188,103 @@ namespace apps::inconel::value {
                     .frame              = frame,
                     .source             = value_page_source::writable,
                     .original_free_mask = frame->free_mask,
+                    .prefill_loaded     = true,
                 });
+                dirty_pages_.insert(frame->id.base);
                 return &rnd.pages.back();
             }
 
-            // Priority 3: allocator (whole_pool / fresh bump).
-            auto ar = alloc_.acquire_page(ci);
+            // Priority 3: whole-page reuse. These pages are already known
+            // empty, so they are still cheaper than hole reuse.
+            auto ar = alloc_.try_acquire_whole_page(ci);
+            if (ar) {
+                auto* frame = alloc_value_frame(
+                    ar->page_base,
+                    ci,
+                    ar->span_lbas,
+                    ar->free_mask,
+                    memory::frame_state::dirty_append,
+                    memory::value_page_frame::open_mode::append,
+                    true);
+
+                displace_open_frame(ci);
+                open_frames_[ci] = frame;
+                rnd.pages.push_back(round_page{
+                    .frame              = frame,
+                    .source             = ar->source,
+                    .original_free_mask = ar->free_mask,
+                    .prefill_loaded     = true,
+                });
+                dirty_pages_.insert(frame->id.base);
+                return &rnd.pages.back();
+            }
+
+            // Priority 4: scheduler-managed hole pages. Cache hit turns the
+            // readonly frame into a writable resident frame; cache miss
+            // allocates a frame and returns a prefill read descriptor.
+            auto hole_it = hole_pages_[ci].begin();
+            if (hole_it != hole_pages_[ci].end()) {
+                paddr page_base = hole_it->first;
+                uint64_t free_mask = hole_it->second.free_mask;
+                hole_pages_[ci].erase(hole_it);
+
+                displace_open_frame(ci);
+
+                memory::value_page_frame* frame = nullptr;
+                bool prefill_loaded = false;
+
+                auto cached = readonly_cache_.take(memory::frame_id{
+                    page_base,
+                    static_cast<uint16_t>(alloc_.span_lbas(ci)),
+                    memory::frame_id::domain::value_page,
+                });
+                if (cached) {
+                    frame = adopt_cache_frame(
+                        *cached,
+                        ci,
+                        free_mask,
+                        memory::frame_state::dirty_hole_fill,
+                        memory::value_page_frame::open_mode::hole_fill);
+                    prefill_loaded = true;
+                } else {
+                    frame = alloc_value_frame(
+                        page_base,
+                        ci,
+                        alloc_.span_lbas(ci),
+                        free_mask,
+                        memory::frame_state::dirty_hole_fill,
+                        memory::value_page_frame::open_mode::hole_fill,
+                        false);
+                    rnd.reads.push_back(read_desc{
+                        .lba      = page_base.lba,
+                        .buf      = frame->buf,
+                        .num_lbas = alloc_.span_lbas(ci),
+                    });
+                }
+
+                open_frames_[ci] = frame;
+                rnd.pages.push_back(round_page{
+                    .frame              = frame,
+                    .source             = value_page_source::hole_page,
+                    .original_free_mask = free_mask,
+                    .prefill_loaded     = prefill_loaded,
+                });
+                dirty_pages_.insert(frame->id.base);
+                return &rnd.pages.back();
+            }
+
+            // Priority 5: fresh bump from the device head.
+            ar = alloc_.try_acquire_fresh_page(ci);
             if (!ar) return nullptr;
 
-            uint32_t img_bytes = ar->span_lbas * alloc_.lba_size();
-            auto* frame = new memory::value_page_frame{};
-            frame->id = memory::frame_id{
+            auto* frame = alloc_value_frame(
                 ar->page_base,
-                static_cast<uint16_t>(ar->span_lbas),
-                memory::frame_id::domain::value_page,
-            };
-            frame->st         = memory::frame_state::dirty_append;
-            frame->buf        = new char[img_bytes]();
-            frame->byte_len   = img_bytes;
-            frame->pin_count  = 0;
-            frame->crc_valid  = false;
-            frame->class_idx      = ci;
-            frame->slots_per_page = static_cast<uint16_t>(alloc_.slots_per_page(ci));
-            frame->free_mask      = ar->free_mask;
-            frame->free_count     = static_cast<uint16_t>(
-                __builtin_popcountll(ar->free_mask));
-            frame->mode           = memory::value_page_frame::open_mode::append;
+                ci,
+                ar->span_lbas,
+                ar->free_mask,
+                memory::frame_state::dirty_append,
+                memory::value_page_frame::open_mode::append,
+                true);
 
             displace_open_frame(ci);
             open_frames_[ci] = frame;
@@ -836,13 +1292,354 @@ namespace apps::inconel::value {
                 .frame              = frame,
                 .source             = ar->source,
                 .original_free_mask = ar->free_mask,
+                .prefill_loaded     = true,
             });
+            dirty_pages_.insert(frame->id.base);
             return &rnd.pages.back();
         }
 
+        memory::page_frame*
+        demote_to_readonly_frame(memory::value_page_frame* frame) {
+            auto* pf = new memory::page_frame{
+                .id        = frame->id,
+                .st        = memory::frame_state::clean_readonly,
+                .buf       = frame->buf,
+                .byte_len  = frame->byte_len,
+                .pin_count = 0,
+                .crc_valid = frame->crc_valid,
+            };
+            frame->buf = nullptr;
+            delete frame;
+            return pf;
+        }
+
+        static void
+        destroy_frame(memory::value_page_frame* frame) {
+            if (!frame) return;
+            delete[] frame->buf;
+            delete frame;
+        }
+
+        static void
+        destroy_frame(memory::page_frame* frame) {
+            if (!frame) return;
+            delete[] frame->buf;
+            delete frame;
+        }
+
+        uint64_t
+        take_deferred_mask(paddr page_base) {
+            auto it = deferred_freed_.find(page_base);
+            if (it == deferred_freed_.end()) return 0;
+            uint64_t mask = it->second;
+            deferred_freed_.erase(it);
+            return mask;
+        }
+
+        memory::value_page_frame*
+        take_allocatable_frame(uint16_t ci, paddr page_base) {
+            auto& frames = allocatable_frames_[ci];
+            for (auto it = frames.begin(); it != frames.end(); ++it) {
+                if ((*it)->id.base == page_base) {
+                    auto* frame = *it;
+                    frames.erase(it);
+                    return frame;
+                }
+            }
+            return nullptr;
+        }
+
+        memory::value_page_frame*
+        find_allocatable_frame(uint16_t ci, paddr page_base) {
+            auto& frames = allocatable_frames_[ci];
+            for (auto* frame : frames) {
+                if (frame->id.base == page_base) return frame;
+            }
+            return nullptr;
+        }
+
+        void
+        validate_class_idx(uint16_t ci, const char* who) const {
+            if (ci >= alloc_.class_count()) {
+                core::panic_inconsistency(who,
+                    "class_idx %u out of range (class_count=%u)",
+                    static_cast<unsigned>(ci),
+                    static_cast<unsigned>(alloc_.class_count()));
+            }
+        }
+
+        uint64_t
+        validate_partial_reclaim_mask(uint16_t ci,
+                                      uint64_t freed_mask,
+                                      const char* who) const {
+            if (!alloc_.is_sub_lba(ci)) {
+                core::panic_inconsistency(who,
+                    "partial reclaim requires sub-LBA class, got class_idx=%u",
+                    static_cast<unsigned>(ci));
+            }
+            uint64_t all_mask = alloc_.all_free_mask(ci);
+            if ((freed_mask & ~all_mask) != 0) {
+                core::panic_inconsistency(who,
+                    "freed_mask 0x%llx exceeds class mask 0x%llx for class_idx=%u",
+                    static_cast<unsigned long long>(freed_mask),
+                    static_cast<unsigned long long>(all_mask),
+                    static_cast<unsigned>(ci));
+            }
+            return freed_mask;
+        }
+
+        uint16_t
+        class_for_reclaim_ref(const value_ref& vr, const char* who) const {
+            auto ci_opt = class_for_len(vr.len);
+            if (!ci_opt) {
+                core::panic_inconsistency(who,
+                    "value_ref len=%u exceeds configured classes",
+                    static_cast<unsigned>(vr.len));
+            }
+            return *ci_opt;
+        }
+
+        uint32_t
+        slot_index_for_reclaim_ref(const value_ref& vr,
+                                   uint16_t ci,
+                                   const char* who) const {
+            const auto& cls = alloc_.get_class(ci);
+            if (vr.byte_offset % cls.class_size != 0) {
+                core::panic_inconsistency(who,
+                    "value_ref byte_offset=%u is not aligned to class_size=%u",
+                    static_cast<unsigned>(vr.byte_offset),
+                    static_cast<unsigned>(cls.class_size));
+            }
+            uint32_t slot_idx = vr.byte_offset / cls.class_size;
+            if (slot_idx >= cls.slots_per_page) {
+                core::panic_inconsistency(who,
+                    "value_ref slot_idx=%u out of range (slots_per_page=%u)",
+                    static_cast<unsigned>(slot_idx),
+                    static_cast<unsigned>(cls.slots_per_page));
+            }
+            return slot_idx;
+        }
+
+        void
+        validate_whole_reclaim_ref(const value_ref& vr,
+                                   uint16_t ci,
+                                   const char* who) const {
+            if (alloc_.slots_per_page(ci) != 1) {
+                core::panic_inconsistency(who,
+                    "whole reclaim requires single-slot class, got class_idx=%u",
+                    static_cast<unsigned>(ci));
+            }
+            if (vr.byte_offset != 0) {
+                core::panic_inconsistency(who,
+                    "whole reclaim requires byte_offset=0, got %u",
+                    static_cast<unsigned>(vr.byte_offset));
+            }
+        }
+
+        bool
+        is_trim_pending(paddr page_base) const {
+            return trim_pending_pages_.contains(page_base);
+        }
+
+        void
+        mark_trim_pending(uint16_t ci, paddr page_base) {
+            auto [it, inserted] = trim_pending_pages_.try_emplace(
+                page_base,
+                trim_pending_descriptor{
+                    .class_idx = ci,
+                    .span_lbas = alloc_.span_lbas(ci),
+                    .st        = trim_pending_descriptor::state::pending,
+                });
+            if (!inserted) {
+                if (it->second.class_idx != ci ||
+                    it->second.span_lbas != alloc_.span_lbas(ci)) {
+                    core::panic_inconsistency("value::value_alloc_sched::mark_trim_pending",
+                        "page dev=%u lba=%lu already pending with different class/span",
+                        static_cast<unsigned>(page_base.device_id),
+                        static_cast<unsigned long>(page_base.lba));
+                }
+                it->second.st = trim_pending_descriptor::state::pending;
+            }
+        }
+
+        void
+        stage_trim_for_whole_page(uint16_t ci,
+                                  paddr page_base,
+                                  memory::value_page_frame* frame) {
+            destroy_frame(frame);
+            mark_trim_pending(ci, page_base);
+        }
+
+        void
+        apply_partial_reclaim(uint16_t ci, paddr page_base, uint64_t freed_mask) {
+            constexpr const char* who = "value::value_alloc_sched::apply_partial_reclaim";
+
+            freed_mask = validate_partial_reclaim_mask(ci, freed_mask, who);
+            if (freed_mask == 0 || is_trim_pending(page_base)) return;
+
+            if (dirty_pages_.contains(page_base)) {
+                deferred_freed_[page_base] |= freed_mask;
+                return;
+            }
+
+            uint64_t all_free_mask = alloc_.all_free_mask(ci);
+
+            if (open_frames_[ci] && open_frames_[ci]->id.base == page_base) {
+                auto* frame = open_frames_[ci];
+                frame->free_mask |= freed_mask;
+                frame->free_count = static_cast<uint16_t>(
+                    __builtin_popcountll(frame->free_mask));
+                if (frame->free_mask == all_free_mask) {
+                    open_frames_[ci] = nullptr;
+                    stage_trim_for_whole_page(ci, page_base, frame);
+                }
+                return;
+            }
+
+            if (auto* frame = find_allocatable_frame(ci, page_base)) {
+                frame->free_mask |= freed_mask;
+                frame->free_count = static_cast<uint16_t>(
+                    __builtin_popcountll(frame->free_mask));
+                if (frame->free_mask == all_free_mask) {
+                    auto* removed = take_allocatable_frame(ci, page_base);
+                    stage_trim_for_whole_page(ci, page_base, removed);
+                }
+                return;
+            }
+
+            auto cached = readonly_cache_.take(memory::frame_id{
+                page_base,
+                static_cast<uint16_t>(alloc_.span_lbas(ci)),
+                memory::frame_id::domain::value_page,
+            });
+            if (cached) {
+                if (freed_mask == all_free_mask) {
+                    destroy_frame(*cached);
+                    mark_trim_pending(ci, page_base);
+                } else {
+                    auto* frame = adopt_cache_frame(
+                        *cached,
+                        ci,
+                        freed_mask,
+                        memory::frame_state::clean_allocatable,
+                        memory::value_page_frame::open_mode::none);
+                    allocatable_frames_[ci].push_back(frame);
+                }
+                return;
+            }
+
+            auto hole_it = hole_pages_[ci].find(page_base);
+            if (hole_it != hole_pages_[ci].end()) {
+                hole_it->second.free_mask |= freed_mask;
+                if (hole_it->second.free_mask == all_free_mask) {
+                    hole_pages_[ci].erase(hole_it);
+                    mark_trim_pending(ci, page_base);
+                }
+                return;
+            }
+
+            if (freed_mask == all_free_mask) {
+                mark_trim_pending(ci, page_base);
+            } else {
+                hole_pages_[ci][page_base] = hole_page_descriptor{
+                    .free_mask = freed_mask,
+                };
+            }
+        }
+
+        void
+        apply_whole_reclaim(uint16_t ci, paddr page_base) {
+            constexpr const char* who = "value::value_alloc_sched::apply_whole_reclaim";
+
+            validate_class_idx(ci, who);
+            if (alloc_.slots_per_page(ci) != 1) {
+                core::panic_inconsistency(who,
+                    "whole reclaim requires single-slot class, got class_idx=%u",
+                    static_cast<unsigned>(ci));
+            }
+            if (is_trim_pending(page_base)) return;
+
+            if (dirty_pages_.contains(page_base)) {
+                deferred_freed_[page_base] |= alloc_.all_free_mask(ci);
+                return;
+            }
+
+            if (open_frames_[ci] && open_frames_[ci]->id.base == page_base) {
+                auto* frame = open_frames_[ci];
+                open_frames_[ci] = nullptr;
+                destroy_frame(frame);
+            }
+
+            if (auto* frame = take_allocatable_frame(ci, page_base)) {
+                destroy_frame(frame);
+            }
+
+            hole_pages_[ci].erase(page_base);
+
+            if (auto cached = readonly_cache_.take(memory::frame_id{
+                    page_base,
+                    static_cast<uint16_t>(alloc_.span_lbas(ci)),
+                    memory::frame_id::domain::value_page,
+                })) {
+                destroy_frame(*cached);
+            }
+
+            mark_trim_pending(ci, page_base);
+        }
+
         // ════════════════════════════════════════════════════════════════
-        //  handle_finalize  —  commit or abort an in-flight round
+        //  handle_continue / handle_finalize  —  resume / settle rounds
         // ════════════════════════════════════════════════════════════════
+
+        void
+        handle_continue(_value_continue::req* item) {
+            auto it = inflight_rounds_.find(item->round_id);
+            if (it == inflight_rounds_.end()) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_continue",
+                    "unknown round_id %lu",
+                    static_cast<unsigned long>(item->round_id));
+            }
+
+            auto* rnd = it->second.get();
+            if (rnd->st != round::stage::prefill_pending) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_continue",
+                    "round %lu is not waiting for prefill",
+                    static_cast<unsigned long>(item->round_id));
+            }
+
+            if (!item->read_ok) {
+                auto failure = std::make_exception_ptr(std::runtime_error(
+                    "value::persist: hole page prefill read failed"));
+                rollback_pages(*rnd);
+                for (auto* f : rnd->followers) {
+                    f->fail(failure);
+                    delete f;
+                }
+                inflight_rounds_.erase(it);
+                item->fail(failure);
+                delete item;
+                return;
+            }
+
+            for (auto& page : rnd->pages) {
+                if (page.source == value_page_source::hole_page &&
+                    !page.prefill_loaded) {
+                    page.prefill_loaded = true;
+                }
+            }
+            rnd->reads.clear();
+
+            auto status = encode_round_entries(*rnd);
+            if (status != persist_entry_status::ok) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_continue",
+                    "encode after prefill failed — internal logic break");
+            }
+            finalize_round_writes(*rnd);
+
+            auto writes_span = freeze_round_for_writeback(*rnd);
+            item->cb(persist_leader{rnd->id, writes_span});
+            delete item;
+        }
 
         void
         handle_finalize(_value_finalize::req* item) {
@@ -860,6 +1657,12 @@ namespace apps::inconel::value {
 
             auto rnd = std::move(it->second);
             inflight_rounds_.erase(it);
+
+            if (rnd->st != round::stage::writeback_inflight) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_finalize",
+                    "round %lu finalized before writeback stage",
+                    static_cast<unsigned long>(item->round_id));
+            }
 
             // finalize is the local commit/abort step of the round state
             // machine. Both nvme-ok and nvme-fail are *normal* inputs and
@@ -889,52 +1692,51 @@ namespace apps::inconel::value {
         commit_pages(round& rnd) {
             for (auto& page : rnd.pages) {
                 auto* frame = page.frame;
+                if (!frame) continue;
+
                 uint16_t ci = frame->class_idx;
+                paddr page_base = frame->id.base;
+                uint64_t all_free_mask = alloc_.all_free_mask(ci);
+
                 // Clear open_frames_ reference: the round is done, this
                 // frame is no longer the active dirty target. A newer
                 // round may have already displaced us (open != frame);
                 // only clear if we're still the current occupant.
                 if (open_frames_[ci] == frame) open_frames_[ci] = nullptr;
+                dirty_pages_.erase(page_base);
+
+                frame->free_mask |= take_deferred_mask(page_base);
+                frame->free_count = static_cast<uint16_t>(
+                    __builtin_popcountll(frame->free_mask));
+
+                if (frame->free_mask == all_free_mask) {
+                    stage_trim_for_whole_page(ci, page_base, frame);
+                    page.frame = nullptr;
+                    continue;
+                }
 
                 if (frame->free_mask == 0) {
                     // Full page. Transition: writeback_inflight → clean_readonly.
                     // Decision D1: only 1-LBA pages enter readonly_cache_.
-                    frame->free_count = 0;
                     if (frame->id.span_lbas == 1) {
-                        // Transfer buf to a plain page_frame for the cache
-                        // (avoids polymorphic-delete UB since page_frame
-                        // has no virtual destructor).
-                        auto* pf = new memory::page_frame{
-                            .id        = frame->id,
-                            .st        = memory::frame_state::clean_readonly,
-                            .buf       = frame->buf,
-                            .byte_len  = frame->byte_len,
-                            .pin_count = 0,
-                            .crc_valid = false,
-                        };
-                        frame->buf = nullptr;
-                        delete frame;
+                        auto* pf = demote_to_readonly_frame(frame);
                         page.frame = nullptr;
                         if (auto evicted = readonly_cache_.put(pf)) {
-                            delete[] (*evicted)->buf;
-                            delete *evicted;
+                            destroy_frame(*evicted);
                         }
                     } else {
-                        // multi-LBA full page → drop (no cache value)
-                        delete[] frame->buf;
-                        delete frame;
+                        destroy_frame(frame);
                         page.frame = nullptr;
                     }
-                } else {
-                    // Partial page: writeback_inflight → clean_allocatable.
-                    // Enters allocatable_frames_[ci], NOT readonly_cache_.
-                    frame->st         = memory::frame_state::clean_allocatable;
-                    frame->mode       = memory::value_page_frame::open_mode::none;
-                    frame->free_count = static_cast<uint16_t>(
-                        __builtin_popcountll(frame->free_mask));
-                    allocatable_frames_[ci].push_back(frame);
-                    page.frame = nullptr;
+                    continue;
                 }
+
+                // Partial page: writeback_inflight → clean_allocatable.
+                // Enters allocatable_frames_[ci], NOT readonly_cache_.
+                frame->st   = memory::frame_state::clean_allocatable;
+                frame->mode = memory::value_page_frame::open_mode::none;
+                allocatable_frames_[ci].push_back(frame);
+                page.frame = nullptr;
             }
         }
 
@@ -944,42 +1746,64 @@ namespace apps::inconel::value {
         // order. Reverse order is required so that fresh_bump pages can be
         // returned to the device head — `value_allocator::push_back_bump`
         // only accepts the page that currently sits at bump_head, which is
-        // the most recently bumped page, i.e. the last one in rnd.pages.
-        // Walking forward would leak every fresh_bump page that isn't the
-        // very first acquisition.
+        // the most recent bump, i.e. the last one in rnd.pages.
         //
-        //   - fresh_bump  → push_back_bump (returns LBAs to bump head)
-        //   - whole_page  → recycle_whole_page (back into the class pool)
-        //   - writable    → clear matching open_frames_ reference, restore
-        //                   original free_mask, set clean_allocatable, and
-        //                   return it to allocatable_frames_
+        // Deferred reclaim (`deferred_freed_`) is merged on both commit and
+        // abort. That matches the spec's "return_page on abort" contract:
+        // reclaim requests that arrived while a page was dirty are about the
+        // old durable image and must not be lost just because the new writes
+        // were rolled back.
 
         void
         rollback_pages(round& rnd) {
             for (auto it = rnd.pages.rbegin(); it != rnd.pages.rend(); ++it) {
                 auto& page = *it;
                 auto* frame = page.frame;
+                if (!frame) continue;
+
                 uint16_t ci = frame->class_idx;
+                paddr page_base = frame->id.base;
+                uint64_t all_free_mask = alloc_.all_free_mask(ci);
+                uint64_t restored_free_mask =
+                    page.original_free_mask | take_deferred_mask(page_base);
+
                 if (open_frames_[ci] == frame) open_frames_[ci] = nullptr;
+                dirty_pages_.erase(page_base);
+
                 switch (page.source) {
                 case value_page_source::fresh_bump:
                     alloc_.push_back_bump(frame->id.base, frame->id.span_lbas);
-                    delete[] frame->buf;
-                    delete frame;
+                    destroy_frame(frame);
                     page.frame = nullptr;
                     break;
                 case value_page_source::whole_page:
                     alloc_.recycle_whole_page(ci, frame->id.base);
-                    delete[] frame->buf;
-                    delete frame;
+                    destroy_frame(frame);
                     page.frame = nullptr;
                     break;
+                case value_page_source::hole_page:
+                    if (!page.prefill_loaded) {
+                        destroy_frame(frame);
+                        page.frame = nullptr;
+                        if (restored_free_mask == all_free_mask) {
+                            mark_trim_pending(ci, page_base);
+                        } else {
+                            hole_pages_[ci][page_base] = hole_page_descriptor{
+                                .free_mask = restored_free_mask,
+                            };
+                        }
+                        break;
+                    }
+                    [[fallthrough]];
                 case value_page_source::writable:
-                    // Resident source: restore free_mask and transition to
-                    // clean_allocatable → allocatable_frames_.
-                    frame->free_mask  = page.original_free_mask;
+                    if (restored_free_mask == all_free_mask) {
+                        stage_trim_for_whole_page(ci, page_base, frame);
+                        page.frame = nullptr;
+                        break;
+                    }
+                    frame->free_mask  = restored_free_mask;
                     frame->free_count = static_cast<uint16_t>(
-                        __builtin_popcountll(page.original_free_mask));
+                        __builtin_popcountll(restored_free_mask));
                     frame->st   = memory::frame_state::clean_allocatable;
                     frame->mode = memory::value_page_frame::open_mode::none;
                     allocatable_frames_[ci].push_back(frame);
@@ -987,6 +1811,116 @@ namespace apps::inconel::value {
                     break;
                 }
             }
+        }
+
+        void
+        handle_reclaim(_value_reclaim::req* item) {
+            constexpr const char* who = "value::value_alloc_sched::handle_reclaim";
+
+            std::vector<absl::flat_hash_map<paddr, uint64_t>> partial_by_class(
+                alloc_.class_count());
+            std::vector<absl::flat_hash_set<paddr>> whole_by_class(
+                alloc_.class_count());
+
+            for (const auto& vr : item->dead_values) {
+                uint16_t ci = class_for_reclaim_ref(vr, who);
+                validate_class_idx(ci, who);
+
+                if (alloc_.is_sub_lba(ci)) {
+                    uint32_t slot_idx = slot_index_for_reclaim_ref(vr, ci, who);
+                    partial_by_class[ci][vr.base] |= (1ULL << slot_idx);
+                } else {
+                    validate_whole_reclaim_ref(vr, ci, who);
+                    whole_by_class[ci].insert(vr.base);
+                }
+            }
+
+            for (uint16_t ci = 0; ci < alloc_.class_count(); ++ci) {
+                for (const auto& [page_base, freed_mask] : partial_by_class[ci]) {
+                    apply_partial_reclaim(ci, page_base, freed_mask);
+                }
+                for (const auto& page_base : whole_by_class[ci]) {
+                    apply_whole_reclaim(ci, page_base);
+                }
+            }
+
+            item->cb();
+            delete item;
+        }
+
+        void
+        handle_prepare_trim_batch(_value_trim_prepare::req* item) {
+            auto batch = std::make_unique<trim_batch_state>();
+            batch->id = next_trim_batch_id_++;
+
+            for (auto& [page_base, desc] : trim_pending_pages_) {
+                if (desc.st != trim_pending_descriptor::state::pending) continue;
+                desc.st = trim_pending_descriptor::state::inflight;
+                batch->pages.push_back(page_base);
+                batch->trims.push_back(trim_desc{
+                    .lba      = page_base.lba,
+                    .num_lbas = desc.span_lbas,
+                });
+            }
+
+            if (batch->pages.empty()) {
+                item->cb(prepare_trim_result{trim_idle{}});
+                delete item;
+                return;
+            }
+
+            uint64_t batch_id = batch->id;
+            auto trims_span = std::span<trim_desc>(batch->trims);
+            inflight_trim_batches_[batch_id] = std::move(batch);
+            item->cb(prepare_trim_result{
+                trim_batch{
+                    .batch_id = batch_id,
+                    .trims    = trims_span,
+                }
+            });
+            delete item;
+        }
+
+        void
+        handle_complete_trim_batch(_value_trim_complete::req* item) {
+            auto it = inflight_trim_batches_.find(item->batch_id);
+            if (it == inflight_trim_batches_.end()) {
+                core::panic_inconsistency("value::value_alloc_sched::handle_complete_trim_batch",
+                    "unknown trim batch_id %lu",
+                    static_cast<unsigned long>(item->batch_id));
+            }
+
+            auto batch = std::move(it->second);
+            inflight_trim_batches_.erase(it);
+
+            if (!item->ok) {
+                for (const auto& page_base : batch->pages) {
+                    auto pending_it = trim_pending_pages_.find(page_base);
+                    if (pending_it != trim_pending_pages_.end()) {
+                        pending_it->second.st = trim_pending_descriptor::state::pending;
+                    }
+                }
+                item->fail(std::make_exception_ptr(
+                    std::runtime_error("value::reclaim: NVMe trim failed")));
+                delete item;
+                return;
+            }
+
+            for (const auto& page_base : batch->pages) {
+                auto pending_it = trim_pending_pages_.find(page_base);
+                if (pending_it == trim_pending_pages_.end()) {
+                    core::panic_inconsistency("value::value_alloc_sched::handle_complete_trim_batch",
+                        "page dev=%u lba=%lu missing from trim_pending_pages_",
+                        static_cast<unsigned>(page_base.device_id),
+                        static_cast<unsigned long>(page_base.lba));
+                }
+                uint16_t ci = pending_it->second.class_idx;
+                trim_pending_pages_.erase(pending_it);
+                alloc_.recycle_whole_page(ci, page_base);
+            }
+
+            item->cb();
+            delete item;
         }
 
         // install_writable_page removed in step 019: commit_pages and
@@ -1236,6 +2170,15 @@ namespace apps::inconel::value {
     }
 
     inline auto
+    value_alloc_sched_base::continue_persist(uint64_t round_id, bool read_ok) {
+        return _value_continue::sender{
+            .sched    = this,
+            .round_id = round_id,
+            .read_ok  = read_ok,
+        };
+    }
+
+    inline auto
     value_alloc_sched_base::prepare_read(value_ref vr) {
         return _value_read::sender{.sched = this, .vr = vr};
     }
@@ -1251,6 +2194,28 @@ namespace apps::inconel::value {
             .buf            = std::move(buf),
             .buf_size       = buf_size,
             .admit_to_cache = admit_to_cache,
+        };
+    }
+
+    inline auto
+    value_alloc_sched_base::reclaim_values(std::span<const value_ref> dead_values) {
+        return _value_reclaim::sender{
+            .sched       = this,
+            .dead_values = dead_values,
+        };
+    }
+
+    inline auto
+    value_alloc_sched_base::prepare_trim_batch() {
+        return _value_trim_prepare::sender{.sched = this};
+    }
+
+    inline auto
+    value_alloc_sched_base::complete_trim_batch(uint64_t batch_id, bool ok) {
+        return _value_trim_complete::sender{
+            .sched    = this,
+            .batch_id = batch_id,
+            .ok       = ok,
         };
     }
 
@@ -1291,12 +2256,72 @@ namespace apps::inconel::value {
     }
 
     template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _value_continue::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_continue(new req{
+            .round_id = round_id,
+            .read_ok  = read_ok,
+            .cb = [ctx = ctx, scope = scope](persist_leader&& r) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(r));
+            },
+            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
+                    ctx, scope, std::move(ep));
+            },
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
     void _value_read::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_read(new req{
             .vr = vr,
             .cb = [ctx = ctx, scope = scope](read_prepare_result&& r) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(
                     ctx, scope, std::move(r));
+            },
+            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
+                    ctx, scope, std::move(ep));
+            },
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _value_reclaim::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_reclaim(new req{
+            .dead_values = std::vector<value_ref>(
+                dead_values.begin(), dead_values.end()),
+            .cb = [ctx = ctx, scope = scope]() mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
+            },
+            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
+                    ctx, scope, std::move(ep));
+            },
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _value_trim_prepare::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_trim_prepare(new req{
+            .cb = [ctx = ctx, scope = scope](prepare_trim_result&& batch) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(batch));
+            },
+            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
+                    ctx, scope, std::move(ep));
+            },
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void _value_trim_complete::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_trim_complete(new req{
+            .batch_id = batch_id,
+            .ok       = ok,
+            .cb = [ctx = ctx, scope = scope]() mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
             },
             .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_exception(
@@ -1371,6 +2396,27 @@ namespace pump::core {
         }
     };
 
+    // value_continue
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::value_continue_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::value::_value_continue::sender> {
+        consteval static uint32_t count_value() { return 1; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<apps::inconel::value::persist_leader>{};
+        }
+    };
+
     // value_read
     template<uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
@@ -1410,6 +2456,69 @@ namespace pump::core {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
             return std::type_identity<std::string>{};
+        }
+    };
+
+    // value_reclaim → void
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::value_reclaim_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::value::_value_reclaim::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    // value_trim_prepare
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::value_trim_prepare_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::value::_value_trim_prepare::sender> {
+        consteval static uint32_t count_value() { return 1; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<apps::inconel::value::prepare_trim_result>{};
+        }
+    };
+
+    // value_trim_complete → void
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::value_trim_complete_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct
+    compute_sender_type<ctx_t, apps::inconel::value::_value_trim_complete::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
         }
     };
 

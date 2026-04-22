@@ -35,8 +35,8 @@
 | `persist_put_values` | `(batch PUT entries)` → `durable value_refs` | RSM §6.2, WP §2.1/5.4 |
 | `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
 | `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
-| `freed_slots` | `(page_base, class_idx, freed_mask)` → `void` | RSM §6.7, FF §7.2 |
-| `recycle_whole` | `(class_idx, page_base)` → `void` | RSM §6.2 |
+| `reclaim_values` | `(dead_value_refs[])` → `void` | RSM §6.7, FF §7.2 |
+| `drain_trim_pending` | `()` → `void` | RSM §6.8/§6.9 |
 | `alloc_segment` | `(stream_id, sealed_info?)` → `segment_runtime*` | RSM §5.3, WP §7.2 |
 | `reclaim_check` | `(recovery_safe_lsn)` → `void` | RSM §5.4, RW §12.4 |
 | `tree_lookup` | `(key, manifest)` → `variant<leaf_value, leaf_tombstone, absent>` | RSM §4.7, RAP §4.2 |
@@ -64,7 +64,7 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `tree_manifest` | `root_slot, slot_map, leaf_order` | OV §4.4/§9.4, RSM §4.5 | FF §3.4/§3.8, RW §7.2 |
 | `tree_allocator` | `head, free_ranges, shared_heads` | RSM §4.4 | RW §9.1 |
 | `data_area_heads` | `tree_head_lba (atomic), value_head_lba (atomic)` | RSM §4.3 | RSM §4.4/6.3 |
-| `value_alloc_state` | `dev_state, classes, open_frames, dirty_pages, deferred_freed, config` | RSM §6.3 | WP §5.4, RMC §7.1 |
+| `value_alloc_state` | `dev_state, classes, open_frames, dirty_pages, deferred_freed, trim_pending_pages, config` | RSM §6.3 | WP §5.4, RMC §7.1 |
 | `per_device_value_state` | `bump_head_lba, shared_heads` | RSM §6.3 | RW §9.2 |
 | `batch_ctx` | `batch_lsn, entry_count, canonical_entries, fragments` | WP §2.2 | — |
 | `page_frame` | `id, st, dma_buf, byte_len, pin_count, crc_valid` | RMC §5.4 | — |

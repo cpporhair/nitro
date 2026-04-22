@@ -32,6 +32,7 @@ namespace apps::inconel::value {
 
     enum class value_page_source : uint8_t {
         writable,      // from open_frames_[ci] or allocatable_frames_[ci]
+        hole_page,     // reopened from scheduler-managed hole_pages metadata
         whole_page,    // taken from whole_pool[ci] (recycled empty page)
         fresh_bump,    // freshly bumped from per_device head
     };
@@ -101,9 +102,11 @@ namespace apps::inconel::value {
     // physical page should host the next slot for a given class. The
     // scheduler layer above owns the page images and the cache.
     //
-    // v6 scope: no hole_pool / freed_slots / install_recovered_state /
-    // collision detection. Future steps will fill these in when tree_sched
-    // can drive the reclaim path.
+    // The scheduler above owns reclaim-time metadata such as hole_pages /
+    // dirty_pages / deferred_freed and drives resident-frame reuse. This
+    // allocator stays focused on whole-page pools plus the per-device bump
+    // head. Recovery-time reconstruction and collision detection still live
+    // in future steps.
 
     class value_allocator {
     public:
@@ -147,20 +150,8 @@ namespace apps::inconel::value {
             }
         }
 
-        // ── acquire_page ──
-        //
-        // Decision tree (v7):
-        //   1. whole_pool[ci] non-empty?       — return whole_page
-        //   2. bump fresh from per_device head — return fresh_bump
-        //   3. otherwise nullopt (out of space)
-        //
-        // The resident path (open_frames_ / allocatable_frames_) is
-        // handled entirely by the scheduler — the allocator does not know
-        // it exists. acquire_page is only called when the scheduler has
-        // exhausted both resident sources.
-
         std::optional<value_alloc_result>
-        acquire_page(uint16_t class_idx) noexcept {
+        try_acquire_whole_page(uint16_t class_idx) noexcept {
             auto& cls = classes_[class_idx];
 
             if (!cls.whole_pool.empty()) {
@@ -175,6 +166,12 @@ namespace apps::inconel::value {
                 };
             }
 
+            return std::nullopt;
+        }
+
+        std::optional<value_alloc_result>
+        try_acquire_fresh_page(uint16_t class_idx) noexcept {
+            auto& cls = classes_[class_idx];
             auto fresh = dev_.bump_next_page(cls.span_lbas);
             if (!fresh) return std::nullopt;
             return value_alloc_result{
@@ -184,6 +181,19 @@ namespace apps::inconel::value {
                 .source    = value_page_source::fresh_bump,
                 .free_mask = cls.all_free_mask,
             };
+        }
+
+        // ── acquire_page ──
+        //
+        // Compatibility helper: prefer whole_page, then fresh_bump. The
+        // scheduler may still call the split helpers directly when it needs
+        // a different policy order (for example, whole_page → hole_page →
+        // fresh_bump once reclaim metadata is present).
+
+        std::optional<value_alloc_result>
+        acquire_page(uint16_t class_idx) noexcept {
+            if (auto whole = try_acquire_whole_page(class_idx)) return whole;
+            return try_acquire_fresh_page(class_idx);
         }
 
         // ── reclaim ──

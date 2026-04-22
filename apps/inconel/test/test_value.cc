@@ -31,6 +31,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -155,6 +156,17 @@ std::string read_value_sync(value::value_alloc_sched_base* sched,
         >> pump::sender::submit(ctx);
     wait_for(counter, 1);
     return got;
+}
+
+template<typename sender_t, typename ctx_t>
+void wait_void_sender(sender_t&& sender, ctx_t& ctx) {
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    std::forward<sender_t>(sender)
+        >> pump::sender::then([counter]() {
+            counter->fetch_add(1);
+        })
+        >> pump::sender::submit(ctx);
+    wait_for(counter, 1);
 }
 
 // Decode an on-device page slot at (lba, byte_offset) into the body bytes,
@@ -962,6 +974,254 @@ void case_13_open_frame_visible_until_finalize() {
            "(read hit open_frames before rollback finalize)\n");
 }
 
+// ════════════════════════════════════════════════════════════════
+//  case_14: freed_slots on a cached full sub-LBA page reopens it resident
+//
+//  Fill an entire class-0 page so it becomes clean_readonly in the cache,
+//  then reclaim one dead slot through the batch API. reclaim_values must:
+//    - remove the page from readonly_cache_
+//    - reopen it as clean_allocatable resident state
+//    - let the next persist reuse the freed slot with no NVMe read
+// ════════════════════════════════════════════════════════════════
+
+void case_14_reclaim_batch_promotes_cached_partial_page() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    constexpr uint16_t CLASS_IDX = 0;
+    constexpr uint16_t FREED_SLOT = 1;
+    constexpr uint16_t SLOT_COUNT = 64;
+
+    std::vector<std::string> bodies;
+    std::vector<value_ref> vrs(SLOT_COUNT);
+    std::vector<value::put_entry> entries;
+    bodies.reserve(SLOT_COUNT);
+    entries.reserve(SLOT_COUNT);
+    for (uint16_t i = 0; i < SLOT_COUNT; ++i) {
+        bodies.push_back(std::string(30, static_cast<char>('a' + (i % 26))));
+        entries.push_back({bodies.back(), &vrs[i]});
+    }
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries));
+
+    const auto page_base = vrs[0].base;
+    const auto fid = value_frame_id_for(page_base, 1);
+    CHECK(sched_typed->readonly_cache_.contains(fid));
+    CHECK(sched_typed->allocatable_frames_[CLASS_IDX].empty());
+
+    wait_void_sender(value::reclaim_values(
+        std::span<const value_ref>(vrs).subspan(FREED_SLOT, 1)), ctx);
+
+    CHECK(!sched_typed->readonly_cache_.contains(fid));
+    CHECK(sched_typed->allocatable_frames_[CLASS_IDX].size() == 1);
+    CHECK(env.dev.get_trim_count() == 0);
+
+    auto* frame = sched_typed->allocatable_frames_[CLASS_IDX].back();
+    CHECK(frame != nullptr);
+    CHECK(frame->id == fid);
+    CHECK(frame->st == frame_state::clean_allocatable);
+    CHECK(frame->mode == value_page_frame::open_mode::none);
+    CHECK(frame->free_count == 1);
+    CHECK(frame->free_mask == (1ULL << FREED_SLOT));
+
+    env.dev.reset_io_counters();
+    CHECK(read_value_sync(sched_base, ctx, vrs[0]) == bodies[0]);
+    CHECK(env.dev.get_read_count() == 0);
+
+    std::string refill = make_body("reopen", 30);
+    value_ref vr_new{};
+    std::vector<value::put_entry> refill_entries = {{refill, &vr_new}};
+
+    env.dev.reset_io_counters();
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(refill_entries));
+    CHECK(vr_new.base == page_base);
+    CHECK(vr_new.byte_offset == FREED_SLOT * EXPECTED_CLASS_SIZES[CLASS_IDX]);
+    CHECK(env.dev.get_read_count() == 0);
+    CHECK(read_value_sync(sched_base, ctx, vr_new) == refill);
+
+    printf("  case_14_reclaim_batch_promotes_cached_partial_page: OK "
+           "(slot=%u reopened resident with 0 prefill reads)\n",
+           static_cast<unsigned>(FREED_SLOT));
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_15: whole-page reclaim trims cached page and returns whole page
+//
+//  A full class-3 page sits only in readonly_cache_. reclaim_values must
+//  delete that cache entry, issue one trim, and only then return the page
+//  to whole_pool so the next write can reuse the same LBA without a fresh bump.
+// ════════════════════════════════════════════════════════════════
+
+void case_15_reclaim_batch_trims_cached_whole_page() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string first = make_body("whole", 4000);
+    value_ref first_vr{};
+    std::vector<value::put_entry> first_entries = {{first, &first_vr}};
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(first_entries));
+
+    const auto fid = value_frame_id_for(first_vr.base, 1);
+    CHECK(sched_typed->readonly_cache_.contains(fid));
+
+    wait_void_sender(value::reclaim_values(
+        std::span<const value_ref>(&first_vr, 1)), ctx);
+    wait_void_sender(value::drain_trim_pending(), ctx);
+
+    CHECK(!sched_typed->readonly_cache_.contains(fid));
+    CHECK(sched_typed->allocatable_frames_[3].empty());
+    CHECK(env.dev.get_trim_count() == 1);
+    CHECK(env.dev.test_is_trimmed(first_vr.base.lba));
+    uint64_t trim_count = env.dev.get_trim_count();
+
+    std::string second = make_body("reuse", 4000);
+    value_ref second_vr{};
+    std::vector<value::put_entry> second_entries = {{second, &second_vr}};
+
+    env.dev.reset_io_counters();
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(second_entries));
+    CHECK(second_vr.base == first_vr.base);
+    CHECK(env.dev.get_read_count() == 0);
+    CHECK(read_value_sync(sched_base, ctx, second_vr) == second);
+
+    printf("  case_15_reclaim_batch_trims_cached_whole_page: OK "
+           "(trim_count=%lu, reused lba=%lu)\n",
+           static_cast<unsigned long>(trim_count),
+           static_cast<unsigned long>(second_vr.base.lba));
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_16: non-resident hole page takes the prefill-read path
+//
+//  Start from an on-device page that is not resident anywhere. reclaim_values
+//  inserts metadata into hole_pages_; the next persist must pick that hole,
+//  issue exactly one NVMe prefill read, preserve the surviving slot, and
+//  then return the page as clean_allocatable.
+// ════════════════════════════════════════════════════════════════
+
+void case_16_nonresident_hole_reclaim_reuses_page() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    std::string live_body = make_body("live", 30);
+    std::string reclaimed_body = make_body("old", 30);
+    std::vector<char> page;
+    build_subLba_page_image(page, /*class_size*/ 64, {live_body, reclaimed_body});
+    void* dst = env.dev.test_write_raw(SEED_AREA_LBA);
+    std::memcpy(dst, page.data(), LBA_SIZE);
+
+    value_ref live_vr{
+        .base = paddr{0, SEED_AREA_LBA},
+        .byte_offset = 0,
+        .len = static_cast<uint32_t>(live_body.size()),
+        .flags = 0,
+    };
+    value_ref reclaimed_vr{
+        .base = paddr{0, SEED_AREA_LBA},
+        .byte_offset = 64,
+        .len = static_cast<uint32_t>(reclaimed_body.size()),
+        .flags = 0,
+    };
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+
+    wait_void_sender(value::reclaim_values(
+        std::span<const value_ref>(&reclaimed_vr, 1)), ctx);
+
+    CHECK(sched_typed->hole_pages_[0].contains(paddr{0, SEED_AREA_LBA}));
+    CHECK(env.dev.get_trim_count() == 0);
+
+    std::string refill = make_body("hole", 30);
+    value_ref refill_vr{};
+    std::vector<value::put_entry> entries = {{refill, &refill_vr}};
+    const paddr seed_page{0, SEED_AREA_LBA};
+
+    env.dev.reset_io_counters();
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries));
+
+    CHECK(refill_vr.base == seed_page);
+    CHECK(refill_vr.byte_offset == 64);
+    CHECK(env.dev.get_read_count() == 1);
+    CHECK(sched_typed->hole_pages_[0].empty());
+    CHECK(sched_typed->allocatable_frames_[0].empty());
+    CHECK(sched_typed->readonly_cache_.contains(value_frame_id_for(seed_page, 1)));
+
+    env.dev.reset_io_counters();
+    CHECK(read_value_sync(sched_base, ctx, live_vr) == live_body);
+    CHECK(read_value_sync(sched_base, ctx, refill_vr) == refill);
+    CHECK(env.dev.get_read_count() == 0);
+
+    printf("  case_16_nonresident_hole_reclaim_reuses_page: OK "
+           "(prefill read count=%lu, reused lba=%lu)\n",
+           static_cast<unsigned long>(1),
+           static_cast<unsigned long>(refill_vr.base.lba));
+}
+
+// ════════════════════════════════════════════════════════════════
+//  case_17: batch reclaim aggregates a full sub-LBA page into one trim
+//
+//  All slots from the same class-0 page are reclaimed in a single batch.
+//  The value owner must aggregate them to one page-level action, trim the
+//  page exactly once, and make it reusable as a whole page.
+// ════════════════════════════════════════════════════════════════
+
+void case_17_reclaim_batch_trims_full_sub_lba_page() {
+    test_env env;
+    auto ctx = pump::core::make_root_context();
+
+    constexpr uint16_t CLASS_IDX = 0;
+    constexpr uint16_t SLOT_COUNT = 64;
+
+    std::vector<std::string> bodies;
+    std::vector<value_ref> vrs(SLOT_COUNT);
+    std::vector<value::put_entry> entries;
+    bodies.reserve(SLOT_COUNT);
+    entries.reserve(SLOT_COUNT);
+    for (uint16_t i = 0; i < SLOT_COUNT; ++i) {
+        bodies.push_back(std::string(30, static_cast<char>('a' + (i % 26))));
+        entries.push_back({bodies.back(), &vrs[i]});
+    }
+
+    auto* sched_base = core::registry::value_sched();
+    auto* sched_typed = static_cast<test_env::value_scheduler_t*>(sched_base);
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(entries));
+
+    const auto page_base = vrs[0].base;
+    const auto fid = value_frame_id_for(page_base, 1);
+    CHECK(sched_typed->readonly_cache_.contains(fid));
+
+    wait_void_sender(value::reclaim_values(std::span<const value_ref>(vrs)), ctx);
+    wait_void_sender(value::drain_trim_pending(), ctx);
+
+    CHECK(!sched_typed->readonly_cache_.contains(fid));
+    CHECK(sched_typed->allocatable_frames_[CLASS_IDX].empty());
+    CHECK(env.dev.get_trim_count() == 1);
+    CHECK(env.dev.test_is_trimmed(page_base.lba));
+    uint64_t trim_count = env.dev.get_trim_count();
+
+    std::string refill = make_body("batch-trim", 30);
+    value_ref refill_vr{};
+    std::vector<value::put_entry> refill_entries = {{refill, &refill_vr}};
+
+    env.dev.reset_io_counters();
+    persist_entries(sched_base, ctx, std::span<value::put_entry>(refill_entries));
+    CHECK(refill_vr.base == page_base);
+    CHECK(refill_vr.byte_offset == 0);
+    CHECK(env.dev.get_read_count() == 0);
+    CHECK(read_value_sync(sched_base, ctx, refill_vr) == refill);
+
+    printf("  case_17_reclaim_batch_trims_full_sub_lba_page: OK "
+           "(trim_count=%lu, reused lba=%lu)\n",
+           static_cast<unsigned long>(trim_count),
+           static_cast<unsigned long>(refill_vr.base.lba));
+}
+
 }  // namespace
 
 int main() {
@@ -981,6 +1241,10 @@ int main() {
     case_11_next_round_reopens_clean_allocatable_frame();
     case_12_full_page_enters_readonly_cache_only();
     case_13_open_frame_visible_until_finalize();
+    case_14_reclaim_batch_promotes_cached_partial_page();
+    case_15_reclaim_batch_trims_cached_whole_page();
+    case_16_nonresident_hole_reclaim_reuses_page();
+    case_17_reclaim_batch_trims_full_sub_lba_page();
 
     printf("all passed\n");
     return 0;

@@ -24,6 +24,7 @@ namespace apps::inconel::mock_nvme {
         std::mutex* shared_mtx = nullptr;  // optional, for multi-threaded testing
         std::atomic<uint64_t> read_count_{0};
         std::atomic<uint64_t> write_count_{0};
+        std::atomic<uint64_t> trim_count_{0};
 
         // Blank-buffer ctor: allocates a zero-initialised `ns_size` block.
         // `trimmed(total_lbas, false)` reflects "no LBA has been explicitly
@@ -102,6 +103,7 @@ namespace apps::inconel::mock_nvme {
             if (lba + num_lbas > total_lbas) return false;
             std::memset(storage.get() + lba * lba_size, 0, static_cast<uint64_t>(num_lbas) * lba_size);
             for (uint64_t i = lba; i < lba + num_lbas; ++i) trimmed[i] = true;
+            trim_count_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     public:
@@ -134,9 +136,11 @@ namespace apps::inconel::mock_nvme {
 
         uint64_t get_read_count() const  { return read_count_.load(std::memory_order_relaxed); }
         uint64_t get_write_count() const { return write_count_.load(std::memory_order_relaxed); }
+        uint64_t get_trim_count() const  { return trim_count_.load(std::memory_order_relaxed); }
         void reset_io_counters() {
             read_count_.store(0, std::memory_order_relaxed);
             write_count_.store(0, std::memory_order_relaxed);
+            trim_count_.store(0, std::memory_order_relaxed);
         }
     };
 

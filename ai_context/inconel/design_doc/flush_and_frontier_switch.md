@@ -508,8 +508,9 @@ else:
 ```
 
 recycle_value_slot 对不同 class 的处理（在 tree_sched 上）：
-- LBA-aligned / multi-LBA：tree_sched 先 TRIM，再投递 recycle_whole(class_idx, page_base) 到 value_alloc_sched
-- sub-LBA：tree_sched 按 page_base 聚合 freed slots，batch 投递 freed_slots { page_base, class_idx, freed_mask } 到 value_alloc_sched
+- tree_sched 先按 dead `value_ref` 收集一批 `dead_value_refs`
+- 然后统一投递 `reclaim_values(dead_value_refs[])` 到 value_alloc_sched
+- sub-LBA / whole-page 的 page-level 聚合，以及 whole-free page 的 TRIM 完成态，都在 value_alloc_sched owner 内部处理
 
 完整的 value_alloc_sched handle 逻辑见 `runtime_state_machine.md` §6.4-§6.8。
 

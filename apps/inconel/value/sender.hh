@@ -29,6 +29,30 @@ namespace apps::inconel::value {
     using format::value_ref;
 
     inline auto
+    drain_trim_pending() {
+        return rt::value()->prepare_trim_batch()
+            >> visit()
+            >> flat_map([]<typename T>(T&& alt) {
+                using alt_t = std::decay_t<T>;
+                if constexpr (std::is_same_v<alt_t, trim_batch>) {
+                    uint64_t batch_id = alt.batch_id;
+                    return just()
+                        >> as_stream(alt.trims)
+                        >> concurrent()
+                        >> flat_map([](format::trim_desc d) {
+                            return rt::local_nvme()->trim(d.lba, d.num_lbas);
+                        })
+                        >> all()
+                        >> flat_map([batch_id](bool trim_ok) {
+                            return rt::value()->complete_trim_batch(batch_id, trim_ok);
+                        });
+                } else {
+                    return just();
+                }
+            });
+    }
+
+    inline auto
     on_persist_leader(persist_leader&& alt) {
         uint64_t rid = alt.round_id;
         return just()
@@ -42,6 +66,24 @@ namespace apps::inconel::value {
             >> flat_map([rid](bool nvme_ok) {
                 return rt::value()->finalize_persist(rid, nvme_ok)
                     >> forward_value(nvme_ok);
+            });
+    }
+
+    inline auto
+    on_persist_prefill(persist_prefill&& alt) {
+        uint64_t rid = alt.round_id;
+        return just()
+            >> as_stream(__mov__(alt.reads))
+            >> concurrent()
+            >> flat_map([](format::read_desc d) {
+                return rt::local_nvme()->read(d.lba, d.buf, d.num_lbas);
+            })
+            >> all()
+            >> flat_map([rid](bool read_ok) {
+                return rt::value()->continue_persist(rid, read_ok);
+            })
+            >> flat_map([](persist_leader&& leader) {
+                return on_persist_leader(__mov__(leader));
             });
     }
 
@@ -75,8 +117,11 @@ namespace apps::inconel::value {
         return rt::value()->prepare_persist(entries)
             >> visit()
             >> flat_map([]<typename T>(T &&alt) {
-                if constexpr (std::is_same_v<T, persist_leader>) {
+                using alt_t = std::decay_t<T>;
+                if constexpr (std::is_same_v<alt_t, persist_leader>) {
                     return on_persist_leader(__fwd__(alt));
+                } else if constexpr (std::is_same_v<alt_t, persist_prefill>) {
+                    return on_persist_prefill(__fwd__(alt));
                 } else {
                     return just(static_cast<bool>(alt.ok));
                 }
@@ -121,6 +166,11 @@ namespace apps::inconel::value {
                     return on_read_miss(vr, __fwd__(alt));
                 }
             });
+    }
+
+    inline auto
+    reclaim_values(std::span<const value_ref> dead_values) {
+        return rt::value()->reclaim_values(dead_values);
     }
 
 }

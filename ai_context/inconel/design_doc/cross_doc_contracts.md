@@ -63,14 +63,13 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `checkpoint_guard` | `manifest, retired { old_slots, old_ranges, old_tree_values }` | OV §5.2, RSM §4.6 | FF §4.1/5 |
 | `tree_manifest` | `root_slot, slot_map, leaf_order` | OV §4.4/§9.4, RSM §4.5 | FF §3.4/§3.8, RW §7.2 |
 | `tree_allocator` | `head, free_ranges, shared_heads` | RSM §4.4 | RW §9.1 |
-| `data_area_heads` | `tree_head_lba (atomic), value_head_lba (atomic)` | RSM §4.3 | RSM §4.4/6.3 |
-| `value_alloc_state` | `dev_state, classes, open_frames, dirty_pages, deferred_freed, trim_pending_pages, config` | RSM §6.3 | WP §5.4, RMC §7.1 |
-| `per_device_value_state` | `bump_head_lba, shared_heads` | RSM §6.3 | RW §9.2 |
+| `data_area_heads` | `tree_head_lba (atomic), value_head_lba (atomic)`；reservation boundary 使用 release/acquire，不能作为独立 relaxed collision check | RSM §4.3 | RSM §4.4 |
+| `value_space_manager` | `global_free_extents, sparse partial_pages/by_page_delta/buckets, cached_partial_index, trim_withheld/trim_inflight, acknowledged_alloc_floor, pressure budgets`；不保存 DMA frame，不提交 NVMe I/O | RSM §6.3, INC-051 | CM value |
+| `value_alloc_state` | `space, open_frames, dirty_pages, value_read_cache, io_policy` | RSM §6.3 | CM value |
 | `batch_ctx` | `batch_lsn, entry_count, canonical_entries, fragments` | WP §2.2 | — |
 | `page_frame` | `id, st, dma_buf, byte_len, pin_count, crc_valid` | RMC §5.4 | — |
 | `value_page_frame` | `class_idx, slots_per_page, free_bitmap, free_count, mode` | RMC §5.5 | RSM §6.3 (open_frames) |
 | `frame_id` | `base, span_lbas, dom` | RMC §5.2 | — |
-| `hole_page_descriptor` | `page_base, class_idx, free_mask` | RMC §6.4 | RSM §6.7 |
 | `shard_partition` | `fence_upper_off (u32), fence_upper_len (u16), _pad0 (u16), shard_idx (u32)`；POD 12B | core/shard_partition.hh (step 030 §2.1) | RSM §4.7, OV §8.1 |
 | `shard_partition_map` | `fence_pool: string, shards: vector<shard_partition>`；最后一个 shard 必须是 +∞ sentinel（`fence_upper_len == 0`） | core/shard_partition.hh (step 030 §2.1) | RSM §4.7, OV §1.7/§8.1 |
 | `tree_read_domain<Cache>` | `read_domain_index (u32), partitions: shared_ptr<const shard_partition_map>, node_cache: Cache, lookup: unique_ptr<tree_lookup_sched<Cache>>, worker: unique_ptr<tree_worker_sched<Cache>>`；继承 `tree_read_domain_base` 并填充其 `lookup_sched` / `worker_sched` base pointers | core/tree_read_domain.hh (step 030 §2.3) | RSM §1/§4, OV §1.7, CM tree |
@@ -82,9 +81,9 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 
 | 状态 | Owner | 声明点 | 违反检测 |
 |------|-------|--------|---------|
-| value open frames (dirty_append / dirty_hole_fill) | `value_alloc_sched` | RMC §7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
-| value placement metadata (pools, hole_page_list, generic_free_spans) | `value_alloc_sched` | RMC §6.4/7.1, RSM §6.3 | 如果 front_sched 持有 → 错 |
-| **value_page readonly_frame_cache（读写共享）** | **`value_alloc_sched`** | RMC §7.1, RSM §6.1/6.5 | 如果 front_sched、tree_lookup_sched 或 tree_worker_sched 持有 value_page cache → 错 |
+| value logical placement metadata (`global_free_extents`, `partial_pages`, `cached_partial_index`, trim withheld/inflight, alloc floor) | `value_space_manager` inside `value_alloc_sched` | RSM §6.3, CM value, INC-051 | 如果 scheduler/cache layer 旁路维护 allocator truth → 错 |
+| value resident frames/cache (`open_frames`, `dirty_pages`, `readonly_frame_cache`) | `value_alloc_sched` | RSM §6.1/6.3/6.5 | 如果 `value_space_manager` 保存 `value_page_frame*` 或提交 NVMe I/O → 错 |
+| **value_page readonly_frame_cache（读写共享）** | **`value_alloc_sched`** | RSM §6.1/6.5 | 如果 front_sched、tree_lookup_sched 或 tree_worker_sched 持有 value_page cache → 错 |
 | WAL tail frame | `front_sched` | RMC §7.1, RSM §3.9 | — |
 | tree node read-only frame cache（普通读路径 + flush old-leaf read） | `tree_read_domain` shard | RMC §7.1/9.1, RSM §4/§4.7/§4.8 | 如果 front_sched 或 tree_sched 持有 tree_node cache → 错 |
 | tree flush write buffers | `tree_sched` | RMC §7.1 | — |

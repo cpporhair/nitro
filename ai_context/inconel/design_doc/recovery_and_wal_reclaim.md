@@ -45,6 +45,7 @@ boot recovery 输出：
    - wal_base_paddr, wal_segment_size, wal_segment_count
    - data_area_base_paddr, data_area_end_paddr
    - value_size_classes
+   - value_space_quantum_bytes, value_space_group_size_lbas
    - root_base_paddr（作为扫描 hint，不是 correctness source）
 ```
 

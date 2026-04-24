@@ -15,7 +15,7 @@
 | ↳ `tree_worker_sched` | 与 `tree_read_domain` 1:1 | candidate-build 临时状态 | 继承 `tree_read_domain_index`；cache / paired_lookup 均通过 `read_domain_->...` 间接拿 |
 | `tree_sched` | 1 | tree allocator、flush 状态、retire 队列 | 固定单点 |
 | `wal_space_sched` | 1 | segment free pool、alloc head | 固定单点 |
-| `value_alloc_sched` | 1 | bump head、per-class pools、per-class open_frames、dirty_pages、deferred_freed、trim_pending_pages、value_page `readonly_frame_cache` | 固定单点 |
+| `value_alloc_sched` | 1 | `value_space_manager`（free-space / partial / cached-partial / trim / floor metadata）、open_frames、dirty_pages、value_page `readonly_frame_cache` | 固定单点 |
 | `nvme_sched` | 每核心 × 每设备（v1 单盘 = 每核心 1 个） | SPDK qpair | 各 scheduler 使用本核心的实例 |
 
 **路由层提醒（step 030 §2.7）**：`shard_partition_map` 是读路径（`tree::lookup`）和 flush fold 路径（`memtable_fold.build_key_partitions`）唯一共享的路由决策源，确保"同 key → 同 shard" 不变量在两条路径上同时成立。map 由 builder 在启动时装入一个单 shard 占位（空树 → `{ upper=+∞, idx=0 }`），每次 flush 完成由 tree_sched 重建并 `install_shard_partitions()` 原子替换（B1 目标设计；step 030 不触发 rebuild，仅建立占位 + API）。
@@ -708,17 +708,28 @@ struct tree_flush_result {
 
 ### 4.3 Data Area 碰撞检测
 
-概要 §10.4：tree 向高地址增长，value 向低地址增长，两端在中间相遇表示 Data Area 已满。碰撞检测通过 per-device 的共享 atomic 实现：
+概要 §10.4：tree 向高地址增长，value 向低地址增长，两端在中间相遇表示 Data Area 已满。碰撞检测必须是跨 owner 的 reservation / fence 协议，不能只靠两侧 relaxed 采样对方 head 后各自本地 bump。旧的 relaxed 论证无效：stale 方向不保守，tree 可能读到过高的旧 `value_head_lba`，value 可能读到过低的旧 `tree_head_lba`，二者都会把新区间分配进对方已经保留的区域。
 
 ```cpp
 // 全局共享（per-device，v1 单设备只有一份）
 struct data_area_heads {
-    std::atomic<uint64_t> tree_head_lba;             // tree_sched relaxed store, value_alloc_sched relaxed load
-    std::atomic<uint64_t> value_head_lba;            // value_alloc_sched relaxed store, tree_sched relaxed load
+    std::atomic<uint64_t> tree_head_lba;             // tree reservation boundary: store-release / load-acquire
+    std::atomic<uint64_t> value_head_lba;            // value reservation boundary: store-release / load-acquire
 };
-// 两个 head 都是单调的（tree 只增，value 只减），读到略旧的值只会导致
-// 少分配一点后重试，不破坏正确性。不需要 acquire/release。
 ```
+
+`store-release` / `load-acquire` 是最小内存序要求，但它们只提供发布顺序，
+不保证读到最新值，也不能把“两侧各自 check-and-bump”变成原子 claim。
+真正的 correctness boundary 必须满足以下之一：
+
+1. 通过单 owner / lock / CAS-over-whole-gap 等机制原子地 reserve 共享 free gap。
+2. 通过 `INC-051` value-space floor 协议：tree 提升 floor 时先发布
+   reservation request，value owner 在自己的 scheduler 上处理并确认该
+   floor reservation；tree 只有在收到确认后才能使用新吞掉的 LBA 区间。
+
+因此，下面 allocator 伪码中的 acquire/release load/store 只是 reservation
+协议内部的发布/观察动作；不能被简化回 relaxed，也不能脱离 reservation
+协议单独作为碰撞检测。
 
 ### 4.4 `tree_allocator`
 
@@ -735,11 +746,11 @@ struct tree_allocator {
             return *r;
         // 碰撞检测：确保 bump 不会撞到 value 端
         uint64_t next_end = head.lba + tree_page_size * shadow_slots_per_range / lba_size;
-        if (next_end > shared_heads->value_head_lba.load(std::memory_order_relaxed))
+        if (next_end > shared_heads->value_head_lba.load(std::memory_order_acquire))
             return {};  // Data Area 已满
         range_ref r = { .base = head, .slot_count = shadow_slots_per_range };
         head.lba = next_end;
-        shared_heads->tree_head_lba.store(head.lba, std::memory_order_relaxed);
+        shared_heads->tree_head_lba.store(head.lba, std::memory_order_release);
         return r;
     }
 
@@ -1071,15 +1082,17 @@ handle_reclaim_check(recovery_safe_lsn):
 
 ### 6.1 定位
 
-集中管理 value page 的分配、DMA frame 填充、NVMe FUA 写入（leader-follower 模式），以及 **value read 服务**（tree-path value 读取的唯一执行域）。通过本核 `nvme_sched` 提交 value FUA 写入和 value page 读取。
+集中管理 value page 的写入执行、DMA frame 填充、NVMe FUA 写入（leader-follower 模式），以及 **value read 服务**（tree-path value 读取的唯一执行域）。通过本核 `nvme_sched` 提交 value FUA 写入、value page 读取和 TRIM。
+
+free-space / partial-page / cached-partial candidate / trim withheld 的逻辑状态由 `value_space_manager` 持有；`value_alloc_sched` 只持有执行层 resident 状态（open/dirty DMA frame、readonly cache）并推进 I/O completion。`value_space_manager` 是 owner-local 同步 metadata component，不直接提交 NVMe I/O，也不保存 `value_page_frame*`。
 
 最佳实践是把它部署在独占核心上；但语义上只要求它保持单实例 owner。读写共享同一份 `readonly_frame_cache`（value_page domain），避免跨 shard 缓存重复和 invalidate 开销。
 
 | 属性 | 值 |
 |------|---|
 | 实例数 | 1（全局唯一） |
-| Owner 状态 | bump head（per-device）、per-class pools（whole_page_pool / hole_page_list / extent_free_pool）、owner-local `generic_free_spans`、dirty_pages、deferred_freed、per-class open frames、本地 `readonly_frame_cache`（value_page domain，读写共享） |
-| NVMe I/O | 通过本核 nvme_sched 提交 value FUA 写入和 value page 读取 |
+| Owner 状态 | `value_space_manager`、open_frames、dirty_pages / writeback-inflight frame summary、本地 `readonly_frame_cache`（value_page domain，读写共享） |
+| NVMe I/O | 通过本核 nvme_sched 提交 value FUA 写入、value page 读取和 TRIM |
 | 路由 | 固定单点 |
 
 ### 6.2 请求类型
@@ -1090,134 +1103,122 @@ handle_reclaim_check(recovery_safe_lsn):
 | `read_value` | `value_ref` | owning value bytes | 读路径（tree hit value 后） |
 | `read_page_values` | `value_read_group { page_fid, refs[] }` | owning value bytes[] | 读路径（MultiGet / Scan 的 tree hit values） |
 | `reclaim_values` | `dead_value_refs[]` | void | tree_sched（dead value 回收，按 batch 投递） |
-| `install_recovered_state` | `live_extents`, `global_value_head`, `data_area_end_lba`, optional `dead_class_hints` | void | boot recovery（一次性初始化） |
+| `drain_trim_pending` | `max_ranges`, `max_lbas` | void | maintenance / reclaim cadence |
+| `install_recovered_state` | `live_extents`, `tree_alloc_head_lba`, `data_area_end_lba`, optional `dead_class_hints` | void | boot recovery（一次性初始化） |
 
 注：
 
-1. `alloc_page` 和 `return_page` 不再是跨 scheduler 请求——它们是 `persist_put_values` 内部的本地操作（value_alloc_sched 自己持有 open frames 和 per-class pools）。
+1. `alloc_page` 和 `return_page` 不再是跨 scheduler 请求——它们是 `persist_put_values` 内部的本地操作；logical placement / release / trim metadata 统一通过 `value_space_manager`，scheduler 不再持有 per-class free pools。
 2. `read_value` 是 Point GET 使用的单值包装；`read_page_values` 是 MultiGet / Scan 使用的页级批量原语。两者都由 `value_alloc_sched` 服务：先查 dirty open frames，再查 value_page `readonly_frame_cache`，miss 时通过本核 `nvme_sched` 读取并回填 cache。返回 copy 后的 owning bytes，调用方无需管理 DMA frame 生命周期。
-3. `install_recovered_state` 是 boot-only 初始化接口；steady-state 下不走这条路径。recovery 只交出 occupied truth，allocator 内部自行重建 `hole_pages` / pools / `generic_free_spans`。
+3. `install_recovered_state` 是 boot-only 初始化接口；steady-state 下不走这条路径。recovery 只交出 occupied truth，`value_alloc_sched` 清空执行层 frames/cache 后调用 `value_space_manager.install_recovered_state(...)` 重建 free-space / partial metadata；cached residency 从空开始。
 
 ### 6.3 Owner 状态
 
 ```cpp
-struct per_device_value_state {
-    uint64_t bump_head_lba;                          // 从 data_area_end 向低地址递减
-    data_area_heads* shared_heads;                   // 碰撞检测共享结构（同 tree_allocator）
-
-    // bump 分配一个 page（返回 null 表示 Data Area 已满）
-    paddr bump_next_page(uint32_t span_lbas) {
-        uint64_t next = bump_head_lba - span_lbas;
-        if (next < shared_heads->tree_head_lba.load(std::memory_order_relaxed))
-            return {};  // 撞到 tree 端
-        bump_head_lba = next;
-        shared_heads->value_head_lba.store(bump_head_lba, std::memory_order_relaxed);
-        return { .device_id = 0, .lba = next };
-    }
-};
-
 struct value_alloc_state {
-    // ── 分配 ──
-    per_device_value_state dev_state;                // bump head（per-device，v1 单设备）
+    // ── Logical placement metadata ──
+    // Owns global_free_extents, sparse partial_pages, cached_partial_index,
+    // trim withheld/inflight state, allocation pressure mode, and the
+    // acknowledged tree/value alloc floor.
+    value_space_manager space;
 
-    struct free_span_descriptor {
-        paddr base;
-        uint32_t span_lbas;
-        uint16_t class_idx_or_invalid;               // UINT16_MAX = 暂无可用 class hint
-    };
-
-    // ── Per-class pools ──
-    struct per_class_state {
-        flat_hash_map<paddr, hole_page_descriptor> hole_pages;  // 带空洞页
-        local::queue<paddr, 256> whole_page_pool;               // 整页空闲
-        local::queue<paddr, 64>  extent_free_pool;              // multi-LBA extent
-    };
-    small_vector<per_class_state, 16> classes;
-
-    // ── Whole-free region，但暂时无法归入某个 class pool ──
-    // 典型来源：boot recovery 后，某些 region 语义上确定 free，
-    // 但没有足够 surviving refs 可立即唯一推断 class。
-    intrusive_list<free_span_descriptor> generic_free_spans;
-
-    // ── Per-class open frames（当前正在填充的 DMA page）──
+    // ── Open frames（当前正在填充的 DMA page）──
     // persist_put_values 中 leader 统一分配 slot、memcpy 到 open_frame，
-    // 本轮结束后提交 FUA。满页转 clean_readonly，未满页保留到下一轮继续填充。
-    small_vector<value_page_frame*, 16> open_frames; // index by class_idx，null = 无 open page
+    // 本轮结束后提交 FUA。logical claims 已经在 space round 中保留，
+    // frame 本身仍由 scheduler/cache layer 管理。
+    small_vector<value_page_frame*, 16> open_frames; // active tail by class / policy
 
-    // ── Dirty tracking ──
+    // ── Dirty / writeback tracking ──
     // 跟踪 value_alloc_sched 当前持有的 active open pages 的地址集合。
-    // tree_sched 投递 reclaim_values 时，如果命中 dirty page，则先
-    // 暂存到 deferred_freed，等 return_page / rollback 时合并。
-    flat_hash_set<paddr> dirty_pages;                // 当前 value_alloc_sched 的 active open pages
-    flat_hash_map<paddr, bitset> deferred_freed;     // dirty 期间暂存的回收 mask
+    // reclaim_values 命中 dirty page 时，space 先更新 logical metadata；
+    // scheduler 只更新 frame-local summary，避免 resident frame stale。
+    flat_hash_map<paddr, dirty_value_frame_state> dirty_pages;
 
-    // ── TRIM gating ──
-    // 已经逻辑全空，但还没完成 TRIM 的页不能立即回 whole_page_pool。
-    flat_hash_map<paddr, trim_pending_descriptor> trim_pending_pages;
+    // ── Read cache（value_page domain）──
+    readonly_frame_cache value_read_cache;
 
-    // ── Placement policy ──
-    value_placement_config config;                   // hole_reuse_watermark 等
+    // ── Execution policy ──
+    value_io_policy io_policy;                       // cache admission / FUA batch / read prefill caps
 };
 ```
 
-`install_recovered_state()` 的职责边界固定为：
+状态边界固定为：
 
-1. recovery 提供 `live_extents`（occupied truth）和 `global_value_head`；
-2. `value_alloc_sched` 先清空旧的 free metadata / open frame 残留，再从 `live_extents` 反推出：
-   - sub-LBA partially-free 页的 `hole_pages`
-   - class 可判定的 `whole_page_pool` / `extent_free_pool`
-   - class 暂不可判定的 `generic_free_spans`
-3. `dead_class_hints` 只用于 class 归桶或 TRIM 优化；没有它也不能泄漏 free 空间。
+1. `value_space_manager` 是 logical free-space truth：`global_free_extents`、
+   sparse `partial_pages` / `by_page_delta` / bucket index、`cached_partial_index`、
+   trim withheld/inflight state、partial metadata budget 和 alloc-floor reconcile。
+2. `value_alloc_sched` 是 execution owner：open/dirty DMA frames、value page
+   readonly cache、cache epoch pin/take、NVMe read/write/trim submission 和 completion。
+3. scheduler 只能通过 `space.begin_round()` / `allocate_batch()` /
+   `commit()` / `abort()` / `release_values()` / `prepare_trim()` /
+   `complete_trim()` 改 logical metadata；不能旁路维护 per-class pools、
+   `hole_pages`、`generic_free_spans` 或 `trim_pending_pages`。
+4. `cached_partial_index` 只存 page address + summary + cache epoch。actual
+   resident frame 仍在 scheduler/cache layer；claim 后 pin/take 失败表示
+   stale index，scheduler 必须 `abort(round)` 并 `erase_cached_partial(...)`
+   后重新规划。
+5. `install_recovered_state()` 先清空 `open_frames` / `dirty_pages` /
+   `value_read_cache`，再用 recovery 提供的 live extents 调用
+   `space.install_recovered_state(...)`；不读取 Value Area payload，也不恢复
+   cached residency。
 
-不变量：`dirty_pages` 中的 page 不会同时出现在 `hole_pages` 中。`deferred_freed` 只在 dirty 期间累积，`return_page` / rollback 时一次性合并清空。`trim_pending_pages` 中的页在 TRIM 完成前不会重新进入 any allocatable pool。
-
-### 6.4 `handle_alloc_page`
+### 6.4 `persist_put_values` 分配 / 写入流程
 
 ```text
-handle_alloc_page(class_idx):
-    cls = classes[class_idx]
+handle_persist_put_values(entries):
+    round = space.begin_round()
+    reqs = build_allocation_requests(entries)
+    claims = space.allocate_batch(round, reqs, current_allocation_policy())
 
-    if !hole_reuse_enabled:
-        // fresh_first 模式（Data Area 使用率低于 watermark）
-        if try_alloc_whole_page(class_idx) → result: return result
-        if try_alloc_bump(class_idx) → result: return result
-        if try_alloc_hole_page(class_idx) → result: return result
-        → space_exhausted
+    for claim in claims:
+        switch claim.src:
+        case cached_partial:
+            frame = value_read_cache.take_or_pin(claim.page_base, claim.cache_epoch)
+            if frame == stale_or_missing:
+                space.abort(round)
+                space.erase_cached_partial(claim.page_base, claim.cache_epoch)
+                retry planning
+            make_dirty_open(frame)
 
-    else:
-        // hole_first 模式（使用率超过 watermark）
-        if try_alloc_hole_page(class_idx) → result: return result
-        if try_alloc_whole_page(class_idx) → result: return result
-        if try_alloc_bump(class_idx) → result: return result
-        → space_exhausted
+        case nonresident_partial:
+            frame = read_or_take_cached_page(claim.page_base)
+            make_dirty_open(frame)
 
-try_alloc_hole_page(class_idx):
-    if (page_base, desc) = classes[class_idx].hole_pages.take_any():
-        dirty_pages.insert(page_base)
-        return alloc_result { page_base, class_idx, desc.free_mask, source=non_resident_hole }
-    return null
+        case new_whole_page:
+            value_read_cache.erase_range(claimed_lba_range(claim))
+            frame = alloc_zeroed_dma_frame(claim.page_base)
+            make_dirty_open(frame)
 
-try_alloc_whole_page(class_idx):
-    if cls.whole_page_pool.try_dequeue() → page_addr:
-        dirty_pages.insert(page_addr)
-        return alloc_result { page_addr, class_idx, all_free_mask, source=whole_page }
-    if cls.extent_free_pool.try_dequeue() → extent_addr:
-        dirty_pages.insert(extent_addr)
-        return alloc_result { extent_addr, class_idx, all_free_mask, source=whole_page }
-    return null
+        copy value bytes into frame at claim.byte_offset
 
-try_alloc_bump(class_idx):
-    page_addr = bump_next_page(class_idx)
-    if page_addr == null: return null
-    dirty_pages.insert(page_addr)
-    return alloc_result { page_addr, class_idx, all_free_mask, source=fresh }
+    submit value FUA writeback through local nvme_sched
+
+    on writeback success:
+        space.commit(round)
+        publish returned value_refs
+        finalize_written_frames()
+
+    on writeback failure / abort:
+        space.abort(round)
+        drop dirty frames from this round
 ```
 
-`persist_put_values` 内部根据 `source` 准备 DMA frame：
-- `fresh` / `whole_page` → 分配 DMA frame，清零
-- `non_resident_hole` → 先查本地 `readonly_frame_cache`；cache hit 则零 NVMe read，cache miss 则通过本核 nvme_sched 读整页
+source 边界：
 
-其中 `whole_page` source 只会来自已经完成过 `value_page` invalidate barrier 的 free pool；因此这里允许继续用裸 `frame_id` 命中本地 cache，而不会把旧页像误认成新对象。
+1. `cached_partial` 只表示 `value_space_manager.cached_partial_index` 中有可用
+   logical slot；actual frame 必须由 scheduler/cache layer 以
+   `page_base + cache_epoch` pin/take。失败时这是 stale index，不是 logical
+   metadata corruption。
+2. `nonresident_partial` 表示 manager 已经扣减 partial bitmap，但 scheduler
+   仍需要读整页（或命中 readonly cache）后才能 patch page image。
+3. `new_whole_page` 来自 manager 的 whole-free extent；scheduler 先删除同
+   range 的旧 readonly cache entry，再分配新 DMA frame 并清零，不需要读旧页。
+4. `commit(round)` 只在 value FUA 成功后执行；失败或 stale cached claim 必须
+   `abort(round)` 释放本 round claims。
+5. `finalize_written_frames()` 只处理 resident frame state：full page 可直接转
+   clean readonly / evict；仍 partial 的 page 调用
+   `space.mark_cached_partial(...)` 更新 cached candidate index；不再回写任何
+   per-class pool。
 
 ### 6.5 `handle_read_value` / `handle_read_page_values`
 
@@ -1243,8 +1244,8 @@ handle_read_page_values(value_read_group group):
     if hit_open_frame(fid) → frame:
         goto serve_from_frame
 
-    // ── 2. 查 readonly_frame_cache ──
-    if frame = readonly_frame_cache.get(fid):
+    // ── 2. 查 value_read_cache / readonly_frame_cache ──
+    if frame = value_read_cache.get(fid):
         goto serve_from_frame
 
     // ── 3. Cache miss → NVMe read ──
@@ -1252,7 +1253,7 @@ handle_read_page_values(value_read_group group):
     nvme_sched->read(fid.base, frame->dma_buf, fid.span_lbas * lba_size)
     // NVMe read 完成后：
     frame->st = clean_readonly
-    readonly_frame_cache.put(fid, frame)
+    value_read_cache.put(fid, frame)
     goto serve_from_frame
 
 serve_from_frame:
@@ -1271,105 +1272,108 @@ serve_from_frame:
 1. **请求内按页分组**：MultiGet / Scan 先在调用方按 `frame_id` 分组，避免把同页多个 `value_ref` 变成多条独立消息。
 2. **dirty frame 命中**：sub-LBA page 停留在 `open_frames` 的时间窗口内，tree-path read 可直接从 DMA buffer 读取，零 NVMe。这对频繁 flush + 小 value 的工作负载有意义。
 3. **copy 返回**：返回 owning bytes 而非 `value_view` + `frame_pin`。DMA frame 生命周期完全封闭在 `value_alloc_sched` 内部，`pin_count` 保持 `uint32_t` 不需要 atomic。copy 发生在 CRC 校验后，数据在 L1/L2 中是热的，成本最低。上层（如网络发送）最终也需要 copy，在这里做等价于在那里做。
-4. **无 coherence 开销**：value_alloc_sched 既是 writer 又是唯一的 cache owner。hole-fill writeback 后直接更新本地 cache，不需要跨 shard invalidate barrier。
+4. **无 coherence 开销**：value_alloc_sched 既是 writer 又是唯一的 cache owner。partial rewrite writeback 后直接更新本地 cache，不需要跨 shard invalidate barrier。
 
-### 6.6 `handle_return_page`
+### 6.6 Writeback completion / cached partial admission
 
 ```text
-handle_return_page(page_base, class_idx, free_bitmap):
-    dirty_pages.erase(page_base)
+finalize_written_frames(round_frames):
+    for frame in round_frames:
+        dirty_pages.erase(frame.page_base)
+        frame.st = clean_readonly
 
-    // 合并借出期间积累的 deferred freed_mask
-    if deferred_freed.contains(page_base):
-        free_bitmap |= deferred_freed[page_base]
-        deferred_freed.erase(page_base)
-
-    if free_bitmap.none():
-        // 全满 → value_alloc_sched 不管该页
-        pass
-    elif free_bitmap.all():
-        // 全空 → 进入 trim_pending，TRIM 完成后才能回 whole_page_pool
-        trim_pending_pages.insert(page_base,
-            trim_pending_descriptor { class_idx, span_lbas(class_idx), pending })
-    else:
-        // 部分空 → 记入 hole_pages
-        classes[class_idx].hole_pages.insert(page_base,
-            hole_page_descriptor { page_base, class_idx, free_bitmap })
+        if frame.summary.is_partial_allocatable():
+            value_read_cache.put(frame)
+            space.mark_cached_partial(cached_partial_update {
+                page_base = frame.page_base,
+                kind = active_tail or cached_free_candidate,
+                heat_seq = next_heat_seq(),
+                cache_epoch = frame.cache_epoch,
+            })
+        else:
+            space.erase_cached_partial(frame.page_base, frame.cache_epoch)
+            value_read_cache.put_or_evict(frame)
 ```
 
-`handle_return_page()` 只更新 allocator metadata。writeback completion 后，`value_alloc_sched` 直接把 updated frame 转为 `clean_readonly` 放回本地 cache。无需跨 shard invalidate（`value_alloc_sched` 是 value_page cache 唯一 owner）。
+writeback completion 之后，logical allocator metadata 已由 `space.commit(round)`
+发布。这里不再执行 `return_page` / `hole_pages.insert` / `whole_page_pool.push`
+这类 allocator 操作，只维护 resident frame state 和 cached-partial index。
+无需跨 shard invalidate（`value_alloc_sched` 是 value_page cache 唯一 owner）。
 
 ### 6.7 `handle_reclaim_values`（batch reclaim 核心）
 
 ```text
 handle_reclaim_values(dead_value_refs[]):
-    partial_by_page = {}
-    whole_pages = {}
+    by_page = group_by_page(dead_value_refs)
 
-    for vr in dead_value_refs:
-        class_idx = class_for_len(vr.len)
-        if is_sub_lba(class_idx):
-            slot_idx = vr.byte_offset / class_size[class_idx]
-            partial_by_page[{class_idx, vr.base}] |= (1 << slot_idx)
-        else:
-            whole_pages.insert({class_idx, vr.base})
+    // 先更新 logical metadata truth。
+    space.release_values(dead_value_refs)
 
-    for (class_idx, page_base, freed_mask) in partial_by_page:
-        apply_partial_reclaim(class_idx, page_base, freed_mask)
+    // 再修正 scheduler-owned resident frame/cache summary。
+    for (page_base, refs) in by_page:
+        if frame = dirty_pages.find(page_base):
+            apply_reclaim_to_dirty_frame_summary(frame, refs)
+            continue
 
-    for (class_idx, page_base) in whole_pages:
-        apply_whole_reclaim(class_idx, page_base)
+        if frame = value_read_cache.find(page_base):
+            apply_reclaim_to_clean_frame_summary(frame, refs)
+            if frame.summary.is_partial_allocatable():
+                space.mark_cached_partial(update_from(frame))
+            else:
+                space.erase_cached_partial(frame.page_base, frame.cache_epoch)
+                if frame.summary.is_all_free():
+                    value_read_cache.erase(frame.page_base)
 ```
 
-`apply_partial_reclaim(...)` / `apply_whole_reclaim(...)` 都是 owner-local helper，不再作为跨 scheduler handle 暴露。
+`space.release_values(...)` 是 free-space truth 的唯一更新入口。scheduler 的
+resident-frame 修正只防止 open/clean cached frame summary stale；它不再维护
+`hole_pages`、whole-page pool 或 `trim_pending_pages`。
 
 聚合后的 page-level 处理规则：
 
 1. dirty page
-   - 先累积到 `deferred_freed`
-2. resident open / allocatable frame
-   - 直接更新 resident `free_mask`
-3. readonly cache 命中
-   - `take(frame_id)` 摘出 cache frame
-   - partial free → 转 resident clean_allocatable
-   - all-free → 进入 `trim_pending_pages`
-4. metadata-only hole page
-   - 更新 `hole_pages`
-   - all-free → 移出 `hole_pages`，转 `trim_pending_pages`
-5. completely untracked page
-   - partial free → 新建 `hole_pages`
-   - all-free → 直接转 `trim_pending_pages`
+   - `space.release_values` 已经释放 logical slots
+   - scheduler 直接更新 dirty frame summary；不需要 allocator-level
+     `deferred_freed`
+2. readonly cache 命中
+   - 更新 frame summary
+   - still partial → `mark_cached_partial`
+   - full / all-free → `erase_cached_partial`；all-free 同时从 readonly cache
+     删除，实际可分配状态由 manager metadata 决定
+3. nonresident page
+   - 只更新 manager metadata；没有 resident frame summary 要修
+4. all-free page
+   - manager 将其转入 whole-free / trim withheld 候选；scheduler 只有在
+     `prepare_trim` 返回 plan 后才提交 NVMe TRIM
 
 **幂等性**：slot reclaim 一律用 `|=` 聚合，不用计数递增。
 
-### 6.8 `trim_pending` / `complete_trim` 统一路径
+### 6.8 Manager TRIM drain / `complete_trim`
 
 ```text
-mark_trim_pending(class_idx, page_base):
-    trim_pending_pages[page_base] = { class_idx, span_lbas(class_idx), pending }
+drain_trim_pending(max_ranges, max_lbas):
+    plan = space.prepare_trim(max_ranges, max_lbas)
+    if plan.empty():
+        return
 
-prepare_trim_batch():
-    take all trim_pending_pages with state=pending
-    mark as inflight
-    return trim_desc[]
+    value_read_cache.erase_ranges(plan.ranges)
+    submit NVMe TRIM for plan.ranges through local nvme_sched
 
-complete_trim_batch(batch_id, ok=true):
-    for page in batch:
-        trim_pending_pages.erase(page)
-        classes[class_idx].whole_page_pool.push(page)
+    on trim completion ok:
+        space.complete_trim(plan.id, true)
 
-complete_trim_batch(batch_id, ok=false):
-    for page in batch:
-        trim_pending_pages[page].state = pending
+    on trim completion error:
+        space.complete_trim(plan.id, false)
 ```
 
-也就是说 value owner 现在自己保证：
+也就是说 logical TRIM gating 由 `value_space_manager` 保证：
 
 ```text
 all-free
-    -> trim_pending
+    -> manager global_free_extents (logical free, trim eligible)
+    -> prepare_trim withholds selected ranges
     -> NVMe trim complete
-    -> whole-page reusable
+    -> complete_trim returns ranges to global_free_extents
 ```
 
 ### 6.9 TRIM 顺序协议
@@ -1380,21 +1384,27 @@ all-free
 
 ```text
 tree_sched: reclaim_values(dead_value_refs[]) -> value_alloc_sched
-value_alloc_sched: whole-free page -> trim_pending
-upper-layer maintenance: drain_trim_pending() -> prepare_trim_batch -> submit_trim(page_base...) -> complete_trim_batch
-// complete_trim_batch 之前，这些页不会进入 whole_page_pool
+value_alloc_sched: space.release_values(...) -> all-free ranges become trim candidates
+value_alloc_sched maintenance: space.prepare_trim(...) -> submit TRIM -> space.complete_trim(...)
+// complete_trim 之前，withheld ranges 不会重新进入 allocatable free truth
 ```
 
-`persist_put_values` finalize 不负责 TRIM drain。dirty page 上的 deferred reclaim 在 commit / rollback 后若把页凑成 all-free，只会进入 `trim_pending`；真正何时发 TRIM 由上层按 reclaim cadence 决定。
+`persist_put_values` finalize 不负责 TRIM drain。reclaim 若把页凑成 all-free，
+只改变 manager 的 logical state；真正何时发 TRIM 由
+`value_alloc_sched.drain_trim_pending()` 按 reclaim cadence 决定。
 
-### 6.10 `dirty_pages` / `deferred_freed` 生命周期
+### 6.10 `dirty_pages` / cached partial 生命周期
 
 | 事件 | 动作 |
 |------|------|
-| `persist_put_values` 内部 `alloc_page` | `dirty_pages.insert(page_base)` |
-| `persist_put_values` 完成 FUA 后 `return_page` | `dirty_pages.erase(page_base)` + 合并 `deferred_freed` |
-| `handle_reclaim_values` 命中 dirty page | `deferred_freed[page_base] \|= freed_mask`（暂存） |
-| value 写入失败 / abort | 归还 → 同 return_page |
+| `persist_put_values` 收到 `byte_claim` 并准备 DMA frame | `dirty_pages[page_base] = frame_state` |
+| cached claim 的 `page_base + cache_epoch` pin/take 失败 | `space.abort(round)` + `space.erase_cached_partial(...)` + retry |
+| value FUA 成功 | `space.commit(round)`，`dirty_pages.erase(page_base)`，frame 转 clean readonly |
+| value FUA 失败 / abort | `space.abort(round)`，丢弃本 round dirty frame |
+| writeback 后仍 partial | `value_read_cache.put(frame)` + `space.mark_cached_partial(update)` |
+| writeback 后 full / all-free | `space.erase_cached_partial(page_base, cache_epoch)` |
+| `handle_reclaim_values` 命中 dirty page | `space.release_values(...)` 已释放 logical slots；scheduler 同步更新 dirty frame summary |
+| `handle_reclaim_values` 命中 readonly cache | 更新 frame summary，并按 partial/full/all-free 调用 `mark_cached_partial` / `erase_cached_partial` |
 
 ## 7. `nvme_sched`（NVMe Scheduler）
 

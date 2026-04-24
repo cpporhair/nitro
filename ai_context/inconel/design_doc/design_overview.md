@@ -683,12 +683,16 @@ v1 冻结如下规则：
 8. `data_area_base_paddr`
 9. `data_area_end_paddr`
 10. `value_size_classes`
+11. `value_space_quantum_bytes`
+12. `value_space_group_size_lbas`
 
 其中：
 
 1. `shadow_slots_per_range` 直接决定 Shadow CoW 的摊销写放大与 consolidation 频率。
 2. `value_size_classes` 是 Value Area allocator 的格式参数，而不是运行期随意热插拔的策略对象。
-3. `front_sched_count` / WAL stream 数 / memtable 拓扑不属于盘格式；它们在每次 clean start 时作为 runtime state 重新建立。
+3. `value_space_quantum_bytes` 决定 sub-LBA value_ref 如何恢复成 page-local occupied/free quantum ranges；它必须随 superblock 持久化，不能只放在 start-time profile。
+4. `value_space_group_size_lbas` 决定 value partial metadata 的 group 边界；它是格式化时冻结的 disk 参数，start 只读。
+5. `front_sched_count` / WAL stream 数 / memtable 拓扑不属于盘格式；它们在每次 clean start 时作为 runtime state 重新建立。
 
 ### 4.2 Superblock A/B
 
@@ -700,9 +704,10 @@ superblock 是盘格式入口和最新 clean tree 根信息的记录，不是运
 4. `wal_base_paddr / wal_segment_size / wal_segment_count`
 5. `data_area_base_paddr / data_area_end_paddr`
 6. `value_size_classes`
-7. `root_base_paddr`
-8. generation
-9. crc
+7. `value_space_quantum_bytes / value_space_group_size_lbas`
+8. `root_base_paddr`
+9. generation
+10. crc
 
 规则：
 
@@ -1355,7 +1360,7 @@ tree allocator -> [shadow ranges ... free space ... value slabs] <- value alloca
 1. Data Area 不预先切出固定的 tree/value 比例；两端共享同一连续空间。
 2. tree allocator 从低地址向高地址分配，单位是整个 shadow range；`range_size = tree_page_size * shadow_slots_per_range`，并按该粒度天然对齐。
 3. value allocator 从高地址向低地址分配，单位是 `value_size_classes` 定义的 size class / slab。
-4. 两端在中间相遇就表示 Data Area 已满。碰撞检测通过 per-device 的 `std::atomic<uint64_t>` 实现：`tree_sched` 分配新 range 后 relaxed store 更新 `tree_alloc_head`，`value_alloc_sched` bump 分配时 relaxed store 更新 `value_alloc_head`；两侧分配前各自 relaxed load 对方的 head 做本地检查。两个 head 都是单调的（tree 只增，value 只减），读到略旧的值只会导致少分配一点后重试，不破坏正确性。
+4. 两端在中间相遇就表示 Data Area 已满。跨 tree/value owner 的碰撞检测必须是**显式 reservation / fence 协议**，不能只靠两侧各自 relaxed load 对方 head 再本地 bump。旧的 relaxed 论证无效：stale 方向并不保守。tree head 单调增时，value 读到更小的旧 tree head 会以为 tree 占得更少；value head 单调减时，tree 读到更大的旧 value head 会以为 value 占得更少，二者都可能把新区间分配进对方已经保留的区域。典型 race：`tree_head=100, value_head=200`；value 先把 head 降到 `110` 并保留 `[110,200)`，tree relaxed load 仍读到旧 `200`，于是认为 `[100,130)` 可用并写入，和 value 区间重叠。正确边界是：head / floor 的跨 owner 发布至少使用 store-release / load-acquire，并且 acquire/release 只提供发布顺序，不提供“读到最新值”或 check-and-claim 原子性；真正的安全来自单 owner / lock / CAS-over-whole-gap 这类原子 reservation，或 `INC-051` 的 value-space floor 协议（tree 提升 floor 后必须等 value owner 处理并确认该 floor reservation，之后才能使用新吞掉的 LBA 区间）。禁止把 relaxed 采样当作 correctness boundary。
 5. tree 和 value 都有各自的 free pool；真正回收到可重用状态，要等各自对应的读/恢复屏障满足后再由 owner scheduler 处理。
 6. tree free pool 和 value free pool 不混用；tree 侧回收的是整个 shadow range，value 侧回收的是按 size class 组织的 value extent/slab。
 7. value free pool 的来源有两类：

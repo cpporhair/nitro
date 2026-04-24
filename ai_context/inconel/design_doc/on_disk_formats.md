@@ -95,6 +95,8 @@ struct __attribute__((packed)) superblock {
     uint8_t  value_size_class_count;                 // size class 数量
     uint32_t value_size_classes[16];                 // 每个 size class 的字节数（含 header）
                                                      // v1 最多 16 个 class
+    uint32_t value_space_quantum_bytes;              // INC-051 page-local allocation quantum；v1 支持值固定为 64
+    uint32_t value_space_group_size_lbas;            // INC-051 partial metadata group 大小，单位 LBA
 
     // ── 当前状态 ──
     paddr    root_base_paddr;                        // 最新 clean root 的 range base
@@ -480,7 +482,11 @@ struct __attribute__((packed)) value_object_header {
 
 ### 5.2 Size Class 分配
 
-Value Area 按 size class 分配（slab allocator 模式）。每个 size class 的 slab 大小在 superblock 中定义。
+Value Area 按 size class 分配。每个 size class 的 allocation size 在
+superblock 中定义；INC-051 起，sub-LBA page-local allocator 的最小 quantum
+也在 superblock 中定义为 `value_space_quantum_bytes`，当前支持值固定为
+64B。该字段不能只放在 start-time profile，否则 recovery 在 profile 变更后
+可能用错误 quantum 重建 partial page metadata。
 
 ```text
 value_size_classes[] 示例：
@@ -506,8 +512,18 @@ LBA-aligned class (class_size >= lba_size, class_size % lba_size == 0):
   每个 slot 独占 class_size / lba_size 个 LBA
   byte_offset 恒为 0
 
-约束：class_size 必须能整除 lba_size，或 lba_size 能整除 class_size
+约束：
+  class_size 必须能整除 lba_size，或 lba_size 能整除 class_size
+  value_space_quantum_bytes 当前必须为 64
+  lba_size % value_space_quantum_bytes == 0
+  sub-LBA class_size 必须为 value_space_quantum_bytes * 2^n
+  LBA-equal / multi-LBA class_size 必须为 lba_size * 2^m
 ```
+
+`value_space_group_size_lbas` 也是 superblock disk-format 字段。它固定
+value partial metadata 的 group 边界，format/init 写入，start/recovery
+只读；生产默认值为 256 MiB 对应的 LBA 数，合法范围为 64 MiB 到 1 GiB
+对应的 LBA 数，且 `value_space_group_size_lbas * lba_size` 必须是 2 的幂。
 
 ### 5.3 Value Area 物理布局
 
@@ -597,6 +613,10 @@ value_slab_granularity    = value_size_classes[i]
   wal_segment_size % lba_size == 0
   value_size_classes[i] % lba_size == 0 或 lba_size % value_size_classes[i] == 0
   （class 可以是 sub-LBA 或整数个 LBA，但必须能整除或被整除）
+  value_space_quantum_bytes == 64
+  lba_size % value_space_quantum_bytes == 0
+  value_space_group_size_lbas * lba_size 是 2 的幂
+  64 MiB <= value_space_group_size_lbas * lba_size <= 1 GiB
 ```
 
 ## 7. 格式化流程

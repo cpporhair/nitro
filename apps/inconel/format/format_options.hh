@@ -55,6 +55,17 @@ namespace apps::inconel::format {
         // ── WAL area ──
         uint32_t wal_segment_size;
         uint32_t wal_segment_count;   // >= kMinWalSegmentCount
+
+        // ── INC-051 value-space format-time inputs ──
+        //
+        // Defaults match `kBootstrapFormatProfile` — production format
+        // commands MAY override `value_space_group_size_lbas`, but the
+        // legal range is fixed by validate_layout (group_bytes ∈
+        // [64 MiB, 1 GiB], power-of-two). `value_space_quantum_bytes` is
+        // not a knob today (only 64 is supported); future versions that
+        // widen the manager's bitmap can promote it.
+        uint32_t value_space_quantum_bytes   = 64;
+        uint32_t value_space_group_size_lbas = (256u * 1024u * 1024u) / 4096u;
     };
 
 }

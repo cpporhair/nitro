@@ -71,6 +71,22 @@ namespace apps::inconel::format {
         uint8_t  value_size_class_count;
         uint32_t value_size_classes[16];
 
+        // INC-051 (037 plan §"Allocation Quantum" / §"Group 分片"). Both
+        // are disk-format truth, not runtime config: recovery rebuilds
+        // value_space_manager partial metadata using `value_space_quantum_bytes`
+        // to convert (byte_offset, len) → (quantum_offset, quantum_count) and
+        // uses `value_space_group_size_lbas` to materialize per-group
+        // partial maps. Inferring either at start time would silently corrupt
+        // metadata if the on-disk class table or group sharding ever drifted
+        // from the format-time value.
+        //
+        // Hard constraints (enforced by inspect/validate paths):
+        //   value_space_quantum_bytes        == 64 (only supported value)
+        //   value_space_group_size_lbas * lba_size  ∈ [64 MiB, 1 GiB]
+        //   value_space_group_size_lbas * lba_size  is a power of two
+        uint32_t value_space_quantum_bytes;
+        uint32_t value_space_group_size_lbas;
+
         // ── current state ──
         paddr    root_base_paddr;
         uint64_t generation;

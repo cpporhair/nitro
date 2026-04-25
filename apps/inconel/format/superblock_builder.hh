@@ -53,6 +53,9 @@ namespace apps::inconel::format {
             sb.value_size_classes[i] = L.value_class_sizes[i];
         }
 
+        sb.value_space_quantum_bytes   = L.value_space_quantum_bytes;
+        sb.value_space_group_size_lbas = L.value_space_group_size_lbas;
+
         // Null-root sentinel: format-time there is no tree to point at.
         // Recovery reads `root_base_paddr.lba == 0` and treats the leaf
         // record pool as empty (design_overview.md §2.4 / §12.2 step 2).

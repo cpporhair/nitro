@@ -50,6 +50,13 @@ namespace apps::inconel::format {
         // ── value-class table (from options, passed through) ──
         uint8_t  value_class_count;
         uint32_t value_class_sizes[kMaxValueClassCount];
+
+        // ── INC-051 value-space format-time fields (from options,
+        //    passed through). superblock builder writes them into the
+        //    on-disk format; recovery reads them back and feeds the
+        //    value_space_manager. ──
+        uint32_t value_space_quantum_bytes;
+        uint32_t value_space_group_size_lbas;
     };
 
     // ── reserved trailer footprint ─────────────────────────────────────────
@@ -118,6 +125,9 @@ namespace apps::inconel::format {
         for (uint8_t i = 0; i < kMaxValueClassCount; ++i) {
             L.value_class_sizes[i] = opts.value_class_sizes[i];
         }
+
+        L.value_space_quantum_bytes   = opts.value_space_quantum_bytes;
+        L.value_space_group_size_lbas = opts.value_space_group_size_lbas;
 
         return L;
     }
@@ -255,6 +265,48 @@ namespace apps::inconel::format {
                 }
             }
             // cs == lba_size is always valid.
+        }
+
+        // ── INC-051 value-space parameters (037 plan §"Allocation
+        //    Quantum" / §"Group 分片") ──
+        if (L.value_space_quantum_bytes != 64) {
+            throw std::invalid_argument(
+                "validate_layout: value_space_quantum_bytes must be 64 "
+                "(037 §\"Allocation Quantum\")");
+        }
+        if (L.lba_size % L.value_space_quantum_bytes != 0) {
+            throw std::invalid_argument(
+                "validate_layout: lba_size is not a multiple of "
+                "value_space_quantum_bytes");
+        }
+        // quantums_per_lba must fit value_space_manager's uint64_t free-bit
+        // word; reject any geometry that would overflow it.
+        if (L.lba_size / L.value_space_quantum_bytes > 64) {
+            throw std::invalid_argument(
+                "validate_layout: lba_size / value_space_quantum_bytes > 64 "
+                "(value_space_manager's free_quantum_bits is uint64_t)");
+        }
+
+        if (L.value_space_group_size_lbas == 0) {
+            throw std::invalid_argument(
+                "validate_layout: value_space_group_size_lbas is 0");
+        }
+        const uint64_t group_bytes =
+            static_cast<uint64_t>(L.value_space_group_size_lbas) * L.lba_size;
+        if (group_bytes < (64ULL * 1024 * 1024)) {
+            throw std::invalid_argument(
+                "validate_layout: value_space_group_size_lbas * lba_size is "
+                "below 64 MiB (037 §\"Group 分片\" lower bound)");
+        }
+        if (group_bytes > (1024ULL * 1024 * 1024)) {
+            throw std::invalid_argument(
+                "validate_layout: value_space_group_size_lbas * lba_size is "
+                "above 1 GiB (037 §\"Group 分片\" upper bound)");
+        }
+        if ((group_bytes & (group_bytes - 1)) != 0) {
+            throw std::invalid_argument(
+                "validate_layout: value_space_group_size_lbas * lba_size is "
+                "not a power of two (037 §\"Group 分片\" rule 1)");
         }
     }
 

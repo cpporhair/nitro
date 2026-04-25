@@ -72,6 +72,24 @@ namespace apps::inconel::format {
         uint32_t tree_page_size;
         uint32_t shadow_slots_per_range;
 
+        // ── value-space parameters (INC-051, 037 plan) ──
+        //
+        // value_space_quantum_bytes: page-local allocator unit (037 plan
+        // §"Allocation Quantum"). Currently fixed at 64 B; recovery uses it
+        // to invert byte_offset → quantum index and to derive class shapes,
+        // so it MUST come from the superblock (not be re-derived from the
+        // class table).
+        //
+        // value_space_group_size_lbas: group sharding granularity for
+        // sparse partial-page metadata (037 plan §"Group 分片"). Production
+        // default 256 MiB per group; legal range [64 MiB, 1 GiB]; the
+        // product `value_space_group_size_lbas * lba_size` must be a power
+        // of two so group_id arithmetic stays cheap. Like quantum_bytes,
+        // this lives on disk because recovery materializes the same group
+        // sharding it had at format time.
+        uint32_t value_space_quantum_bytes;
+        uint32_t value_space_group_size_lbas;
+
         constexpr std::span<const uint32_t>
         class_sizes() const noexcept {
             return std::span<const uint32_t>(value_class_sizes, value_class_count);
@@ -136,6 +154,23 @@ namespace apps::inconel::format {
         if (p.tree_page_size % p.lba_size != 0) return false;
         if (p.shadow_slots_per_range == 0) return false;
 
+        // ── value-space parameters (INC-051) ──
+        // Currently the only legal quantum is 64 B (037 §"Allocation
+        // Quantum"). lba_size must be an integral multiple, and the
+        // resulting quantums_per_lba must fit the manager's 64-bit free-bit
+        // word.
+        if (p.value_space_quantum_bytes != 64) return false;
+        if (p.lba_size % p.value_space_quantum_bytes != 0) return false;
+        if (p.lba_size / p.value_space_quantum_bytes > 64) return false;
+        // group_size_lbas * lba_size must be a power of two, in
+        // [64 MiB, 1 GiB] (037 §"Group 分片").
+        if (p.value_space_group_size_lbas == 0) return false;
+        const uint64_t group_bytes =
+            static_cast<uint64_t>(p.value_space_group_size_lbas) * p.lba_size;
+        if (group_bytes < (64ULL * 1024 * 1024)) return false;
+        if (group_bytes > (1024ULL * 1024 * 1024)) return false;
+        if ((group_bytes & (group_bytes - 1)) != 0) return false; // power-of-two
+
         return true;
     }
 
@@ -173,6 +208,10 @@ namespace apps::inconel::format {
         // them.
         .tree_page_size         = 4096,
         .shadow_slots_per_range = 1,
+        // INC-051: production defaults. quantum 64 B is the only legal
+        // value today; group size 256 MiB at 4 KiB lba_size = 65536 LBAs.
+        .value_space_quantum_bytes    = 64,
+        .value_space_group_size_lbas  = (256u * 1024u * 1024u) / 4096u,
     };
 
     static_assert(profile_is_self_consistent(kBootstrapFormatProfile),

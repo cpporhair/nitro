@@ -243,6 +243,50 @@ namespace apps::inconel::runtime {
             throw std::invalid_argument(
                 "runtime::build_runtime: profile.shadow_slots_per_range is 0");
         }
+
+        // INC-051 / 037 plan §"Allocation Quantum" + §"Group 分片". Both
+        // fields are disk-format truth (recovery rebuilds value_space_manager
+        // partial metadata from them); reject any drift before the runtime
+        // ever touches a value page.
+        if (profile.value_space_quantum_bytes != 64) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.value_space_quantum_bytes "
+                "must be 64 (only supported value)");
+        }
+        if (profile.lba_size % profile.value_space_quantum_bytes != 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.lba_size is not a multiple "
+                "of profile.value_space_quantum_bytes");
+        }
+        if (profile.lba_size / profile.value_space_quantum_bytes > 64) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.lba_size / "
+                "profile.value_space_quantum_bytes > 64 "
+                "(value_space_manager free_quantum_bits is uint64_t)");
+        }
+        if (profile.value_space_group_size_lbas == 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.value_space_group_size_lbas is 0");
+        }
+        {
+            const uint64_t group_bytes =
+                static_cast<uint64_t>(profile.value_space_group_size_lbas)
+                * profile.lba_size;
+            if (group_bytes < (64ULL * 1024 * 1024)) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile group bytes "
+                    "(value_space_group_size_lbas * lba_size) below 64 MiB");
+            }
+            if (group_bytes > (1024ULL * 1024 * 1024)) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile group bytes above 1 GiB");
+            }
+            if ((group_bytes & (group_bytes - 1)) != 0) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile group bytes not a power "
+                    "of two");
+            }
+        }
         // M-2 (review §1): the cache key `memory::frame_id::span_lbas`
         // is a uint16_t, and `make_tree_frame_id` feeds it
         // `tree_page_size / lba_size` via a static_cast that would
@@ -441,12 +485,15 @@ namespace apps::inconel::runtime {
                     profile.value_data_area_base,
                     profile.value_data_area_end,
                     shared_heads.get(),
-                    ValueCache(opts.value_cache_capacity));
+                    ValueCache(opts.value_cache_capacity),
+                    profile.value_space_quantum_bytes,
+                    profile.value_space_group_size_lbas);
                 core::registry::value_alloc_sched = value_sched;
                 value_sched_singleton = value_sched;
-                shared_heads->value_head_lba.store(
-                    value_sched->alloc_.bump_head().lba,
-                    std::memory_order_relaxed);
+                // value_head_lba is published by value_alloc_sched's ctor
+                // (it constructs the value_space_manager and pins the
+                // initial low watermark to data_area_end). No explicit
+                // publish needed here.
             }
 
             tree::tree_sched* tsched = nullptr;

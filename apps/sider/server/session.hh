@@ -1,6 +1,6 @@
 #pragma once
 
-#include <bits/move_only_function.h>
+#include <functional>
 
 #include "pump/core/lock_free_queue.hh"
 #include "pump/core/op_pusher.hh"

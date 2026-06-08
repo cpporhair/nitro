@@ -21,15 +21,8 @@
 namespace apps::kv::fs {
     namespace _allocate {
 
-        struct leader_res ;
-        struct follower_res ;
-        struct failed_res ;
-
         struct
-        req {
-            data::batch* batch;
-            std::move_only_function<void(std::variant<leader_res*, follower_res, failed_res>)> cb;
-        };
+        req;
 
         struct
         leader_res {
@@ -44,6 +37,12 @@ namespace apps::kv::fs {
 
         struct
         failed_res {
+        };
+
+        struct
+        req {
+            data::batch* batch;
+            std::move_only_function<void(std::variant<leader_res*, follower_res, failed_res>)> cb;
         };
 
         template <typename scheduler_t>
@@ -189,15 +188,9 @@ namespace apps::kv::fs {
     }
 
     namespace _metadata {
-        struct leader_res ;
-        struct follower_res ;
-        struct failed_res ;
 
         struct
-        req {
-            _allocate::leader_res* prev_allocate_res;
-            std::move_only_function<void(std::variant<leader_res*, follower_res, failed_res>)> cb;
-        };
+        req;
 
         struct
         leader_res {
@@ -212,6 +205,12 @@ namespace apps::kv::fs {
 
         struct
         failed_res {
+        };
+
+        struct
+        req {
+            _allocate::leader_res* prev_allocate_res;
+            std::move_only_function<void(std::variant<leader_res*, follower_res, failed_res>)> cb;
         };
 
         template <typename scheduler_t>

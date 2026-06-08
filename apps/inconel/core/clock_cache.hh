@@ -16,27 +16,34 @@ namespace apps::inconel::core {
 
     using memory::frame_id;
     using memory::frame_state;
-    using memory::page_frame;
     using memory::frame_pin;
+    using memory::page_frame;
+    using memory::segmented_frame_pin;
+    using memory::segmented_page_frame;
 
     // ── Clock (second-chance) cache ──
     //
     // Fixed-capacity slot array + ref bit per slot + circular hand.
-    // pin(): find + set ref=1 + return RAII frame_pin (pin_count++)
+    // pin(): find + set ref=1 + return RAII pin_type (pin_count++)
     // put() on full cache: advance hand, clear ref=1 to ref=0, skip
     //   pinned entries, evict first ref=0 + pin_count=0
     //
     // Hot pages (root, upper internal) are touched every lookup, so their
     // ref bit is constantly refreshed and they are never evicted.
     //
-    // Ownership: the cache stores page_frame* and never frees them. The
+    // Ownership: the cache stores frame_type* and never frees them. The
     // caller is sole owner of backing buffers and frame descriptors; the
     // cache is a non-owning index with pin-awareness.
 
-    struct clock_cache {
+    template <typename FrameT = page_frame,
+              typename PinT = frame_pin>
+    struct basic_clock_cache {
+        using frame_type = FrameT;
+        using pin_type = PinT;
+
         struct slot {
             frame_id key{};
-            page_frame* frame = nullptr;
+            frame_type* frame = nullptr;
             bool occupied = false;
             bool ref = false;
         };
@@ -48,7 +55,7 @@ namespace apps::inconel::core {
         uint32_t size_ = 0;
 
         explicit
-        clock_cache(uint32_t capacity)
+        basic_clock_cache(uint32_t capacity)
             : slots_(capacity), capacity_(capacity) {
             if (capacity == 0) {
                 throw std::invalid_argument(
@@ -60,16 +67,16 @@ namespace apps::inconel::core {
         // pin: look up a frame by id, mark as recently used, return an
         // RAII pin that increments pin_count. Returns an empty pin (frame
         // == nullptr) on miss.
-        frame_pin
+        pin_type
         pin(frame_id id) {
             auto it = index_.find(id);
-            if (it == index_.end()) return frame_pin{nullptr};
+            if (it == index_.end()) return pin_type{nullptr};
             auto& s = slots_[it->second];
             s.ref = true;
-            return frame_pin{s.frame};
+            return pin_type{s.frame};
         }
 
-        std::optional<page_frame*>
+        std::optional<frame_type*>
         take(frame_id id) {
             auto it = index_.find(id);
             if (it == index_.end()) return std::nullopt;
@@ -84,7 +91,7 @@ namespace apps::inconel::core {
                     static_cast<unsigned>(id.dom),
                     static_cast<unsigned>(s.frame->pin_count));
             }
-            page_frame* out = s.frame;
+            frame_type* out = s.frame;
             index_.erase(it);
             s.frame = nullptr;
             s.occupied = false;
@@ -99,13 +106,13 @@ namespace apps::inconel::core {
         }
 
         // put: insert a clean_readonly frame into the cache. Returns the
-        // displaced page_frame* in three cases:
+        // displaced frame_type* in three cases:
         //   - key already present → old frame for that key
         //   - cache full, evictable victim found → victim frame
         //   - cache full, all entries pinned → the input frame f (rejected)
         // Returns nullopt when inserted into a free slot.
-        std::optional<page_frame*>
-        put(page_frame* f) {
+        std::optional<frame_type*>
+        put(frame_type* f) {
             if (!f || f->st != frame_state::clean_readonly) {
                 throw std::invalid_argument(
                     "clock_cache::put: frame must be non-null and clean_readonly");
@@ -118,7 +125,7 @@ namespace apps::inconel::core {
             if (auto it = index_.find(f->id); it != index_.end()) {
                 auto& s = slots_[it->second];
                 if (s.frame && s.frame->pin_count > 0) return f;
-                page_frame* old = s.frame;
+                frame_type* old = s.frame;
                 s.frame = f;
                 s.ref = true;
                 return old;
@@ -157,7 +164,7 @@ namespace apps::inconel::core {
 
                 if (!s.ref) {
                     // Evict this slot.
-                    page_frame* victim = s.frame;
+                    frame_type* victim = s.frame;
                     index_.erase(s.key);
 
                     s.key = f->id;
@@ -175,16 +182,16 @@ namespace apps::inconel::core {
         }
 
         // drain_one: teardown-only drain. Pulls one entry out regardless
-        // of ref/pin state and returns its page_frame* so the caller can
+        // of ref/pin state and returns its frame_type* so the caller can
         // free the backing buffer and descriptor. Returns nullopt when
         // empty. Calling repeatedly until nullopt empties the cache.
-        std::optional<page_frame*>
+        std::optional<frame_type*>
         drain_one() {
             if (index_.empty()) return std::nullopt;
             auto it = index_.begin();
             uint32_t idx = it->second;
             auto& s = slots_[idx];
-            page_frame* victim = s.frame;
+            frame_type* victim = s.frame;
             index_.erase(it);
             s.occupied = false;
             s.frame = nullptr;
@@ -196,6 +203,10 @@ namespace apps::inconel::core {
         uint32_t size() const { return size_; }
         uint32_t capacity() const { return capacity_; }
     };
+
+    using clock_cache = basic_clock_cache<>;
+    using segmented_clock_cache =
+        basic_clock_cache<segmented_page_frame, segmented_frame_pin>;
 
 }
 

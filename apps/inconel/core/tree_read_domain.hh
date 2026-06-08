@@ -66,6 +66,7 @@
 #include "./page_cache.hh"        // cache_concept
 #include "./shard_partition.hh"
 #include "./tree_geometry.hh"
+#include "../memory/dma_page_pool.hh"
 
 // Forward-declare the schedulers the read_domain owns. The full
 // definitions live in `tree/lookup_scheduler.hh` /
@@ -162,7 +163,11 @@ namespace apps::inconel::core {
                          std::shared_ptr<const shard_partition_map>  parts,
                          Cache                                       cache,
                          const tree_geometry*                        geom,
-                         std::size_t                                 queue_depth = 2048);
+                         std::size_t                                 queue_depth = 2048,
+                         memory::dma_page_allocator                  frame_allocator =
+                             memory::make_heap_dma_page_allocator(),
+                         uint32_t                                    frame_alignment = 4096,
+                         int                                         frame_numa_id = -1);
 
         ~tree_read_domain() override;
 
@@ -198,13 +203,18 @@ namespace apps::inconel::core {
         std::shared_ptr<const shard_partition_map>  parts,
         Cache                                       cache,
         const tree_geometry*                        geom,
-        std::size_t                                 queue_depth)
+        std::size_t                                 queue_depth,
+        memory::dma_page_allocator                  frame_allocator,
+        uint32_t                                    frame_alignment,
+        int                                         frame_numa_id)
         : tree_read_domain_base(rdi, std::move(parts))
         , node_cache(std::move(cache))
         , lookup(std::make_unique<tree::tree_lookup_sched<Cache>>(
-              this, geom, queue_depth))
+              this, geom, queue_depth, frame_allocator, frame_alignment,
+              frame_numa_id))
         , worker(std::make_unique<tree::tree_worker_sched<Cache>>(
-              this, queue_depth)) {
+              this, geom, queue_depth, frame_allocator, frame_alignment,
+              frame_numa_id)) {
         // Publish base pointers after unique_ptrs are constructed.
         // Non-templated callers see the schedulers through the base
         // class; typed callers still reach them via `lookup.get()`
@@ -226,6 +236,52 @@ namespace apps::inconel::core {
         const bool worker_progress = worker->advance();
         return lookup_progress || worker_progress;
     }
+
+    template <>
+    struct tree_read_domain<clock_cache> : tree_read_domain<segmented_clock_cache> {
+        using base = tree_read_domain<segmented_clock_cache>;
+
+        tree_read_domain(uint32_t                                   rdi,
+                         std::shared_ptr<const shard_partition_map> parts,
+                         clock_cache                                cache,
+                         const tree_geometry*                       geom,
+                         std::size_t                                queue_depth = 2048,
+                         memory::dma_page_allocator                 frame_allocator =
+                             memory::make_heap_dma_page_allocator(),
+                         uint32_t                                   frame_alignment = 4096,
+                         int                                        frame_numa_id = -1)
+            : base(rdi,
+                   std::move(parts),
+                   segmented_clock_cache(cache.capacity()),
+                   geom,
+                   queue_depth,
+                   std::move(frame_allocator),
+                   frame_alignment,
+                   frame_numa_id) {}
+    };
+
+    template <>
+    struct tree_read_domain<slru_cache> : tree_read_domain<segmented_slru_cache> {
+        using base = tree_read_domain<segmented_slru_cache>;
+
+        tree_read_domain(uint32_t                                   rdi,
+                         std::shared_ptr<const shard_partition_map> parts,
+                         slru_cache                                 cache,
+                         const tree_geometry*                       geom,
+                         std::size_t                                queue_depth = 2048,
+                         memory::dma_page_allocator                 frame_allocator =
+                             memory::make_heap_dma_page_allocator(),
+                         uint32_t                                   frame_alignment = 4096,
+                         int                                        frame_numa_id = -1)
+            : base(rdi,
+                   std::move(parts),
+                   segmented_slru_cache(cache.capacity()),
+                   geom,
+                   queue_depth,
+                   std::move(frame_allocator),
+                   frame_alignment,
+                   frame_numa_id) {}
+    };
 
 }  // namespace apps::inconel::core
 

@@ -30,6 +30,8 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -45,6 +47,7 @@
 #include "../core/page_cache.hh"
 #include "../core/panic.hh"
 #include "../core/tree_manifest.hh"
+#include "../memory/dma_page_pool.hh"
 #include "../memory/frame.hh"
 #include "../format/tree_page.hh"
 #include "./lookup.hh"
@@ -210,7 +213,7 @@ namespace apps::inconel::tree {
         void schedule_cache(_cache_pages::req* r)  { cache_queue_.try_enqueue(r); }
 
         auto process(lookup_state& state);
-        auto submit_cache(std::vector<memory::page_frame*> frames);
+        auto submit_cache(std::vector<memory::segmented_page_frame*> frames);
     };
 
     // ── process sender (lookup request) ──
@@ -253,14 +256,14 @@ namespace apps::inconel::tree {
     namespace _cache_pages {
 
         struct req {
-            std::vector<memory::page_frame*> frames;
+            std::vector<memory::segmented_page_frame*> frames;
             std::move_only_function<void(bool)> cb;
         };
 
         struct op {
             constexpr static bool cache_pages_op = true;
             tree_lookup_sched_base* sched;
-            std::vector<memory::page_frame*> frames;
+            std::vector<memory::segmented_page_frame*> frames;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
@@ -268,7 +271,7 @@ namespace apps::inconel::tree {
 
         struct sender {
             tree_lookup_sched_base* sched;
-            std::vector<memory::page_frame*> frames;
+            std::vector<memory::segmented_page_frame*> frames;
 
             auto make_op() {
                 return op{.sched = sched, .frames = std::move(frames)};
@@ -309,11 +312,13 @@ namespace apps::inconel::tree {
         // is recorded here so it can be freed on destruction — regardless
         // of whether the frame is currently in the cache, in free_frames_,
         // or in-flight inside a pipeline request.
-        std::vector<memory::page_frame*> all_frames_;
+        std::vector<memory::segmented_page_frame*> all_frames_;
 
         // Recyclable frames evicted from the cache. Their backing buffer
         // is reused for the next miss read.
-        std::vector<memory::page_frame*> free_frames_;
+        std::vector<memory::segmented_page_frame*> free_frames_;
+
+        memory::lba_dma_page_pool frame_pool_;
 
         static constexpr uint32_t kMaxCacheOpsPerAdvance  = 64;
         static constexpr uint32_t kMaxLookupOpsPerAdvance = 64;
@@ -325,13 +330,19 @@ namespace apps::inconel::tree {
         explicit
         tree_lookup_sched(core::tree_read_domain<Cache>* rd,
                           const core::tree_geometry* geom,
-                          size_t depth = 2048)
+                          size_t depth = 2048,
+                          memory::dma_page_allocator frame_allocator =
+                              memory::make_heap_dma_page_allocator(),
+                          uint32_t frame_alignment = 4096,
+                          int frame_numa_id = -1)
             : tree_lookup_sched_base(geom, depth)
-            , read_domain_(rd) {}
+            , read_domain_(rd)
+            , frame_pool_(geom->lba_size, frame_alignment, frame_numa_id,
+                          frame_allocator) {}
 
         ~tree_lookup_sched() override {
             for (auto* f : all_frames_) {
-                delete[] f->buf;
+                frame_pool_.put_frame(std::move(*f));
                 delete f;
             }
         }
@@ -411,7 +422,7 @@ namespace apps::inconel::tree {
 
             decision_need_read decision;
             prepare_reads(s, decision);
-            if (!decision.read_descs.empty()) {
+            if (!decision.frames.empty()) {
                 --pending_lookups;
                 r->cb(std::move(decision));
                 delete r;
@@ -454,7 +465,10 @@ namespace apps::inconel::tree {
                     make_tree_frame_id(e.next_page, s.page_lbas));
                 if (!pin.frame) continue;
 
-                const char* page = pin.frame->buf;
+                std::vector<char> scratch;
+                auto image = frame_bytes_for_page(
+                    *pin.frame, s.page_size, scratch);
+                const char* page = image.data();
                 auto status = inspect_tree_page(page, s.page_size);
                 if (status != tree_page_status::ok) {
                     core::panic_inconsistency(
@@ -499,7 +513,7 @@ namespace apps::inconel::tree {
                 if (read_domain_->node_cache.contains(make_tree_frame_id(e.next_page, s.page_lbas))) continue;
                 if (inflight_reads_.contains(e.next_page)) continue;
 
-                memory::page_frame* pf;
+                memory::segmented_page_frame* pf;
                 if (!free_frames_.empty()) {
                     pf = free_frames_.back();
                     free_frames_.pop_back();
@@ -508,25 +522,34 @@ namespace apps::inconel::tree {
                     pf->pin_count = 0;
                     pf->crc_valid = false;
                 } else {
-                    pf = new memory::page_frame{
-                        .id       = make_tree_frame_id(e.next_page, s.page_lbas),
-                        .st       = memory::frame_state::clean_readonly,
-                        .buf      = new char[s.page_size],
-                        .byte_len = s.page_size,
-                        .pin_count = 0,
-                        .crc_valid = false,
-                    };
+                    auto frame = frame_pool_
+                        .get_typed_frame<memory::segmented_page_frame>(
+                            make_tree_frame_id(e.next_page, s.page_lbas),
+                            memory::frame_state::clean_readonly,
+                            /*zero_fill=*/false);
+                    if (!frame) {
+                        throw std::runtime_error(
+                            "tree::tree_lookup_sched::prepare_reads: DMA page allocation failed");
+                    }
+                    pf = new memory::segmented_page_frame(std::move(*frame));
                     all_frames_.push_back(pf);
                 }
 
                 inflight_reads_.emplace(e.next_page, pending_read{});
                 decision.frames.push_back(pf);
-                decision.read_descs.push_back({
-                    .lba      = e.next_page.lba,
-                    .buf      = pf->buf,
-                    .num_lbas = s.page_lbas,
-                });
             }
+        }
+
+        static std::span<const char>
+        frame_bytes_for_page(const memory::segmented_page_frame& frame,
+                             uint32_t page_size,
+                             std::vector<char>& scratch) {
+            if (page_size <= frame.lba_size()) {
+                return frame.contiguous_bytes(0, page_size);
+            }
+            scratch.resize(page_size);
+            frame.copy_to_contiguous(scratch.data(), page_size);
+            return std::span<const char>(scratch.data(), scratch.size());
         }
     };
 
@@ -562,7 +585,8 @@ namespace apps::inconel::tree {
     }
 
     inline auto
-    tree_lookup_sched_base::submit_cache(std::vector<memory::page_frame*> frames) {
+    tree_lookup_sched_base::submit_cache(
+        std::vector<memory::segmented_page_frame*> frames) {
         return _cache_pages::sender{this, std::move(frames)};
     }
 

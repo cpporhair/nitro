@@ -54,7 +54,8 @@
 #include "../core/tree_manifest.hh"
 #include "../core/tree_read_domain.hh"
 #include "../format/superblock.hh"
-#include "../mock_nvme/sender.hh"
+#include "../nvme/frame_io.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "../runtime/facade.hh"
 
 namespace apps::inconel::tree {
@@ -78,17 +79,15 @@ namespace apps::inconel::tree {
     // explicit.
     inline auto
     on_decision_need_read(tree_lookup_sched_base* tree_sched, decision_need_read&& dec) {
-        auto n = dec.read_descs.size();
+        auto n = dec.frames.size();
         return just()
             >> with_context(__fwd__(dec))([tree_sched, n]() {
                 return loop(n)
                     >> concurrent()
                     >> get_context<decision_need_read>()
                     >> flat_map([](decision_need_read& ctx, size_t i) {
-                        return rt::local_nvme()->read(
-                            ctx.read_descs[i].lba,
-                            ctx.read_descs[i].buf,
-                            ctx.read_descs[i].num_lbas);
+                        return nvme::read_frame(
+                            rt::local_nvme(), ctx.frames[i]);
                     })
                     >> all()
                     >> get_context<decision_need_read>()
@@ -323,17 +322,15 @@ namespace apps::inconel::tree {
 
         inline auto
         on_flush_round_need_read(flush_round_need_read &&dec) {
-            auto n = dec.read_descs.size();
+            auto n = dec.reads.size();
             return just()
                 >> with_context(__fwd__(dec))([n]() {
                     return loop(n)
                         >> concurrent()
                         >> get_context<flush_round_need_read>()
                         >> flat_map([](flush_round_need_read &ctx, size_t i) {
-                            return rt::local_nvme()->read(
-                                ctx.read_descs[i].lba,
-                                ctx.read_descs[i].buf,
-                                ctx.read_descs[i].num_lbas);
+                            return nvme::read_frame(
+                                rt::local_nvme(), ctx.reads[i]);
                         })
                         >> all();
                     // No cache submit — flush reads are about to be retired.
@@ -371,12 +368,13 @@ namespace apps::inconel::tree {
             uint64_t           inactive_lba  = 0;
             superblock_slot    inactive_slot = superblock_slot::A;
             uint32_t           lba_size      = 0;
-            std::vector<char>  read_buf;
-            std::vector<char>  write_buf;
+            memory::pooled_frame_ptr<memory::segmented_tree_frame> read_frame;
+            memory::pooled_frame_ptr<memory::segmented_tree_frame> write_frame;
         };
 
         inline auto
         perform_superblock_io(begin_update_superblock_result r) {
+            auto* owner = rt::owner();
             superblock_update_state st{
                 .round_id            = r.round_id,
                 .new_root_base_paddr = r.new_root_base_paddr,
@@ -384,8 +382,16 @@ namespace apps::inconel::tree {
                 .inactive_lba        = r.inactive_lba,
                 .inactive_slot       = r.inactive_slot,
                 .lba_size            = r.lba_size,
-                .read_buf            = std::vector<char>(r.lba_size, '\0'),
-                .write_buf           = std::vector<char>(r.lba_size, '\0'),
+                .read_frame          = owner->alloc_frame(
+                    paddr{r.new_root_base_paddr.device_id, r.active_lba},
+                    1,
+                    memory::frame_id::domain::superblock_page),
+                .write_frame         = owner->alloc_frame(
+                    paddr{r.new_root_base_paddr.device_id, r.inactive_lba},
+                    1,
+                    memory::frame_id::domain::superblock_page,
+                    memory::frame_state::dirty_append,
+                    /*zero_fill=*/true),
             };
             // `with_context(v)(body)` is a bind_back — the `flat_map`
             // inside `finalize_root_change` that consumes us needs a
@@ -394,14 +400,14 @@ namespace apps::inconel::tree {
                 >> with_context(std::move(st))([]() {
                 return get_context<superblock_update_state>()
                     >> flat_map([](superblock_update_state& s) {
-                        return rt::local_nvme()->read(
-                            s.active_lba, s.read_buf.data(), 1);
+                        return nvme::read_frame(
+                            rt::local_nvme(), s.read_frame.get());
                     })
                     >> get_context<superblock_update_state>()
                     >> then([](superblock_update_state& s, bool read_ok) -> bool {
                         if (!read_ok) return false;
                         format::superblock cur{};
-                        std::memcpy(&cur, s.read_buf.data(), sizeof(cur));
+                        s.read_frame->copy_to(0, &cur, sizeof(cur));
                         auto status = format::inspect_superblock(cur);
                         if (status != format::superblock_status::ok) {
                             core::panic_inconsistency(
@@ -413,8 +419,7 @@ namespace apps::inconel::tree {
                         cur.generation += 1;
                         cur.crc = 0;
                         cur.crc = format::superblock_compute_crc(cur);
-                        std::fill(s.write_buf.begin(), s.write_buf.end(), '\0');
-                        std::memcpy(s.write_buf.data(), &cur, sizeof(cur));
+                        s.write_frame->copy_from(0, &cur, sizeof(cur));
                         return true;
                     })
                     >> visit()
@@ -423,11 +428,10 @@ namespace apps::inconel::tree {
                             superblock_update_state& s, Flag&&) {
                         if constexpr (std::is_same_v<
                                 std::decay_t<Flag>, std::true_type>) {
-                            return rt::local_nvme()->write(
-                                s.inactive_lba,
-                                s.write_buf.data(),
-                                1,
-                                mock_nvme::IO_FLAGS_FUA);
+                            return nvme::write_frame(
+                                rt::local_nvme(),
+                                s.write_frame.get(),
+                                nvme::IO_FLAGS_FUA);
                         } else {
                             return just(false);
                         }
@@ -465,15 +469,14 @@ namespace apps::inconel::tree {
         // chain — the NVMe scheduler sees all N ops as concurrent
         // in-flight requests, no kind-based serialization.
         //
-        // Pointer lifetime:
-        //   - read_desc.buf → `merge_round_state::fetched_old_pages[rb].data()`
-        //     (tree_sched-owned; lives until finalize_merge)
-        //   - write_desc.data → `mem_tree_node::content.data()` inside
-        //     `merge_round_state::combined_root` (same lifetime)
-        // NVMe read DMAs directly into the fetched buffers; NVMe
-        // write DMAs from the tree page buffer. After the iter's
-        // all() barrier completes, the next merge_step resume picks
-        // up the fresh bytes in place.
+        // Descriptor lifetime:
+        //   - frame_read_desc.frame points into
+        //     merge_round_state::fetched_old_frames.
+        //   - frame_write_desc.frame points into
+        //     merge_round_state::writeback_frames.
+        // Both vectors are tree_sched-owned and live until
+        // finalize_merge. After the iter's all() barrier completes,
+        // the next merge_step resume can inspect fetched frames.
         //
         // If `io.has_reads` is set (the seam handler precomputed it
         // so we don't re-scan), the iter ACKs back via
@@ -489,13 +492,12 @@ namespace apps::inconel::tree {
                 >> visit()
                 >> flat_map([]<typename D>(D&& d) {
                     using T = std::decay_t<D>;
-                    auto* nvme = rt::local_nvme();
-                    if constexpr (std::is_same_v<T, format::read_desc>) {
-                        return nvme->read(d.lba, d.buf, d.num_lbas);
+                    auto* sched = rt::local_nvme();
+                    if constexpr (std::is_same_v<T, memory::frame_read_desc>) {
+                        return nvme::read_frame(sched, d);
                     } else {
-                        static_assert(std::is_same_v<T, format::write_desc>);
-                        return nvme->write(
-                            d.lba, d.data, d.num_lbas, d.flags);
+                        static_assert(std::is_same_v<T, memory::frame_write_desc>);
+                        return nvme::write_frame(sched, d);
                     }
                 })
                 >> all()

@@ -51,6 +51,8 @@
 
 #include "../core/page_cache.hh"
 #include "../core/panic.hh"
+#include "../core/tree_geometry.hh"
+#include "../memory/dma_page_pool.hh"
 #include "./candidate_build.hh"
 #include "./flush_types.hh"
 #include "./lookup_scheduler.hh"
@@ -156,6 +158,7 @@ namespace apps::inconel::tree {
     template <core::cache_concept Cache>
     struct tree_worker_sched : tree_worker_sched_base {
         core::tree_read_domain<Cache>* read_domain_ = nullptr;
+        memory::lba_dma_page_pool frame_pool_;
 
         // Constructed by `core::tree_read_domain<Cache>::ctor` with
         // `this` pointing back at the enclosing read_domain (030 §2.8
@@ -163,9 +166,16 @@ namespace apps::inconel::tree {
         // sit in the same `unique_ptr` tree.
         explicit
         tree_worker_sched(core::tree_read_domain<Cache>* rd,
-                          std::size_t                    depth = 2048)
+                          const core::tree_geometry*      geom,
+                          std::size_t                    depth = 2048,
+                          memory::dma_page_allocator     frame_allocator =
+                              memory::make_heap_dma_page_allocator(),
+                          uint32_t                       frame_alignment = 4096,
+                          int                            frame_numa_id = -1)
             : tree_worker_sched_base(depth)
-            , read_domain_(rd) {}
+            , read_domain_(rd)
+            , frame_pool_(geom->lba_size, frame_alignment, frame_numa_id,
+                          frame_allocator) {}
 
         uint32_t
         read_domain_index() const noexcept override {
@@ -197,7 +207,8 @@ namespace apps::inconel::tree {
                         static_cast<unsigned>(read_domain_->read_domain_index));
                 }
 
-                auto decision = process_flush_round(*r->state, &read_domain_->node_cache);
+                auto decision = process_flush_round(
+                    *r->state, &read_domain_->node_cache, &frame_pool_);
                 r->cb(std::move(decision));
                 delete r;
                 progress = true;

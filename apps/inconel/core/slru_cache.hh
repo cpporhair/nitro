@@ -16,8 +16,10 @@ namespace apps::inconel::core {
 
     using memory::frame_id;
     using memory::frame_state;
-    using memory::page_frame;
     using memory::frame_pin;
+    using memory::page_frame;
+    using memory::segmented_frame_pin;
+    using memory::segmented_page_frame;
 
     // ── Segmented LRU cache ──
     //
@@ -36,12 +38,17 @@ namespace apps::inconel::core {
     // Scan resistance: a one-pass scan only fills probation, never threatens
     // protected segment where hot pages live.
 
-    struct slru_cache {
+    template <typename FrameT = page_frame,
+              typename PinT = frame_pin>
+    struct basic_slru_cache {
+        using frame_type = FrameT;
+        using pin_type = PinT;
+
         static constexpr uint32_t NIL = UINT32_MAX;
 
         struct node {
             frame_id key{};
-            page_frame* frame = nullptr;
+            frame_type* frame = nullptr;
             uint32_t prev = NIL;
             uint32_t next = NIL;
             bool in_protected = false;
@@ -63,7 +70,7 @@ namespace apps::inconel::core {
         uint32_t free_head_ = NIL;  // free node list
 
         explicit
-        slru_cache(uint32_t capacity, float prot_ratio = 0.8f)
+        basic_slru_cache(uint32_t capacity, float prot_ratio = 0.8f)
             : nodes_(capacity)
             , prot_cap_(static_cast<uint32_t>(capacity * prot_ratio))
             , prob_cap_(capacity - static_cast<uint32_t>(capacity * prot_ratio)) {
@@ -87,10 +94,10 @@ namespace apps::inconel::core {
         // pin: look up a frame by id, promote it (probation→protected or
         // protected→head), return an RAII pin that increments pin_count.
         // Returns an empty pin (frame == nullptr) on miss.
-        frame_pin
+        pin_type
         pin(frame_id id) {
             auto it = index_.find(id);
-            if (it == index_.end()) return frame_pin{nullptr};
+            if (it == index_.end()) return pin_type{nullptr};
             uint32_t idx = it->second;
             auto& n = nodes_[idx];
 
@@ -100,10 +107,10 @@ namespace apps::inconel::core {
                 unlink_probation(idx);
                 promote_to_protected(idx);
             }
-            return frame_pin{n.frame};
+            return pin_type{n.frame};
         }
 
-        std::optional<page_frame*>
+        std::optional<frame_type*>
         take(frame_id id) {
             auto it = index_.find(id);
             if (it == index_.end()) return std::nullopt;
@@ -119,7 +126,7 @@ namespace apps::inconel::core {
                     static_cast<unsigned>(id.dom),
                     static_cast<unsigned>(n.frame->pin_count));
             }
-            page_frame* out = n.frame;
+            frame_type* out = n.frame;
             if (n.in_protected) unlink_protected(idx);
             else unlink_probation(idx);
             index_.erase(it);
@@ -133,11 +140,11 @@ namespace apps::inconel::core {
         }
 
         // put: insert a clean_readonly frame. Returns the displaced
-        // page_frame* on replacement or eviction; returns f itself if
+        // frame_type* on replacement or eviction; returns f itself if
         // probation is full and all entries are pinned (rejected).
         // Returns nullopt when inserted into a free slot.
-        std::optional<page_frame*>
-        put(page_frame* f) {
+        std::optional<frame_type*>
+        put(frame_type* f) {
             if (!f || f->st != frame_state::clean_readonly) {
                 throw std::invalid_argument(
                     "slru_cache::put: frame must be non-null and clean_readonly");
@@ -148,7 +155,7 @@ namespace apps::inconel::core {
             // keeps the old frame (no promote/move), caller gets f back.
             if (auto it = index_.find(f->id); it != index_.end()) {
                 uint32_t idx = it->second;
-                page_frame* old = nodes_[idx].frame;
+                frame_type* old = nodes_[idx].frame;
                 if (old && old->pin_count > 0) return f;
                 nodes_[idx].frame = f;
                 if (nodes_[idx].in_protected) {
@@ -160,7 +167,7 @@ namespace apps::inconel::core {
                 return old;
             }
 
-            std::optional<page_frame*> result;
+            std::optional<frame_type*> result;
 
             // Probation full → evict the LRU non-pinned probation entry.
             if (prob_size_ >= prob_cap_) {
@@ -190,14 +197,14 @@ namespace apps::inconel::core {
         }
 
         // drain_one: teardown-only drain. Pulls one entry regardless of
-        // pin state and returns its page_frame*. Probation tail first, then
+        // pin state and returns its frame_type*. Probation tail first, then
         // protected tail. Returns nullopt when empty.
-        std::optional<page_frame*>
+        std::optional<frame_type*>
         drain_one() {
             if (prob_tail_ != NIL) {
                 uint32_t idx = prob_tail_;
                 auto& n = nodes_[idx];
-                page_frame* victim = n.frame;
+                frame_type* victim = n.frame;
                 unlink_probation(idx);
                 index_.erase(n.key);
                 free_node(idx);
@@ -206,7 +213,7 @@ namespace apps::inconel::core {
             if (prot_tail_ != NIL) {
                 uint32_t idx = prot_tail_;
                 auto& n = nodes_[idx];
-                page_frame* victim = n.frame;
+                frame_type* victim = n.frame;
                 unlink_protected(idx);
                 index_.erase(n.key);
                 free_node(idx);
@@ -324,6 +331,10 @@ namespace apps::inconel::core {
             link_protected_head(idx);
         }
     };
+
+    using slru_cache = basic_slru_cache<>;
+    using segmented_slru_cache =
+        basic_slru_cache<segmented_page_frame, segmented_frame_pin>;
 
 }
 

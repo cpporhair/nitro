@@ -15,18 +15,19 @@ namespace apps::inconel::core {
     //
     // Any type satisfying this concept can be plugged into the templated
     // tree_lookup_sched and value_alloc_sched. Concrete implementations:
-    // clock_cache, slru_cache.
+    // clock_cache/slru_cache for legacy contiguous frames, and
+    // segmented_clock_cache/segmented_slru_cache for LBA DMA frames.
     //
     // Compile-time interface contract — no virtual dispatch, no variant
     // visit, all calls are inlined directly at the use site.
     //
     // Ownership rules:
     //
-    //   - The cache stores page_frame* and never frees them on its own.
-    //     The caller owns both the page_frame descriptor and its backing
+    //   - The cache stores Cache::frame_type* and never frees them on its own.
+    //     The caller owns both the frame descriptor and its backing
     //     buffer; the cache is a non-owning index with pin semantics.
     //   - `put(f)` only accepts frames with st == clean_readonly.
-    //     Returns optional<page_frame*> whenever the call displaces a
+    //     Returns optional<frame_type*> whenever the call displaces a
     //     previously-held frame:
     //       * key already present + old pin_count == 0 → returned frame
     //         is the OLD entry (the cache now holds the new f).
@@ -40,7 +41,7 @@ namespace apps::inconel::core {
     //       * key absent + cache has space → returns nullopt.
     //     In every "Some(...)" case the caller MUST free the returned
     //     frame + its backing buffer.
-    //   - `pin(id)` returns an RAII frame_pin. On hit, pin_count is
+    //   - `pin(id)` returns the cache's RAII pin_type. On hit, pin_count is
     //     incremented before the pin is returned. On miss, the pin's
     //     frame pointer is nullptr.
     //   - `take(id)` removes a clean frame from the cache and returns it
@@ -55,18 +56,22 @@ namespace apps::inconel::core {
     template <typename C>
     concept cache_concept = requires(C c, const C cc,
                                      memory::frame_id id,
-                                     memory::page_frame* f) {
-        { c.pin(id) }       -> std::same_as<memory::frame_pin>;
-        { c.take(id) }      -> std::same_as<std::optional<memory::page_frame*>>;
-        { c.put(f) }        -> std::same_as<std::optional<memory::page_frame*>>;
+                                     typename C::frame_type* f) {
+        typename C::frame_type;
+        typename C::pin_type;
+        { c.pin(id) }       -> std::same_as<typename C::pin_type>;
+        { c.take(id) }      -> std::same_as<std::optional<typename C::frame_type*>>;
+        { c.put(f) }        -> std::same_as<std::optional<typename C::frame_type*>>;
         { cc.contains(id) } -> std::same_as<bool>;
         { cc.size() }       -> std::same_as<uint32_t>;
         { cc.capacity() }   -> std::same_as<uint32_t>;
-        { c.drain_one() }   -> std::same_as<std::optional<memory::page_frame*>>;
+        { c.drain_one() }   -> std::same_as<std::optional<typename C::frame_type*>>;
     };
 
     static_assert(cache_concept<clock_cache>);
     static_assert(cache_concept<slru_cache>);
+    static_assert(cache_concept<segmented_clock_cache>);
+    static_assert(cache_concept<segmented_slru_cache>);
 
 }
 

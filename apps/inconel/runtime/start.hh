@@ -22,7 +22,9 @@ namespace apps::inconel::runtime {
     // main core.
     //
     // The cache template parameters only cross this single dispatch point —
-    // every other module sees only base classes via core::registry. Two
+    // production runtime policies instantiate the segmented cache aliases
+    // used by LBA DMA frames. Every other module sees only base classes via
+    // core::registry. Two
     // nested template dispatches expand into 4 instantiations
     // (clock×clock, clock×slru, slru×clock, slru×slru), which is more
     // readable than a flat 4-way if/else chain.
@@ -52,7 +54,7 @@ namespace apps::inconel::runtime {
 
         std::span<const uint32_t> cores;
         uint32_t                  main_core = 0;
-        mock_nvme::mock_device*   device;
+        nvme::runtime_device*     device;
     };
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
@@ -94,9 +96,9 @@ namespace apps::inconel::runtime {
     inline void
     start_with_tree(const start_options& opts) {
         if (opts.value_cache_policy == "clock") {
-            run_with<TreeCache, core::clock_cache>(opts);
+            run_with<TreeCache, core::segmented_clock_cache>(opts);
         } else if (opts.value_cache_policy == "slru") {
-            run_with<TreeCache, core::slru_cache>(opts);
+            run_with<TreeCache, core::segmented_slru_cache>(opts);
         } else {
             throw std::invalid_argument("unknown value_cache_policy");
         }
@@ -105,9 +107,9 @@ namespace apps::inconel::runtime {
     inline void
     start_runtime(const start_options& opts) {
         if (opts.tree_cache_policy == "clock") {
-            start_with_tree<core::clock_cache>(opts);
+            start_with_tree<core::segmented_clock_cache>(opts);
         } else if (opts.tree_cache_policy == "slru") {
-            start_with_tree<core::slru_cache>(opts);
+            start_with_tree<core::segmented_slru_cache>(opts);
         } else {
             throw std::invalid_argument("unknown tree_cache_policy");
         }

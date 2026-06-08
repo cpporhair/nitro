@@ -35,6 +35,7 @@
 #include "../core/tree_manifest.hh"
 #include "../format/tree_page.hh"
 #include "../format/types.hh"
+#include "../memory/dma_page_pool.hh"
 #include "../memory/frame.hh"
 #include "./flush_types.hh"
 #include "./lookup_scheduler.hh"
@@ -70,8 +71,8 @@ namespace apps::inconel::tree {
             // memtable winners.
             std::span<const flush_key_group> keys;
 
-            // NVMe read landing buffer; may stay null if cache hit.
-            std::unique_ptr<char[]> read_buf;
+            // NVMe read landing frame; may stay empty if cache hit.
+            memory::pooled_frame_ptr<memory::segmented_tree_frame> read_frame;
             bool page_loaded   = false;
             bool read_inflight = false;
             bool merged        = false;
@@ -585,6 +586,18 @@ namespace apps::inconel::tree {
 
     using _wb::merge_and_build_leaf_impl;
 
+    inline std::span<const char>
+    frame_bytes_for_page(const memory::segmented_page_frame& frame,
+                         uint32_t page_size,
+                         std::vector<char>& scratch) {
+        if (page_size <= frame.lba_size()) {
+            return frame.contiguous_bytes(0, page_size);
+        }
+        scratch.resize(page_size);
+        frame.copy_to_contiguous(scratch.data(), page_size);
+        return std::span<const char>(scratch.data(), scratch.size());
+    }
+
     inline leaf_page_image
     make_leaf_page_image(std::unique_ptr<mem_tree_node> node,
                          uint32_t                       page_size)
@@ -657,13 +670,15 @@ namespace apps::inconel::tree {
     // Worker advance() calls this once per round, supplying the
     // worker_state and the read-domain-local cache. Returns
     // `flush_round_done` once the leaf chain is complete, or
-    // `flush_round_need_read` with a batch of old leaf reads to
-    // dispatch. The returned read_desc buffers are owned by
-    // `worker_state.leaves[*].read_buf`.
+    // `flush_round_need_read` with a batch of old leaf frame reads to
+    // dispatch. The returned frame descriptors point at frames owned by
+    // `worker_state.leaves[*].read_frame`.
 
     template <core::cache_concept Cache>
     inline flush_round_decision
-    process_flush_round(worker_state& s, Cache* cache)
+    process_flush_round(worker_state& s,
+                        Cache* cache,
+                        memory::lba_dma_page_pool* frame_pool)
     {
         if (s.all_done) {
             return flush_round_done{};
@@ -723,17 +738,17 @@ namespace apps::inconel::tree {
         for (auto& lw : s.leaves) {
             if (lw.merged || !lw.page_loaded) continue;
 
-            memory::frame_pin pin{nullptr};
-            const char* page_data = nullptr;
+            typename Cache::pin_type pin{nullptr};
+            const memory::segmented_page_frame* page_frame = nullptr;
             if (cache) {
                 pin = cache->pin(make_tree_frame_id(
                     lw.old_slot_paddr, s.page_lbas));
-                if (pin.frame) page_data = pin.frame->buf;
+                if (pin.frame) page_frame = pin.frame;
             }
-            if (!page_data && lw.read_buf) {
-                page_data = lw.read_buf.get();
+            if (page_frame == nullptr && lw.read_frame) {
+                page_frame = lw.read_frame.get();
             }
-            if (!page_data) {
+            if (page_frame == nullptr) {
                 core::panic_inconsistency(
                     "process_flush_round",
                     "leaf page_loaded but no page bytes "
@@ -741,10 +756,13 @@ namespace apps::inconel::tree {
                     static_cast<unsigned>(s.read_domain_index),
                     static_cast<unsigned>(lw.leaf_idx));
             }
+            std::vector<char> scratch;
+            auto image = frame_bytes_for_page(
+                *page_frame, s.page_size, scratch);
 
             absl::InlinedVector<core::retired_value_ref, 64> retired_old_values;
             auto built_pages = _wb::merge_and_build_leaf_impl(
-                page_data,
+                image.data(),
                 s.page_size,
                 lw.keys,
                 s.recovery_safe_lsn,
@@ -760,7 +778,7 @@ namespace apps::inconel::tree {
                 s.page_size));
 
             lw.merged = true;
-            lw.read_buf.reset();
+            lw.read_frame.reset();
         }
 
         bool all_leaves_merged = true;
@@ -775,15 +793,34 @@ namespace apps::inconel::tree {
             flush_round_need_read need;
             for (auto& lw : s.leaves) {
                 if (lw.page_loaded || lw.read_inflight) continue;
-                lw.read_buf = std::make_unique<char[]>(s.page_size);
-                need.read_descs.push_back(format::read_desc{
-                    .lba      = lw.old_slot_paddr.lba,
-                    .buf      = lw.read_buf.get(),
-                    .num_lbas = s.page_lbas,
+                if (frame_pool == nullptr) {
+                    core::panic_inconsistency(
+                        "process_flush_round",
+                        "frame_pool is null for NVMe leaf read");
+                }
+                auto frame = frame_pool
+                    ->get_typed_frame<memory::segmented_tree_frame>(
+                        make_tree_frame_id(lw.old_slot_paddr, s.page_lbas),
+                        memory::frame_state::clean_readonly,
+                        /*zero_fill=*/false);
+                if (!frame) {
+                    core::panic_inconsistency(
+                        "process_flush_round",
+                        "failed to allocate DMA frame for old leaf "
+                        "(rdi=%u leaf_idx=%u)",
+                        static_cast<unsigned>(s.read_domain_index),
+                        static_cast<unsigned>(lw.leaf_idx));
+                }
+                lw.read_frame =
+                    memory::pooled_frame_ptr<memory::segmented_tree_frame>(
+                        frame_pool,
+                        new memory::segmented_tree_frame(std::move(*frame)));
+                need.reads.push_back(memory::frame_read_desc{
+                    .frame = lw.read_frame.get(),
                 });
                 lw.read_inflight = true;
             }
-            if (need.read_descs.empty()) {
+            if (need.reads.empty()) {
                 core::panic_inconsistency(
                     "process_flush_round",
                     "leaf worker made no progress and staged no reads "

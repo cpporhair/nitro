@@ -1,6 +1,7 @@
 #ifndef APPS_INCONEL_RUNTIME_BUILDER_HH
 #define APPS_INCONEL_RUNTIME_BUILDER_HH
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -20,7 +21,8 @@
 #include "../core/tree_read_domain.hh"
 #include "../format/format_profile.hh"
 #include "../format/types.hh"
-#include "../mock_nvme/scheduler.hh"
+#include "../memory/spdk_dma_page_allocator.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "../tree/scheduler.hh"
 #include "../value/scheduler.hh"
 #include "./facade.hh"
@@ -55,7 +57,7 @@ namespace apps::inconel::runtime {
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     using inconel_runtime_t = pump::env::runtime::global_runtime_t<
-        mock_nvme::scheduler,
+        nvme::runtime_scheduler,
         core::tree_read_domain<TreeCache>,
         value::value_alloc_sched<ValueCache>,
         tree::tree_sched
@@ -84,7 +86,7 @@ namespace apps::inconel::runtime {
     // ── Build context ──
     //
     // `cores` lists every core that participates in the runtime. Each such
-    // core unconditionally hosts a `mock_nvme::scheduler` so the per-core
+    // core unconditionally hosts an `nvme::runtime_scheduler` so the per-core
     // advance loop always has an I/O seam available.
     //
     // The three per-role fields describe where the remaining schedulers
@@ -109,7 +111,7 @@ namespace apps::inconel::runtime {
 
     struct build_options {
         std::span<const uint32_t> cores;             // which cores to populate
-        mock_nvme::mock_device*   device;            // nvme backing device
+        nvme::runtime_device*     device;            // nvme backing device
 
         // Optional per-role topology. Leave default for the symmetric
         // layout (read_domain on every core, value + owner on cores[0]).
@@ -132,6 +134,20 @@ namespace apps::inconel::runtime {
         // value cache capacity (entries). Applies to value::value_alloc_sched<ValueCache>.
         // Same minimum-capacity rules as tree_cache_capacity above.
         uint32_t                  value_cache_capacity = 32;
+
+        // Per-role scheduler queue depths. Existing callers that do not set
+        // them keep the previous constructor defaults.
+        size_t                    tree_queue_depth = 2048;
+        size_t                    value_queue_depth = 2048;
+
+        // Real NVMe scheduler queue knobs. The device/qpair lifecycle is owned
+        // by nvme::real_device; these tune the per-core PUMP scheduler and
+        // the request-scope LBA DMA page pool.
+        size_t                    nvme_queue_depth = 2048;
+        size_t                    nvme_local_depth = 128;
+        uint64_t                  nvme_dma_pool_pages_per_core = 4096;
+        uint32_t                  nvme_dma_alignment = 4096;
+        int                       nvme_numa_id = SPDK_ENV_NUMA_ID_ANY;
     };
 
     // ── validate_build_inputs ──
@@ -305,15 +321,23 @@ namespace apps::inconel::runtime {
         }
 
         // ── tier 3: profile ↔ device agreement ──
-        if (opts.device->get_lba_size() != profile.lba_size) {
+        if (opts.device->sector_size() == 0) {
             throw std::invalid_argument(
-                "runtime::build_runtime: device lba_size does not match "
-                "profile.lba_size");
+                "runtime::build_runtime: real NVMe sector_size is 0");
         }
-        if (opts.device->get_total_lbas() < profile.value_data_area_end.lba) {
+        if (profile.lba_size % opts.device->sector_size() != 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.lba_size is not an "
+                "integral multiple of real NVMe sector_size");
+        }
+        if (opts.device->total_logical_lbas(profile.lba_size) <
+            profile.value_data_area_end.lba) {
             throw std::runtime_error(
-                "runtime::build_runtime: device namespace too small for "
+                "runtime::build_runtime: real NVMe namespace too small for "
                 "profile value_data_area_end.lba");
+        }
+        for (uint32_t core : opts.cores) {
+            (void)opts.device->qpair_for_core(core);
         }
 
         // ── tier 4: role-core membership ──
@@ -371,7 +395,7 @@ namespace apps::inconel::runtime {
     //      The shard count tracks the number of read_domain hosts, not
     //      the total core count.
     //   4. Per core in `opts.cores`:
-    //        - unconditionally build `mock_nvme::scheduler`;
+    //        - unconditionally build `nvme::runtime_scheduler`;
     //        - if this core is a read_domain host, build
     //          `tree_read_domain<TreeCache>` (which owns
     //          `tree_lookup_sched` / `tree_worker_sched` via unique_ptr);
@@ -458,7 +482,15 @@ namespace apps::inconel::runtime {
             // before constructing schedulers that hold such queues.
             pump::core::this_core_id = core;
 
-            auto* nvme = new mock_nvme::scheduler(opts.device);
+            auto* nvme_sched = new nvme::runtime_scheduler(
+                opts.device->qpair_for_core(core),
+                profile.lba_size,
+                opts.nvme_dma_pool_pages_per_core,
+                opts.nvme_queue_depth,
+                opts.nvme_local_depth,
+                opts.nvme_dma_alignment,
+                opts.nvme_numa_id,
+                opts.device->device_id());
 
             // H-1 (review §1): every tree_lookup_sched is locked to a
             // single tree_geometry instance — namely the bootstrap one
@@ -474,7 +506,11 @@ namespace apps::inconel::runtime {
                     static_cast<uint32_t>(rd_index),
                     core::registry::current_shard_partitions(),
                     TreeCache(opts.tree_cache_capacity),
-                    &kBootstrapTreeGeometry);
+                    &kBootstrapTreeGeometry,
+                    opts.tree_queue_depth,
+                    memory::make_spdk_dma_page_allocator(),
+                    opts.nvme_dma_alignment,
+                    opts.nvme_numa_id);
             }
 
             value_sched_t* value_sched = nullptr;
@@ -487,7 +523,11 @@ namespace apps::inconel::runtime {
                     shared_heads.get(),
                     ValueCache(opts.value_cache_capacity),
                     profile.value_space_quantum_bytes,
-                    profile.value_space_group_size_lbas);
+                    profile.value_space_group_size_lbas,
+                    opts.value_queue_depth,
+                    memory::make_spdk_dma_page_allocator(),
+                    opts.nvme_dma_alignment,
+                    opts.nvme_numa_id);
                 core::registry::value_alloc_sched = value_sched;
                 value_sched_singleton = value_sched;
                 // value_head_lba is published by value_alloc_sched's ctor
@@ -501,7 +541,11 @@ namespace apps::inconel::runtime {
                 tsched = new tree::tree_sched(
                     &kBootstrapTreeGeometry,
                     profile.value_data_area_base,
-                    shared_heads.get());
+                    shared_heads.get(),
+                    opts.tree_queue_depth,
+                    memory::make_spdk_dma_page_allocator(),
+                    opts.nvme_dma_alignment,
+                    opts.nvme_numa_id);
                 core::registry::tree_sched_singleton_ptr = tsched;
                 tsched_singleton = tsched;
                 shared_heads->tree_head_lba.store(
@@ -510,11 +554,12 @@ namespace apps::inconel::runtime {
 
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
             // nvme, tree_read_domain, value_alloc, tree_sched.
-            rt->add_core_schedulers(core, nvme, read_domain, value_sched, tsched);
+            rt->add_core_schedulers(
+                core, nvme_sched, read_domain, value_sched, tsched);
 
             // Application registry (non-templated)
-            core::registry::nvme_scheds.list.push_back(nvme);
-            core::registry::nvme_scheds.by_core[core] = nvme;
+            core::registry::nvme_scheds.list.push_back(nvme_sched);
+            core::registry::nvme_scheds.by_core[core] = nvme_sched;
             if (read_domain != nullptr) {
                 core::registry::tree_read_domains.list.push_back(read_domain);
                 core::registry::tree_read_domains.by_core[core] = read_domain;

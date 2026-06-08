@@ -31,16 +31,15 @@
 #include "../core/panic.hh"
 #include "../format/types.hh"
 #include "../format/value_object.hh"
+#include "../memory/dma_page_pool.hh"
 #include "../memory/frame.hh"
 #include "./space_manager.hh"
 
 namespace apps::inconel::value {
 
     using format::paddr;
-    using format::read_desc;
     using format::trim_desc;
     using format::value_ref;
-    using format::write_desc;
 
     // ── Public input/output types ─────────────────────────────────────────
     //
@@ -59,13 +58,13 @@ namespace apps::inconel::value {
     // branch (already unblocked by leader's finalize).
 
     struct persist_leader {
-        uint64_t              round_id;
-        std::span<write_desc> writes;
+        uint64_t                           round_id;
+        std::span<memory::frame_write_desc> writes;
     };
 
     struct persist_prefill {
-        uint64_t             round_id;
-        std::span<read_desc> reads;
+        uint64_t                          round_id;
+        std::span<memory::frame_read_desc> reads;
     };
 
     struct trim_batch {
@@ -99,19 +98,18 @@ namespace apps::inconel::value {
 
     struct read_hit { std::string body; };
 
-    // read miss → pipeline issues the NVMe read into rm.buf, then hands the
-    // buffer back via fill_and_decode for cache admission + decode.
+    // read miss → pipeline issues the NVMe read into rm.frame, then hands
+    // the frame back via fill_and_decode for cache admission + decode.
     //
     // admit_to_cache encodes the policy that only span_lbas == 1 pages are
     // cache-admissible — the readonly cache pool is single-sized for
     // simplicity, multi-LBA hit rate is too low to justify the capacity hit.
 
     struct read_miss {
-        paddr                   base;
-        uint32_t                span_lbas;
-        std::unique_ptr<char[]> buf;
-        uint32_t                buf_size;
-        bool                    admit_to_cache;
+        paddr                                           base;
+        uint32_t                                        span_lbas;
+        memory::pooled_frame_ptr<memory::segmented_page_frame> frame;
+        bool                                            admit_to_cache;
     };
 
     using read_prepare_result = std::variant<read_hit, read_miss>;
@@ -259,8 +257,7 @@ namespace apps::inconel::value {
 
         struct req {
             value_ref                                         vr;
-            std::unique_ptr<char[]>                           buf;
-            uint32_t                                          buf_size;
+            memory::pooled_frame_ptr<memory::segmented_page_frame> frame;
             bool                                              admit_to_cache;
             std::move_only_function<void(std::string&&)>      cb;
             std::move_only_function<void(std::exception_ptr)> fail;
@@ -270,8 +267,7 @@ namespace apps::inconel::value {
             constexpr static bool value_fill_op = true;
             value_alloc_sched_base* sched;
             value_ref               vr;
-            std::unique_ptr<char[]> buf;
-            uint32_t                buf_size;
+            memory::pooled_frame_ptr<memory::segmented_page_frame> frame;
             bool                    admit_to_cache;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -281,16 +277,14 @@ namespace apps::inconel::value {
         struct sender {
             value_alloc_sched_base* sched;
             value_ref               vr;
-            std::unique_ptr<char[]> buf;
-            uint32_t                buf_size;
+            memory::pooled_frame_ptr<memory::segmented_page_frame> frame;
             bool                    admit_to_cache;
 
             auto make_op() {
                 return op{
                     .sched          = sched,
                     .vr             = vr,
-                    .buf            = std::move(buf),
-                    .buf_size       = buf_size,
+                    .frame          = std::move(frame),
                     .admit_to_cache = admit_to_cache,
                 };
             }
@@ -449,8 +443,10 @@ namespace apps::inconel::value {
         auto finalize_persist(uint64_t round_id, bool ok);
         auto continue_persist(uint64_t round_id, bool read_ok);
         auto prepare_read(value_ref vr);
-        auto fill_and_decode(value_ref vr, std::unique_ptr<char[]> buf,
-                             uint32_t buf_size, bool admit_to_cache);
+        auto fill_and_decode(
+            value_ref vr,
+            memory::pooled_frame_ptr<memory::segmented_page_frame> frame,
+            bool admit_to_cache);
         auto reclaim_values(std::span<const value_ref> dead_values);
         auto prepare_trim_batch();
         auto complete_trim_batch(uint64_t batch_id, bool ok);
@@ -494,7 +490,7 @@ namespace apps::inconel::value {
         // the manager state again.
 
         struct round_page {
-            memory::page_frame* frame;                  // DMA buffer for this page
+            memory::segmented_page_frame* frame;        // DMA buffer for this page
             paddr               page_base;
             uint16_t            span_lbas;
             byte_claim_source   src;
@@ -532,8 +528,8 @@ namespace apps::inconel::value {
 
             std::vector<round_page>  pages;
             std::vector<byte_claim>  claims;       // parallel to entries_flat
-            std::vector<read_desc>   reads;
-            std::vector<write_desc>  writes;
+            std::vector<memory::frame_read_desc>   reads;
+            std::vector<memory::frame_write_desc>  writes;
             value_space_round        space_round;
             uint64_t                 lowest_fresh_lba;  // min(page_base.lba) over fresh pages
         };
@@ -545,7 +541,7 @@ namespace apps::inconel::value {
         // paired with manager.cached_partial_index entries.
 
         struct resident_partial_entry {
-            memory::page_frame* frame;
+            memory::segmented_page_frame* frame;
             uint16_t            span_lbas;
             uint64_t            cache_epoch;
         };
@@ -598,6 +594,7 @@ namespace apps::inconel::value {
         uint64_t               data_area_end_lba_       = 0;
         uint16_t               device_id_                = 0;
         uint32_t               lba_size_                 = 0;
+        memory::lba_dma_page_pool                         frame_pool_;
         uint32_t               quantums_per_lba_         = 0;
         uint32_t               quantum_bytes_            = 0;
 
@@ -618,13 +615,19 @@ namespace apps::inconel::value {
                           Cache                     cache,
                           uint32_t                  value_space_quantum_bytes,
                           uint32_t                  value_space_group_size_lbas,
-                          size_t                    queue_depth = 2048)
+                          size_t                    queue_depth = 2048,
+                          memory::dma_page_allocator frame_allocator =
+                              memory::make_heap_dma_page_allocator(),
+                          uint32_t                  frame_alignment = 4096,
+                          int                       frame_numa_id = -1)
             : value_alloc_sched_base(queue_depth)
             , readonly_cache_(std::move(cache))
             , shared_heads_(shared_heads)
             , data_area_end_lba_(data_area_end.lba)
             , device_id_(data_area_base.device_id)
             , lba_size_(lba_size)
+            , frame_pool_(lba_size, frame_alignment, frame_numa_id,
+                          frame_allocator)
             , quantum_bytes_(value_space_quantum_bytes)
             , class_sizes_storage_(class_sizes.begin(), class_sizes.end())
         {
@@ -701,7 +704,7 @@ namespace apps::inconel::value {
             // round never reached commit. Free the frame from the round
             // path; the resident_partial_ entry will then be skipped (its
             // pointer matches one of the round's frames).
-            absl::flat_hash_set<memory::page_frame*> freed;
+            absl::flat_hash_set<memory::segmented_page_frame*> freed;
             for (auto& [id, rnd] : inflight_rounds_) {
                 for (auto& page : rnd->pages) {
                     if (page.frame == nullptr) continue;
@@ -1013,7 +1016,7 @@ namespace apps::inconel::value {
         // with the appropriate DMA frame:
         //   cached_partial      → pin existing resident_partial_ entry
         //   new_whole_page      → fresh zero-filled DMA buffer
-        //   nonresident_partial → fresh DMA buffer + read_desc for prefill
+        //   nonresident_partial → fresh DMA buffer + frame_read_desc prefill
         //
         // entries_flat parallels rnd.claims; we also fill each entry's
         // out_vr in this pass so the caller sees the durable address as
@@ -1091,10 +1094,8 @@ namespace apps::inconel::value {
                                                         // via consumed only
                         rp.needs_prefill  = true;
                         rp.prefill_loaded = false;
-                        rnd.reads.push_back(read_desc{
-                            .lba      = c.page_base.lba,
-                            .buf      = rp.frame->buf,
-                            .num_lbas = ci.span_lbas,
+                        rnd.reads.push_back(memory::frame_read_desc{
+                            .frame = rp.frame,
                         });
                         break;
                     }
@@ -1131,7 +1132,7 @@ namespace apps::inconel::value {
         persist_entry_status
         encode_round_entries(round&                         rnd,
                              const std::vector<put_entry*>& entries_flat) {
-            absl::flat_hash_map<paddr, memory::page_frame*> pages;
+            absl::flat_hash_map<paddr, memory::segmented_page_frame*> pages;
             pages.reserve(rnd.pages.size());
             for (auto& page : rnd.pages) {
                 if (!page.prefill_loaded) {
@@ -1148,12 +1149,12 @@ namespace apps::inconel::value {
                     return persist_entry_status::encode_failure;
                 }
                 auto* frame = it->second;
-                std::span<char> slot_span(
-                    frame->buf + c.byte_offset, ci.class_size);
                 std::span<const char> body_span(
                     entries_flat[i]->body.data(),
                     entries_flat[i]->body.size());
-                if (!format::encode_value_object(slot_span, body_span)) {
+                if (!format::encode_value_object_slot(
+                        *frame,
+                        c.byte_offset, ci.class_size, body_span)) {
                     return persist_entry_status::encode_failure;
                 }
             }
@@ -1165,11 +1166,9 @@ namespace apps::inconel::value {
         finalize_round_writes(round& rnd) {
             rnd.writes.reserve(rnd.pages.size());
             for (auto& page : rnd.pages) {
-                rnd.writes.push_back(write_desc{
-                    .lba      = page.page_base.lba,
-                    .data     = page.frame->buf,
-                    .num_lbas = page.span_lbas,
-                    .flags    = 0,
+                rnd.writes.push_back(memory::frame_write_desc{
+                    .frame = page.frame,
+                    .flags = 0,
                 });
             }
         }
@@ -1190,20 +1189,22 @@ namespace apps::inconel::value {
             leader_item->cb(prepare_persist_result{
                 persist_prefill{
                     rid,
-                    std::span<read_desc>(stored->reads.data(), stored->reads.size()),
+                    std::span<memory::frame_read_desc>(
+                        stored->reads.data(), stored->reads.size()),
                 }
             });
             delete leader_item;
         }
 
-        std::span<write_desc>
+        std::span<memory::frame_write_desc>
         freeze_round_for_writeback(round& rnd) {
             for (auto& page : rnd.pages) {
                 if (page.frame == nullptr) continue;
                 page.frame->st = memory::frame_state::writeback_inflight;
             }
             rnd.st = round::stage::writeback_inflight;
-            return std::span<write_desc>(rnd.writes.data(), rnd.writes.size());
+            return std::span<memory::frame_write_desc>(
+                rnd.writes.data(), rnd.writes.size());
         }
 
         void
@@ -1437,7 +1438,9 @@ namespace apps::inconel::value {
             // Capture which pages came from cached_partial — after abort,
             // the manager has restored their bits, and we want to put the
             // frame back in resident_partial_ instead of leaking.
-            absl::flat_hash_map<paddr, std::pair<memory::page_frame*, uint16_t>>
+            absl::flat_hash_map<
+                paddr,
+                std::pair<memory::segmented_page_frame*, uint16_t>>
                 returnable_cached;
             for (auto& page : rnd.pages) {
                 if (page.frame == nullptr) continue;
@@ -1735,9 +1738,7 @@ namespace apps::inconel::value {
 
             // 1. Inflight round frames (freshest source).
             if (auto* rfp = lookup_round_frame_(item->vr.base)) {
-                serve_hit_or_fail(item,
-                    std::span<const char>(rfp->buf, rfp->byte_len),
-                    "round_frame");
+                serve_frame_hit_or_fail(item, *rfp, "round_frame");
                 delete item;
                 return;
             }
@@ -1745,10 +1746,8 @@ namespace apps::inconel::value {
             // 2. Resident partial pages (post-commit, write-reuse).
             if (auto rit = resident_partial_.find(item->vr.base);
                 rit != resident_partial_.end()) {
-                serve_hit_or_fail(item,
-                    std::span<const char>(rit->second.frame->buf,
-                                           rit->second.frame->byte_len),
-                    "resident_partial");
+                serve_frame_hit_or_fail(
+                    item, *rit->second.frame, "resident_partial");
                 delete item;
                 return;
             }
@@ -1760,19 +1759,19 @@ namespace apps::inconel::value {
                     memory::frame_id::domain::value_page,
                 });
                 if (pin.frame) {
-                    serve_hit_or_fail(item,
-                        std::span<const char>(pin.frame->buf, pin.frame->byte_len),
-                        "readonly_cache");
+                    serve_frame_hit_or_fail(
+                        item, *pin.frame, "readonly_cache");
                     delete item;
                     return;
                 }
             }
 
             // 4. NVMe miss.
-            uint32_t img_bytes = span * lba_size_;
-            auto buf = std::make_unique<char[]>(img_bytes);
+            auto frame = alloc_pooled_frame(
+                item->vr.base, span, memory::frame_state::clean_readonly,
+                /*zero_fill=*/false);
             item->cb(read_prepare_result{
-                read_miss{item->vr.base, span, std::move(buf), img_bytes, admit}
+                read_miss{item->vr.base, span, std::move(frame), admit}
             });
             delete item;
         }
@@ -1783,29 +1782,25 @@ namespace apps::inconel::value {
 
         void
         handle_fill(_value_fill::req* item) {
-            auto decoded = try_decode_value(
-                std::span<const char>(item->buf.get(), item->buf_size),
-                item->vr);
-            if (decoded.status != format::value_decode_status::ok) {
-                panic_decode_failure(item->vr, decoded.status, "post_nvme");
+            if (!item->frame) {
+                item->fail(std::make_exception_ptr(
+                    std::runtime_error("value::fill: missing frame")));
+                delete item;
+                return;
+            }
+            auto decoded = try_decode_value(*item->frame.get(), item->vr);
+            if (decoded.first != format::value_decode_status::ok) {
+                panic_decode_failure(item->vr, decoded.first, "post_nvme");
             }
 
             if (item->admit_to_cache) {
-                auto* pf = new memory::page_frame{
-                    .id        = memory::frame_id{item->vr.base, 1,
-                                    memory::frame_id::domain::value_page},
-                    .st        = memory::frame_state::clean_readonly,
-                    .buf       = item->buf.release(),
-                    .byte_len  = item->buf_size,
-                    .pin_count = 0,
-                    .crc_valid = false,
-                };
+                auto* pf = item->frame.release();
                 if (auto evicted = readonly_cache_.put(pf)) {
                     destroy_frame(*evicted);
                 }
             }
 
-            item->cb(std::string(decoded.body.data(), decoded.body.size()));
+            item->cb(std::move(decoded.second));
             delete item;
         }
 
@@ -1813,14 +1808,35 @@ namespace apps::inconel::value {
 
         format::value_decode_result
         try_decode_value(std::span<const char> image, value_ref vr) const {
-            if (vr.byte_offset >= image.size()) {
+            auto ci_opt = class_for_body_len(vr.len);
+            if (!ci_opt) {
                 return format::value_decode_result{
-                    .status = format::value_decode_status::truncated,
+                    .status = format::value_decode_status::bad_body_len,
                     .body   = {},
                 };
             }
-            auto slot = image.subspan(vr.byte_offset);
-            return format::decode_value_object(slot, vr.len);
+            const class_info& ci = class_table_[*ci_opt];
+            return format::decode_value_object_slot(
+                image, vr.byte_offset, ci.class_size, vr.len);
+        }
+
+        std::pair<format::value_decode_status, std::string>
+        try_decode_value(const memory::segmented_page_frame& frame,
+                         value_ref vr) const {
+            auto ci_opt = class_for_body_len(vr.len);
+            if (!ci_opt) {
+                return {format::value_decode_status::bad_body_len, {}};
+            }
+            const class_info& ci = class_table_[*ci_opt];
+            std::string body;
+            body.resize(vr.len);
+            auto status = format::decode_value_object_slot_to(
+                frame, vr.byte_offset, ci.class_size, vr.len,
+                std::span<char>(body.data(), body.size()));
+            if (status != format::value_decode_status::ok) {
+                body.clear();
+            }
+            return {status, std::move(body)};
         }
 
         void
@@ -1833,6 +1849,19 @@ namespace apps::inconel::value {
             }
             item->cb(read_prepare_result{
                 read_hit{ std::string(decoded.body.data(), decoded.body.size()) }
+            });
+        }
+
+        void
+        serve_frame_hit_or_fail(_value_read::req* item,
+                                const memory::segmented_page_frame& frame,
+                                const char* source_label) {
+            auto decoded = try_decode_value(frame, item->vr);
+            if (decoded.first != format::value_decode_status::ok) {
+                panic_decode_failure(item->vr, decoded.first, source_label);
+            }
+            item->cb(read_prepare_result{
+                read_hit{std::move(decoded.second)}
             });
         }
 
@@ -1873,33 +1902,41 @@ namespace apps::inconel::value {
         }
 
         // ── DMA frame allocation / destruction ──
-        //
-        // v1 keeps the simple new[]/delete[] backing buffer the previous
-        // implementation already used; SPDK iobuf integration is the next
-        // step (INC-016 / INC-052) and slots in here without changing the
-        // scheduler interface — only this helper changes.
 
-        memory::page_frame*
-        alloc_dma_frame(paddr page_base, uint32_t span_lbas, bool zero_fill) {
-            const uint32_t img_bytes = span_lbas * lba_size_;
-            auto* pf = new memory::page_frame{};
-            pf->id = memory::frame_id{
-                page_base,
-                static_cast<uint16_t>(span_lbas),
-                memory::frame_id::domain::value_page,
-            };
-            pf->st        = memory::frame_state::dirty_append;
-            pf->buf       = zero_fill ? new char[img_bytes]() : new char[img_bytes];
-            pf->byte_len  = img_bytes;
-            pf->pin_count = 0;
-            pf->crc_valid = false;
-            return pf;
+        memory::pooled_frame_ptr<memory::segmented_page_frame>
+        alloc_pooled_frame(paddr page_base,
+                           uint32_t span_lbas,
+                           memory::frame_state state,
+                           bool zero_fill) {
+            auto frame = frame_pool_.get_typed_frame<memory::segmented_page_frame>(
+                memory::frame_id{
+                    page_base,
+                    static_cast<uint16_t>(span_lbas),
+                    memory::frame_id::domain::value_page,
+                },
+                state,
+                zero_fill);
+            if (!frame) {
+                throw std::runtime_error(
+                    "value::value_alloc_sched::alloc_pooled_frame: DMA page allocation failed");
+            }
+            auto* raw = new memory::segmented_page_frame(std::move(*frame));
+            return memory::pooled_frame_ptr<memory::segmented_page_frame>(
+                &frame_pool_, raw);
         }
 
-        static void
-        destroy_frame(memory::page_frame* frame) {
+        memory::segmented_page_frame*
+        alloc_dma_frame(paddr page_base, uint32_t span_lbas, bool zero_fill) {
+            auto frame = alloc_pooled_frame(
+                page_base, span_lbas, memory::frame_state::dirty_append,
+                zero_fill);
+            return frame.release();
+        }
+
+        void
+        destroy_frame(memory::segmented_page_frame* frame) {
             if (!frame) return;
-            delete[] frame->buf;
+            frame_pool_.put_frame(std::move(*frame));
             delete frame;
         }
 
@@ -1915,7 +1952,7 @@ namespace apps::inconel::value {
         // so we just take the first match. With the cap on rounds-per-
         // advance and per-round entries this stays O(1) amortized.
 
-        memory::page_frame*
+        memory::segmented_page_frame*
         lookup_round_frame_(paddr page_base) noexcept {
             auto it = dirty_round_pages_.find(page_base);
             if (it == dirty_round_pages_.end()) return nullptr;
@@ -1971,6 +2008,70 @@ namespace apps::inconel::value {
         absl::InlinedVector<uint32_t, 16> class_sizes_storage_;
     };
 
+    template <>
+    struct value_alloc_sched<core::clock_cache>
+        : value_alloc_sched<core::segmented_clock_cache> {
+        using base = value_alloc_sched<core::segmented_clock_cache>;
+
+        value_alloc_sched(std::span<const uint32_t> class_sizes,
+                          uint32_t                  lba_size,
+                          paddr                     data_area_base,
+                          paddr                     data_area_end,
+                          core::data_area_heads*    shared_heads,
+                          core::clock_cache         cache,
+                          uint32_t                  value_space_quantum_bytes,
+                          uint32_t                  value_space_group_size_lbas,
+                          size_t                    queue_depth = 2048,
+                          memory::dma_page_allocator frame_allocator =
+                              memory::make_heap_dma_page_allocator(),
+                          uint32_t                  frame_alignment = 4096,
+                          int                       frame_numa_id = -1)
+            : base(class_sizes,
+                   lba_size,
+                   data_area_base,
+                   data_area_end,
+                   shared_heads,
+                   core::segmented_clock_cache(cache.capacity()),
+                   value_space_quantum_bytes,
+                   value_space_group_size_lbas,
+                   queue_depth,
+                   std::move(frame_allocator),
+                   frame_alignment,
+                   frame_numa_id) {}
+    };
+
+    template <>
+    struct value_alloc_sched<core::slru_cache>
+        : value_alloc_sched<core::segmented_slru_cache> {
+        using base = value_alloc_sched<core::segmented_slru_cache>;
+
+        value_alloc_sched(std::span<const uint32_t> class_sizes,
+                          uint32_t                  lba_size,
+                          paddr                     data_area_base,
+                          paddr                     data_area_end,
+                          core::data_area_heads*    shared_heads,
+                          core::slru_cache          cache,
+                          uint32_t                  value_space_quantum_bytes,
+                          uint32_t                  value_space_group_size_lbas,
+                          size_t                    queue_depth = 2048,
+                          memory::dma_page_allocator frame_allocator =
+                              memory::make_heap_dma_page_allocator(),
+                          uint32_t                  frame_alignment = 4096,
+                          int                       frame_numa_id = -1)
+            : base(class_sizes,
+                   lba_size,
+                   data_area_base,
+                   data_area_end,
+                   shared_heads,
+                   core::segmented_slru_cache(cache.capacity()),
+                   value_space_quantum_bytes,
+                   value_space_group_size_lbas,
+                   queue_depth,
+                   std::move(frame_allocator),
+                   frame_alignment,
+                   frame_numa_id) {}
+    };
+
     // ── value_alloc_sched_base sender factory deferred definitions ─────────
 
     inline auto
@@ -1999,14 +2100,13 @@ namespace apps::inconel::value {
 
     inline auto
     value_alloc_sched_base::fill_and_decode(value_ref vr,
-                                            std::unique_ptr<char[]> buf,
-                                            uint32_t buf_size,
+                                            memory::pooled_frame_ptr<
+                                                memory::segmented_page_frame> frame,
                                             bool admit_to_cache) {
         return _value_fill::sender{
             .sched          = this,
             .vr             = vr,
-            .buf            = std::move(buf),
-            .buf_size       = buf_size,
+            .frame          = std::move(frame),
             .admit_to_cache = admit_to_cache,
         };
     }
@@ -2144,8 +2244,7 @@ namespace apps::inconel::value {
     void _value_fill::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_fill(new req{
             .vr             = vr,
-            .buf            = std::move(buf),
-            .buf_size       = buf_size,
+            .frame          = std::move(frame),
             .admit_to_cache = admit_to_cache,
             .cb = [ctx = ctx, scope = scope](std::string&& s) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(

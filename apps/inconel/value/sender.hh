@@ -17,7 +17,8 @@
 
 #include "../core/registry.hh"
 #include "../format/types.hh"
-#include "../mock_nvme/scheduler.hh"
+#include "../nvme/frame_io.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "../runtime/facade.hh"
 #include "./scheduler.hh"
 #include "pump/sender/get_context.hh"
@@ -58,9 +59,9 @@ namespace apps::inconel::value {
         return just()
             >> as_stream(__mov__(alt.writes))
             >> concurrent()
-            >> flat_map([](format::write_desc d) {
-                return rt::local_nvme()->write(
-                    d.lba, d.data, d.num_lbas, mock_nvme::IO_FLAGS_FUA);
+            >> flat_map([](memory::frame_write_desc d) {
+                d.flags |= nvme::IO_FLAGS_FUA;
+                return nvme::write_frame(rt::local_nvme(), d);
             })
             >> all()
             >> flat_map([rid](bool nvme_ok) {
@@ -75,8 +76,8 @@ namespace apps::inconel::value {
         return just()
             >> as_stream(__mov__(alt.reads))
             >> concurrent()
-            >> flat_map([](format::read_desc d) {
-                return rt::local_nvme()->read(d.lba, d.buf, d.num_lbas);
+            >> flat_map([](memory::frame_read_desc d) {
+                return nvme::read_frame(rt::local_nvme(), d);
             })
             >> all()
             >> flat_map([rid](bool read_ok) {
@@ -133,16 +134,15 @@ namespace apps::inconel::value {
         return just()
             >> with_context(__fwd__(alt), vr)([]() {
                 return get_context<read_miss>()
-                    >> flat_map([](const read_miss &rm) {
-                        return rt::local_nvme()->read(
-                            rm.base.lba, rm.buf.get(), rm.span_lbas);
+                    >> flat_map([](read_miss &rm) {
+                        return nvme::read_frame(
+                            rt::local_nvme(), rm.frame.get());
                     })
                     >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
                     >> get_context<read_miss, value_ref>()
                     >> flat_map([](read_miss &rm, const value_ref &vr, bool) mutable {
                         return rt::value()->fill_and_decode(
-                            vr, std::move(rm.buf),
-                            rm.buf_size, rm.admit_to_cache);
+                            vr, std::move(rm.frame), rm.admit_to_cache);
                     });
             });
     }

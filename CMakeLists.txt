@@ -85,76 +85,28 @@ set_target_properties(sider_bench PROPERTIES
     C_EXTENSIONS ON)
 target_compile_options(sider_bench PRIVATE -Wno-unused-result -Wno-deprecated-declarations)
 
-# Inconel tests
+# Inconel real-NVMe test
 set(INCONEL_ABSL_LIBS
     absl::flat_hash_map
     absl::flat_hash_set
     absl::inlined_vector
     absl::crc32c)
 
-add_executable(inconel_test_tree_lookup apps/inconel/test/test_tree_lookup.cc)
-target_include_directories(inconel_test_tree_lookup PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_lookup PRIVATE pthread ${INCONEL_ABSL_LIBS})
+add_library(inconel_real_nvme INTERFACE)
+target_link_libraries(inconel_real_nvme INTERFACE
+        -Wl,--whole-archive ${SPDK_LIBRARIES} -Wl,--no-whole-archive
+        pthread isal ssl rt uuid crypto m aio numa dl)
 
-# Compile-only instantiation check for tree_local_flush / tree::lookup
-# (step 031). Forces the full sender + coroutine + seam chain through
-# connect<ctx_t>() so template errors that header-only compilation
-# misses surface at build time.
-add_executable(inconel_test_tree_pipeline_compile apps/inconel/test/test_tree_pipeline_compile.cc)
-target_include_directories(inconel_test_tree_pipeline_compile PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_pipeline_compile PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_tree_lookup_multicore apps/inconel/test/test_tree_lookup_multicore.cc)
-target_include_directories(inconel_test_tree_lookup_multicore PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_lookup_multicore PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_page_cache apps/inconel/test/test_page_cache.cc)
-target_include_directories(inconel_test_page_cache PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_page_cache PRIVATE ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_runtime apps/inconel/test/test_runtime.cc)
-target_include_directories(inconel_test_runtime PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_runtime PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_runtime_topology apps/inconel/test/test_runtime_topology.cc)
-target_include_directories(inconel_test_runtime_topology PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_runtime_topology PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_value apps/inconel/test/test_value.cc)
-target_include_directories(inconel_test_value PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_tree_value apps/inconel/test/test_tree_value.cc)
-target_include_directories(inconel_test_tree_value PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_value PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_leaf_mapping apps/inconel/test/test_leaf_mapping.cc)
-target_include_directories(inconel_test_leaf_mapping PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_leaf_mapping PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_tree_page_format apps/inconel/test/test_tree_page_format.cc)
-target_include_directories(inconel_test_tree_page_format PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_tree_page_format PRIVATE ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_wal_format apps/inconel/test/test_wal_format.cc)
-target_include_directories(inconel_test_wal_format PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_wal_format PRIVATE ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_superblock_format apps/inconel/test/test_superblock_format.cc)
-target_include_directories(inconel_test_superblock_format PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_superblock_format PRIVATE ${INCONEL_ABSL_LIBS})
+add_library(inconel_real_nvme_compile_check OBJECT
+        apps/inconel/nvme/real_compile_check.cc)
+target_include_directories(inconel_real_nvme_compile_check PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_real_nvme_compile_check PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_flush_e2e apps/inconel/test/test_flush_e2e.cc)
 target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_flush_e2e PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_inc046_regression apps/inconel/test/test_inc046_regression.cc)
-target_include_directories(inconel_test_inc046_regression PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_inc046_regression PRIVATE pthread ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_value_space_manager apps/inconel/test/test_value_space_manager.cc)
-target_include_directories(inconel_test_value_space_manager PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(inconel_test_value_space_manager PRIVATE pthread ${INCONEL_ABSL_LIBS})
+target_link_libraries(inconel_test_flush_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)

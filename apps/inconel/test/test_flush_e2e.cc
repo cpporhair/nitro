@@ -3,7 +3,7 @@
 //
 // Drives three back-to-back flush rounds on the asymmetric topology
 // (value core 0, tree_read_domains on cores 2/4/6, owner core 8) against
-// a freshly formatted mock disk, then verifies every sampled key lines
+// a freshly formatted real NVMe namespace, then verifies every sampled key lines
 // up with an independently-tracked expected state.
 //
 //   Round 1 (bootstrap)  — N PUTs on [0, N).
@@ -45,7 +45,6 @@
 #include <future>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <random>
 #include <span>
 #include <string>
@@ -75,10 +74,10 @@
 #include "apps/inconel/core/tree_manifest.hh"
 #include "apps/inconel/format/format_options.hh"
 #include "apps/inconel/format/format_profile.hh"
-#include "apps/inconel/format/formatted_storage.hh"
+#include "apps/inconel/format/layout_plan.hh"
+#include "apps/inconel/format/superblock_builder.hh"
 #include "apps/inconel/format/types.hh"
-#include "apps/inconel/mock_nvme/device.hh"
-#include "apps/inconel/mock_nvme/scheduler.hh"
+#include "apps/inconel/nvme/runtime_scheduler.hh"
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/runtime/facade.hh"
 #include "apps/inconel/runtime/run.hh"
@@ -104,8 +103,8 @@ constexpr int32_t           kOwnerCore       = 8;
 
 // ── Disk size ───────────────────────────────────────────────────────────
 //
-// Sized off the profile's Value Area top so the mock device always
-// satisfies build_runtime's tier-3 validate_build_inputs gate
+// Sized off the profile's Value Area top so the real namespace must
+// satisfy build_runtime's tier-3 validate_build_inputs gate
 // (device_bytes >= profile.value_data_area_end.lba * lba_size). Any
 // further scaling happens by editing the profile, not here.
 
@@ -128,23 +127,34 @@ constexpr uint32_t kMinNumKeysForMultiRound = 1000;
 // ── CLI ─────────────────────────────────────────────────────────────────
 
 struct harness_options {
+    std::string pci_addr;
+    std::string spdk_core_mask;
     uint32_t num_keys           = 1000;
     uint32_t rounds             = 3;        // ≥ 2 (round 1 bootstrap + round 2 mix); round 3+ reuses round-3 pattern with escalating round_tag/gen_id/lsn
     uint32_t readback_samples   = 50;       // approximate sample count; stride derived from expected-state size
     uint32_t concurrent_readers = 2;        // 0 disables; cap 2 (cores 10 + idx must not collide with advance cores 0/2/4/6/8 or main core 0)
     uint32_t reader_batch       = 16;       // keys per reader lookup batch
+    uint32_t qpair_depth        = 256;
+    bool     force_format       = false;
 };
 
 void
 print_usage(const char* argv0) {
     std::printf(
-        "usage: %s [--num-keys N] [--rounds R] [--readback-samples S]\n"
+        "usage: %s --pci-addr BDF --force-format "
+        "[--num-keys N] [--rounds R] [--readback-samples S]\n"
         "         [--concurrent-readers N] [--reader-batch K]\n"
+        "         [--spdk-core-mask MASK] [--qpair-depth D]\n"
+        "  --pci-addr BDF           PCI BDF of the SPDK-bound NVMe controller\n"
+        "                           (or INCONEL_NVME_PCI_ADDR env var)\n"
+        "  --force-format           required; writes Inconel metadata to the device\n"
         "  --num-keys N             N >= %u (default 1000)\n"
         "  --rounds   R             R >= 2   (default 3; extra rounds reuse the round-3 op pattern)\n"
         "  --readback-samples S     target number of keys to read back after rounds (default 50)\n"
         "  --concurrent-readers N   0..2 (default 2; 0 disables; readers run on cores 10..10+N-1)\n"
-        "  --reader-batch K         keys per reader lookup batch (default 16)\n",
+        "  --reader-batch K         keys per reader lookup batch (default 16)\n"
+        "  --spdk-core-mask MASK    optional SPDK env core mask override\n"
+        "  --qpair-depth D          NVMe qpair depth (default 256)\n",
         argv0, kMinNumKeysForMultiRound);
 }
 
@@ -178,6 +188,15 @@ parse_argv(int argc, char** argv) {
             o.num_keys = static_cast<uint32_t>(parse_long_arg(
                 "--num-keys", want_arg("--num-keys"),
                 kMinNumKeysForMultiRound, 100'000'000L));
+        } else if (a == "--pci-addr") {
+            o.pci_addr = want_arg("--pci-addr");
+        } else if (a == "--spdk-core-mask") {
+            o.spdk_core_mask = want_arg("--spdk-core-mask");
+        } else if (a == "--force-format") {
+            o.force_format = true;
+        } else if (a == "--qpair-depth") {
+            o.qpair_depth = static_cast<uint32_t>(parse_long_arg(
+                "--qpair-depth", want_arg("--qpair-depth"), 1L, 65535L));
         } else if (a == "--rounds") {
             o.rounds = static_cast<uint32_t>(parse_long_arg(
                 "--rounds", want_arg("--rounds"), 2L, 1000L));
@@ -207,6 +226,22 @@ parse_argv(int argc, char** argv) {
             print_usage(argv[0]);
             std::exit(2);
         }
+    }
+    if (o.pci_addr.empty()) {
+        if (const char* env = std::getenv("INCONEL_NVME_PCI_ADDR")) {
+            o.pci_addr = env;
+        }
+    }
+    if (o.pci_addr.empty()) {
+        std::fprintf(stderr, "--pci-addr or INCONEL_NVME_PCI_ADDR is required\n");
+        print_usage(argv[0]);
+        std::exit(2);
+    }
+    if (!o.force_format) {
+        std::fprintf(stderr,
+            "--force-format is required because this test writes to the NVMe device\n");
+        print_usage(argv[0]);
+        std::exit(2);
     }
     return o;
 }
@@ -642,6 +677,74 @@ derive_format_options() {
     return opts;
 }
 
+// ── Real NVMe bootstrap format ─────────────────────────────────────────
+
+template <typename SenderBuilder>
+bool
+submit_nvme_and_wait(nvme::runtime_scheduler& sched,
+                     SenderBuilder&&          build_sender) {
+    auto ctx     = pump::core::make_root_context();
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto fut     = promise->get_future();
+
+    std::forward<SenderBuilder>(build_sender)()
+        >> pump::sender::then([promise](bool ok) {
+            promise->set_value(ok);
+        })
+        >> pump::sender::submit(ctx);
+
+    while (fut.wait_for(std::chrono::milliseconds(0)) !=
+           std::future_status::ready) {
+        sched.advance();
+        std::this_thread::yield();
+    }
+    return fut.get();
+}
+
+void
+write_superblock_page(nvme::runtime_scheduler&     sched,
+                      uint64_t                     lba,
+                      const format::superblock&    sb,
+                      uint32_t                     lba_size) {
+    CHECK(sizeof(sb) <= lba_size);
+    std::vector<char> page(lba_size, 0);
+    std::memcpy(page.data(), &sb, sizeof(sb));
+
+    const bool ok = submit_nvme_and_wait(sched, [&]() {
+        return sched.write(lba, page.data(), 1, nvme::IO_FLAGS_FUA);
+    });
+    CHECK(ok && "real NVMe superblock write failed");
+}
+
+void
+format_real_nvme_bootstrap(nvme::runtime_device& dev,
+                           const format::format_options& fmt_opts) {
+    const auto layout = format::compute_layout(fmt_opts, kNamespaceBytes);
+    format::validate_layout(layout);
+
+    const auto sb_a = format::build_superblock(layout, /*generation=*/1);
+    const auto sb_b = format::build_superblock(layout, /*generation=*/0);
+
+    pump::core::this_core_id = 0;
+    nvme::runtime_scheduler fmt_sched(
+        dev.qpair_for_core(0),
+        fmt_opts.lba_size,
+        /*pool_pages=*/64,
+        /*queue_depth=*/128,
+        /*local_depth=*/32,
+        /*alignment=*/4096,
+        SPDK_ENV_NUMA_ID_ANY,
+        dev.device_id());
+
+    write_superblock_page(fmt_sched, 0, sb_a, fmt_opts.lba_size);
+    write_superblock_page(fmt_sched, 1, sb_b, fmt_opts.lba_size);
+
+    const bool flushed = submit_nvme_and_wait(fmt_sched, [&]() {
+        return fmt_sched.flush();
+    });
+    CHECK(flushed && "real NVMe flush after bootstrap format failed");
+}
+
 // ── Submit helper ──────────────────────────────────────────────────────
 
 template <typename T, typename SenderBuilder>
@@ -782,8 +885,8 @@ reader_main(uint32_t         reader_idx,
 // `round_ops`; build_sealed_gen walks the ops span in parallel with a
 // running `put_idx` counter to pair entries with durables.
 
-// Persist in fixed-size chunks so we stay well below mock_nvme's
-// per_core::queue capacity (2048). `value::persist_values` fans out
+// Persist in fixed-size chunks so we stay well below the per-core NVMe
+// queue capacity. `value::persist_values` fans out
 // one `nvme->write` per write_desc inside the leader pipeline via an
 // unbounded `concurrent()`, so a single monolithic call with >2k put
 // entries overflows the queue. Chunking at the harness level keeps
@@ -1371,8 +1474,10 @@ main(int argc, char** argv) {
 
     auto opts = parse_argv(argc, argv);
 
-    std::printf("test_flush_e2e: num_keys=%u, rounds=%u, readback_samples=%u, "
-                "topology cores=[0,2,4,6,8] rd=[2,4,6] value=%d owner=%d\n",
+    std::printf("test_flush_e2e: pci=%s num_keys=%u, rounds=%u, "
+                "readback_samples=%u, topology cores=[0,2,4,6,8] "
+                "rd=[2,4,6] value=%d owner=%d\n",
+                opts.pci_addr.c_str(),
                 opts.num_keys,
                 opts.rounds,
                 opts.readback_samples,
@@ -1389,19 +1494,30 @@ main(int argc, char** argv) {
     std::printf("  key_digits=%u (max_key_index=%u)\n",
                 key_digits, max_key_index);
 
-    // ── Disk ──
+    // ── Real NVMe device ──
     auto fmt_opts = derive_format_options();
-    auto buf      = format::make_formatted_storage(fmt_opts, kNamespaceBytes);
-    mock_nvme::mock_device dev(std::move(buf),
-                               kNamespaceBytes,
-                               fmt_opts.lba_size);
-    std::mutex dev_mtx;
-    dev.enable_thread_safety(&dev_mtx);
-    std::printf("  formatted mock device: %lu bytes (%lu LBAs @ %u B)\n",
+    nvme::runtime_device dev(nvme::real_device_options{
+        .pci_addr = opts.pci_addr.c_str(),
+        .cores = kCores,
+        .spdk_core_mask = opts.spdk_core_mask.empty()
+            ? nullptr
+            : opts.spdk_core_mask.c_str(),
+        .spdk_name = "inconel_flush_e2e",
+        .init_spdk_env = true,
+        .qpair_depth = opts.qpair_depth,
+        .device_id = 0,
+    });
+    std::printf("  opened real NVMe: sector=%u namespace=%lu bytes "
+                "(profile needs %lu bytes / %lu LBAs @ %u B)\n",
+                dev.sector_size(),
+                static_cast<unsigned long>(dev.size_bytes()),
                 static_cast<unsigned long>(kNamespaceBytes),
                 static_cast<unsigned long>(
                     kNamespaceBytes / fmt_opts.lba_size),
                 fmt_opts.lba_size);
+    format_real_nvme_bootstrap(dev, fmt_opts);
+    std::printf("  formatted real NVMe bootstrap superblocks on %s\n",
+                opts.pci_addr.c_str());
 
     // ── Runtime ──
     runtime::build_options bopts{

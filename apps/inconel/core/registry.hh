@@ -14,7 +14,7 @@
 #include "./panic.hh"
 #include "./shard_partition.hh"
 #include "./tree_manifest.hh"
-#include "../mock_nvme/scheduler.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::tree_lookup_sched_base
 #include "../value/scheduler.hh" // for value::value_alloc_sched_base
 
@@ -44,8 +44,8 @@ namespace apps::inconel::core::registry {
     // template parameter on tree_lookup_sched<Cache> stays inside the builder.
 
     struct nvme_list {
-        std::vector<mock_nvme::scheduler*> list;     // all instances
-        std::vector<mock_nvme::scheduler*> by_core;  // index = core_id; nullptr ok
+        std::vector<nvme::runtime_scheduler*> list;     // all instances
+        std::vector<nvme::runtime_scheduler*> by_core;  // index = core_id; nullptr ok
     };
     inline nvme_list nvme_scheds;
 
@@ -163,7 +163,7 @@ namespace apps::inconel::core::registry {
     // Caller must be running on a core that hosts the requested scheduler;
     // configuration validation is the builder's responsibility.
 
-    inline mock_nvme::scheduler*
+    inline nvme::runtime_scheduler*
     local_nvme() {
         auto* s = nvme_scheds.by_core[pump::core::this_core_id];
         assert(s && "current core has no nvme scheduler");
@@ -179,7 +179,7 @@ namespace apps::inconel::core::registry {
 
     // ── Per-core access by explicit core_id ──
 
-    inline mock_nvme::scheduler*
+    inline nvme::runtime_scheduler*
     nvme_for_core(uint32_t core) {
         return nvme_scheds.by_core[core];
     }

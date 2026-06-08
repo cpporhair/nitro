@@ -12,8 +12,8 @@
 #include "./wal.hh"              // WAL_SEGMENT_HEADER_SIZE, WAL_SEALED_TRAILER_SIZE, WAL_PUT_FIXED_BYTES
 
 // ─────────────────────────────────────────────────────────────────────────────
-// layout_plan — derived disk geometry fed to `build_superblock` and
-// `make_formatted_storage`.
+// layout_plan — derived disk geometry fed to `build_superblock` and runtime
+// format/bootstrap writers.
 //
 // `compute_layout` performs the arithmetic (with a bare minimum of
 // pre-condition checks to avoid UB from /0); `validate_layout` is the single

@@ -39,7 +39,8 @@
 #include "../core/panic.hh"
 #include "../format/superblock.hh"
 #include "../format/types.hh"
-#include "../mock_nvme/sender.hh"
+#include "../memory/dma_page_pool.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "./flush_round_state.hh"
 #include "./flush_types.hh"
 #include "./memtable_fold.hh"
@@ -54,7 +55,7 @@ namespace apps::inconel::tree {
 }  // namespace apps::inconel::tree
 
 namespace apps::inconel::core::registry {
-    inline mock_nvme::scheduler* local_nvme();
+    inline nvme::runtime_scheduler* local_nvme();
 }
 
 namespace apps::inconel::tree {
@@ -197,19 +198,22 @@ namespace apps::inconel::tree {
     //   - `worker_leaf_chains` owns every worker-formatted leaf page.
     //   - `detached_subtrees` owns same-range stop subtrees whose
     //     writes/slot-map updates commit without propagating further.
-    //   - `fetched_old_pages[slot_paddr]` is the landing buffer the
-    //     outer pipeline DMAs into for owner-side old-internal reads;
-    //     the coroutine re-reads them in place on resume.
-    //   - `pending_ios[i]` is either `format::read_desc` whose buf
-    //     points into `fetched_old_pages[slot_paddr].data()`, or
-    //     `format::write_desc` whose data points into mem_tree_node
-    //     content owned by `combined_root` / `detached_subtrees`.
+    //   - `fetched_old_frames[slot_paddr]` is the segmented DMA frame the
+    //     outer pipeline reads into for owner-side old-internal pages.
+    //   - `pending_ios[i]` is a frame read/write descriptor whose frame
+    //     lives in `fetched_old_frames` or `writeback_frames`.
     //   - `retired_slots_seen` / `retired_ranges_seen` dedupe inserts
     //     into the linked `flush_round_state.retired` vectors.
     struct merge_round_state {
         flush_round_id                             round_id;
         std::vector<worker_leaf_chain>             worker_leaf_chains;
-        absl::flat_hash_map<paddr, std::vector<char>> fetched_old_pages;
+        absl::flat_hash_map<
+            paddr,
+            memory::pooled_frame_ptr<memory::segmented_tree_frame>>
+                                                    fetched_old_frames;
+        std::vector<
+            memory::pooled_frame_ptr<memory::segmented_tree_frame>>
+                                                    writeback_frames;
 
         child_ref                                     combined_root;
         std::vector<child_ref>                        detached_subtrees;
@@ -250,9 +254,12 @@ namespace apps::inconel::tree {
         uint64_t       recovery_safe_lsn   = 0;
         superblock_slot active_superblock_slot = superblock_slot::A;
 
-        // Owner-only raw non-leaf cache keyed by live slot paddr.
+        // Owner-only segmented non-leaf cache keyed by live slot paddr.
         // Read domains never touch non-leaf pages after INC-046.
-        absl::flat_hash_map<paddr, std::vector<char>> non_leaf_page_cache;
+        absl::flat_hash_map<
+            paddr,
+            memory::pooled_frame_ptr<memory::segmented_tree_frame>>
+            non_leaf_page_cache;
 
         pump::core::per_core::queue<reclaim_task*> reclaim_q{256};
 
@@ -537,6 +544,44 @@ namespace apps::inconel::tree {
     namespace _owner {
 
         using format::paddr;
+
+        static inline memory::pooled_frame_ptr<memory::segmented_tree_frame>
+        alloc_tree_frame(memory::lba_dma_page_pool& pool,
+                         paddr page_base,
+                         uint32_t page_lbas,
+                         bool zero_fill = false) {
+            auto frame = pool.get_typed_frame<memory::segmented_tree_frame>(
+                memory::frame_id{
+                    page_base,
+                    static_cast<uint16_t>(page_lbas),
+                    memory::frame_id::domain::tree_node,
+                },
+                memory::frame_state::clean_readonly,
+                zero_fill);
+            if (!frame) {
+                core::panic_inconsistency(
+                    "tree::_owner::alloc_tree_frame",
+                    "DMA page allocation failed dev=%u lba=%lu span=%u",
+                    static_cast<unsigned>(page_base.device_id),
+                    static_cast<unsigned long>(page_base.lba),
+                    static_cast<unsigned>(page_lbas));
+            }
+            return memory::pooled_frame_ptr<memory::segmented_tree_frame>(
+                &pool,
+                new memory::segmented_tree_frame(std::move(*frame)));
+        }
+
+        static inline std::span<const char>
+        frame_bytes_for_page(const memory::segmented_page_frame& frame,
+                             uint32_t page_size,
+                             std::vector<char>& scratch) {
+            if (page_size <= frame.lba_size()) {
+                return frame.contiguous_bytes(0, page_size);
+            }
+            scratch.resize(page_size);
+            frame.copy_to_contiguous(scratch.data(), page_size);
+            return std::span<const char>(scratch.data(), scratch.size());
+        }
 
         struct final_leaf_item {
             paddr                   range_base{};
@@ -1624,7 +1669,11 @@ namespace apps::inconel::tree {
             const core::tree_manifest*                 base_manifest,
             tree_allocator&                            alloc,
             const core::tree_geometry*                 geom,
-            absl::flat_hash_map<paddr, std::vector<char>>& non_leaf_cache,
+            absl::flat_hash_map<
+                paddr,
+                memory::pooled_frame_ptr<memory::segmented_tree_frame>>&
+                non_leaf_cache,
+            memory::lba_dma_page_pool&                 frame_pool,
             flush_round_state&                         round)
         {
             constexpr std::size_t kWriteBatchSize = 32;
@@ -1760,12 +1809,17 @@ namespace apps::inconel::tree {
                 std::vector<const mem_tree_node*> write_nodes;
                 collect_nodes_for_writes(s.combined_root, write_nodes);
                 for (auto* node : write_nodes) {
+                    auto frame = alloc_tree_frame(
+                        frame_pool, node->new_paddr, geom->page_lbas(),
+                        /*zero_fill=*/false);
+                    frame->copy_from_contiguous(
+                        node->content.data(), node->content.size());
+                    auto* raw_frame = frame.get();
+                    s.writeback_frames.push_back(std::move(frame));
                     s.pending_ios.push_back(merge_io_desc{
-                        format::write_desc{
-                            .lba      = node->new_paddr.lba,
-                            .data     = node->content.data(),
-                            .num_lbas = geom->page_lbas(),
-                            .flags    = 0,
+                        memory::frame_write_desc{
+                            .frame = raw_frame,
+                            .flags = 0,
                         }});
                     if (s.pending_ios.size() >= kWriteBatchSize) {
                         co_yield merge_yield::need_io;
@@ -1899,17 +1953,18 @@ namespace apps::inconel::tree {
                         topo.internal_nodes[delta.parent_idx].range_base;
                     const auto live_slot = base_manifest->resolve(parent_rb);
                     if (non_leaf_cache.contains(live_slot)
-                        || s.fetched_old_pages.contains(live_slot)
+                        || s.fetched_old_frames.contains(live_slot)
                         || !reads_seen.insert(live_slot).second) {
                         continue;
                     }
-                    auto& buf = s.fetched_old_pages[live_slot];
-                    buf.assign(page_size, '\0');
+                    auto frame = alloc_tree_frame(
+                        frame_pool, live_slot, page_lbas,
+                        /*zero_fill=*/false);
+                    auto* raw_frame = frame.get();
+                    s.fetched_old_frames.emplace(live_slot, std::move(frame));
                     s.pending_ios.push_back(merge_io_desc{
-                        format::read_desc{
-                            .lba      = live_slot.lba,
-                            .buf      = buf.data(),
-                            .num_lbas = page_lbas,
+                        memory::frame_read_desc{
+                            .frame = raw_frame,
                         }});
                 }
                 if (!s.pending_ios.empty()) {
@@ -1930,16 +1985,17 @@ namespace apps::inconel::tree {
                         topo.internal_nodes[parent_idx].range_base;
                     const auto live_slot = base_manifest->resolve(parent_rb);
 
-                    const std::vector<char>* old_page = nullptr;
+                    const memory::segmented_tree_frame* old_frame = nullptr;
                     if (auto it = non_leaf_cache.find(live_slot);
                         it != non_leaf_cache.end()) {
-                        old_page = &it->second;
-                    } else if (auto it = s.fetched_old_pages.find(live_slot);
-                               it != s.fetched_old_pages.end()) {
-                        non_leaf_cache.try_emplace(live_slot, it->second);
-                        old_page = &non_leaf_cache.find(live_slot)->second;
+                        old_frame = it->second.get();
+                    } else if (auto fit = s.fetched_old_frames.find(live_slot);
+                               fit != s.fetched_old_frames.end()) {
+                        auto [cit, inserted] = non_leaf_cache.try_emplace(
+                            live_slot, std::move(fit->second));
+                        old_frame = cit->second.get();
                     }
-                    if (old_page == nullptr) {
+                    if (old_frame == nullptr) {
                         core::panic_inconsistency(
                             "run_leaf_only_merge",
                             "missing old internal page dev=%u lba=%lu",
@@ -1947,8 +2003,11 @@ namespace apps::inconel::tree {
                             static_cast<unsigned long>(live_slot.lba));
                     }
 
+                    std::vector<char> old_page_scratch;
+                    auto old_page = frame_bytes_for_page(
+                        *old_frame, page_size, old_page_scratch);
                     internal_page_reader reader;
-                    if (!reader.parse(old_page->data(), page_size)) {
+                    if (!reader.parse(old_page.data(), page_size)) {
                         core::panic_inconsistency(
                             "run_leaf_only_merge",
                             "failed to parse old internal dev=%u lba=%lu",
@@ -2083,12 +2142,17 @@ namespace apps::inconel::tree {
                 collect_nodes_for_writes(subtree, write_nodes);
             }
             for (auto* node : write_nodes) {
+                auto frame = alloc_tree_frame(
+                    frame_pool, node->new_paddr, geom->page_lbas(),
+                    /*zero_fill=*/false);
+                frame->copy_from_contiguous(
+                    node->content.data(), node->content.size());
+                auto* raw_frame = frame.get();
+                s.writeback_frames.push_back(std::move(frame));
                 s.pending_ios.push_back(merge_io_desc{
-                    format::write_desc{
-                        .lba      = node->new_paddr.lba,
-                        .data     = node->content.data(),
-                        .num_lbas = geom->page_lbas(),
-                        .flags    = 0,
+                    memory::frame_write_desc{
+                        .frame = raw_frame,
+                        .flags = 0,
                     }});
                 if (s.pending_ios.size() >= kWriteBatchSize) {
                     co_yield merge_yield::need_io;
@@ -2150,6 +2214,7 @@ namespace apps::inconel::tree {
 
         const core::tree_geometry* geom = nullptr;
         tree_state                 state;
+        memory::lba_dma_page_pool  frame_pool;
         pump::core::per_core::queue<_flush_fold::req*>               fold_q;
         pump::core::per_core::queue<_merge_step::req*>               merge_step_q;
         pump::core::per_core::queue<_merge_reads_done::req*>         merge_reads_done_q;
@@ -2166,8 +2231,16 @@ namespace apps::inconel::tree {
         tree_sched(const core::tree_geometry* g = nullptr,
                    format::paddr              data_area_base = {0, 0},
                    core::data_area_heads*     shared_heads = nullptr,
-                   std::size_t                depth = 256)
+                   std::size_t                depth = 256,
+                   memory::dma_page_allocator frame_allocator =
+                       memory::make_heap_dma_page_allocator(),
+                   uint32_t                   frame_alignment = 4096,
+                   int                        frame_numa_id = -1)
             : geom(g)
+            , frame_pool(g ? g->lba_size : 4096,
+                         frame_alignment,
+                         frame_numa_id,
+                         frame_allocator)
             , fold_q(depth)
             , merge_step_q(depth)
             , merge_reads_done_q(depth)
@@ -2260,6 +2333,34 @@ namespace apps::inconel::tree {
             return std::min(state.flush_max_lsn, state.superblock_safe_lsn);
         }
 
+        memory::pooled_frame_ptr<memory::segmented_tree_frame>
+        alloc_frame(format::paddr base,
+                    uint32_t span_lbas,
+                    memory::frame_id::domain dom,
+                    memory::frame_state st = memory::frame_state::clean_readonly,
+                    bool zero_fill = false) {
+            auto frame = frame_pool.get_typed_frame<memory::segmented_tree_frame>(
+                memory::frame_id{
+                    base,
+                    static_cast<uint16_t>(span_lbas),
+                    dom,
+                },
+                st,
+                zero_fill);
+            if (!frame) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::alloc_frame",
+                    "DMA page allocation failed dev=%u lba=%lu span=%u dom=%u",
+                    static_cast<unsigned>(base.device_id),
+                    static_cast<unsigned long>(base.lba),
+                    static_cast<unsigned>(span_lbas),
+                    static_cast<unsigned>(dom));
+            }
+            return memory::pooled_frame_ptr<memory::segmented_tree_frame>(
+                &frame_pool,
+                new memory::segmented_tree_frame(std::move(*frame)));
+        }
+
         // Builds the merge_step_decision for the just-yielded state.
         // Moves staged pending_ios out of `active_merge` into the
         // returned need_io payload. Scans once to precompute
@@ -2275,7 +2376,7 @@ namespace apps::inconel::tree {
                 case merge_yield::need_io: {
                     bool has_reads = false;
                     for (const auto& d : active.pending_ios) {
-                        if (std::holds_alternative<format::read_desc>(d)) {
+                        if (std::holds_alternative<memory::frame_read_desc>(d)) {
                             has_reads = true;
                             break;
                         }
@@ -2531,6 +2632,7 @@ namespace apps::inconel::tree {
                 state.alloc,
                 round.pinned_base_guard->manifest->geom,
                 state.non_leaf_page_cache,
+                frame_pool,
                 round));
             active.coro->resume();
             r->cb(build_merge_step_decision_after_yield());
@@ -2732,7 +2834,24 @@ namespace apps::inconel::tree {
             }
             for (auto* node : cached_nodes) {
                 if (node->type != format::node_type::internal) continue;
-                state.non_leaf_page_cache[node->new_paddr] = node->content;
+                bool installed = false;
+                for (auto& frame : active.writeback_frames) {
+                    if (!frame || frame->id.base != node->new_paddr) {
+                        continue;
+                    }
+                    state.non_leaf_page_cache.erase(node->new_paddr);
+                    state.non_leaf_page_cache.emplace(
+                        node->new_paddr, std::move(frame));
+                    installed = true;
+                    break;
+                }
+                if (!installed) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::emit_finalize_merge_success",
+                        "missing writeback frame for internal node dev=%u lba=%lu",
+                        static_cast<unsigned>(node->new_paddr.device_id),
+                        static_cast<unsigned long>(node->new_paddr.lba));
+                }
             }
 
             // Happy path: transfer new_manifest onto the round so

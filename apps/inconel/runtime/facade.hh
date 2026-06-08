@@ -32,7 +32,7 @@
 #include "../core/registry.hh"
 #include "../core/shard_partition.hh"
 #include "../core/tree_read_domain.hh"
-#include "../mock_nvme/scheduler.hh"
+#include "../nvme/runtime_scheduler.hh"
 #include "../tree/scheduler.hh"        // tree::tree_sched
 #include "../value/scheduler.hh"       // value::value_alloc_sched_base
 
@@ -57,7 +57,7 @@ namespace apps::inconel::rt {
     // every core listed in `build_options::cores`. Asserts non-null
     // to catch misconfigured topologies early.
 
-    inline mock_nvme::scheduler*
+    inline nvme::runtime_scheduler*
     local_nvme() {
         return core::registry::local_nvme();
     }

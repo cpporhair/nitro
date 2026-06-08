@@ -281,5 +281,5 @@ hole 复用: clean_allocatable → dirty_hole_fill → writeback_inflight → cl
 | 资源回收/GC | tree/ + value/ | flush §5,§7 | runtime_state §8 | recovery §8-9 tombstone |
 | Superblock 读写 | format/ + recovery/ | on_disk §2 | recovery §2 | design_overview §12.3 |
 | 域对象/共享类型 | core/ | design_overview §5 | cross_doc §2 字段 | — |
-| NVMe 操作 | nvme/ or mock_nvme/ | runtime_state §7 | code_modules | — |
+| NVMe 操作 | nvme/ | runtime_state §7 | code_modules | — |
 | 模块归属判定 | — | code_modules 全文 | — | — |

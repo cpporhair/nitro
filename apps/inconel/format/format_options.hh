@@ -6,9 +6,10 @@
 #include "./format_profile.hh"   // kMaxValueClassCount (ODF §2.2 cap of 16)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// format_options — complete format-time input for make_formatted_storage().
+// format_options — complete format-time input for Inconel superblock/layout
+// construction.
 //
-// Scope (032 test-only helper):
+// Scope:
 //   - Carries every parameter that must land in a superblock A/B pair.
 //   - Deliberately does NOT accept a `format_profile&`: profile carries
 //     `value_data_area_base/end` which are runtime placeholders rather than
@@ -21,9 +22,9 @@
 //     init is concise enough.
 //
 // Out of scope:
-//   - `namespace_size` is a fixture decision ("how big is this mock SSD"),
-//     passed separately to make_formatted_storage().
-//   - No I/O, no mock_nvme dependency, no runtime dependency.
+//   - `namespace_size` is a device/namespace property, passed separately to
+//     compute_layout().
+//   - No I/O and no runtime dependency.
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace apps::inconel::format {

@@ -177,8 +177,8 @@ namespace apps::inconel::format {
     // ── Bootstrap profile ───────────────────────────────────────────────────
     //
     // v1 dev / bring-up defaults. The constants are deliberately aligned with
-    // the mock_nvme harness the current test suite uses so the standard build
-    // path stays drop-in compatible.
+    // the real-NVMe flush_e2e harness so the standard build path can format
+    // and validate a small dedicated namespace.
     //
     // Any change here must also keep `profile_is_self_consistent` happy — the
     // `static_assert` below will fire on drift.
@@ -187,7 +187,7 @@ namespace apps::inconel::format {
         .lba_size               = 4096,
         .value_data_area_base   = paddr{0, 4000},
         // ~400 MiB namespace (100 000 LBAs @ 4 KiB). Sized to carry the
-        // mock_nvme e2e harness up to ~10^6 keys with 2× headroom. The
+        // real-NVMe e2e harness up to ~10^6 keys with 2x headroom. The
         // tree allocator grows from `value_data_area_base` downward via
         // retire-and-replan, so this end LBA is the only knob gating
         // how many keys the whole tree/value area can fit; nothing in

@@ -43,6 +43,7 @@
 #include "../core/tree_manifest.hh"
 #include "../format/types.hh"
 #include "../format/tree_page.hh"
+#include "../memory/frame.hh"
 
 namespace apps::inconel::tree {
 
@@ -189,9 +190,8 @@ namespace apps::inconel::tree {
     //   - owner owns every non-leaf read / cache / reverse / write
     //
     // `leaf_page_image.page` is the final on-disk leaf page body.
-    // Worker formats the page once and owner only moves the vector
-    // through the `worker -> owner -> write_desc.data` chain with no
-    // extra page-body copy.
+    // Worker formats the page once; owner copies it into a segmented
+    // writeback frame before issuing NVMe I/O.
 
     struct leaf_page_image {
         std::vector<char> page;
@@ -249,7 +249,7 @@ namespace apps::inconel::tree {
     struct flush_round_done {};
 
     struct flush_round_need_read {
-        std::vector<format::read_desc> read_descs;
+        std::vector<memory::frame_read_desc> reads;
     };
 
     using flush_round_decision = std::variant<flush_round_done, flush_round_need_read>;
@@ -356,19 +356,23 @@ namespace apps::inconel::tree {
     // `as_stream >> concurrent(N) >> visit() >> flat_map(...)`
     // chain — no artificial serialization between the two.
     // Pointer lifetime:
-    //   - read_desc.buf   → `merge_round_state::fetched_old_pages[rb].data()`
-    //   - write_desc.data → `mem_tree_node::content.data()` inside
-    //                       `merge_round_state::combined_root`
-    // Both buffers are tree_sched-owned and live until finalize_merge.
-    using merge_io_desc = std::variant<format::read_desc, format::write_desc>;
+    //   - frame_read_desc.frame  → owner merge read frame for an old
+    //                              internal page
+    //   - frame_write_desc.frame → owner merge writeback frame copied from
+    //                              owner-built tree page bytes
+    // Both descriptors point at tree_sched-owned frames that live until the
+    // merge round is finalized.
+    using merge_io_desc = std::variant<
+        memory::frame_read_desc,
+        memory::frame_write_desc>;
 
     // `merge_step_need_io` carries one yield's worth of IOs moved
     // out of `merge_round_state::pending_ios`. `has_reads` is
     // precomputed by the seam handler so the outer pipeline doesn't
     // need to re-scan the vector; it's true iff the coroutine
     // cannot safely be resumed until every io in this batch
-    // completes (i.e. any `read_desc` present whose buffer the
-    // next resume will read in place). The outer pipeline ACKs
+    // completes (i.e. any frame_read_desc present whose frame the
+    // next resume will inspect). The outer pipeline ACKs
     // back via `submit_merge_reads_done` when `has_reads` is true.
     //
     // `merge_step_done` is returned once the coroutine reaches

@@ -5,7 +5,7 @@
 #include <variant>
 #include "../format/types.hh"
 
-namespace apps::inconel::memory { struct page_frame; }
+namespace apps::inconel::memory { struct segmented_page_frame; }
 
 namespace apps::inconel::tree {
 
@@ -27,8 +27,7 @@ namespace apps::inconel::tree {
     struct decision_done {};
 
     struct decision_need_read {
-        std::vector<format::read_desc> read_descs;
-        std::vector<memory::page_frame*> frames;
+        std::vector<memory::segmented_page_frame*> frames;
     };
 
     using batch_decision = std::variant<decision_done, decision_need_read>;

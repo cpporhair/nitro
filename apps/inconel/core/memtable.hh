@@ -10,17 +10,16 @@
 // ai_context/inconel/plan/021_front_input_memtable_carrier.md
 // for the Phase 1 scope rationale.
 //
-// Key design choice: each memtable_gen owns a kv_arena that
-// holds BOTH key bytes and value bytes for that gen. String
-// views into the arena are what the btree_map's key and
-// value_handle::hot carry. The arena frees all its chunks
-// atomically when the last shared_ptr<memtable_gen> drops,
-// retiring keys, values, and hot data together.
+// Current target design: memtable_gen owns key bytes and value
+// metadata only. Value bodies are durable in the Value Area before
+// WAL/memtable insertion, and memtable value hits return durable
+// value_ref, not a value body view.
 //
-// This collapses what was previously a separate hot_blob /
-// unique_ptr machinery into a single lifetime owner, and
-// lets memtable_entry / value_handle be trivially copyable
-// PODs.
+// This header still carries the legacy Phase 021 carrier
+// value_handle{durable, hot} because the front/memtable module has
+// not been replaced yet and flush_e2e still constructs sealed gens
+// directly. Treat value_view/hot as compatibility debt tracked by
+// INC-055; new code should depend only on durable value_ref.
 //
 // Any structural change here must also update:
 //   - design_overview.md §5.1, §5.3
@@ -49,9 +48,9 @@ namespace apps::inconel::core {
 
     // ── gen_arena ────────────────────────────────────────────
     //
-    // Per-memtable_gen bump allocator. Holds BOTH key bytes and
-    // value bytes for this gen; key string_views and value
-    // views in memtable_entry point into it.
+    // Per-memtable_gen bump allocator. Target usage is key bytes
+    // only. Legacy flush_e2e/front carriers may still allocate value
+    // hot views here until INC-055 removes value_handle::hot.
     //
     // Single-writer: only the owning front_sched mutates the
     // arena while the gen is active. Once the gen is sealed,
@@ -96,12 +95,10 @@ namespace apps::inconel::core {
 
     // ── value_view ──────────────────────────────────────────
     //
-    // A {pointer, length} view over value bytes. Used as the
-    // "hot" half of value_handle (pointing into the owning
-    // gen's kv_arena) and as the return type of lookup_memtable
-    // on a value hit. Lifetime is tied to the owning gen via
-    // the read_handle → cat → prs → shared_ptr<memtable_gen>
-    // pin chain (see RSM §3.7, RMC §9.3).
+    // Legacy {pointer, length} view over value bytes. Target
+    // memtable lookup returns durable value_ref only; this type
+    // remains temporarily for the old value_handle carrier and is
+    // scheduled for removal by INC-055.
 
     struct value_view {
         const char* data;
@@ -110,10 +107,10 @@ namespace apps::inconel::core {
 
     // ── value_handle ────────────────────────────────────────
     //
-    // Payload of a memtable PUT entry (OV §5.1, RSM §3.3).
-    // POD: both fields are trivially copyable. `durable` is
-    // the stable on-disk location of the value object; `hot`
-    // is a zero-copy view into the owning gen's kv_arena.
+    // Legacy payload of a memtable PUT entry. `durable` is the
+    // stable on-disk location and is the only field new code should
+    // consume. `hot` is compatibility debt for the pre-INC-055
+    // memtable carrier.
 
     struct value_handle {
         value_ref  durable;
@@ -172,9 +169,9 @@ namespace apps::inconel::core {
     // ── memtable_entry ──────────────────────────────────────
     //
     // Trivially copyable (no unique_ptr, no heap-owning field).
-    // Value bytes live in the owning gen's kv_arena; vh.hot is
-    // just a view into them. data_ver is semantically
-    // equivalent to batch_lsn (OV §6).
+    // Target value entries carry durable value_ref only; the vh.hot
+    // subfield is a legacy compatibility view. data_ver is
+    // semantically equivalent to batch_lsn (OV §6).
 
     struct memtable_entry {
         uint64_t data_ver;
@@ -196,12 +193,11 @@ namespace apps::inconel::core {
     // gen, which may clear+rebuild loser_durable_refs only
     // (never touch table or arena).
     //
-    // kv_arena holds all gen-local bytes (both keys and values).
-    // The btree_map's key is std::string_view into kv_arena;
-    // memtable_entry.vh.hot is a value_view into the same arena.
-    // When the last shared_ptr<memtable_gen> drops, the arena
-    // frees all its chunks in one sweep, retiring keys, values,
-    // and hot data together.
+    // kv_arena target usage is key bytes only. The btree_map's key
+    // is std::string_view into kv_arena; any memtable_entry.vh.hot
+    // view is legacy compatibility state and must not be copied into
+    // new designs. When the last shared_ptr<memtable_gen> drops, the
+    // arena frees all chunks in one sweep.
     //
     // Declaration order: kv_arena declared BEFORE table so that
     // reverse-order destruction destroys table first. Purely
@@ -242,9 +238,10 @@ namespace apps::inconel::core {
     // Readonly snapshot of a single front's active + imms
     // chain, captured at PRS construction time (OV §5.3,
     // RSM §3.1). Each shared_ptr copy bumps the gen's control
-    // block refcount; the pin chain keeps every memtable_entry
-    // and all its arena-backed bytes alive for the full
-    // lifetime of any reader holding this PRS snapshot.
+    // block refcount; the pin chain keeps every memtable_entry and
+    // key view alive for the full lifetime of any reader holding this
+    // PRS snapshot. Value body residency belongs to value_alloc_sched,
+    // not the memtable pin chain.
 
     struct front_read_set {
         std::shared_ptr<memtable_gen>                         active;
@@ -256,7 +253,7 @@ namespace apps::inconel::core {
     static_assert(std::is_trivially_copyable_v<value_view>,
                   "value_view must be a POD (pointer + length)");
     static_assert(std::is_trivially_copyable_v<value_handle>,
-                  "value_handle must be POD now that hot is a view");
+                  "legacy value_handle must stay POD until INC-055 removes hot");
     static_assert(std::is_trivially_copyable_v<memtable_entry>,
                   "memtable_entry must be POD now that value_handle is POD");
     static_assert(sizeof(value_view) <= 16,

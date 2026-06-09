@@ -20,7 +20,7 @@
 | `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
 | `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
 | `batch_lookup` | `(keys[], read_lsn, front_read_set)` → `batch_lookup_results[]` | RSM §3.4/3.7, RAP §5.1-5.3 |
-| **`lookup_memtable`** | **`(key, read_lsn, front_read_set)`** → `variant<value_view, tombstone, miss>` | **RSM §3.4/3.7, RAP §4.2/4.3/5.3, OV §8.1/14.2** |
+| **`lookup_memtable`** | **`(key, read_lsn, front_read_set)`** → `variant<value_ref, tombstone, miss>` | **RSM §3.4/3.7, RAP §4.2/4.3/5.3, OV §8.1/14.2** |
 | **`scan_memtable`** | **`(begin, end, read_lsn, front_read_set)`** → `scan_result_set` | **RSM §3.4, RAP §6.2/6.3, OV §14.4** |
 | `collect_eligible_gens` | `(durable_lsn)` → `eligible_gens[]` | RSM §3.4/3.8, FF §2.2/8.1 |
 | `seal_active` | `()` → `front_read_set` | RSM §3.6, OV §9.2 |
@@ -52,10 +52,9 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `coord_state` | `next_lsn, gate, current_cat, ready_set, seal_in_progress, cat_epoch` | RSM §2.1 | — |
 | `front_state` | `owner_id, active, imms, wal` | RSM §3.1 | — |
 | `memtable_gen` | `gen_id, st, front_owner_index, min_lsn, max_lsn, kv_arena, table, loser_durable_refs`（无内嵌 refcount；生命周期由 `std::shared_ptr<memtable_gen>` 管理；flush 可写 `loser_durable_refs`） | OV §5.1, RSM §3.2 | FF §3.3, RW §6 |
-| `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；`allocate(src, len) -> string_view` | RSM §3.2 | RMC §9.3 |
+| `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；`allocate(src, len) -> string_view`；只保存 key bytes，不保存 value body | RSM §3.2 | RMC §9.3 |
 | `memtable_entry` | `data_ver, kind, vh`（trivially copyable POD） | RSM §3.3 | RAP §4.3 |
-| `value_handle` | `durable: value_ref, hot: value_view`（POD）；`hot` 指向 owning gen 的 `kv_arena` 切片 | OV §5.1, RSM §3.3 | RAP §4.4 |
-| `value_view` | `data: const char*, len: uint32_t`（POD；lookup_memtable 命中 value 时返回，生命周期与 read_handle 绑定） | RSM §3.3/3.7 | RAP §4.2/4.4 |
+| `value_handle` | `durable: value_ref`（POD）；memtable 不保存 value body | OV §5.1, RSM §3.3 | RAP §4.4 |
 | `publish_catalog` | `prs, durable_lsn (atomic), epoch` | OV §5.4 | RSM §2.1/2.3 |
 | `published_read_set` | `tree_guard, fronts, epoch` | OV §5.3 | FF §4.2, RAP §2 |
 | `front_read_set` | `active, imms` | OV §5.3 | RSM §3.4/3.7, RAP §4.2/4.3/5.3/6.3 |
@@ -104,7 +103,7 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 | `scan_memtable` | active, imms | 同上 | 同上 |
 | `tree_lookup` | manifest | 请求携带的 `read_handle.cat->prs->tree_guard->manifest` (snapshot) | `tree_sched` 当前 manifest |
 | `tree_lookup` 路由 | shard_idx | `current_shard_partitions()->route(key)`（全局 `shard_partition_map` snapshot） | 不是 `leaf_order.find_leaf_for_key(key) % K`，也不是 `front_owner % K` |
-| `read_value` | value_ref | `tree_lookup` 返回的 `leaf_value_record.vr` | 不是 front_sched / tree_read_domain 本地读取 |
+| `read_value` | value_ref | `lookup_memtable` 或 `tree_lookup` 返回的 durable `value_ref` | 不是 front_sched / tree_read_domain 本地读取 |
 | `read_page_values` | value_read_group | 调用方对 tree-sourced `value_ref`s 做 request-local page grouping 后得到 | 不是逐条 `read_value()` fan-out |
 
 ## 5. Pipeline 跳转路径

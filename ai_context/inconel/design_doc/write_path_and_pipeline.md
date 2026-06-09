@@ -405,24 +405,18 @@ insert_memtable_entries(frag):
             it = active->table.try_emplace(arena_key).first
 
         if entry.op_type == PUT:
-            // Value bytes 同 arena：得到 value_view
-            string_view val_slice =
-                active->kv_arena.allocate(entry.value_data, entry.value_len)
-            value_view hot = { val_slice.data(), val_slice.size() }
-
             it->second.push_back(memtable_entry {
                 data_ver = frag.batch_lsn,
                 k        = memtable_entry::kind::value,
                 vh       = value_handle {
                     durable = entry.allocated_vr,
-                    hot     = hot,
                 },
             })
         else:
             it->second.push_back(memtable_entry {
                 data_ver = frag.batch_lsn,
                 k        = memtable_entry::kind::tombstone,
-                vh       = {},                              // hot = {nullptr, 0}
+                vh       = {},
             })
 
     active->max_lsn = max(active->max_lsn, frag.batch_lsn)

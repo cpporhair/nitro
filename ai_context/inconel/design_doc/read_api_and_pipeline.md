@@ -2,7 +2,7 @@
 
 > 依据：`ai_context/inconel/design_overview.md`（唯一概要规范）
 >
-> 本文细化 GET / MultiGet / Scan 的 read_handle 生命周期、batch cache、memtable value zero-copy 返回路径、tree lookup sender 编排、tree tombstone 读语义以及长读资源上界策略。
+> 本文细化 GET / MultiGet / Scan 的 read_handle 生命周期、batch cache、memtable value_ref 返回与 value cache 读取路径、tree lookup sender 编排、tree tombstone 读语义以及长读资源上界策略。
 
 ## 1. 读路径总览
 
@@ -46,7 +46,7 @@ read_handle 通过 `shared_ptr<publish_catalog>` 间接 pin 住：
 持有期间，所有被 pin 住的对象不会被释放：
 - memtable gens 的数据不会被清理
 - tree guard 保护的旧 slots / old values 不会被 TRIM
-- memtable 的 `kv_arena` 引用链不会断裂（所有 key/value bytes 随 gen 一起保活）
+- memtable 的 `kv_arena` 引用链不会断裂（key bytes 与 entry metadata 随 gen 一起保活；value body 不进入 memtable）
 
 ### 2.3 释放
 
@@ -144,10 +144,11 @@ point_get(key)
 
 5. 处理 memtable 结果：
    match result:
-       value_view(vv):
-           // memtable hit → vv 指向 owning gen 的 kv_arena 切片，zero-copy
-           // read_handle 仍在手，shared_ptr<memtable_gen> 保活整个 arena
-           return vv   // 上层把 vv.data/vv.len 写到响应 buffer
+       value_ref(vr):
+           // memtable hit value → value body 已先落到 Value Area
+           // 通过 value_alloc_sched 读；recently-written / memtable-visible 页应尽量命中 cache
+           value_data = value_alloc_sched->read_value(vr)
+           return value_data
        tombstone:
            // memtable hit tombstone → not found
            return not_found
@@ -197,12 +198,12 @@ point_get(key)
          return front_sched[owner]->lookup_memtable(key, rh.read_lsn, frs);
      })
   >> flat()
-  >> visit()                    // variant<value_view, tombstone, miss>
+  >> visit()                    // variant<value_ref, tombstone, miss>
   >> then([key](auto&& result) {
          using T = std::decay_t<decltype(result)>;
-         if constexpr (std::is_same_v<T, value_view>) {
-             // memtable hit → zero-copy view，read_handle 仍持有
-             return just(std::move(result));
+         if constexpr (std::is_same_v<T, value_ref>) {
+             // memtable hit → 统一走 value_alloc_sched；cache hit 时不读 NVMe
+             return value_alloc_sched->read_value(result);
          } else if constexpr (std::is_same_v<T, tombstone_tag>) {
              return just(not_found_result{});
          } else {
@@ -254,18 +255,18 @@ lookup_memtable(key, read_lsn, frs):
 
 4. 如果 winner 不存在 → 返回 miss
 
-5. 如果 winner.kind == value → 返回 `value_view{winner.vh.hot->data, winner.vh.hot->len}`（zero-copy，生命周期绑定 read_handle）
+5. 如果 winner.kind == value → 返回 `winner.vh.durable`（`value_ref`）
 
 6. 否则 winner.kind == tombstone → 返回 tombstone
 ```
 
 这里不能因为 active 命中就提前返回。gen 的拓扑顺序（active / imms）不等价于同一 key 的 `data_ver` 新旧顺序；正确性标准始终是“在 `active + imms` 中取 `data_ver <= read_lsn` 的最大版本”。
 
-### 4.4 memtable value 的 zero-copy 返回契约
+### 4.4 memtable value 的 value_ref 返回契约
 
-概要 §8.1 规则 4：memtable hit value 时，必须直接从 `value_handle.hot` 返回，绝不能退化成 SSD 读。
+memtable 不保存 value body，也不返回 `value_view`。`lookup_memtable` 命中 value 时只返回 `winner.vh.durable`（`value_ref`）；调用方必须继续走 `value_alloc_sched.read_value(vr)` 或批量 `read_page_values(group)`。
 
-`lookup_memtable` 命中 value 时直接返回 `winner.vh.hot`——它本身就是 `value_view { const char* data; uint32_t len; }`，指向 owning `memtable_gen.kv_arena` 中的某段切片。**不做任何 copy**——调用方在 `read_handle` 作用域内消费 view 即可（例如写到 RESP / RPC 响应 buffer）。
+正确性来自写路径顺序：`value_alloc_sched.persist_put_values()` 先把 value object 写入 Value Area 并返回 durable `value_ref`，随后 WAL 记录 `PUT(value_ref)`，最后 memtable 插入 `{key, data_ver, value_ref}`。因此 memtable 只需要保活 key bytes 与版本元数据；value bytes 的驻留由 value 模块负责。
 
 **保证链**（唯一的跨线程 atomic gate 在 `shared_ptr<memtable_gen>` 的 control block）：
 ```text
@@ -274,18 +275,18 @@ read_handle          shared_ptr<publish_catalog>
   → prs              shared_ptr<front_read_set[]>
   → front_read_set   shared_ptr<memtable_gen>   ← 整条链上唯一的 atomic gate
   → memtable_gen     by-value { kv_arena, table, ... }
-    → kv_arena         vector<unique_ptr<char[]>> (所有 gen-local bytes)
+    → kv_arena         vector<unique_ptr<char[]>> (key bytes)
     → table            btree_map<string_view → InlinedVec<memtable_entry>>
       → memtable_entry    POD
         → value_handle    POD
-          → value_view    指向 kv_arena 的 slice（const char*, uint32_t）
+          → value_ref     指向 Value Area 中的 durable value object
 ```
 
-只要 `read_handle` 未释放，`shared_ptr<memtable_gen>` 的 `use_count ≥ 1`，整条链上的所有对象都活着，`value_view` 里的指针稳定可读。value bytes 自身**没有** refcount——它们是 `kv_arena` 的内部切片，随 gen 析构一次 sweep 释放，跨线程访问完全由 shared_ptr control block 这个唯一的 atomic gate 保证。
+只要 `read_handle` 未释放，`shared_ptr<memtable_gen>` 的 `use_count ≥ 1`，key view 与 memtable entry 稳定可读；value body 不依赖这条链。memtable hit 后是否读 NVMe 不是正确性条件，而是 value cache 的效率目标：recently-written / memtable-visible value page 在 FUA 完成后应尽量留在 `value_alloc_sched` 的 `readonly_frame_cache` 或 dedicated residency tier 中，按 budget / epoch / pin 管理，具体作为 `INC-055` 高优先级项在实现 memtable 模块时落地。
 
 **调用方义务**：
-1. 在 `read_handle` 作用域内消费 view；不能把 `value_view` 保存在比 read_handle 更长寿的对象里。
-2. 如果需要把 bytes 送到 `read_handle` 作用域之外（例如 enqueue 到一个跨 request 的 buffer），调用方自行做一次 copy。lookup path 不为这种情况提前 copy。
+1. 不得假设 memtable entry 持有 value bytes，也不得缓存 `kv_arena` 指针作为 value body。
+2. 对 Point GET 直接调用 `read_value(vr)`；MultiGet / Scan 先按 value page 分组，再调用 `read_page_values(group)`。
 
 ### 4.5 Tree Path Value Read
 
@@ -336,8 +337,11 @@ multi_get(keys[])
    `tree::lookup(group.keys, manifest)` sender 内部按 key 再次做 shard-partition
    routing + scatter，调用方不需要显式传 sched 指针。
 
-7. 从 tree results 中提取 value refs，按 value page 分组
-   value_groups = group_value_refs_by_page(tree_results)
+7. 为每个 key 选择最终 winner，并从所有 live value winners 中提取 value refs
+   - memtable value_ref 赢过 tree
+   - memtable tombstone 直接 not found
+   - memtable miss 才使用 tree result
+   value_groups = group_value_refs_by_page(winner_value_refs)
 
 8. Fan-out 到 `value_alloc_sched` 做批量 value read
    for each group in value_groups:
@@ -345,8 +349,7 @@ multi_get(keys[])
 
 9. 合并结果
    for each key in keys:
-       if memtable_results has value: use memtable result（value_view → kv_arena 切片）
-       else if tree_results has value: use grouped page values
+       if winner has value_ref: use grouped page values
        else if memtable_results has tombstone: not found
        else if tree_results has tombstone: not found
        else: not found
@@ -540,14 +543,14 @@ range_scan(begin, end)
   >> then([](auto&& merged) {
          return filter_tombstones(merged);
      })
-  // ── value read for tree-sourced value records ──
-  // memtable-sourced records 已有 value_view（直接输出 zero-copy view）
-  // tree-sourced value records 先按 value page 分组，再通过 value_alloc_sched 批量读 value body
+  // ── value read for all value_ref records ──
+  // memtable-sourced 和 tree-sourced value records 都先按 value page 分组，
+  // 再通过 value_alloc_sched 批量读 value body；memtable 不携带 value bytes
   >> then([](auto&& filtered) {
-         auto tree_value_groups = group_value_refs_by_page(filtered);
-         if (tree_value_groups.empty())
+         auto value_groups = group_value_refs_by_page(filtered);
+         if (value_groups.empty())
              return just(std::move(filtered));
-         return for_each(tree_value_groups)
+         return for_each(value_groups)
              >> concurrent()
              >> flat_map([](auto&& group) {
                     return value_alloc_sched->read_page_values(group);
@@ -733,7 +736,7 @@ v1 先实现策略 3（内存反压）和策略 2（作为观测/告警手段）
 |--------|---------|
 | `node_cache` | `readonly_frame_cache` 在 `tree_node` domain 的逻辑视图 |
 | `value_cache` | value page frame residency + `read_value()` / `read_page_values()` copy-out 服务 |
-| `hot_blob` | **已废除**。value bytes 住在 `memtable_gen.kv_arena` 里，随 gen 一起生灭 |
+| `hot_blob` | **已废除**。memtable 不保存 value body；recently-written / memtable-visible value bytes 的驻留由 value cache / residency tier 负责 |
 
 ### 9.2 Tree Node Frame Cache
 
@@ -782,21 +785,21 @@ MultiGet / Scan:
 5. **sub-LBA 共享**：同一 LBA 的多个 value objects 共享一个 frame。按页分组后，同页多个 value 只做一次 page lookup / page miss 判定。
 6. **部署建议**：最佳实践是把 `value_alloc_sched` 放在独占核心上，读写共享同一份大 cache；但这属于部署优化，不是语义前提。
 
-### 9.4 memtable value bytes 不经任何 frame cache
+### 9.4 memtable hit 统一走 value cache
 
-memtable hit 的语义不受 frame cache 影响：
+memtable hit 的语义由 `value_ref` 与 Value Area durability 保证，性能由 value cache 负责：
 
-1. memtable hit value → 返回 `value_view`，zero-copy 指向 owning gen 的 `kv_arena` 切片，不经过任何 frame cache
-2. value bytes 住在 `memtable_gen.kv_arena` 里，没有独立的 `hot_blob` 对象；`value_alloc_sched` **不**维护 `value_ref -> value bytes` 的 materialized 索引
-3. page cache 驱逐不影响 memtable 的 kv bytes（它们不在任何 page cache 中）
-4. memtable hit 绝不退化成 SSD 读
-5. view 的生命周期由 `read_handle → cat → prs → shared_ptr<memtable_gen>` 的 pin 链保证，`shared_ptr<memtable_gen>` 的 control block 是唯一的跨线程 atomic gate
+1. memtable hit value → 返回 `value_ref`，随后调用 `read_value(vr)` / `read_page_values(group)`
+2. value bytes 不住在 `memtable_gen.kv_arena`，也没有独立 `hot_blob`；`kv_arena` 只保活 key bytes
+3. page cache 驱逐不会破坏 memtable 的可见性；cache miss 时可从 NVMe 重读 durable value object
+4. recently-written / memtable-visible value page 应在 FUA 完成后尽量留驻，减少 memtable hit 读盘；预算、epoch、pin 策略见 `INC-055`
+5. read_handle 的 pin 链只保护 memtable key/entry metadata，不保护 value body
 
 ### 9.5 读路径 Frame 使用总结
 
 ```text
 point_get(key):
-  memtable hit value → value_view → kv_arena 切片（零拷贝，不经 frame cache）
+  memtable hit value → value_ref → value_alloc_sched.read_value(vr)
   memtable hit tombstone → not found
   memtable miss → route to home tree_read_domain (via current_shard_partitions()->route(key)):
     tree traversal: get_or_read_tree_node() × depth 次（在 read_domain.lookup 上执行，共享 read_domain.node_cache）
@@ -853,6 +856,6 @@ entry 对 reader 可见 ⟺ entry.data_ver <= reader.read_lsn
 4. 最终 winner 为 tombstone → not found
 ```
 
-### 11.3 Never 退化
+### 11.3 Memtable Hit Value 来源
 
-memtable hit value 时直接返回 `value_view` 指向 owning gen 的 `kv_arena` 切片，不走 SSD。这不是优化，是正确性保证（概要 §5.1 规则 5：memtable live 时，value bytes 的唯一来源就是 gen 的 `kv_arena`）。
+memtable hit value 时返回的是 durable `value_ref`，value body 的唯一正确来源是 Value Area（可由 `value_alloc_sched` 的 resident frame/cache 命中，也可在 cache miss 后读 NVMe）。memtable 不保存第二份 value body；减少 memtable-hit 读盘是 value cache 的高优先级实现目标（`INC-055`），不是通过恢复 memtable hot copy 解决。

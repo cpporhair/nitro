@@ -55,8 +55,10 @@ namespace apps::inconel::tree {
 
         // Strong references to every sealed gen included in this
         // round. kv_arena bytes for the `flush_key_group.key` views
-        // and for every winner `value_handle.hot` are alive as long
-        // as at least one shared_ptr here survives.
+        // are alive as long as at least one shared_ptr here survives.
+        // Value body residency belongs to value_alloc_sched; the
+        // legacy value_handle.hot carrier is not part of the target
+        // contract (INC-055).
         absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>
             pinned_gens;
 

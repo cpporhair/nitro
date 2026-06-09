@@ -481,7 +481,7 @@ new CAT2 installed
   │               │           ├── gen 析构（反向声明顺序）
   │               │           │   ├── table 先析构（POD entries，trivial）
   │               │           │   ├── kv_arena 后析构 → vector<unique_ptr<char[]>>
-  │               │           │   │   → 所有 chunk 一次 sweep → key/value bytes 全部消失
+  │               │           │   │   → 所有 chunk 一次 sweep → key bytes 全部消失
   │               │           │   └── （durable value_ref 不在此释放）
   │               │           └── gen.loser_durable_refs 进入回收判定
   │               │

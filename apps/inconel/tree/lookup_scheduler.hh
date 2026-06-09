@@ -465,11 +465,7 @@ namespace apps::inconel::tree {
                     make_tree_frame_id(e.next_page, s.page_lbas));
                 if (!pin.frame) continue;
 
-                std::vector<char> scratch;
-                auto image = frame_bytes_for_page(
-                    *pin.frame, s.page_size, scratch);
-                const char* page = image.data();
-                auto status = inspect_tree_page(page, s.page_size);
+                auto status = inspect_segmented_tree_page(*pin.frame, s.page_size);
                 if (status != tree_page_status::ok) {
                     core::panic_inconsistency(
                         "tree::tree_lookup_sched::process_entries",
@@ -479,19 +475,16 @@ namespace apps::inconel::tree {
                         tree_page_status_to_string(status));
                 }
 
-                auto* hdr = reinterpret_cast<const tree_slot_header*>(page);
-                if (hdr->type != node_type::leaf) {
+                segmented_leaf_page_reader reader;
+                if (!reader.parse_validated(*pin.frame, s.page_size)) {
                     core::panic_inconsistency(
                         "tree::tree_lookup_sched::process_entries",
-                        "read_domain lookup expected leaf page, got type=%u "
+                        "read_domain lookup expected valid leaf page "
                         "(dev=%u lba=%lu)",
-                        static_cast<unsigned>(hdr->type),
                         static_cast<unsigned>(e.next_page.device_id),
                         static_cast<unsigned long>(e.next_page.lba));
                 }
 
-                leaf_page_reader reader;
-                reader.parse(page, s.page_size);
                 auto rec = reader.find(e.key);
                 if (!rec.has_value())
                     e.result = lookup_absent{};
@@ -540,17 +533,6 @@ namespace apps::inconel::tree {
             }
         }
 
-        static std::span<const char>
-        frame_bytes_for_page(const memory::segmented_page_frame& frame,
-                             uint32_t page_size,
-                             std::vector<char>& scratch) {
-            if (page_size <= frame.lba_size()) {
-                return frame.contiguous_bytes(0, page_size);
-            }
-            scratch.resize(page_size);
-            frame.copy_to_contiguous(scratch.data(), page_size);
-            return std::span<const char>(scratch.data(), scratch.size());
-        }
     };
 
     // ── Deferred definitions ──

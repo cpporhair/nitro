@@ -120,6 +120,9 @@ namespace apps::inconel::nvme {
             return advance();
         }
 
+        // Compatibility API for legacy contiguous callers. Runtime
+        // tree/value paths must use read_frame()/write_frame() so PUMP fills
+        // the segmented LBA DMA pages directly.
         auto
         read(uint64_t lba, void* buf, uint32_t num_lbas) {
             validate_io_span(num_lbas, "read");
@@ -168,6 +171,9 @@ namespace apps::inconel::nvme {
                 });
         }
 
+        // Compatibility API for legacy contiguous callers. Runtime
+        // tree/value paths must use read_frame()/write_frame() to avoid a
+        // staging copy through a flat buffer.
         auto
         write(uint64_t lba, const void* data, uint32_t num_lbas,
               uint32_t flags = 0) {

@@ -190,11 +190,12 @@ namespace apps::inconel::tree {
     //
     // Routes every key in the workset through the globally installed
     // `shard_partition_map`, which is the SAME decision surface the
-    // read path uses. Keys go into per-shard buckets keyed by
-    // `shard_partition.shard_idx`; the workset is rewritten as the
-    // concatenation of buckets so each partition's slice is
-    // contiguous, and `flush_key_partition.groups` is a span over
-    // that slice.
+    // read path uses. The folded workset is already sorted by key, so
+    // this function emits a partition for each consecutive same-shard
+    // run and does not rewrite/copy the workset. If a future routing
+    // table maps multiple discontiguous fence ranges to the same
+    // shard_idx, that read_domain simply receives multiple partition
+    // requests.
     //
     // Empty base_manifest is a legitimate bootstrap case — the
     // first flush on a freshly formatted disk. Routing still works
@@ -240,10 +241,30 @@ namespace apps::inconel::tree {
 
         const uint32_t K = partitions->shard_count();
 
-        std::vector<std::vector<flush_key_group>> buckets(K);
+        rs.partitions.clear();
+        rs.partitions.reserve(std::min<uint32_t>(N, K));
 
-        for (const auto& k : rs.workset) {
-            const uint32_t shard = partitions->route(k.key);
+        uint32_t run_start = 0;
+        uint32_t run_shard = partitions->route(rs.workset[0].key);
+        if (run_shard >= K) {
+            core::panic_inconsistency(
+                "tree::build_key_partitions",
+                "route() returned shard=%u >= shard_count=%u",
+                static_cast<unsigned>(run_shard),
+                static_cast<unsigned>(K));
+        }
+
+        auto emit_run = [&](uint32_t begin, uint32_t end, uint32_t shard) {
+            if (end == begin) return;
+            rs.partitions.push_back(flush_key_partition{
+                .read_domain_index = shard,
+                .groups = std::span<const flush_key_group>(
+                    rs.workset.data() + begin, end - begin),
+            });
+        };
+
+        for (uint32_t i = 1; i < N; ++i) {
+            const uint32_t shard = partitions->route(rs.workset[i].key);
             if (shard >= K) {
                 // `shard_count()` is the highest `shard_idx + 1`,
                 // so `route()` never returns a larger value. Trip
@@ -256,33 +277,13 @@ namespace apps::inconel::tree {
                     static_cast<unsigned>(shard),
                     static_cast<unsigned>(K));
             }
-            buckets[shard].push_back(k);
-        }
-
-        // Rewrite workset as the concatenation of buckets so each
-        // partition's slice is contiguous.
-        rs.workset.clear();
-        rs.workset.reserve(N);
-
-        std::vector<uint32_t> bucket_offsets(K);
-        for (uint32_t p = 0; p < K; ++p) {
-            bucket_offsets[p] = static_cast<uint32_t>(rs.workset.size());
-            for (auto& k : buckets[p]) {
-                rs.workset.push_back(k);
+            if (shard != run_shard) {
+                emit_run(run_start, i, run_shard);
+                run_start = i;
+                run_shard = shard;
             }
         }
-
-        rs.partitions.reserve(K);
-        for (uint32_t p = 0; p < K; ++p) {
-            const auto offset = bucket_offsets[p];
-            const auto count  = static_cast<uint32_t>(buckets[p].size());
-            if (count == 0) continue;
-            rs.partitions.push_back(flush_key_partition{
-                .read_domain_index = p,
-                .groups = std::span<const flush_key_group>(
-                    rs.workset.data() + offset, count),
-            });
-        }
+        emit_run(run_start, N, run_shard);
 
         return flush_stage_status::ok;
     }

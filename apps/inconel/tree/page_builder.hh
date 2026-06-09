@@ -84,9 +84,12 @@ namespace apps::inconel::tree {
         }
 
     public:
+        template <typename CopyKey>
         bool
-        add_value(std::string_view key, uint64_t data_ver, const value_ref& vr) {
-            auto key_len = static_cast<uint16_t>(key.size());
+        add_value_with_key_copy(uint16_t key_len,
+                                uint64_t data_ver,
+                                const value_ref& vr,
+                                CopyKey&& copy_key) {
             uint32_t needed = value_record_size(key_len);
             if (!can_fit(needed)) return false;
 
@@ -96,7 +99,7 @@ namespace apps::inconel::tree {
             leaf_record_header hdr { .data_ver = data_ver, .kind = record_kind::value, .key_len = key_len };
             std::memcpy(p, &hdr, sizeof(hdr));
             p += sizeof(hdr);
-            std::memcpy(p, key.data(), key_len);
+            copy_key(p);
             p += key_len;
             std::memcpy(p, &vr, sizeof(vr));
 
@@ -106,8 +109,20 @@ namespace apps::inconel::tree {
         }
 
         bool
-        add_tombstone(std::string_view key, uint64_t data_ver) {
+        add_value(std::string_view key, uint64_t data_ver, const value_ref& vr) {
             auto key_len = static_cast<uint16_t>(key.size());
+            return add_value_with_key_copy(
+                key_len, data_ver, vr,
+                [&](char* dst) {
+                    std::memcpy(dst, key.data(), key_len);
+                });
+        }
+
+        template <typename CopyKey>
+        bool
+        add_tombstone_with_key_copy(uint16_t key_len,
+                                    uint64_t data_ver,
+                                    CopyKey&& copy_key) {
             uint32_t needed = tombstone_record_size(key_len);
             if (!can_fit(needed)) return false;
 
@@ -117,11 +132,21 @@ namespace apps::inconel::tree {
             leaf_record_header hdr { .data_ver = data_ver, .kind = record_kind::tombstone, .key_len = key_len };
             std::memcpy(p, &hdr, sizeof(hdr));
             p += sizeof(hdr);
-            std::memcpy(p, key.data(), key_len);
+            copy_key(p);
 
             offset += needed;
             ++count;
             return true;
+        }
+
+        bool
+        add_tombstone(std::string_view key, uint64_t data_ver) {
+            auto key_len = static_cast<uint16_t>(key.size());
+            return add_tombstone_with_key_copy(
+                key_len, data_ver,
+                [&](char* dst) {
+                    std::memcpy(dst, key.data(), key_len);
+                });
         }
 
         void

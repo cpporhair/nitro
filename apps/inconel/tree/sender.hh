@@ -123,13 +123,42 @@ namespace apps::inconel::tree {
 
     namespace _lookup_impl {
 
+        struct routed_entry {
+            uint32_t         input_index;
+            std::string_view key;
+        };
+
         struct routed_group {
-            uint32_t                      shard_idx;
-            std::vector<uint32_t>         input_indices;
-            std::vector<std::string_view> keys;
+            uint32_t shard_idx;
+            uint32_t offset;
+            uint32_t count;
+        };
+
+        struct routed_group_keys {
+            const std::vector<routed_entry>* entries = nullptr;
+            uint32_t offset = 0;
+            uint32_t count = 0;
+
+            struct iterator {
+                const routed_entry* p = nullptr;
+                std::string_view operator*() const noexcept { return p->key; }
+                iterator& operator++() noexcept { ++p; return *this; }
+                bool operator!=(const iterator& rhs) const noexcept {
+                    return p != rhs.p;
+                }
+            };
+
+            iterator begin() const noexcept {
+                return iterator{entries->data() + offset};
+            }
+
+            iterator end() const noexcept {
+                return iterator{entries->data() + offset + count};
+            }
         };
 
         struct lookup_route_plan {
+            std::vector<routed_entry> entries;
             std::vector<routed_group> groups;
             size_t                    total_keys = 0;
         };
@@ -160,18 +189,11 @@ namespace apps::inconel::tree {
 
             lookup_route_plan plan;
 
-            // Materialize the caller's range into a stable view vector
-            // before any routing decisions — `build_route_plan` runs
-            // synchronously at sender-construction time, but we want to
-            // treat the caller's range as potentially one-shot (e.g.
-            // views, ranges-style adaptors) and keep a single well-defined
-            // iteration site.
-            std::vector<std::string_view> snapshot;
-            for (auto&& k : keys)
-                snapshot.emplace_back(std::string_view{k});
-            plan.total_keys = snapshot.size();
-
             if (!manifest->has_root()) {
+                for (auto&& ignored : keys) {
+                    (void)ignored;
+                    ++plan.total_keys;
+                }
                 // Empty tree — no groups produced; outer pipeline's
                 // pre-initialized `all_lookup_results` stays all-absent.
                 return plan;
@@ -192,26 +214,45 @@ namespace apps::inconel::tree {
             // so K here tracks the number of distinct target
             // read_domains rather than `shards.size()`.
             const uint32_t K = partitions->shard_count();
-            std::vector<routed_group> buckets(K);
-            for (uint32_t s = 0; s < K; ++s)
-                buckets[s].shard_idx = s;
+            std::vector<uint32_t> counts(K, 0);
 
-            for (size_t i = 0; i < snapshot.size(); ++i) {
-                const auto key = snapshot[i];
+            for (auto&& raw_key : keys) {
+                const auto key = std::string_view{raw_key};
                 // `route()` panics if the map lacks the +∞ sentinel
                 // (builder-enforced invariant). No key-coverage
                 // check needed — the map spans (-∞, +∞).
                 const uint32_t shard_idx = partitions->route(key);
-                buckets[shard_idx].input_indices.push_back(
-                    static_cast<uint32_t>(i));
-                buckets[shard_idx].keys.push_back(key);
+                ++counts[shard_idx];
+                ++plan.total_keys;
             }
 
             plan.groups.reserve(K);
-            for (auto& b : buckets) {
-                if (b.input_indices.empty()) continue;
-                plan.groups.push_back(std::move(b));
+            std::vector<uint32_t> cursors(K, 0);
+            uint32_t offset = 0;
+            for (uint32_t s = 0; s < K; ++s) {
+                cursors[s] = offset;
+                if (counts[s] != 0) {
+                    plan.groups.push_back(routed_group{
+                        .shard_idx = s,
+                        .offset    = offset,
+                        .count     = counts[s],
+                    });
+                }
+                offset += counts[s];
             }
+
+            plan.entries.resize(plan.total_keys);
+            uint32_t input_index = 0;
+            for (auto&& raw_key : keys) {
+                const auto key = std::string_view{raw_key};
+                const uint32_t shard_idx = partitions->route(key);
+                plan.entries[cursors[shard_idx]++] = routed_entry{
+                    .input_index = input_index,
+                    .key         = key,
+                };
+                ++input_index;
+            }
+
             return plan;
         }
 
@@ -222,14 +263,18 @@ namespace apps::inconel::tree {
         // pointer.
         template<typename key_range_t>
         inline auto
-        shard_lookup(tree_lookup_sched_base* tree_sched,
-                     key_range_t&& keys,
-                     const core::tree_manifest* manifest) {
+        shard_lookup_into(tree_lookup_sched_base* tree_sched,
+                          key_range_t&& keys,
+                          const routed_group& group,
+                          const std::vector<routed_entry>* entries,
+                          all_lookup_results* results,
+                          const core::tree_manifest* manifest) {
             return with_context(
                 make_lookup_state(std::forward<key_range_t>(keys), manifest))(
-                [tree_sched]() {
+                [tree_sched, group, entries, results]() {
                     return get_context<lookup_state>()
-                        >> flat_map([tree_sched](lookup_state& state) {
+                        >> flat_map([tree_sched, group, entries, results](
+                                        lookup_state& state) {
                             return just()
                                 >> for_each(pump::coro::make_view_able(check_not_done(state)))
                                 >> flat_map([tree_sched, &state](bool) {
@@ -245,12 +290,13 @@ namespace apps::inconel::tree {
                                     }
                                 })
                                 >> all()
-                                >> then([&state](bool) {
-                                    std::vector<lookup_result> results;
-                                    results.reserve(state.entries.size());
-                                    for (auto& e : state.entries)
-                                        results.push_back(std::move(e.result));
-                                    return results;
+                                >> then([&state, group, entries, results](bool) {
+                                    for (uint32_t k = 0; k < group.count; ++k) {
+                                        const auto& routed =
+                                            (*entries)[group.offset + k];
+                                        results->by_index[routed.input_index] =
+                                            std::move(state.entries[k].result);
+                                    }
                                 });
                         });
                 }
@@ -279,13 +325,14 @@ namespace apps::inconel::tree {
                                 const auto& g = p.groups[i];
                                 auto* rd =  core::registry::tree_read_domain_at(g.shard_idx);
                                 auto* sched = rd->lookup_sched;
-                                auto indices = g.input_indices;
+                                auto keys = _lookup_impl::routed_group_keys{
+                                    .entries = &p.entries,
+                                    .offset  = g.offset,
+                                    .count   = g.count,
+                                };
                                 return just()
-                                    >> _lookup_impl::shard_lookup(sched, g.keys, manifest)
-                                    >> then([&a, idx = std::move(indices)](std::vector<lookup_result>&& r) mutable {
-                                        for (size_t k = 0; k < idx.size(); ++k)
-                                            a.by_index[idx[k]] =  r[k];
-                                    });
+                                    >> _lookup_impl::shard_lookup_into(
+                                        sched, keys, g, &p.entries, &a, manifest);
                             })
                             >> all();
                     })

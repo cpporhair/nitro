@@ -67,18 +67,17 @@ namespace apps::inconel::tree {
 
         // ── populated by Phase 4 (memtable fold / workset build) ──
         //
-        // After Phase 7 leaf-aligned partitioning, `workset` is
-        // grouped by `leaf_idx % worker_count` (each partition's
-        // keys form a contiguous chunk). Within each partition the
-        // keys remain sorted because grouping preserves relative
-        // order of insertion from a sorted source.
+        // Folded winners in key order. Partitioning no longer rewrites
+        // this vector; `partitions` below points at consecutive same-
+        // read_domain runs inside this sorted workset.
         std::vector<flush_key_group> workset;
 
         // ── populated by Phase 4 (partition plan for worker fanout) ──
         //
         // Stable as long as workset is not reallocated after
         // `build_key_partitions()` completes. Each partition's
-        // `groups` span points into `workset` above.
+        // `groups` span points into a consecutive run in `workset`
+        // above. The same read_domain may appear in multiple runs.
         std::vector<flush_key_partition> partitions;
 
         // ── Phase 4 fold pushes losers directly into gen ──

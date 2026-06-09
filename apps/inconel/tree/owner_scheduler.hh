@@ -571,18 +571,6 @@ namespace apps::inconel::tree {
                 new memory::segmented_tree_frame(std::move(*frame)));
         }
 
-        static inline std::span<const char>
-        frame_bytes_for_page(const memory::segmented_page_frame& frame,
-                             uint32_t page_size,
-                             std::vector<char>& scratch) {
-            if (page_size <= frame.lba_size()) {
-                return frame.contiguous_bytes(0, page_size);
-            }
-            scratch.resize(page_size);
-            frame.copy_to_contiguous(scratch.data(), page_size);
-            return std::span<const char>(scratch.data(), scratch.size());
-        }
-
         struct final_leaf_item {
             paddr                   range_base{};
             bool                    is_new = false;
@@ -2003,28 +1991,14 @@ namespace apps::inconel::tree {
                             static_cast<unsigned long>(live_slot.lba));
                     }
 
-                    std::vector<char> old_page_scratch;
-                    auto old_page = frame_bytes_for_page(
-                        *old_frame, page_size, old_page_scratch);
-                    internal_page_reader reader;
-                    if (!reader.parse(old_page.data(), page_size)) {
+                    segmented_internal_page_reader reader;
+                    if (!reader.parse(*old_frame, page_size)) {
                         core::panic_inconsistency(
                             "run_leaf_only_merge",
                             "failed to parse old internal dev=%u lba=%lu",
                             static_cast<unsigned>(live_slot.device_id),
                             static_cast<unsigned long>(live_slot.lba));
                     }
-
-                    std::vector<paddr> old_children;
-                    std::vector<std::string_view> old_separators;
-                    old_children.reserve(static_cast<std::size_t>(reader.record_count()) + 1);
-                    old_separators.reserve(reader.record_count());
-                    for (uint16_t i = 0; i < reader.record_count(); ++i) {
-                        auto e = reader.get(i);
-                        old_children.push_back(e.child_base);
-                        old_separators.push_back(e.separator_key);
-                    }
-                    old_children.push_back(reader.rightmost_child());
 
                     absl::flat_hash_map<paddr, std::size_t> delta_by_child;
                     for (std::size_t i = 0; i < deltas.size(); ++i) {
@@ -2043,15 +2017,26 @@ namespace apps::inconel::tree {
 
                     std::vector<child_ref>   new_children;
                     std::vector<std::string> new_separators;
-                    for (std::size_t i = 0; i < old_children.size(); ++i) {
+                    const uint16_t old_separator_count = reader.record_count();
+                    const uint32_t old_child_count =
+                        static_cast<uint32_t>(old_separator_count) + 1;
+                    new_children.reserve(old_child_count + deltas.size());
+                    new_separators.reserve(old_separator_count + deltas.size());
+                    for (uint32_t i = 0; i < old_child_count; ++i) {
                         if (!new_children.empty()) {
-                            new_separators.emplace_back(old_separators[i - 1]);
+                            auto sep = reader.get(static_cast<uint16_t>(i - 1));
+                            new_separators.emplace_back(
+                                std::move(sep.separator_key));
                         }
 
-                        auto it = delta_by_child.find(old_children[i]);
+                        const paddr old_child =
+                            (i < old_separator_count)
+                                ? reader.child_base_at(static_cast<uint16_t>(i))
+                                : reader.rightmost_child();
+                        auto it = delta_by_child.find(old_child);
                         if (it == delta_by_child.end()) {
                             new_children.push_back(child_ref{
-                                .target = old_children[i],
+                                .target = old_child,
                             });
                             continue;
                         }
@@ -2059,7 +2044,8 @@ namespace apps::inconel::tree {
                         auto& delta = deltas[it->second];
                         for (std::size_t n = 0; n < delta.nodes.size(); ++n) {
                             if (!new_children.empty() && n > 0) {
-                                new_separators.push_back(delta.sibling_seps[n - 1]);
+                                new_separators.push_back(
+                                    std::move(delta.sibling_seps[n - 1]));
                             }
                             new_children.push_back(child_ref{
                                 .target = std::move(delta.nodes[n]),

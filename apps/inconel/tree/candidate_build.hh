@@ -359,6 +359,250 @@ namespace apps::inconel::tree {
             return result;
         }
 
+        inline absl::InlinedVector<std::unique_ptr<mem_tree_node>, 1>
+        merge_and_build_leaf_segmented_impl(
+            const memory::segmented_page_frame&      old_page_frame,
+            uint32_t                                 page_size,
+            std::span<const flush_key_group>         keys,
+            uint64_t                                 recovery_safe_lsn,
+            paddr                                    old_leaf_range_base,
+            absl::InlinedVector<core::retired_value_ref, 64>& retired_out)
+        {
+            segmented_leaf_page_reader reader;
+            if (!reader.parse(old_page_frame, page_size)) {
+                core::panic_inconsistency(
+                    "merge_and_build_leaf_segmented",
+                    "old leaf page failed validation "
+                    "(leaf_range_base dev=%u lba=%lu)",
+                    static_cast<unsigned>(old_leaf_range_base.device_id),
+                    static_cast<unsigned long>(old_leaf_range_base.lba));
+            }
+
+            struct merged_rec {
+                enum class key_source : uint8_t {
+                    old_page,
+                    workset,
+                };
+
+                key_source                    src;
+                uint16_t                      old_index;
+                std::string_view              key;
+                uint16_t                      key_len;
+                uint64_t                      data_ver;
+                core::memtable_entry::kind    kind;
+                format::value_ref             vr;
+            };
+
+            std::vector<merged_rec> merged;
+            merged.reserve(static_cast<std::size_t>(reader.record_count())
+                           + keys.size());
+
+            const auto old_count = reader.record_count();
+            uint16_t    oi = 0;
+            std::size_t ni = 0;
+
+            auto read_old = [&](uint16_t idx) {
+                segmented_leaf_record_ref r{};
+                if (!reader.get_ref(idx, r)) {
+                    core::panic_inconsistency(
+                        "merge_and_build_leaf_segmented",
+                        "old leaf record failed decode "
+                        "(leaf_range_base dev=%u lba=%lu idx=%u)",
+                        static_cast<unsigned>(old_leaf_range_base.device_id),
+                        static_cast<unsigned long>(old_leaf_range_base.lba),
+                        static_cast<unsigned>(idx));
+                }
+                return r;
+            };
+
+            auto emit_old = [&](const segmented_leaf_record_ref& r) {
+                if (r.kind == format::record_kind::tombstone
+                    && r.data_ver <= recovery_safe_lsn) {
+                    return;
+                }
+                merged.push_back(merged_rec{
+                    .src       = merged_rec::key_source::old_page,
+                    .old_index = r.index,
+                    .key       = {},
+                    .key_len   = r.key_len,
+                    .data_ver  = r.data_ver,
+                    .kind      = (r.kind == format::record_kind::value)
+                                     ? core::memtable_entry::kind::value
+                                     : core::memtable_entry::kind::tombstone,
+                    .vr        = (r.kind == format::record_kind::value)
+                                     ? r.vr
+                                     : format::value_ref{},
+                });
+            };
+
+            auto emit_winner = [&](const flush_key_group& kg) {
+                if (kg.winner_kind == core::memtable_entry::kind::tombstone
+                    && kg.winner_data_ver <= recovery_safe_lsn) {
+                    return;
+                }
+                merged.push_back(merged_rec{
+                    .src       = merged_rec::key_source::workset,
+                    .old_index = 0,
+                    .key       = kg.key,
+                    .key_len   = static_cast<uint16_t>(kg.key.size()),
+                    .data_ver  = kg.winner_data_ver,
+                    .kind      = kg.winner_kind,
+                    .vr        = (kg.winner_kind == core::memtable_entry::kind::value)
+                                     ? kg.winner_value.durable
+                                     : format::value_ref{},
+                });
+            };
+
+            while (oi < old_count || ni < keys.size()) {
+                const bool have_old = (oi < old_count);
+                const bool have_new = (ni < keys.size());
+                if (have_old && have_new) {
+                    auto old_rec = read_old(oi);
+                    int cmp = reader.compare_key_at(oi, keys[ni].key);
+                    if (cmp < 0) {
+                        emit_old(old_rec);
+                        ++oi;
+                    } else if (cmp > 0) {
+                        emit_winner(keys[ni]);
+                        ++ni;
+                    } else {
+                        if (old_rec.kind == format::record_kind::value) {
+                            retired_out.push_back(core::retired_value_ref{
+                                .vr       = old_rec.vr,
+                                .data_ver = old_rec.data_ver,
+                            });
+                        }
+                        emit_winner(keys[ni]);
+                        ++oi;
+                        ++ni;
+                    }
+                } else if (have_old) {
+                    emit_old(read_old(oi));
+                    ++oi;
+                } else {
+                    emit_winner(keys[ni]);
+                    ++ni;
+                }
+            }
+
+            absl::InlinedVector<std::unique_ptr<mem_tree_node>, 1> result;
+
+            auto emit_chunk_to_node = [&](std::size_t start, std::size_t end)
+                -> std::unique_ptr<mem_tree_node>
+            {
+                auto node = std::make_unique<mem_tree_node>();
+                node->type = format::node_type::leaf;
+                node->content.resize(page_size);
+
+                leaf_page_builder builder;
+                builder.init(node->content.data(), page_size);
+                for (std::size_t i = start; i < end; ++i) {
+                    auto& m = merged[i];
+                    auto copy_key = [&](char* dst) {
+                        if (m.src == merged_rec::key_source::workset) {
+                            std::memcpy(dst, m.key.data(), m.key_len);
+                            return;
+                        }
+                        auto old_ref = read_old(m.old_index);
+                        uint64_t copied = 0;
+                        if (!reader.visit_key(
+                                old_ref,
+                                [&](const char* src, uint64_t n) {
+                                    std::memcpy(
+                                        dst + copied,
+                                        src,
+                                        static_cast<std::size_t>(n));
+                                    copied += n;
+                                })) {
+                            core::panic_inconsistency(
+                                "merge_and_build_leaf_segmented",
+                                "old leaf key failed segmented copy "
+                                "(leaf_range_base dev=%u lba=%lu idx=%u)",
+                                static_cast<unsigned>(old_leaf_range_base.device_id),
+                                static_cast<unsigned long>(old_leaf_range_base.lba),
+                                static_cast<unsigned>(m.old_index));
+                        }
+                    };
+                    bool ok = (m.kind == core::memtable_entry::kind::value)
+                                  ? builder.add_value_with_key_copy(
+                                        m.key_len, m.data_ver, m.vr, copy_key)
+                                  : builder.add_tombstone_with_key_copy(
+                                        m.key_len, m.data_ver, copy_key);
+                    if (!ok) {
+                        core::panic_inconsistency(
+                            "merge_and_build_leaf_segmented",
+                            "record did not fit despite chunk pre-sizing "
+                            "(idx=%zu)",
+                            i);
+                    }
+                }
+                builder.finalize();
+                return node;
+            };
+
+            std::size_t chunk_start = 0;
+            std::size_t i           = 0;
+            uint32_t    used        = sizeof(format::tree_slot_header);
+            uint16_t    chunk_count = 0;
+
+            auto rec_size = [](const merged_rec& m) -> uint32_t {
+                if (m.kind == core::memtable_entry::kind::value) {
+                    return sizeof(format::leaf_record_header) + m.key_len
+                         + sizeof(format::value_ref);
+                }
+                return sizeof(format::leaf_record_header) + m.key_len;
+            };
+
+            while (i < merged.size()) {
+                uint32_t add = rec_size(merged[i]);
+                uint32_t dir_after = sizeof(uint16_t)
+                                   * static_cast<uint32_t>(chunk_count + 1u);
+                if (used + add + dir_after > page_size) {
+                    if (chunk_count == 0) {
+                        core::panic_inconsistency(
+                            "merge_and_build_leaf_segmented",
+                            "single record larger than page "
+                            "(rec_size=%u page_size=%u key_len=%zu)",
+                            add, page_size,
+                            static_cast<std::size_t>(merged[i].key_len));
+                    }
+                    auto node = emit_chunk_to_node(chunk_start, i);
+                    if (result.empty()) {
+                        node->replaces_old_paddrs.push_back(old_leaf_range_base);
+                    }
+                    result.push_back(std::move(node));
+                    chunk_start = i;
+                    used        = sizeof(format::tree_slot_header);
+                    chunk_count = 0;
+                    continue;
+                }
+                used += add;
+                chunk_count++;
+                ++i;
+            }
+
+            if (chunk_count > 0) {
+                auto node = emit_chunk_to_node(chunk_start, merged.size());
+                if (result.empty()) {
+                    node->replaces_old_paddrs.push_back(old_leaf_range_base);
+                }
+                result.push_back(std::move(node));
+            }
+
+            if (result.empty()) {
+                auto node = std::make_unique<mem_tree_node>();
+                node->type = format::node_type::leaf;
+                node->content.resize(page_size);
+                node->replaces_old_paddrs.push_back(old_leaf_range_base);
+                leaf_page_builder builder;
+                builder.init(node->content.data(), page_size);
+                builder.finalize();
+                result.push_back(std::move(node));
+            }
+
+            return result;
+        }
+
         // ── bootstrap leaf build (empty base_manifest) ──
         //
         // Chunks a contiguous sorted run of memtable winners into one
@@ -586,18 +830,6 @@ namespace apps::inconel::tree {
 
     using _wb::merge_and_build_leaf_impl;
 
-    inline std::span<const char>
-    frame_bytes_for_page(const memory::segmented_page_frame& frame,
-                         uint32_t page_size,
-                         std::vector<char>& scratch) {
-        if (page_size <= frame.lba_size()) {
-            return frame.contiguous_bytes(0, page_size);
-        }
-        scratch.resize(page_size);
-        frame.copy_to_contiguous(scratch.data(), page_size);
-        return std::span<const char>(scratch.data(), scratch.size());
-    }
-
     inline leaf_page_image
     make_leaf_page_image(std::unique_ptr<mem_tree_node> node,
                          uint32_t                       page_size)
@@ -756,13 +988,9 @@ namespace apps::inconel::tree {
                     static_cast<unsigned>(s.read_domain_index),
                     static_cast<unsigned>(lw.leaf_idx));
             }
-            std::vector<char> scratch;
-            auto image = frame_bytes_for_page(
-                *page_frame, s.page_size, scratch);
-
             absl::InlinedVector<core::retired_value_ref, 64> retired_old_values;
-            auto built_pages = _wb::merge_and_build_leaf_impl(
-                image.data(),
+            auto built_pages = _wb::merge_and_build_leaf_segmented_impl(
+                *page_frame,
                 s.page_size,
                 lw.keys,
                 s.recovery_safe_lsn,

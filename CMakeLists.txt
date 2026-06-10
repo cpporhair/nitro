@@ -126,6 +126,12 @@ target_include_directories(inconel_test_m03_coord_scheduler_assign_publish_relea
 target_link_libraries(inconel_test_m03_coord_scheduler_assign_publish_release PRIVATE
         ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m04_wal_space_scheduler
+        apps/inconel/test/test_m04_wal_space_scheduler.cc)
+target_include_directories(inconel_test_m04_wal_space_scheduler PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m04_wal_space_scheduler PRIVATE
+        ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

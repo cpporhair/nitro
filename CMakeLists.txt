@@ -120,6 +120,12 @@ target_include_directories(inconel_test_m02_read_handle_prs_memtable_lookup PRIV
 target_link_libraries(inconel_test_m02_read_handle_prs_memtable_lookup PRIVATE
         ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m03_coord_scheduler_assign_publish_release
+        apps/inconel/test/test_m03_coord_scheduler_assign_publish_release.cc)
+target_include_directories(inconel_test_m03_coord_scheduler_assign_publish_release PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m03_coord_scheduler_assign_publish_release PRIVATE
+        ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

@@ -25,6 +25,10 @@ namespace apps::inconel::core {
     struct tree_read_domain_base;
 }
 
+namespace apps::inconel::coord {
+    struct coord_sched;
+}
+
 namespace apps::inconel::core::registry {
 
     // ── Scheduler registry ──
@@ -81,6 +85,12 @@ namespace apps::inconel::core::registry {
     // namespace inside this file.
     inline tree::tree_sched* tree_sched_singleton_ptr = nullptr;
 
+    // coord::coord_sched is introduced in M03 as a global singleton
+    // scheduler. The runtime builder is still future work; tests and future
+    // builders install the pointer explicitly and access it through
+    // coord_sched_singleton().
+    inline coord::coord_sched* coord_sched_singleton_ptr = nullptr;
+
     // Globally installed `shard_partition_map` (step 030 §2.7). A
     // `shared_ptr<const>` lets a future heat-driven rebuild
     // (issue 2 decision B1, out of scope in step 030) swap the map
@@ -94,7 +104,6 @@ namespace apps::inconel::core::registry {
     // ── Future scheduler slots (placeholder, not implemented yet) ──
     //
     // Singletons:
-    //   inline coord::scheduler*       coord_sched       = nullptr;
     //   inline wal::scheduler*         wal_space_sched   = nullptr;
     //
     // Per-shard:
@@ -128,6 +137,7 @@ namespace apps::inconel::core::registry {
         value_alloc_sched = nullptr;
         data_area_heads_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
+        coord_sched_singleton_ptr = nullptr;
         current_shard_partitions_ptr.reset();
     }
 
@@ -156,6 +166,13 @@ namespace apps::inconel::core::registry {
     tree_sched_singleton() {
         assert(tree_sched_singleton_ptr && "tree::tree_sched not registered");
         return tree_sched_singleton_ptr;
+    }
+
+    inline coord::coord_sched*
+    coord_sched_singleton() {
+        assert(coord_sched_singleton_ptr &&
+               "coord::coord_sched not registered");
+        return coord_sched_singleton_ptr;
     }
 
     // ── Per-core fast access (current core) ──

@@ -132,6 +132,12 @@ target_include_directories(inconel_test_m04_wal_space_scheduler PRIVATE ${CMAKE_
 target_link_libraries(inconel_test_m04_wal_space_scheduler PRIVATE
         ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m05_front_scheduler_memtable_owner
+        apps/inconel/test/test_m05_front_scheduler_memtable_owner.cc)
+target_include_directories(inconel_test_m05_front_scheduler_memtable_owner PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m05_front_scheduler_memtable_owner PRIVATE
+        ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

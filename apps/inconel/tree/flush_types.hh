@@ -73,9 +73,8 @@ namespace apps::inconel::tree {
     //   - `key` is a `std::string_view` into the winner gen's
     //     kv_arena (RSM §3.2). `round_state.pinned_gens` keeps
     //     every gen's arena alive for the full flush round.
-    //   - `winner_value` currently uses the legacy value_handle POD,
-    //     but flush only consumes durable value_ref. The hot view is
-    //     compatibility debt scheduled for removal by INC-055.
+    //   - `winner_value` carries only the durable value_ref for PUT
+    //     winners. Value bytes are not owned by memtables.
     //   - `winner_pinned_gen_index` is an index into
     //     `round_state.pinned_gens[]`, not an owning shared_ptr.
     //

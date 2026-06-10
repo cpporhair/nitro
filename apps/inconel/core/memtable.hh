@@ -10,16 +10,9 @@
 // ai_context/inconel/plan/021_front_input_memtable_carrier.md
 // for the Phase 1 scope rationale.
 //
-// Current target design: memtable_gen owns key bytes and value
-// metadata only. Value bodies are durable in the Value Area before
-// WAL/memtable insertion, and memtable value hits return durable
-// value_ref, not a value body view.
-//
-// This header still carries the legacy Phase 021 carrier
-// value_handle{durable, hot} because the front/memtable module has
-// not been replaced yet and flush_e2e still constructs sealed gens
-// directly. Treat value_view/hot as compatibility debt tracked by
-// INC-055; new code should depend only on durable value_ref.
+// memtable_gen owns key bytes and value metadata only. Value bodies
+// are durable in the Value Area before WAL/memtable insertion, and
+// memtable value hits return durable value_ref, not a value body view.
 //
 // Any structural change here must also update:
 //   - design_overview.md §5.1, §5.3
@@ -35,6 +28,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <absl/container/btree_map.h>
@@ -48,9 +42,7 @@ namespace apps::inconel::core {
 
     // ── gen_arena ────────────────────────────────────────────
     //
-    // Per-memtable_gen bump allocator. Target usage is key bytes
-    // only. Legacy flush_e2e/front carriers may still allocate value
-    // hot views here until INC-055 removes value_handle::hot.
+    // Per-memtable_gen bump allocator. It owns key bytes only.
     //
     // Single-writer: only the owning front_sched mutates the
     // arena while the gen is active. Once the gen is sealed,
@@ -77,7 +69,9 @@ namespace apps::inconel::core {
         // the lifetime of the owning memtable_gen).
         std::string_view
         allocate(const char* src, std::size_t len) {
-            if (bump_next + len > bump_end) {
+            if (len == 0) return {};
+            if (bump_next == nullptr ||
+                static_cast<std::size_t>(bump_end - bump_next) < len) {
                 const std::size_t cap = (len > kChunkBytes) ? len : kChunkBytes;
                 auto chunk = std::make_unique<char[]>(cap);
                 bump_next = chunk.get();
@@ -85,36 +79,19 @@ namespace apps::inconel::core {
                 chunks.push_back(std::move(chunk));
             }
             char* start = bump_next;
-            if (len > 0) {
-                std::memcpy(start, src, len);
-            }
+            std::memcpy(start, src, len);
             bump_next += len;
             return std::string_view{start, len};
         }
     };
 
-    // ── value_view ──────────────────────────────────────────
-    //
-    // Legacy {pointer, length} view over value bytes. Target
-    // memtable lookup returns durable value_ref only; this type
-    // remains temporarily for the old value_handle carrier and is
-    // scheduled for removal by INC-055.
-
-    struct value_view {
-        const char* data;
-        uint32_t    len;
-    };
-
     // ── value_handle ────────────────────────────────────────
     //
-    // Legacy payload of a memtable PUT entry. `durable` is the
-    // stable on-disk location and is the only field new code should
-    // consume. `hot` is compatibility debt for the pre-INC-055
-    // memtable carrier.
+    // Payload of a memtable PUT entry. This is only a durable
+    // locator; memtable does not own or cache value bytes.
 
     struct value_handle {
-        value_ref  durable;
-        value_view hot;
+        value_ref durable;
     };
 
     // ── retired_value_ref ───────────────────────────────────
@@ -169,8 +146,7 @@ namespace apps::inconel::core {
     // ── memtable_entry ──────────────────────────────────────
     //
     // Trivially copyable (no unique_ptr, no heap-owning field).
-    // Target value entries carry durable value_ref only; the vh.hot
-    // subfield is a legacy compatibility view. data_ver is
+    // Value entries carry durable value_ref only. data_ver is
     // semantically equivalent to batch_lsn (OV §6).
 
     struct memtable_entry {
@@ -184,6 +160,16 @@ namespace apps::inconel::core {
         value_handle vh;  // valid iff k == kind::value
     };
 
+    struct memtable_value_hit {
+        value_ref durable;
+    };
+
+    struct memtable_tombstone {};
+    struct memtable_miss {};
+
+    using memtable_lookup_result =
+        std::variant<memtable_value_hit, memtable_tombstone, memtable_miss>;
+
     // ── memtable_gen ────────────────────────────────────────
     //
     // A generation of the front memtable (RSM §3.2). The owning
@@ -193,11 +179,10 @@ namespace apps::inconel::core {
     // gen, which may clear+rebuild loser_durable_refs only
     // (never touch table or arena).
     //
-    // kv_arena target usage is key bytes only. The btree_map's key
-    // is std::string_view into kv_arena; any memtable_entry.vh.hot
-    // view is legacy compatibility state and must not be copied into
-    // new designs. When the last shared_ptr<memtable_gen> drops, the
-    // arena frees all chunks in one sweep.
+    // kv_arena stores key bytes only. The btree_map's key is
+    // std::string_view into kv_arena. When the last
+    // shared_ptr<memtable_gen> drops, the arena frees all chunks in
+    // one sweep.
     //
     // Declaration order: kv_arena declared BEFORE table so that
     // reverse-order destruction destroys table first. Purely
@@ -244,20 +229,90 @@ namespace apps::inconel::core {
     // not the memtable pin chain.
 
     struct front_read_set {
-        std::shared_ptr<memtable_gen>                         active;
-        absl::InlinedVector<std::shared_ptr<memtable_gen>, 8> imms;  // newest → oldest
+        std::shared_ptr<memtable_gen>              active;
+        std::vector<std::shared_ptr<memtable_gen>> imms;  // newest → oldest
     };
+
+    inline void
+    update_lsn_bounds(memtable_gen& gen, uint64_t data_ver) noexcept {
+        if (data_ver < gen.min_lsn) gen.min_lsn = data_ver;
+        if (data_ver > gen.max_lsn) gen.max_lsn = data_ver;
+    }
+
+    inline absl::InlinedVector<memtable_entry, 1>&
+    ensure_versions_for_key(memtable_gen& gen, std::string_view key) {
+        if (auto it = gen.table.find(key); it != gen.table.end()) {
+            return it->second;
+        }
+
+        const auto arena_key = gen.kv_arena.allocate(key.data(), key.size());
+        auto [it, inserted] = gen.table.try_emplace(arena_key);
+        (void)inserted;
+        return it->second;
+    }
+
+    inline void
+    insert_value(memtable_gen& gen,
+                 std::string_view key,
+                 uint64_t data_ver,
+                 value_ref durable) {
+        update_lsn_bounds(gen, data_ver);
+        auto& versions = ensure_versions_for_key(gen, key);
+        versions.push_back(memtable_entry{
+            .data_ver = data_ver,
+            .k        = memtable_entry::kind::value,
+            .vh       = value_handle{.durable = durable},
+        });
+    }
+
+    inline void
+    insert_tombstone(memtable_gen& gen,
+                     std::string_view key,
+                     uint64_t data_ver) {
+        update_lsn_bounds(gen, data_ver);
+        auto& versions = ensure_versions_for_key(gen, key);
+        versions.push_back(memtable_entry{
+            .data_ver = data_ver,
+            .k        = memtable_entry::kind::tombstone,
+            .vh       = {},
+        });
+    }
+
+    inline const memtable_entry*
+    find_visible_entry(const memtable_gen& gen,
+                       std::string_view key,
+                       uint64_t read_lsn) {
+        const auto it = gen.table.find(key);
+        if (it == gen.table.end()) return nullptr;
+
+        const memtable_entry* best = nullptr;
+        for (const auto& entry : it->second) {
+            if (entry.data_ver <= read_lsn &&
+                (!best || entry.data_ver > best->data_ver)) {
+                best = &entry;
+            }
+        }
+        return best;
+    }
+
+    inline memtable_lookup_result
+    lookup_visible(const memtable_gen& gen,
+                   std::string_view key,
+                   uint64_t read_lsn) {
+        const auto* entry = find_visible_entry(gen, key, read_lsn);
+        if (entry == nullptr) return memtable_miss{};
+        if (entry->k == memtable_entry::kind::value) {
+            return memtable_value_hit{.durable = entry->vh.durable};
+        }
+        return memtable_tombstone{};
+    }
 
     // ── Invariants enforced at compile time ────────────────
 
-    static_assert(std::is_trivially_copyable_v<value_view>,
-                  "value_view must be a POD (pointer + length)");
     static_assert(std::is_trivially_copyable_v<value_handle>,
-                  "legacy value_handle must stay POD until INC-055 removes hot");
+                  "value_handle must stay POD: durable value_ref only");
     static_assert(std::is_trivially_copyable_v<memtable_entry>,
                   "memtable_entry must be POD now that value_handle is POD");
-    static_assert(sizeof(value_view) <= 16,
-                  "value_view should remain pointer + length only");
 
 }  // namespace apps::inconel::core
 

@@ -934,10 +934,11 @@ persist_put_values(std::span<const round_op> round_ops) {
 //
 // Mixed put/tombstone entries sharing one gen. value ops reference
 // durables[put_index] where put_index is the number of prior put ops
-// in the same sorted span. Tombstones leave value_handle empty --
-// fold preserves them as kind::tombstone winners / losers the same
-// way it handles put entries (core/memtable.hh kind enum + losers
-// retire list).
+// in the same sorted span. Memtable entries keep only durable
+// value_ref; value bytes stay in the Value Area. Tombstones leave
+// value_handle empty -- fold preserves them as kind::tombstone
+// winners / losers the same way it handles put entries
+// (core/memtable.hh kind enum + losers retire list).
 
 std::shared_ptr<core::memtable_gen>
 build_sealed_gen(uint64_t                           gen_id,
@@ -968,15 +969,9 @@ build_sealed_gen(uint64_t                           gen_id,
         entry.data_ver = lsn_start + static_cast<uint64_t>(i);
 
         if (op.k == round_op::kind::put) {
-            auto val_view = gen->kv_arena.allocate(
-                op.value.data(), op.value.size());
             entry.k  = core::memtable_entry::kind::value;
             entry.vh = core::value_handle{
                 .durable = durables[put_idx++],
-                .hot     = core::value_view{
-                    .data = val_view.data(),
-                    .len  = static_cast<uint32_t>(val_view.size()),
-                },
             };
         } else {
             entry.k  = core::memtable_entry::kind::tombstone;

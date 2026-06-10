@@ -67,11 +67,6 @@ namespace apps::inconel::tree {
     // the start. If the round fails and the same gens are re-folded,
     // the clear ensures no double-push.
     //
-    // Exploits InlinedVector<memtable_entry, 1> data_ver strict
-    // ascending order: back() = gen-local winner (O(1)),
-    // [0..n-2] = intra-gen losers pushed directly. Cross-gen
-    // comparison only among K gen-local winners (O(K)).
-    //
     // Complexity: O(N * K) where N = unique keys, K = gen count.
 
     inline void
@@ -137,7 +132,25 @@ namespace apps::inconel::tree {
                 const auto  n = entries_vec.size();
                 auto&       gen = *rs.pinned_gens[gi];
 
-                for (std::size_t i = 0; i + 1 < n; ++i) {
+                if (n == 0) {
+                    core::panic_inconsistency(
+                        "tree::fold_pinned_gens",
+                        "empty version vector for key");
+                }
+
+                const core::memtable_entry* gen_winner = nullptr;
+                std::size_t                 gen_winner_index = 0;
+                for (std::size_t i = 0; i < n; ++i) {
+                    const auto& e = entries_vec[i];
+                    if (gen_winner == nullptr ||
+                        e.data_ver > gen_winner->data_ver) {
+                        gen_winner = &e;
+                        gen_winner_index = i;
+                    }
+                }
+
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (i == gen_winner_index) continue;
                     const auto& e = entries_vec[i];
                     if (e.k == core::memtable_entry::kind::value) {
                         gen.loser_durable_refs.push(
@@ -150,7 +163,7 @@ namespace apps::inconel::tree {
 
                 candidates.push_back({
                     .gen_index = gi,
-                    .entry     = &entries_vec.back(),
+                    .entry     = gen_winner,
                     .key       = gen_key,
                 });
 

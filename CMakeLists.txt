@@ -108,6 +108,12 @@ target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_flush_e2e PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m01_batch_carrier_memtable
+        apps/inconel/test/test_m01_batch_carrier_memtable.cc)
+target_include_directories(inconel_test_m01_batch_carrier_memtable PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m01_batch_carrier_memtable PRIVATE
+        ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

@@ -31,6 +31,7 @@
 #include "pump/core/op_tuple_builder.hh"
 
 #include "../core/batch_carrier.hh"
+#include "../core/owner_callback.hh"
 #include "../core/read_catalog.hh"
 
 namespace apps::inconel::coord {
@@ -511,8 +512,8 @@ namespace apps::inconel::coord {
         struct req {
             core::client_batch_buffer                         input;
             std::optional<core::client_batch_view>            parsed;
-            std::move_only_function<void(core::batch_ctx&&)>  cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<core::batch_ctx>&&)>      cb;
         };
 
         struct op {
@@ -552,8 +553,8 @@ namespace apps::inconel::coord {
 
         struct req {
             uint64_t batch_lsn;
-            std::move_only_function<void()>                   cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -585,8 +586,8 @@ namespace apps::inconel::coord {
 
         struct req {
             uint64_t batch_lsn;
-            std::move_only_function<void()>                   cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -617,8 +618,8 @@ namespace apps::inconel::coord {
     namespace _coord_read {
 
         struct req {
-            std::move_only_function<void(core::read_handle&&)> cb;
-            std::move_only_function<void(std::exception_ptr)>  fail;
+            std::move_only_function<void(
+                core::owner_outcome<core::read_handle>&&)> cb;
         };
 
         struct op {
@@ -679,8 +680,15 @@ namespace apps::inconel::coord {
         std::move_only_function<void(std::exception_ptr)> fail) {
         schedule_assign(new _coord_assign::req{
             .input = std::move(input),
-            .cb    = std::move(cb),
-            .fail  = std::move(fail),
+            .cb = [cb = std::move(cb),
+                   fail = std::move(fail)](
+                      core::owner_outcome<core::batch_ctx>&& r) mutable {
+                if (r.has_value()) {
+                    if (cb) cb(std::move(*r));
+                } else if (fail) {
+                    fail(std::move(r.error()));
+                }
+            },
         });
     }
 
@@ -732,10 +740,10 @@ namespace apps::inconel::coord {
             ctx = assign_validated_now(
                 std::move(req->input), std::move(*req->parsed));
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return true;
         }
@@ -743,7 +751,7 @@ namespace apps::inconel::coord {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(ctx));
+            cb(core::owner_outcome<core::batch_ctx>{std::move(ctx)});
         }
         return true;
     }
@@ -754,21 +762,22 @@ namespace apps::inconel::coord {
         try {
             req->parsed.emplace(parse_assign_input(req->input));
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
 
         if (!ready_.has_assign_capacity(next_lsn_)) {
             if (pending_assigns_.size() >= pending_assign_capacity_) {
-                auto fail = std::move(req->fail);
+                auto cb = std::move(req->cb);
                 req.reset();
-                if (fail) {
-                    fail(std::make_exception_ptr(std::runtime_error(
-                        "coord assign backpressure overflow")));
+                if (cb) {
+                    cb(std::unexpected(std::make_exception_ptr(
+                        std::runtime_error(
+                            "coord assign backpressure overflow"))));
                 }
                 return;
             }
@@ -785,10 +794,10 @@ namespace apps::inconel::coord {
         try {
             resolve_terminal_lsn(req->batch_lsn);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -796,7 +805,7 @@ namespace apps::inconel::coord {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -806,10 +815,10 @@ namespace apps::inconel::coord {
         try {
             resolve_terminal_lsn(req->batch_lsn);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -817,7 +826,7 @@ namespace apps::inconel::coord {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -828,10 +837,10 @@ namespace apps::inconel::coord {
         try {
             handle = cats_.acquire_read_handle();
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -839,7 +848,7 @@ namespace apps::inconel::coord {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(handle));
+            cb(core::owner_outcome<core::read_handle>{std::move(handle)});
         }
     }
 
@@ -883,14 +892,8 @@ namespace apps::inconel::coord {
     _coord_assign::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_assign(new req{
             .input = std::move(input),
-            .cb = [ctx = ctx, scope = scope](core::batch_ctx&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::batch_ctx>(ctx, scope),
         });
     }
 
@@ -899,13 +902,7 @@ namespace apps::inconel::coord {
     _coord_publish::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_publish(new req{
             .batch_lsn = batch_lsn,
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -914,13 +911,7 @@ namespace apps::inconel::coord {
     _coord_release::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_release(new req{
             .batch_lsn = batch_lsn,
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -928,14 +919,8 @@ namespace apps::inconel::coord {
     void
     _coord_read::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_read(new req{
-            .cb = [ctx = ctx, scope = scope](core::read_handle&& h) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(h));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::read_handle>(ctx, scope),
         });
     }
 

@@ -32,6 +32,7 @@
 #include "../core/batch_carrier.hh"
 #include "../core/memtable.hh"
 #include "../core/memtable_lookup.hh"
+#include "../core/owner_callback.hh"
 #include "../format/wal.hh"
 #include "../memory/dma_page_pool.hh"
 #include "./wal_append.hh"
@@ -742,8 +743,7 @@ namespace apps::inconel::front {
         struct req {
             borrowed_front_fragment fragment;
             std::span<const core::canonical_entry> canonical_entries;
-            std::move_only_function<void()> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -794,8 +794,8 @@ namespace apps::inconel::front {
             std::string_view key;
             uint64_t read_lsn = 0;
             core::front_read_set frs;
-            std::move_only_function<void(core::memtable_lookup_result&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<core::memtable_lookup_result>&&)> cb;
         };
 
         struct op {
@@ -848,8 +848,8 @@ namespace apps::inconel::front {
             std::span<const std::string_view> keys;
             uint64_t read_lsn = 0;
             core::front_read_set frs;
-            std::move_only_function<void(batch_lookup_result&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<batch_lookup_result>&&)> cb;
         };
 
         struct op {
@@ -903,8 +903,8 @@ namespace apps::inconel::front {
             std::string_view end;
             uint64_t read_lsn = 0;
             core::front_read_set frs;
-            std::move_only_function<void(core::memtable_scan_result&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<core::memtable_scan_result>&&)> cb;
         };
 
         struct op {
@@ -958,8 +958,8 @@ namespace apps::inconel::front {
 
     namespace _front_seal {
         struct req {
-            std::move_only_function<void(core::front_read_set&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<core::front_read_set>&&)> cb;
         };
 
         struct op {
@@ -987,8 +987,8 @@ namespace apps::inconel::front {
         struct req {
             uint64_t durable_lsn = 0;
             std::move_only_function<void(
-                std::vector<std::shared_ptr<core::memtable_gen>>&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+                core::owner_outcome<
+                    std::vector<std::shared_ptr<core::memtable_gen>>>&&)> cb;
         };
 
         struct op {
@@ -1019,8 +1019,7 @@ namespace apps::inconel::front {
     namespace _front_release {
         struct req {
             std::vector<uint64_t> gen_ids;
-            std::move_only_function<void()> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -1061,8 +1060,8 @@ namespace apps::inconel::front {
             borrowed_front_fragment fragment;
             std::span<const core::canonical_entry> canonical_entries;
             wal::wal_fragment_cursor cursor;
-            std::move_only_function<void(wal::wal_prepare_result&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(
+                core::owner_outcome<wal::wal_prepare_result>&&)> cb;
         };
 
         struct op {
@@ -1116,8 +1115,7 @@ namespace apps::inconel::front {
     namespace _front_wal_install {
         struct req {
             wal::segment_runtime* segment = nullptr;
-            std::move_only_function<void()> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -1148,8 +1146,8 @@ namespace apps::inconel::front {
             uint64_t plan_id = 0;
             std::vector<wal::wal_frame_write> writes;
             std::move_only_function<void(
-                std::optional<wal::sealed_segment_info>&&)> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+                core::owner_outcome<
+                    std::optional<wal::sealed_segment_info>>&&)> cb;
         };
 
         struct op {
@@ -1198,8 +1196,7 @@ namespace apps::inconel::front {
         struct req {
             uint64_t plan_id = 0;
             std::vector<wal::wal_frame_write> writes;
-            std::move_only_function<void()> cb;
-            std::move_only_function<void(std::exception_ptr)> fail;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
         };
 
         struct op {
@@ -1981,10 +1978,10 @@ namespace apps::inconel::front {
             validate_insert_request(
                 req->fragment.get(), req->canonical_entries);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -1995,7 +1992,7 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -2006,10 +2003,10 @@ namespace apps::inconel::front {
         try {
             result = lookup_memtable_now(req->key, req->read_lsn, req->frs);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2017,7 +2014,8 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<core::memtable_lookup_result>{
+                std::move(result)});
         }
     }
 
@@ -2028,10 +2026,10 @@ namespace apps::inconel::front {
         try {
             result = batch_lookup_now(req->keys, req->read_lsn, req->frs);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2039,7 +2037,7 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<batch_lookup_result>{std::move(result)});
         }
     }
 
@@ -2051,17 +2049,18 @@ namespace apps::inconel::front {
             result = scan_memtable_now(
                 req->begin, req->end, req->read_lsn, req->frs);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
 
         auto cb = std::move(req->cb);
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<core::memtable_scan_result>{
+                std::move(result)});
         }
         req.reset();
     }
@@ -2073,10 +2072,10 @@ namespace apps::inconel::front {
         try {
             result = seal_active_now();
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2084,7 +2083,7 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<core::front_read_set>{std::move(result)});
         }
     }
 
@@ -2095,10 +2094,10 @@ namespace apps::inconel::front {
         try {
             result = collect_eligible_gens_now(req->durable_lsn);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2106,7 +2105,9 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<
+                std::vector<std::shared_ptr<core::memtable_gen>>>{
+                    std::move(result)});
         }
     }
 
@@ -2116,10 +2117,10 @@ namespace apps::inconel::front {
         try {
             release_gens_now(req->gen_ids);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2127,7 +2128,7 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -2175,7 +2176,8 @@ namespace apps::inconel::front {
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<wal::wal_prepare_result>{
+                std::move(result)});
         }
     }
 
@@ -2183,10 +2185,10 @@ namespace apps::inconel::front {
     front_sched::fail_wal_prepare(
         std::unique_ptr<_front_wal_prepare::req> req,
         std::exception_ptr ep) {
-        auto fail = std::move(req->fail);
+        auto cb = std::move(req->cb);
         req.reset();
-        if (fail) {
-            fail(std::move(ep));
+        if (cb) {
+            cb(std::unexpected(std::move(ep)));
         }
     }
 
@@ -2211,10 +2213,10 @@ namespace apps::inconel::front {
             install_wal_segment_now(req->segment);
             wal_awaiting_segment_ = false;
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2223,7 +2225,7 @@ namespace apps::inconel::front {
         req.reset();
         drain_wal_pending_prepares();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -2234,10 +2236,10 @@ namespace apps::inconel::front {
         try {
             result = commit_wal_plan_now(req->plan_id);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2248,7 +2250,8 @@ namespace apps::inconel::front {
             drain_wal_pending_prepares();
         }
         if (cb) {
-            cb(std::move(result));
+            cb(core::owner_outcome<std::optional<wal::sealed_segment_info>>{
+                std::move(result)});
         }
     }
 
@@ -2258,10 +2261,10 @@ namespace apps::inconel::front {
         try {
             abort_wal_plan_now(req->plan_id);
         } catch (...) {
-            auto fail = std::move(req->fail);
+            auto cb = std::move(req->cb);
             req.reset();
-            if (fail) {
-                fail(std::current_exception());
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
             }
             return;
         }
@@ -2270,7 +2273,7 @@ namespace apps::inconel::front {
         req.reset();
         drain_wal_pending_prepares();
         if (cb) {
-            cb();
+            cb(core::owner_outcome<void>{});
         }
     }
 
@@ -2364,13 +2367,7 @@ namespace apps::inconel::front {
         sched->schedule_insert(new req{
             .fragment = fragment,
             .canonical_entries = canonical_entries,
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -2381,15 +2378,8 @@ namespace apps::inconel::front {
             .key = key,
             .read_lsn = read_lsn,
             .frs = std::move(frs),
-            .cb = [ctx = ctx, scope = scope](
-                      core::memtable_lookup_result&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::memtable_lookup_result>(ctx, scope),
         });
     }
 
@@ -2400,14 +2390,8 @@ namespace apps::inconel::front {
             .keys = keys,
             .read_lsn = read_lsn,
             .frs = std::move(frs),
-            .cb = [ctx = ctx, scope = scope](batch_lookup_result&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, batch_lookup_result>(ctx, scope),
         });
     }
 
@@ -2419,15 +2403,8 @@ namespace apps::inconel::front {
             .end = end,
             .read_lsn = read_lsn,
             .frs = std::move(frs),
-            .cb = [ctx = ctx, scope = scope](
-                      core::memtable_scan_result&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::memtable_scan_result>(ctx, scope),
         });
     }
 
@@ -2435,15 +2412,8 @@ namespace apps::inconel::front {
     void
     _front_seal::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_seal(new req{
-            .cb = [ctx = ctx, scope = scope](
-                      core::front_read_set&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::front_read_set>(ctx, scope),
         });
     }
 
@@ -2452,16 +2422,10 @@ namespace apps::inconel::front {
     _front_collect::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_collect(new req{
             .durable_lsn = durable_lsn,
-            .cb = [ctx = ctx, scope = scope](
-                      std::vector<std::shared_ptr<core::memtable_gen>>&& r)
-                      mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos,
+                scope_t,
+                std::vector<std::shared_ptr<core::memtable_gen>>>(ctx, scope),
         });
     }
 
@@ -2470,13 +2434,7 @@ namespace apps::inconel::front {
     _front_release::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_release(new req{
             .gen_ids = std::move(gen_ids),
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -2487,15 +2445,8 @@ namespace apps::inconel::front {
             .fragment = fragment,
             .canonical_entries = canonical_entries,
             .cursor = cursor,
-            .cb = [ctx = ctx, scope = scope](
-                      wal::wal_prepare_result&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos, scope_t, wal::wal_prepare_result>(ctx, scope),
         });
     }
 
@@ -2504,13 +2455,7 @@ namespace apps::inconel::front {
     _front_wal_install::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_wal_install(new req{
             .segment = segment,
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -2520,15 +2465,10 @@ namespace apps::inconel::front {
         sched->schedule_wal_commit(new req{
             .plan_id = plan_id,
             .writes = std::move(writes),
-            .cb = [ctx = ctx, scope = scope](
-                      std::optional<wal::sealed_segment_info>&& r) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(
-                    ctx, scope, std::move(r));
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<
+                pos,
+                scope_t,
+                std::optional<wal::sealed_segment_info>>(ctx, scope),
         });
     }
 
@@ -2538,13 +2478,7 @@ namespace apps::inconel::front {
         sched->schedule_wal_abort(new req{
             .plan_id = plan_id,
             .writes = std::move(writes),
-            .cb = [ctx = ctx, scope = scope]() mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-            },
-            .fail = [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-                pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                    ctx, scope, std::move(ep));
-            },
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 

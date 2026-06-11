@@ -26,6 +26,7 @@
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
 
+#include "../core/owner_callback.hh"
 #include "../core/wal_stream.hh"
 
 namespace apps::inconel::wal {
@@ -47,8 +48,8 @@ struct req {
   uint32_t stream_id = 0;
   std::optional<sealed_segment_info> sealed;
   bool sealed_consumed = false;
-  std::move_only_function<void(segment_runtime *)> cb;
-  std::move_only_function<void(std::exception_ptr)> fail;
+  std::move_only_function<void(
+      core::owner_outcome<segment_runtime *>&&)> cb;
 };
 
 struct op {
@@ -93,8 +94,7 @@ namespace _wal_reclaim {
 
 struct req {
   uint64_t recovery_safe_lsn = 0;
-  std::move_only_function<void()> cb;
-  std::move_only_function<void(std::exception_ptr)> fail;
+  std::move_only_function<void(core::owner_outcome<void>&&)> cb;
 };
 
 struct op {
@@ -467,7 +467,7 @@ private:
       auto cb = std::move(req->cb);
       req.reset();
       if (cb) {
-        cb(seg);
+        cb(core::owner_outcome<segment_runtime *>{seg});
       }
     }
   }
@@ -523,10 +523,10 @@ inline void wal_space_sched::handle_alloc(_wal_alloc::req *r) {
       req->sealed_consumed = true;
     }
   } catch (...) {
-    auto fail = std::move(req->fail);
+    auto cb = std::move(req->cb);
     req.reset();
-    if (fail) {
-      fail(std::current_exception());
+    if (cb) {
+      cb(std::unexpected(std::current_exception()));
     }
     return;
   }
@@ -541,7 +541,7 @@ inline void wal_space_sched::handle_alloc(_wal_alloc::req *r) {
   auto cb = std::move(req->cb);
   req.reset();
   if (cb) {
-    cb(seg);
+    cb(core::owner_outcome<segment_runtime *>{seg});
   }
 }
 
@@ -550,10 +550,10 @@ inline void wal_space_sched::handle_reclaim(_wal_reclaim::req *r) {
   try {
     reclaim_segments(req->recovery_safe_lsn);
   } catch (...) {
-    auto fail = std::move(req->fail);
+    auto cb = std::move(req->cb);
     req.reset();
-    if (fail) {
-      fail(std::current_exception());
+    if (cb) {
+      cb(std::unexpected(std::current_exception()));
     }
     return;
   }
@@ -564,7 +564,7 @@ inline void wal_space_sched::handle_reclaim(_wal_reclaim::req *r) {
   drain_pending_allocs();
 
   if (cb) {
-    cb();
+    cb(core::owner_outcome<void>{});
   }
 }
 
@@ -596,16 +596,8 @@ void _wal_alloc::op::start(ctx_t &ctx, scope_t &scope) {
       .stream_id = stream_id,
       .sealed = std::move(sealed),
       .sealed_consumed = false,
-      .cb =
-          [ctx = ctx, scope = scope](segment_runtime *seg) mutable {
-            pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope,
-                                                                seg);
-          },
-      .fail =
-          [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-            pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                ctx, scope, std::move(ep));
-          },
+      .cb = core::make_owner_pusher<
+          pos, scope_t, segment_runtime *>(ctx, scope),
   });
 }
 
@@ -613,15 +605,7 @@ template <uint32_t pos, typename ctx_t, typename scope_t>
 void _wal_reclaim::op::start(ctx_t &ctx, scope_t &scope) {
   sched->schedule_reclaim(new req{
       .recovery_safe_lsn = recovery_safe_lsn,
-      .cb =
-          [ctx = ctx, scope = scope]() mutable {
-            pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
-          },
-      .fail =
-          [ctx = ctx, scope = scope](std::exception_ptr ep) mutable {
-            pump::core::op_pusher<pos + 1, scope_t>::push_exception(
-                ctx, scope, std::move(ep));
-          },
+      .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
   });
 }
 

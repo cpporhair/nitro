@@ -559,10 +559,10 @@ callback_exceptions_propagate_after_state_commit() {
     sched.schedule_insert(new front::_front_insert::req{
         .fragment = only_fragment(ctx),
         .canonical_entries = canonical_span(ctx),
-        .cb = [] {
-            throw downstream_marker{};
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<void>&& r) {
+            if (r.has_value()) {
+                throw downstream_marker{};
+            }
             ++failures;
         },
     });
@@ -578,11 +578,11 @@ callback_exceptions_propagate_after_state_commit() {
                          ctx.canonical_entries[0].allocated_vr));
 
     sched.schedule_seal(new front::_front_seal::req{
-        .cb = [](core::front_read_set&& frs) {
-            CHECK(frs.imms.size() == 1);
-            throw downstream_marker{};
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<core::front_read_set>&& r) {
+            if (r.has_value()) {
+                CHECK(r->imms.size() == 1);
+                throw downstream_marker{};
+            }
             ++failures;
         },
     });
@@ -613,15 +613,17 @@ scan_callback_keeps_request_snapshot_pin_alive() {
         .end = "pinned-z",
         .read_lsn = 90,
         .frs = std::move(frs),
-        .cb = [&](core::memtable_scan_result&& rows) {
+        .cb = [&](core::owner_outcome<core::memtable_scan_result>&& r) {
+            if (!r.has_value()) {
+                ++failures;
+                return;
+            }
+            auto& rows = *r;
             CHECK(!weak.expired());
             CHECK(rows.size() == 1);
             CHECK(rows[0].key == "pinned-key");
             CHECK(same_value_ref(rows[0].vh.durable, make_value_ref(9000)));
             callback_ran = true;
-        },
-        .fail = [&](std::exception_ptr) {
-            ++failures;
         },
     });
 
@@ -658,13 +660,14 @@ bad_fragment_fails_before_mutation() {
     sched.schedule_insert(new front::_front_insert::req{
         .fragment = std::move(bad_fragment),
         .canonical_entries = canonical_span(bad),
-        .cb = [&] {
-            ++callbacks;
-        },
-        .fail = [&](std::exception_ptr ep) {
+        .cb = [&](core::owner_outcome<void>&& r) {
+            if (r.has_value()) {
+                ++callbacks;
+                return;
+            }
             ++failures;
             try {
-                if (ep) std::rethrow_exception(ep);
+                std::rethrow_exception(r.error());
             } catch (const std::out_of_range&) {
                 return;
             }
@@ -707,10 +710,11 @@ memtable_apply_failure_propagates_as_fatal() {
         .canonical_entries =
             std::span<const core::canonical_entry>{entries.data(),
                                                    entries.size()},
-        .cb = [&] {
-            ++callbacks;
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<void>&& r) {
+            if (r.has_value()) {
+                ++callbacks;
+                return;
+            }
             ++failures;
         },
     });

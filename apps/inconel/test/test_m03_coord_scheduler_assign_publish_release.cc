@@ -789,10 +789,10 @@ downstream_callback_throw_does_not_become_coord_failure() {
     uint32_t terminal_failures = 0;
     sched.schedule_publish(new coord::_coord_publish::req{
         .batch_lsn = 2,
-        .cb = [] {
-            throw downstream_marker{};
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<void>&& r) {
+            if (r.has_value()) {
+                throw downstream_marker{};
+            }
             ++terminal_failures;
         },
     });
@@ -806,10 +806,10 @@ downstream_callback_throw_does_not_become_coord_failure() {
     CHECK(released.batch_lsn == 3);
     sched.schedule_release(new coord::_coord_release::req{
         .batch_lsn = 3,
-        .cb = [] {
-            throw downstream_marker{};
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<void>&& r) {
+            if (r.has_value()) {
+                throw downstream_marker{};
+            }
             ++terminal_failures;
         },
     });
@@ -821,11 +821,11 @@ downstream_callback_throw_does_not_become_coord_failure() {
 
     uint32_t read_failures = 0;
     sched.schedule_read(new coord::_coord_read::req{
-        .cb = [&](core::read_handle&& h) {
-            CHECK(h.read_lsn == 3);
-            throw downstream_marker{};
-        },
-        .fail = [&](std::exception_ptr) {
+        .cb = [&](core::owner_outcome<core::read_handle>&& r) {
+            if (r.has_value()) {
+                CHECK(r->read_lsn == 3);
+                throw downstream_marker{};
+            }
             ++read_failures;
         },
     });

@@ -362,12 +362,16 @@ void pending_alloc_records_sealed_once_and_wakes_after_reclaim() {
       .sealed = info,
       .sealed_consumed = false,
       .cb =
-          [&](wal::segment_runtime *allocated) {
+          [&](core::owner_outcome<wal::segment_runtime *>&& r) {
+            if (!r.has_value()) {
+              ++failures;
+              return;
+            }
+            auto* allocated = *r;
             CHECK(allocated == seg);
             CHECK(allocated->segment_gen == 2);
             callbacks.push_back(allocated->owner_stream);
           },
-      .fail = [&](std::exception_ptr) { ++failures; },
   });
 
   CHECK(sched.advance());
@@ -383,8 +387,13 @@ void pending_alloc_records_sealed_once_and_wakes_after_reclaim() {
 
   sched.schedule_reclaim(new wal::_wal_reclaim::req{
       .recovery_safe_lsn = 8,
-      .cb = [&] { reclaim_done = true; },
-      .fail = [&](std::exception_ptr) { ++failures; },
+      .cb = [&](core::owner_outcome<void>&& r) {
+        if (r.has_value()) {
+          reclaim_done = true;
+        } else {
+          ++failures;
+        }
+      },
   });
 
   CHECK(sched.advance());
@@ -414,10 +423,11 @@ void pending_alloc_fifo_order_is_driven_by_reclaim() {
         .sealed = std::nullopt,
         .sealed_consumed = false,
         .cb =
-            [&](wal::segment_runtime *allocated) {
+            [&](core::owner_outcome<wal::segment_runtime *>&& r) {
+              CHECK(r.has_value());
+              auto* allocated = *r;
               owners.push_back(allocated->owner_stream);
             },
-        .fail = [&](std::exception_ptr) { CHECK(false); },
     });
   };
 
@@ -455,13 +465,15 @@ void duplicate_or_stale_sealed_info_goes_to_fail_without_second_record() {
       .stream_id = 0,
       .sealed = info,
       .sealed_consumed = false,
-      .cb = [&](wal::segment_runtime *) { ++callbacks; },
-      .fail =
-          [&](std::exception_ptr ep) {
+      .cb =
+          [&](core::owner_outcome<wal::segment_runtime *>&& r) {
+            if (r.has_value()) {
+              ++callbacks;
+              return;
+            }
             ++failures;
             try {
-              if (ep)
-                std::rethrow_exception(ep);
+              std::rethrow_exception(r.error());
             } catch (const std::logic_error &) {
               return;
             }
@@ -484,11 +496,15 @@ void callback_exceptions_propagate_after_state_commit() {
       .sealed = std::nullopt,
       .sealed_consumed = false,
       .cb =
-          [&](wal::segment_runtime *seg) {
+          [&](core::owner_outcome<wal::segment_runtime *>&& r) {
+            if (!r.has_value()) {
+              ++failures;
+              return;
+            }
+            auto* seg = *r;
             CHECK(seg->st == wal::wal_segment_state::active);
             throw downstream_marker{};
           },
-      .fail = [&](std::exception_ptr) { ++failures; },
   });
 
   expect_throws<downstream_marker>([&] { (void)sched.advance(); });
@@ -508,8 +524,12 @@ void pending_callback_exceptions_propagate_out_of_reclaim_path() {
       .stream_id = 0,
       .sealed = info,
       .sealed_consumed = false,
-      .cb = [](wal::segment_runtime *) { throw downstream_marker{}; },
-      .fail = [&](std::exception_ptr) { ++failures; },
+      .cb = [&](core::owner_outcome<wal::segment_runtime *>&& r) {
+        if (r.has_value()) {
+          throw downstream_marker{};
+        }
+        ++failures;
+      },
   });
 
   CHECK(sched.advance());

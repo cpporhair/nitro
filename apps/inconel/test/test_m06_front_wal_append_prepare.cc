@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -267,6 +268,46 @@ apply_plan_bytes(const wal::segment_geometry& geom,
     }
 }
 
+std::vector<uint64_t>
+plan_page_indices(const wal::segment_geometry& geom,
+                  const wal::wal_append_plan& plan) {
+    const auto base = wal::segment_base_paddr(geom, plan.segment);
+    std::vector<uint64_t> pages;
+    pages.reserve(plan.writes.size());
+    for (const auto& write : plan.writes) {
+        CHECK(write.frame.id.span_lbas == 1);
+        CHECK(write.frame.id.base.lba >= base.lba);
+        pages.push_back(write.frame.id.base.lba - base.lba);
+    }
+    std::sort(pages.begin(), pages.end());
+    CHECK(std::unique(pages.begin(), pages.end()) == pages.end());
+    return pages;
+}
+
+format::wal_segment_header
+read_segment_header(const std::vector<char>& segment_bytes) {
+    CHECK(segment_bytes.size() >= sizeof(format::wal_segment_header));
+    format::wal_segment_header raw_header{};
+    std::memcpy(&raw_header, segment_bytes.data(), sizeof(raw_header));
+    return raw_header;
+}
+
+format::wal_sealed_trailer
+read_fixed_tail_trailer(const wal::segment_geometry& geom,
+                        const std::vector<char>& segment_bytes) {
+    const uint32_t fixed_tail_offset =
+        geom.wal_segment_size - wal::trailer_reserved_bytes(geom);
+    CHECK(fixed_tail_offset + sizeof(format::wal_sealed_trailer) <=
+          segment_bytes.size());
+
+    format::wal_sealed_trailer raw_trailer{};
+    std::memcpy(
+        &raw_trailer,
+        segment_bytes.data() + fixed_tail_offset,
+        sizeof(raw_trailer));
+    return raw_trailer;
+}
+
 format::decoded_wal_entry
 decode_entry_at(const std::vector<char>& segment_bytes,
                 uint32_t offset,
@@ -284,6 +325,50 @@ decode_entry_at(const std::vector<char>& segment_bytes,
     CHECK(status == format::wal_entry_decode_status::ok);
     if (out_len) *out_len = len;
     return decoded;
+}
+
+uint32_t
+decode_entries_until_stop(const std::vector<char>& segment_bytes,
+                          uint32_t offset,
+                          uint32_t limit,
+                          uint32_t segment_gen,
+                          uint32_t* out_count = nullptr) {
+    CHECK(offset <= limit);
+    CHECK(limit <= segment_bytes.size());
+
+    uint32_t count = 0;
+    while (offset < limit) {
+        uint32_t len = 0;
+        format::decoded_wal_entry decoded;
+        const auto status = format::decode_wal_entry(
+            std::span<const char>{
+                segment_bytes.data() + offset,
+                limit - offset},
+            segment_gen,
+            &decoded,
+            &len);
+        if (status != format::wal_entry_decode_status::ok) break;
+        CHECK(len > 0);
+        CHECK(offset + len <= limit);
+        offset += len;
+        ++count;
+    }
+
+    if (out_count) *out_count = count;
+    return offset;
+}
+
+void
+expect_entries_decode_exactly(const std::vector<char>& segment_bytes,
+                              uint32_t offset,
+                              uint32_t end,
+                              uint32_t segment_gen,
+                              uint32_t expected_count) {
+    uint32_t count = 0;
+    const uint32_t decoded_end = decode_entries_until_stop(
+        segment_bytes, offset, end, segment_gen, &count);
+    CHECK(decoded_end == end);
+    CHECK(count == expected_count);
 }
 
 void
@@ -537,6 +622,63 @@ entry_can_cross_lba_page_without_crossing_segment() {
 }
 
 void
+m06_middle_pages_not_zeroed_but_suffix_zeroed() {
+    auto geom = make_geom(1, 13000, 2048, 128);
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom);
+    install_new_segment(front_sched, wal_space, 0);
+
+    const std::string long_key(320, 'm');
+    auto ctx = make_ctx(
+        {
+            {.op = core::write_op_type::put, .key = long_key, .value = "v"},
+        },
+        32);
+    const auto& fragment = only_fragment(ctx);
+    std::vector<char> segment_bytes(
+        geom.wal_segment_size, static_cast<char>(0x7f));
+
+    auto header = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        fragment, canonical_span(ctx), {}));
+    apply_plan_bytes(geom, header, segment_bytes);
+    CHECK(!front_sched.commit_wal_plan_for_testing(header.plan_id).has_value());
+
+    auto entries = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        fragment, canonical_span(ctx), {}));
+    CHECK(entries.kind == wal::wal_plan_kind::entries);
+    const auto pages = plan_page_indices(geom, entries);
+    CHECK(pages.size() >= 3);
+    apply_plan_bytes(geom, entries, segment_bytes);
+
+    expect_entries_decode_exactly(
+        segment_bytes,
+        entries.start_offset,
+        entries.end_offset,
+        entries.segment_gen,
+        static_cast<uint32_t>(fragment.entry_indices.size()));
+
+    const uint64_t first_page = pages.front();
+    const uint64_t last_page = pages.back();
+    for (const auto page : pages) {
+        if (page == first_page || page == last_page) continue;
+        const auto begin =
+            segment_bytes.begin() +
+            static_cast<std::ptrdiff_t>(page * geom.lba_size);
+        const auto end = begin + static_cast<std::ptrdiff_t>(geom.lba_size);
+        CHECK(std::any_of(begin, end, [](char c) { return c != char{0}; }));
+    }
+
+    const uint32_t end_mod = entries.end_offset & (geom.lba_size - 1);
+    CHECK(end_mod != 0);
+    const uint64_t last_page_start = last_page * geom.lba_size;
+    for (uint32_t i = end_mod; i < geom.lba_size; ++i) {
+        CHECK(segment_bytes[last_page_start + i] == char{0});
+    }
+
+    CHECK(!front_sched.commit_wal_plan_for_testing(entries.plan_id).has_value());
+}
+
+void
 page_budget_bounds_prepare_without_splitting_single_entry() {
     auto geom = make_geom(1, 3000, 2048, 128);
     wal::wal_append_config config{
@@ -608,15 +750,18 @@ segment_rotation_writes_trailer_then_new_header() {
     auto trailer = take_ready(front_sched.prepare_wal_fragment_for_testing(
         fragment, canonical_span(ctx), first_entries.cursor_after));
     CHECK(trailer.kind == wal::wal_plan_kind::trailer);
+    CHECK(trailer.start_offset == wal::segment_usable_end_offset(geom));
     apply_plan_bytes(geom, trailer, first_segment);
-    format::wal_sealed_trailer raw_trailer{};
-    std::memcpy(
-        &raw_trailer,
-        first_segment.data() + trailer.start_offset,
-        sizeof(raw_trailer));
+    const auto raw_trailer = read_fixed_tail_trailer(geom, first_segment);
     CHECK(format::inspect_wal_sealed_trailer(raw_trailer) ==
           format::wal_trailer_status::ok);
     CHECK(raw_trailer.write_end == first_entries.end_offset);
+    const auto entry_pages = plan_page_indices(geom, first_entries);
+    const auto trailer_pages = plan_page_indices(geom, trailer);
+    for (const auto trailer_page : trailer_pages) {
+        CHECK(std::find(entry_pages.begin(), entry_pages.end(), trailer_page) ==
+              entry_pages.end());
+    }
     auto sealed = front_sched.commit_wal_plan_for_testing(trailer.plan_id);
     CHECK(sealed.has_value());
     CHECK(sealed->min_lsn == ctx.batch_lsn);
@@ -642,6 +787,76 @@ segment_rotation_writes_trailer_then_new_header() {
     CHECK(decoded.entry_count == ctx.entry_count);
     CHECK(!front_sched.commit_wal_plan_for_testing(
         last_entry.plan_id).has_value());
+}
+
+void
+m06_trailer_at_fixed_tail_region_decodes_for_recovery_view() {
+    auto geom = make_geom(2, 11000, 4096, 512);
+    wal::wal_append_config config{
+        .max_fua_inflight = 4,
+        .max_pages_per_plan = 64,
+    };
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom, config);
+    install_new_segment(front_sched, wal_space, 0);
+
+    std::vector<core::raw_batch_op> ops;
+    for (uint32_t i = 0; i < 4; ++i) {
+        ops.push_back(core::raw_batch_op{
+            .op = core::write_op_type::put,
+            .key = std::string(900, static_cast<char>('r' + i)),
+            .value = "v",
+        });
+    }
+    auto ctx = make_ctx(std::move(ops), 29);
+    const auto& fragment = only_fragment(ctx);
+    std::vector<char> segment_bytes(geom.wal_segment_size, char{0});
+
+    auto header = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        fragment, canonical_span(ctx), {}));
+    apply_plan_bytes(geom, header, segment_bytes);
+    CHECK(!front_sched.commit_wal_plan_for_testing(header.plan_id).has_value());
+
+    auto entries = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        fragment, canonical_span(ctx), {}));
+    CHECK(!entries.fragment_done);
+    apply_plan_bytes(geom, entries, segment_bytes);
+    CHECK(!front_sched.commit_wal_plan_for_testing(
+        entries.plan_id).has_value());
+
+    auto trailer = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        fragment, canonical_span(ctx), entries.cursor_after));
+    CHECK(trailer.kind == wal::wal_plan_kind::trailer);
+    apply_plan_bytes(geom, trailer, segment_bytes);
+
+    const auto raw_header = read_segment_header(segment_bytes);
+    CHECK(format::inspect_wal_segment_header(
+              raw_header, geom.expected_format_version) ==
+          format::wal_segment_status::ok);
+
+    const auto raw_trailer = read_fixed_tail_trailer(geom, segment_bytes);
+    CHECK(raw_trailer.magic == format::WAL_SEAL_MAGIC);
+    CHECK(raw_trailer.segment_gen == raw_header.segment_gen);
+    CHECK(raw_trailer.crc == format::wal_sealed_trailer_crc(raw_trailer));
+    CHECK(format::inspect_wal_sealed_trailer(raw_trailer) ==
+          format::wal_trailer_status::ok);
+
+    const uint32_t fixed_tail_offset =
+        geom.wal_segment_size - wal::trailer_reserved_bytes(geom);
+    uint32_t decoded_count = 0;
+    const uint32_t decoded_end = decode_entries_until_stop(
+        segment_bytes,
+        format::WAL_SEGMENT_HEADER_SIZE,
+        fixed_tail_offset,
+        raw_header.segment_gen,
+        &decoded_count);
+    CHECK(decoded_count == entries.cursor_after.next_fragment_entry);
+    CHECK(raw_trailer.write_end == decoded_end);
+    CHECK(raw_trailer.min_lsn == ctx.batch_lsn);
+    CHECK(raw_trailer.max_lsn == ctx.batch_lsn);
+
+    auto sealed = front_sched.commit_wal_plan_for_testing(trailer.plan_id);
+    CHECK(sealed.has_value());
 }
 
 void
@@ -727,6 +942,73 @@ l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua() {
         ctx.batch_lsn,
         core::front_read_set{.active = front_sched.active_for_testing()});
     CHECK(std::holds_alternative<core::memtable_miss>(lookup));
+}
+
+void
+m06_frames_return_to_pool_on_front_commit() {
+    auto geom = make_geom(2, 12000, 4096, 512);
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom);
+    test_fake_nvme::scheduler fake_nvme;
+
+    auto warm_ctx = make_ctx(
+        {{.op = core::write_op_type::put, .key = "pool-warm", .value = "v"}},
+        30);
+    const auto& warm_fragment = only_fragment(warm_ctx);
+    auto warm_result = submit_wal_pipeline_and_drive(
+        front_sched,
+        wal_space,
+        fake_nvme,
+        [&] {
+            return write_path::write_wal_fragment(
+                front_sched,
+                wal_space,
+                &fake_nvme,
+                warm_fragment,
+                canonical_span(warm_ctx));
+        });
+    expect_pipeline_ok(warm_result);
+
+    const auto initial_free =
+        front_sched.wal_frame_pool_free_pages_for_testing();
+    CHECK(initial_free > 0);
+    CHECK(!front_sched.wal_has_pending_plan_for_testing());
+
+    auto ctx = make_ctx(
+        {{.op = core::write_op_type::put, .key = "pool-held", .value = "v"}},
+        31);
+    const auto& fragment = only_fragment(ctx);
+    auto submission = submit_wal_pipeline([&] {
+        return write_path::write_wal_fragment(
+            front_sched, wal_space, &fake_nvme, fragment, canonical_span(ctx));
+    });
+
+    for (uint32_t i = 0;
+         fake_nvme.active == 0 &&
+         submission.fut.wait_for(std::chrono::milliseconds(0)) !=
+             std::future_status::ready &&
+         i < 128;
+         ++i) {
+        (void)front_sched.advance();
+        (void)wal_space.advance();
+        std::this_thread::yield();
+    }
+    CHECK(fake_nvme.active > 0);
+
+    while (!fake_nvme.idle()) {
+        (void)fake_nvme.advance_one();
+    }
+    CHECK(fake_nvme.idle());
+    CHECK(submission.fut.wait_for(std::chrono::milliseconds(0)) !=
+          std::future_status::ready);
+    CHECK(front_sched.wal_has_pending_plan_for_testing());
+    CHECK(front_sched.wal_frame_pool_free_pages_for_testing() < initial_free);
+
+    CHECK(front_sched.advance());
+    CHECK(front_sched.wal_frame_pool_free_pages_for_testing() == initial_free);
+    CHECK(submission.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    expect_pipeline_ok(submission.fut.get());
 }
 
 void
@@ -1004,10 +1286,13 @@ main() {
     put_delete_entries_decode_and_keep_global_count();
     fragment_entries_use_batch_global_entry_count();
     entry_can_cross_lba_page_without_crossing_segment();
+    m06_middle_pages_not_zeroed_but_suffix_zeroed();
     page_budget_bounds_prepare_without_splitting_single_entry();
     segment_rotation_writes_trailer_then_new_header();
+    m06_trailer_at_fixed_tail_region_decodes_for_recovery_view();
     abort_after_fua_failure_keeps_cursor_and_memtable_unchanged();
     l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua();
+    m06_frames_return_to_pool_on_front_commit();
     m06_concurrent_fragments_serialize_through_wal_gate();
     m06_prepare_fifo_wakes_after_rotation_install();
     m06_prepare_queue_full_fails_with_explicit_reason();

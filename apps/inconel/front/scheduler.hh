@@ -378,6 +378,11 @@ namespace apps::inconel::front {
             return wal_ && wal_->has_pending_plan();
         }
 
+        [[nodiscard]] std::size_t
+        wal_frame_pool_free_pages_for_testing() const noexcept {
+            return wal_frame_pool_ ? wal_frame_pool_->free_page_count() : 0;
+        }
+
       private:
         static constexpr uint32_t kMaxInsertPerAdvance = 64;
         static constexpr uint32_t kMaxLookupPerAdvance = 128;

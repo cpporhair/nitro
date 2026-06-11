@@ -2,6 +2,7 @@
 #define APPS_INCONEL_MEMORY_DMA_PAGE_POOL_HH
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -94,6 +95,9 @@ namespace apps::inconel::memory {
         [[nodiscard]] uint32_t lba_size() const noexcept { return lba_size_; }
         [[nodiscard]] uint32_t alignment() const noexcept { return alignment_; }
         [[nodiscard]] int numa_id() const noexcept { return numa_id_; }
+        [[nodiscard]] std::size_t free_page_count() const noexcept {
+            return free_pages_.size();
+        }
 
         [[nodiscard]] lba_dma_page*
         get_page(bool zero_fill = false) {

@@ -241,13 +241,13 @@ namespace apps::inconel::core {
 
     inline absl::InlinedVector<memtable_entry, 1>&
     ensure_versions_for_key(memtable_gen& gen, std::string_view key) {
-        if (auto it = gen.table.find(key); it != gen.table.end()) {
+        auto it = gen.table.lower_bound(key);
+        if (it != gen.table.end() && it->first == key) {
             return it->second;
         }
 
         const auto arena_key = gen.kv_arena.allocate(key.data(), key.size());
-        auto [it, inserted] = gen.table.try_emplace(arena_key);
-        (void)inserted;
+        it = gen.table.try_emplace(it, arena_key);
         return it->second;
     }
 
@@ -256,26 +256,26 @@ namespace apps::inconel::core {
                  std::string_view key,
                  uint64_t data_ver,
                  value_ref durable) {
-        update_lsn_bounds(gen, data_ver);
         auto& versions = ensure_versions_for_key(gen, key);
         versions.push_back(memtable_entry{
             .data_ver = data_ver,
             .k        = memtable_entry::kind::value,
             .vh       = value_handle{.durable = durable},
         });
+        update_lsn_bounds(gen, data_ver);
     }
 
     inline void
     insert_tombstone(memtable_gen& gen,
                      std::string_view key,
                      uint64_t data_ver) {
-        update_lsn_bounds(gen, data_ver);
         auto& versions = ensure_versions_for_key(gen, key);
         versions.push_back(memtable_entry{
             .data_ver = data_ver,
             .k        = memtable_entry::kind::tombstone,
             .vh       = {},
         });
+        update_lsn_bounds(gen, data_ver);
     }
 
     inline const memtable_entry*

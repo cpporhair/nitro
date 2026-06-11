@@ -375,6 +375,11 @@ construction_checks_initial_cat_contract() {
         coord::coord_sched sched(make_cat(5, 1, 1), 1, 5, 4);
         (void)sched;
     });
+
+    expect_throws<std::invalid_argument>([] {
+        coord::coord_sched sched(make_cat(0, 1, 1), 1, 1, 3);
+        (void)sched;
+    });
 }
 
 void

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -41,10 +42,15 @@ namespace apps::inconel::coord {
         ready_window(uint64_t base_lsn, std::size_t window_size)
             : base_lsn_(base_lsn)
             , window_size_(window_size)
+            , mask_(window_size == 0 ? 0 : window_size - 1)
             , bits_((window_size + kBitsPerWord - 1) / kBitsPerWord, 0) {
             if (window_size == 0) {
                 throw std::invalid_argument(
                     "coord::ready_window: window_size must be nonzero");
+            }
+            if (!std::has_single_bit(window_size)) {
+                throw std::invalid_argument(
+                    "coord::ready_window: window_size must be a power of two");
             }
         }
 
@@ -92,16 +98,36 @@ namespace apps::inconel::coord {
         advance_contiguous_prefix(uint64_t scan_from_lsn) {
             uint64_t resolved = scan_from_lsn;
             uint64_t lsn = scan_from_lsn + 1;
+            if (lsn < base_lsn_) {
+                return resolved;
+            }
 
-            while (lsn >= base_lsn_ &&
-                   lsn - base_lsn_ < window_size_ &&
-                   test_bit(lsn)) {
-                clear_bit(lsn);
-                if (lsn == base_lsn_) {
-                    ++base_lsn_;
+            while (lsn - base_lsn_ < window_size_) {
+                const std::size_t idx = bit_index(lsn);
+                const std::size_t word = idx / kBitsPerWord;
+                const std::size_t bit = idx % kBitsPerWord;
+                const uint64_t suffix = bits_[word] >> bit;
+                const uint64_t run = std::countr_one(suffix);
+                const uint64_t span =
+                    std::min<uint64_t>(kBitsPerWord - bit,
+                                       window_size_ - idx);
+                const uint64_t take =
+                    std::min<uint64_t>(run, span);
+                if (take == 0) {
+                    break;
                 }
-                resolved = lsn;
-                ++lsn;
+
+                const uint64_t mask =
+                    (take == kBitsPerWord)
+                        ? ~uint64_t{0}
+                        : ((uint64_t{1} << take) - 1) << bit;
+                bits_[word] &= ~mask;
+                lsn += take;
+                base_lsn_ = lsn;
+                resolved = lsn - 1;
+                if (take < span) {
+                    break;
+                }
             }
 
             return resolved;
@@ -112,7 +138,7 @@ namespace apps::inconel::coord {
 
         [[nodiscard]] std::size_t
         bit_index(uint64_t lsn) const noexcept {
-            return static_cast<std::size_t>(lsn % window_size_);
+            return static_cast<std::size_t>(lsn & mask_);
         }
 
         [[nodiscard]] bool
@@ -138,6 +164,7 @@ namespace apps::inconel::coord {
 
         uint64_t              base_lsn_;
         std::size_t           window_size_;
+        std::size_t           mask_;
         std::vector<uint64_t> bits_;
     };
 

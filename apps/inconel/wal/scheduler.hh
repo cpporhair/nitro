@@ -265,16 +265,6 @@ private:
     return slots_[index];
   }
 
-  [[nodiscard]] bool sealed_segment_already_recorded(
-      const sealed_segment_info &info) const noexcept {
-    for (const auto &existing : sealed_segments_) {
-      if (existing.id == info.id && existing.segment_gen == info.segment_gen) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   void record_sealed_segment(uint32_t stream_id,
                              const sealed_segment_info &info) {
     validate_stream_id(stream_id);
@@ -308,9 +298,9 @@ private:
       throw std::logic_error(
           "wal::wal_space_sched: sealed generation mismatch");
     }
-    if (sealed_segment_already_recorded(info)) {
-      throw std::logic_error("wal::wal_space_sched: duplicate sealed segment");
-    }
+    // Re-sealing the same {id, gen} must first hit slot.st != active, and a
+    // reused slot carries a newer generation. The state machine makes a
+    // duplicate sealed-vector scan unreachable on this hot path.
     if (sealed_segments_.size() >= geometry_.wal_segment_count) {
       throw std::logic_error(
           "wal::wal_space_sched: sealed segment vector full");

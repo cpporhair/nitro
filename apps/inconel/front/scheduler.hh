@@ -474,6 +474,20 @@ namespace apps::inconel::front {
             }
         }
 
+        void validate_snapshot_owner_fast(
+            const core::front_read_set& frs) const {
+            if (frs.active && frs.active->front_owner_index != owner_id_) {
+                throw std::logic_error(
+                    "front::front_sched: snapshot active gen owner mismatch");
+            }
+            for (const auto& gen : frs.imms) {
+                if (gen && gen->front_owner_index != owner_id_) {
+                    throw std::logic_error(
+                        "front::front_sched: snapshot imm gen owner mismatch");
+                }
+            }
+        }
+
         void validate_current_imms() const {
             for (const auto& gen : imms_) {
                 if (!gen) {
@@ -610,7 +624,7 @@ namespace apps::inconel::front {
         lookup_memtable_now(std::string_view key,
                             uint64_t read_lsn,
                             const core::front_read_set& frs) const {
-            validate_snapshot_owner(frs);
+            validate_snapshot_owner_fast(frs);
             return core::lookup_memtable(key, read_lsn, frs);
         }
 
@@ -618,7 +632,7 @@ namespace apps::inconel::front {
         batch_lookup_now(std::span<const std::string_view> keys,
                          uint64_t read_lsn,
                          const core::front_read_set& frs) const {
-            validate_snapshot_owner(frs);
+            validate_snapshot_owner_fast(frs);
             batch_lookup_result out;
             out.reserve(keys.size());
             for (std::string_view key : keys) {
@@ -635,7 +649,7 @@ namespace apps::inconel::front {
                           std::string_view end,
                           uint64_t read_lsn,
                           const core::front_read_set& frs) const {
-            validate_snapshot_owner(frs);
+            validate_snapshot_owner_fast(frs);
             return core::scan_memtable(begin, end, read_lsn, frs);
         }
 

@@ -315,6 +315,18 @@ void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
   CHECK(!stream.can_fit_entry(stream.usable_end_offset()));
 }
 
+void stream_state_rejects_install_over_active_segment() {
+  auto geom = make_geom(2);
+  wal::wal_space_sched sched(geom, 2);
+  auto *first = sched.try_alloc_segment_for_testing(0);
+  auto *second = sched.try_alloc_segment_for_testing(0);
+
+  wal::wal_stream_state stream(0, geom);
+  stream.install_segment(first);
+  expect_throws<std::logic_error>([&] { stream.install_segment(second); });
+  CHECK(stream.active_segment() == first);
+}
+
 void sealed_segments_reclaim_to_free_pool_with_incremented_generation() {
   auto geom = make_geom(2, 7000);
   wal::wal_space_sched sched(geom, 1);
@@ -561,6 +573,7 @@ int main() {
   geometry_validation_and_base_address_use_wal_base();
   test_only_helper_can_observe_empty_pool_without_production_success();
   stream_state_tracks_offsets_fit_and_sealed_lsn_range();
+  stream_state_rejects_install_over_active_segment();
   sealed_segments_reclaim_to_free_pool_with_incremented_generation();
   pending_alloc_records_sealed_once_and_wakes_after_reclaim();
   pending_alloc_fifo_order_is_driven_by_reclaim();

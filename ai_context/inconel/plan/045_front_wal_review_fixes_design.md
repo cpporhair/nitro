@@ -195,7 +195,14 @@ pages 在 owner 线程归池。FUA 期间 frames 由 context 中的 plan 钉住,
    include `core/wal_stream.hh`(验证其不再触及 append 侧类型)。
 4. `write_path/sender.hh` 经 `front/sender.hh` 链可达全部类型,不直接
    include 新头。
-5. 本 Phase 禁止任何行为变化;全部测试不改而绿。
+5. 本 Phase 禁止任何行为变化;全部测试**断言**不改而绿。
+6. 测试随迁适配(裁决记录,2026-06-11):`test_m04_wal_space_scheduler.cc`
+   中 042 时代的 `wal_stream_state` 系合约测试直接使用 append-side 类型
+   (`wal_stream_state`/`wal_append_plan`/`wal_plan_kind`),原先经
+   `wal/sender.hh` 传递可见;类型迁移后,允许且仅允许在该文件追加
+   `#include "../front/wal_append.hh"` 作为机械跟随,断言与测试体零改动。
+   include 适配不视为行为变化。禁止用 `wal/scheduler.hh` 反向 include
+   front 头来回避此适配(那会破坏 F3 分层)。
 
 ### Phase C — WAL append 路径重做(F1 代码、F5、P1.2/1.3、P2.7/2.8、P3.11/3.13/3.14、m1)
 
@@ -590,6 +597,8 @@ bool wal_busy() const { return (wal_ && wal_->has_pending_plan()) || wal_awaitin
    (语义断言不变);新增 ctor 拒绝非 2 幂的失败用例。
 4. `test_m04`:duplicate-sealed 用例改为断言状态机错误(意图:重复 seal
    fail-fast);新增 install-over-active fail-fast 用例(经 stream state)。
+5. `test_m04`(Phase B,§5.B.6):追加 `front/wal_append.hh` include,
+   仅此一行,断言零改动。
 
 ### 8.2 必增
 

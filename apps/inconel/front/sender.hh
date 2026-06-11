@@ -60,6 +60,31 @@ namespace apps::inconel::front {
         return sched.release_gens(std::move(gen_ids));
     }
 
+    [[nodiscard]] inline auto
+    prepare_wal_fragment(
+        front_sched& sched,
+        core::front_fragment fragment,
+        std::span<const core::canonical_entry> canonical_entries,
+        wal::wal_fragment_cursor cursor) {
+        return sched.prepare_wal_fragment(
+            std::move(fragment), canonical_entries, cursor);
+    }
+
+    [[nodiscard]] inline auto
+    install_wal_segment(front_sched& sched, wal::segment_runtime* segment) {
+        return sched.install_wal_segment(segment);
+    }
+
+    [[nodiscard]] inline auto
+    commit_wal_plan(front_sched& sched, uint64_t plan_id) {
+        return sched.commit_wal_plan(plan_id);
+    }
+
+    [[nodiscard]] inline auto
+    abort_wal_plan(front_sched& sched, uint64_t plan_id) {
+        return sched.abort_wal_plan(plan_id);
+    }
+
 }  // namespace apps::inconel::front
 
 #endif  // APPS_INCONEL_FRONT_SENDER_HH

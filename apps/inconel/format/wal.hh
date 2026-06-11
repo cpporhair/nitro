@@ -12,6 +12,7 @@
 #include <absl/crc/crc32c.h>
 #include <absl/strings/string_view.h>
 
+#include "./superblock.hh"
 #include "./types.hh"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +138,40 @@ namespace apps::inconel::format {
         constexpr uint32_t covered = offsetof(wal_sealed_trailer, crc);
         return static_cast<uint32_t>(absl::ComputeCrc32c(
             absl::string_view(reinterpret_cast<const char*>(&t), covered)));
+    }
+
+    [[nodiscard]] inline wal_segment_header
+    make_wal_segment_header(uint32_t segment_index,
+                            uint16_t device_id,
+                            uint32_t stream_id,
+                            uint32_t segment_gen,
+                            uint32_t format_version =
+                                SUPERBLOCK_FORMAT_VERSION_V1) noexcept {
+        wal_segment_header h{};
+        h.magic          = WAL_SEGMENT_MAGIC;
+        h.format_version = format_version;
+        h.segment_index  = segment_index;
+        h.device_id      = device_id;
+        h.stream_id      = stream_id;
+        h.segment_gen    = segment_gen;
+        h.crc            = wal_segment_header_crc(h);
+        return h;
+    }
+
+    [[nodiscard]] inline wal_sealed_trailer
+    make_wal_sealed_trailer(uint32_t segment_gen,
+                            uint32_t write_end,
+                            uint64_t min_lsn,
+                            uint64_t max_lsn) noexcept {
+        wal_sealed_trailer t{};
+        t.magic       = WAL_SEAL_MAGIC;
+        t.segment_gen = segment_gen;
+        t.write_end   = write_end;
+        t.min_lsn     = min_lsn;
+        t.max_lsn     = max_lsn;
+        t.sealed      = WAL_SEALED_FLAG_SEALED;
+        t.crc         = wal_sealed_trailer_crc(t);
+        return t;
     }
 
     // ── Reason-aware status enums ──────────────────────────────────────────
@@ -302,6 +337,120 @@ namespace apps::inconel::format {
         std::optional<value_ref> vr;
     };
 
+    struct wal_entry_parts {
+        wal_entry_header      header{};
+        std::span<const char> value_ref_bytes;
+        std::span<const char> key_bytes;
+        uint32_t              crc = 0;
+        uint32_t              total_len = 0;
+    };
+
+    [[nodiscard]] inline std::span<const char>
+    wal_value_ref_bytes(const value_ref& vr) noexcept {
+        return {
+            reinterpret_cast<const char*>(&vr),
+            sizeof(value_ref),
+        };
+    }
+
+    [[nodiscard]] inline uint32_t
+    wal_entry_parts_crc(const wal_entry_parts& parts) noexcept {
+        absl::crc32c_t crc = absl::ComputeCrc32c(
+            absl::string_view(
+                reinterpret_cast<const char*>(&parts.header),
+                sizeof(parts.header)));
+        crc = absl::ExtendCrc32c(
+            crc,
+            absl::string_view(
+                parts.value_ref_bytes.data(),
+                parts.value_ref_bytes.size()));
+        crc = absl::ExtendCrc32c(
+            crc,
+            absl::string_view(parts.key_bytes.data(), parts.key_bytes.size()));
+        return static_cast<uint32_t>(crc);
+    }
+
+    [[nodiscard]] inline wal_entry_parts
+    make_wal_put_entry_parts_unchecked(uint32_t         segment_gen,
+                                       uint64_t         lsn,
+                                       uint32_t         entry_count,
+                                       std::string_view key,
+                                       const value_ref& vr) noexcept {
+        const uint32_t key_len = static_cast<uint32_t>(key.size());
+
+        wal_entry_parts parts{};
+        parts.total_len = wal_put_entry_size(key_len);
+        parts.header.total_len   = parts.total_len;
+        parts.header.segment_gen = segment_gen;
+        parts.header.lsn         = lsn;
+        parts.header.entry_count = entry_count;
+        parts.header.op_type     = static_cast<uint8_t>(wal_op_type::put);
+        parts.header.key_len     = key_len;
+        parts.value_ref_bytes    = wal_value_ref_bytes(vr);
+        parts.key_bytes          = {key.data(), key.size()};
+        parts.crc                = wal_entry_parts_crc(parts);
+        return parts;
+    }
+
+    [[nodiscard]] inline std::optional<wal_entry_parts>
+    build_wal_put_entry_parts(uint32_t         segment_gen,
+                              uint64_t         lsn,
+                              uint32_t         entry_count,
+                              std::string_view key,
+                              const value_ref& vr) noexcept {
+        if (key.size() > WAL_PUT_MAX_KEY_LEN) return std::nullopt;
+        return make_wal_put_entry_parts_unchecked(
+            segment_gen, lsn, entry_count, key, vr);
+    }
+
+    [[nodiscard]] inline wal_entry_parts
+    make_wal_delete_entry_parts_unchecked(uint32_t         segment_gen,
+                                          uint64_t         lsn,
+                                          uint32_t         entry_count,
+                                          std::string_view key) noexcept {
+        const uint32_t key_len = static_cast<uint32_t>(key.size());
+
+        wal_entry_parts parts{};
+        parts.total_len = wal_delete_entry_size(key_len);
+        parts.header.total_len   = parts.total_len;
+        parts.header.segment_gen = segment_gen;
+        parts.header.lsn         = lsn;
+        parts.header.entry_count = entry_count;
+        parts.header.op_type     = static_cast<uint8_t>(wal_op_type::del);
+        parts.header.key_len     = key_len;
+        parts.key_bytes          = {key.data(), key.size()};
+        parts.crc                = wal_entry_parts_crc(parts);
+        return parts;
+    }
+
+    [[nodiscard]] inline std::optional<wal_entry_parts>
+    build_wal_delete_entry_parts(uint32_t         segment_gen,
+                                 uint64_t         lsn,
+                                 uint32_t         entry_count,
+                                 std::string_view key) noexcept {
+        if (key.size() > WAL_DELETE_MAX_KEY_LEN) return std::nullopt;
+        return make_wal_delete_entry_parts_unchecked(
+            segment_gen, lsn, entry_count, key);
+    }
+
+    inline void
+    copy_wal_entry_parts_to(std::span<char> dst,
+                            const wal_entry_parts& parts) noexcept {
+        char* p = dst.data();
+        std::memcpy(p, &parts.header, sizeof(parts.header));
+        p += sizeof(parts.header);
+        if (!parts.value_ref_bytes.empty()) {
+            std::memcpy(
+                p, parts.value_ref_bytes.data(), parts.value_ref_bytes.size());
+            p += parts.value_ref_bytes.size();
+        }
+        if (!parts.key_bytes.empty()) {
+            std::memcpy(p, parts.key_bytes.data(), parts.key_bytes.size());
+            p += parts.key_bytes.size();
+        }
+        std::memcpy(p, &parts.crc, sizeof(parts.crc));
+    }
+
     // ── Encode helpers ─────────────────────────────────────────────────────
     //
     // Both encoders write a complete entry (header + payload + trailing
@@ -318,36 +467,18 @@ namespace apps::inconel::format {
                          std::string_view    key,
                          const value_ref&    vr,
                          uint32_t*           out_total_len) noexcept {
-        if (key.size() > WAL_PUT_MAX_KEY_LEN)
+        auto parts = build_wal_put_entry_parts(
+            segment_gen, lsn, entry_count, key, vr);
+        if (!parts)
             return wal_entry_encode_status::key_too_large;
-        const uint32_t key_len   = static_cast<uint32_t>(key.size());
-        const uint32_t total_len = wal_put_entry_size(key_len);
 
-        if (dst.size() < total_len)
+        if (dst.size() < parts->total_len)
             return wal_entry_encode_status::dst_too_small;
 
-        wal_entry_header hdr{};
-        hdr.total_len   = total_len;
-        hdr.segment_gen = segment_gen;
-        hdr.lsn         = lsn;
-        hdr.entry_count = entry_count;
-        hdr.op_type     = static_cast<uint8_t>(wal_op_type::put);
-        hdr.key_len     = key_len;
+        copy_wal_entry_parts_to(
+            dst.subspan(0, parts->total_len), *parts);
 
-        char* p = dst.data();
-        std::memcpy(p, &hdr, sizeof(hdr));
-        p += sizeof(hdr);
-        std::memcpy(p, &vr, sizeof(value_ref));
-        p += sizeof(value_ref);
-        if (key_len > 0) std::memcpy(p, key.data(), key_len);
-        p += key_len;
-
-        const uint32_t covered = total_len - WAL_ENTRY_TRAILER_CRC_BYTES;
-        const uint32_t crc = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(dst.data(), covered)));
-        std::memcpy(p, &crc, sizeof(crc));
-
-        if (out_total_len) *out_total_len = total_len;
+        if (out_total_len) *out_total_len = parts->total_len;
         return wal_entry_encode_status::ok;
     }
 
@@ -358,34 +489,18 @@ namespace apps::inconel::format {
                             uint32_t            entry_count,
                             std::string_view    key,
                             uint32_t*           out_total_len) noexcept {
-        if (key.size() > WAL_DELETE_MAX_KEY_LEN)
+        auto parts = build_wal_delete_entry_parts(
+            segment_gen, lsn, entry_count, key);
+        if (!parts)
             return wal_entry_encode_status::key_too_large;
-        const uint32_t key_len   = static_cast<uint32_t>(key.size());
-        const uint32_t total_len = wal_delete_entry_size(key_len);
 
-        if (dst.size() < total_len)
+        if (dst.size() < parts->total_len)
             return wal_entry_encode_status::dst_too_small;
 
-        wal_entry_header hdr{};
-        hdr.total_len   = total_len;
-        hdr.segment_gen = segment_gen;
-        hdr.lsn         = lsn;
-        hdr.entry_count = entry_count;
-        hdr.op_type     = static_cast<uint8_t>(wal_op_type::del);
-        hdr.key_len     = key_len;
+        copy_wal_entry_parts_to(
+            dst.subspan(0, parts->total_len), *parts);
 
-        char* p = dst.data();
-        std::memcpy(p, &hdr, sizeof(hdr));
-        p += sizeof(hdr);
-        if (key_len > 0) std::memcpy(p, key.data(), key_len);
-        p += key_len;
-
-        const uint32_t covered = total_len - WAL_ENTRY_TRAILER_CRC_BYTES;
-        const uint32_t crc = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(dst.data(), covered)));
-        std::memcpy(p, &crc, sizeof(crc));
-
-        if (out_total_len) *out_total_len = total_len;
+        if (out_total_len) *out_total_len = parts->total_len;
         return wal_entry_encode_status::ok;
     }
 

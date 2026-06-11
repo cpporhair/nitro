@@ -31,9 +31,9 @@
 #include "../core/batch_carrier.hh"
 #include "../core/memtable.hh"
 #include "../core/memtable_lookup.hh"
-#include "../core/wal_stream.hh"
 #include "../format/wal.hh"
 #include "../memory/dma_page_pool.hh"
+#include "./wal_append.hh"
 
 namespace apps::inconel::front {
 

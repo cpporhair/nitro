@@ -18,6 +18,7 @@
 #include "pump/sender/submit.hh"
 #include "pump/sender/then.hh"
 
+#include "apps/inconel/front/wal_append.hh"
 #include "apps/inconel/wal/sender.hh"
 
 using namespace apps::inconel;

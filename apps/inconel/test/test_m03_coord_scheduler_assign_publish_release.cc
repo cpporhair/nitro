@@ -596,6 +596,103 @@ pending_assign_fifo_waits_without_consuming_lsn() {
 }
 
 void
+pending_malformed_assign_fails_before_queueing() {
+    coord::coord_sched sched(make_cat(0, 1, 1), 1, 1, 1, 4, 2);
+    auto first = sched.assign_batch_lsn_for_testing(make_batch("a"));
+    CHECK(first.batch_lsn == 1);
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    std::vector<uint64_t> assigned;
+    std::string malformed_error;
+    sched.enqueue_assign_batch_lsn_for_testing(
+        make_malformed_batch(),
+        [&](core::batch_ctx&& ctx) {
+            assigned.push_back(ctx.batch_lsn);
+        },
+        [&](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(std::move(ep));
+            } catch (const std::invalid_argument& e) {
+                malformed_error = e.what();
+            } catch (...) {
+                malformed_error = "wrong exception";
+            }
+        });
+
+    CHECK(sched.advance());
+    CHECK(!malformed_error.empty());
+    CHECK(assigned.empty());
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    sched.enqueue_assign_batch_lsn_for_testing(
+        make_batch("b"),
+        [&](core::batch_ctx&& ctx) {
+            assigned.push_back(ctx.batch_lsn);
+        },
+        [&](std::exception_ptr) {
+            malformed_error = "unexpected valid failure";
+        });
+
+    CHECK(sched.advance());
+    CHECK(assigned.empty());
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    sched.publish_batch_for_testing(first.batch_lsn);
+    CHECK((assigned == std::vector<uint64_t>{2}));
+    CHECK(sched.next_lsn_for_testing() == 3);
+}
+
+void
+pending_assign_overflow_fails_before_lsn_assignment() {
+    coord::coord_sched sched(make_cat(0, 1, 1), 1, 1, 1, 4, 1);
+    auto first = sched.assign_batch_lsn_for_testing(make_batch("a"));
+    CHECK(first.batch_lsn == 1);
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    std::vector<uint64_t> assigned;
+    uint32_t unexpected_failures = 0;
+    sched.enqueue_assign_batch_lsn_for_testing(
+        make_batch("b"),
+        [&](core::batch_ctx&& ctx) {
+            assigned.push_back(ctx.batch_lsn);
+        },
+        [&](std::exception_ptr) {
+            ++unexpected_failures;
+        });
+
+    CHECK(sched.advance());
+    CHECK(assigned.empty());
+    CHECK(unexpected_failures == 0);
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    std::string overflow_error;
+    sched.enqueue_assign_batch_lsn_for_testing(
+        make_batch("c"),
+        [&](core::batch_ctx&& ctx) {
+            assigned.push_back(ctx.batch_lsn);
+        },
+        [&](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(std::move(ep));
+            } catch (const std::runtime_error& e) {
+                overflow_error = e.what();
+            } catch (...) {
+                overflow_error = "wrong exception";
+            }
+        });
+
+    CHECK(sched.advance());
+    CHECK(overflow_error == "coord assign backpressure overflow");
+    CHECK(assigned.empty());
+    CHECK(sched.next_lsn_for_testing() == 2);
+
+    sched.publish_batch_for_testing(first.batch_lsn);
+    CHECK((assigned == std::vector<uint64_t>{2}));
+    CHECK(unexpected_failures == 0);
+    CHECK(sched.next_lsn_for_testing() == 3);
+}
+
+void
 acquire_read_handle_uses_cat_snapshot_and_stable_read_lsn() {
     coord::coord_sched sched(make_cat(0, 1, 1), 1, 1, 8);
     (void)sched.assign_batch_lsn_for_testing(make_batch("a"));
@@ -799,6 +896,8 @@ main() {
     closed_gate_accumulates_pending_prefix_without_losing_it();
     closed_gate_pending_applies_to_current_cat_after_switch();
     pending_assign_fifo_waits_without_consuming_lsn();
+    pending_malformed_assign_fails_before_queueing();
+    pending_assign_overflow_fails_before_lsn_assignment();
     acquire_read_handle_uses_cat_snapshot_and_stable_read_lsn();
     old_handle_pins_cat_prs_guard_manifest_and_fronts();
     downstream_callback_throw_does_not_become_coord_failure();

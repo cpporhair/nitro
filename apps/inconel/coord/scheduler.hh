@@ -17,6 +17,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -192,7 +193,8 @@ namespace apps::inconel::coord {
                     uint32_t front_count,
                     uint64_t next_lsn = 1,
                     std::size_t ready_window_size = 65536,
-                    std::size_t queue_depth = 1024)
+                    std::size_t queue_depth = 1024,
+                    std::size_t pending_assign_capacity = 0)
             : assign_q_(queue_depth)
             , publish_q_(queue_depth)
             , release_q_(queue_depth)
@@ -203,9 +205,18 @@ namespace apps::inconel::coord {
                                          ready_window_size))
             , ready_(initial_cat->durable_lsn.load(std::memory_order_acquire) + 1,
                      ready_window_size)
+            , pending_assign_capacity_(
+                  pending_assign_capacity == 0
+                      ? ready_window_size
+                      : pending_assign_capacity)
             , next_lsn_(next_lsn)
             , front_count_(front_count)
-            , cat_epoch_(initial_cat->epoch) {}
+            , cat_epoch_(initial_cat->epoch) {
+            if (pending_assign_capacity_ == 0) {
+                throw std::invalid_argument(
+                    "coord::coord_sched: pending_assign_capacity must be nonzero");
+            }
+        }
 
         ~coord_sched();
 
@@ -233,12 +244,12 @@ namespace apps::inconel::coord {
 
         [[nodiscard]] core::batch_ctx
         assign_batch_lsn_for_testing(core::client_batch_buffer&& input) {
-            validate_assign_input(input);
+            core::client_batch_view parsed = parse_assign_input(input);
             if (!ready_.has_assign_capacity(next_lsn_)) {
                 throw std::runtime_error(
                     "coord::coord_sched: assign window is full");
             }
-            return assign_validated_now(std::move(input));
+            return assign_validated_now(std::move(input), std::move(parsed));
         }
 
         void
@@ -387,20 +398,23 @@ namespace apps::inconel::coord {
             }
         }
 
-        static void
-        validate_assign_input(const core::client_batch_buffer& input) {
-            const core::client_batch_view view = input.view();
+        [[nodiscard]] static core::client_batch_view
+        parse_assign_input(const core::client_batch_buffer& input) {
+            core::client_batch_view view = input.view();
             if (view.op_count() == 0) {
                 throw std::invalid_argument(
                     "coord::coord_sched: empty write batch");
             }
+            return view;
         }
 
         [[nodiscard]] core::batch_ctx
-        assign_validated_now(core::client_batch_buffer&& input) {
+        assign_validated_now(core::client_batch_buffer&& input,
+                             core::client_batch_view&& parsed) {
             const uint64_t lsn = next_lsn_;
             core::batch_ctx ctx =
-                core::build_batch_ctx(std::move(input), lsn, front_count_);
+                core::build_batch_ctx(
+                    std::move(input), std::move(parsed), lsn, front_count_);
             if (ctx.entry_count == 0) {
                 throw std::invalid_argument(
                     "coord::coord_sched: empty canonical write batch");
@@ -486,6 +500,7 @@ namespace apps::inconel::coord {
         ready_window        ready_;
         publish_gate        gate_;
         std::deque<_coord_assign::req*> pending_assigns_;
+        std::size_t         pending_assign_capacity_;
         uint64_t            next_lsn_;
         uint32_t            front_count_;
         uint64_t            cat_epoch_;
@@ -495,6 +510,7 @@ namespace apps::inconel::coord {
 
         struct req {
             core::client_batch_buffer                         input;
+            std::optional<core::client_batch_view>            parsed;
             std::move_only_function<void(core::batch_ctx&&)>  cb;
             std::move_only_function<void(std::exception_ptr)> fail;
         };
@@ -709,7 +725,12 @@ namespace apps::inconel::coord {
         std::unique_ptr<_coord_assign::req> req(r);
         core::batch_ctx ctx;
         try {
-            ctx = assign_validated_now(std::move(req->input));
+            if (!req->parsed.has_value()) {
+                throw std::logic_error(
+                    "coord::coord_sched: assign request was not parsed");
+            }
+            ctx = assign_validated_now(
+                std::move(req->input), std::move(*req->parsed));
         } catch (...) {
             auto fail = std::move(req->fail);
             req.reset();
@@ -731,7 +752,7 @@ namespace apps::inconel::coord {
     coord_sched::handle_assign(_coord_assign::req* r) {
         std::unique_ptr<_coord_assign::req> req(r);
         try {
-            validate_assign_input(req->input);
+            req->parsed.emplace(parse_assign_input(req->input));
         } catch (...) {
             auto fail = std::move(req->fail);
             req.reset();
@@ -742,6 +763,15 @@ namespace apps::inconel::coord {
         }
 
         if (!ready_.has_assign_capacity(next_lsn_)) {
+            if (pending_assigns_.size() >= pending_assign_capacity_) {
+                auto fail = std::move(req->fail);
+                req.reset();
+                if (fail) {
+                    fail(std::make_exception_ptr(std::runtime_error(
+                        "coord assign backpressure overflow")));
+                }
+                return;
+            }
             pending_assigns_.push_back(req.release());
             return;
         }

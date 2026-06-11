@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include <absl/container/btree_map.h>
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/inlined_vector.h>
 
 #include "../format/types.hh"
@@ -115,47 +115,6 @@ namespace apps::inconel::core {
                 throw std::invalid_argument("client_batch_view: record count exceeds payload");
             }
 
-            std::size_t validate_off = off;
-            for (uint32_t i = 0; i < count; ++i) {
-                uint8_t  op_byte = 0;
-                uint32_t key_len = 0;
-                uint32_t value_len = 0;
-                if (!read_u8(bytes_, validate_off, op_byte) ||
-                    !read_u32(bytes_, validate_off, key_len) ||
-                    !read_u32(bytes_, validate_off, value_len)) {
-                    throw std::invalid_argument("client_batch_view: truncated op header");
-                }
-
-                switch (op_byte) {
-                case static_cast<uint8_t>(write_op_type::put):
-                    break;
-                case static_cast<uint8_t>(write_op_type::del):
-                    if (value_len != 0) {
-                        throw std::invalid_argument(
-                            "client_batch_view: DELETE must carry zero value bytes");
-                    }
-                    break;
-                default:
-                    throw std::invalid_argument("client_batch_view: unknown op code");
-                }
-
-                if (validate_off > bytes_.size() ||
-                    bytes_.size() - validate_off < key_len) {
-                    throw std::invalid_argument("client_batch_view: truncated key bytes");
-                }
-                validate_off += key_len;
-
-                if (validate_off > bytes_.size() ||
-                    bytes_.size() - validate_off < value_len) {
-                    throw std::invalid_argument("client_batch_view: truncated value bytes");
-                }
-                validate_off += value_len;
-            }
-
-            if (validate_off != bytes_.size()) {
-                throw std::invalid_argument("client_batch_view: trailing bytes");
-            }
-
             ops_.clear();
             ops_.reserve(count);
 
@@ -203,6 +162,10 @@ namespace apps::inconel::core {
                     .value             = value,
                     .original_position = i,
                 });
+            }
+
+            if (off != bytes_.size()) {
+                throw std::invalid_argument("client_batch_view: trailing bytes");
             }
         }
 
@@ -301,30 +264,18 @@ namespace apps::inconel::core {
 
         inline std::vector<uint32_t>
         build_canonical_positions(std::span<const client_batch_op_view> ops) {
-            std::vector<uint32_t> indices;
-            indices.reserve(ops.size());
+            absl::flat_hash_map<std::string_view, uint32_t> last;
+            last.reserve(ops.size());
             for (uint32_t i = 0; i < ops.size(); ++i) {
-                indices.push_back(i);
+                last[ops[i].key] = i;
             }
-
-            std::sort(indices.begin(), indices.end(),
-                      [&](uint32_t lhs, uint32_t rhs) {
-                          if (ops[lhs].key != ops[rhs].key) {
-                              return ops[lhs].key < ops[rhs].key;
-                          }
-                          return ops[lhs].original_position <
-                                 ops[rhs].original_position;
-                      });
 
             std::vector<uint32_t> keep;
-            keep.reserve(indices.size());
-            for (std::size_t i = 0; i < indices.size(); ++i) {
-                const bool is_last_for_key =
-                    (i + 1 == indices.size()) ||
-                    (ops[indices[i]].key != ops[indices[i + 1]].key);
-                if (is_last_for_key) keep.push_back(indices[i]);
+            keep.reserve(last.size());
+            for (const auto& [key, pos] : last) {
+                (void)key;
+                keep.push_back(pos);
             }
-
             std::sort(keep.begin(), keep.end(),
                       [&](uint32_t lhs, uint32_t rhs) {
                           return ops[lhs].original_position <
@@ -386,8 +337,11 @@ namespace apps::inconel::core {
 
     [[nodiscard]] inline batch_ctx
     build_batch_ctx(client_batch_buffer&& input,
+                    client_batch_view&& view,
                     uint64_t batch_lsn,
                     uint32_t front_count) {
+        // The parsed view must have been produced from this exact input buffer;
+        // its string_views are moved into ctx after ctx takes input ownership.
         if (front_count == 0) {
             throw std::invalid_argument("build_batch_ctx: front_count must be nonzero");
         }
@@ -396,7 +350,6 @@ namespace apps::inconel::core {
         ctx.input = std::move(input);
         ctx.batch_lsn = batch_lsn;
 
-        const client_batch_view view = ctx.input.view();
         const auto ops = view.ops();
         const auto keep = detail::build_canonical_positions(ops);
 
@@ -423,16 +376,27 @@ namespace apps::inconel::core {
         ctx.entry_count = static_cast<uint32_t>(ctx.canonical_entries.size());
         if (ctx.entry_count == 0) return ctx;
 
-        absl::btree_map<uint32_t, absl::InlinedVector<uint32_t, 32>> by_owner;
+        absl::InlinedVector<std::pair<uint32_t, uint32_t>, 64> route;
+        route.reserve(ctx.canonical_entries.size());
         for (uint32_t i = 0; i < ctx.canonical_entries.size(); ++i) {
             const auto& entry = ctx.canonical_entries[i];
             const uint32_t owner =
                 static_cast<uint32_t>(key_hash(entry.key) % front_count);
-            by_owner[owner].push_back(i);
+            route.push_back({owner, i});
         }
+        std::stable_sort(route.begin(), route.end(), [](const auto& lhs,
+                                                        const auto& rhs) {
+            return lhs.first < rhs.first;
+        });
 
-        ctx.fragments.reserve(by_owner.size());
-        for (auto& [owner, indices] : by_owner) {
+        ctx.fragments.reserve(std::min<std::size_t>(front_count, route.size()));
+        for (std::size_t i = 0; i < route.size();) {
+            const uint32_t owner = route[i].first;
+            absl::InlinedVector<uint32_t, 32> indices;
+            do {
+                indices.push_back(route[i].second);
+                ++i;
+            } while (i < route.size() && route[i].first == owner);
             ctx.fragments.push_back(front_fragment{
                 .owner         = owner,
                 .batch_lsn     = batch_lsn,
@@ -442,6 +406,15 @@ namespace apps::inconel::core {
         }
 
         return ctx;
+    }
+
+    [[nodiscard]] inline batch_ctx
+    build_batch_ctx(client_batch_buffer&& input,
+                    uint64_t batch_lsn,
+                    uint32_t front_count) {
+        client_batch_view view = input.view();
+        return build_batch_ctx(
+            std::move(input), std::move(view), batch_lsn, front_count);
     }
 
     [[nodiscard]] inline batch_ctx

@@ -119,6 +119,24 @@ namespace apps::inconel::front {
     namespace _front_wal_commit { struct req; struct sender; }
     namespace _front_wal_abort { struct req; struct sender; }
 
+    struct borrowed_front_fragment {
+        const core::front_fragment* ptr = nullptr;
+
+        borrowed_front_fragment() = default;
+        borrowed_front_fragment(const core::front_fragment* fragment) noexcept
+            : ptr(fragment) {}
+        borrowed_front_fragment(const core::front_fragment& fragment) noexcept
+            : ptr(&fragment) {}
+
+        [[nodiscard]] explicit operator bool() const noexcept {
+            return ptr != nullptr;
+        }
+
+        [[nodiscard]] const core::front_fragment& get() const noexcept {
+            return *ptr;
+        }
+    };
+
     class front_sched {
       public:
         front_sched(uint32_t owner_id,
@@ -215,7 +233,7 @@ namespace apps::inconel::front {
 
         [[nodiscard]] _front_insert::sender
         insert_memtable_entries(
-            core::front_fragment fragment,
+            const core::front_fragment& fragment,
             std::span<const core::canonical_entry> canonical_entries);
 
         [[nodiscard]] _front_lookup::sender
@@ -245,7 +263,7 @@ namespace apps::inconel::front {
 
         [[nodiscard]] _front_wal_prepare::sender
         prepare_wal_fragment(
-            core::front_fragment fragment,
+            const core::front_fragment& fragment,
             std::span<const core::canonical_entry> canonical_entries,
             wal::wal_fragment_cursor cursor);
 
@@ -253,10 +271,12 @@ namespace apps::inconel::front {
         install_wal_segment(wal::segment_runtime* segment);
 
         [[nodiscard]] _front_wal_commit::sender
-        commit_wal_plan(uint64_t plan_id);
+        commit_wal_plan(uint64_t plan_id,
+                        std::vector<wal::wal_frame_write> writes = {});
 
         [[nodiscard]] _front_wal_abort::sender
-        abort_wal_plan(uint64_t plan_id);
+        abort_wal_plan(uint64_t plan_id,
+                       std::vector<wal::wal_frame_write> writes = {});
 
         void schedule_insert(_front_insert::req* r);
         void schedule_lookup(_front_lookup::req* r);
@@ -329,7 +349,7 @@ namespace apps::inconel::front {
             std::span<const core::canonical_entry> canonical_entries,
             wal::wal_fragment_cursor cursor) {
             return prepare_wal_fragment_now(
-                std::move(fragment), canonical_entries, cursor, wal_config_);
+                fragment, canonical_entries, cursor, wal_config_);
         }
 
         void install_wal_segment_for_testing(wal::segment_runtime* segment) {
@@ -371,13 +391,6 @@ namespace apps::inconel::front {
         struct wal_page_builder {
             uint64_t page_index = 0;
             wal::wal_frame_write write;
-        };
-
-        struct pending_wal_tail {
-            uint64_t plan_id = 0;
-            bool valid_tail = false;
-            uint64_t page_index = 0;
-            bool clear_on_commit = false;
         };
 
         void validate_constructor_state(std::size_t queue_depth) const {
@@ -481,7 +494,7 @@ namespace apps::inconel::front {
 
         [[nodiscard]] wal::wal_prepare_result
         prepare_wal_fragment_now(
-            core::front_fragment fragment,
+            const core::front_fragment& fragment,
             std::span<const core::canonical_entry> canonical_entries,
             wal::wal_fragment_cursor cursor,
             wal::wal_append_config config);
@@ -511,31 +524,34 @@ namespace apps::inconel::front {
         [[nodiscard]] wal::wal_prepare_result
         finalize_wal_plan(wal::wal_append_plan&& plan);
 
-        [[nodiscard]] pending_wal_tail
-        make_pending_wal_tail(const wal::wal_append_plan& plan);
-
         [[nodiscard]] wal::wal_frame_write
         make_wal_page_write(uint64_t page_index);
 
         [[nodiscard]] wal_page_builder&
         wal_page_for(std::vector<wal_page_builder>& pages,
-                     uint64_t page_index);
+                     uint64_t page_index,
+                     uint32_t plan_start_offset);
 
         void scatter_to_wal_pages(std::vector<wal_page_builder>& pages,
+                                  uint32_t plan_start_offset,
                                   uint32_t segment_offset,
                                   std::span<const char> bytes);
 
         void scatter_wal_entry_parts(
             std::vector<wal_page_builder>& pages,
+            uint32_t plan_start_offset,
             uint32_t segment_offset,
             const format::wal_entry_parts& parts);
+
+        void zero_wal_plan_suffix(std::vector<wal_page_builder>& pages,
+                                  uint32_t end_offset);
 
         [[nodiscard]] static bool value_ref_is_valid(
             const format::value_ref& vr) noexcept;
 
         [[nodiscard]] static uint32_t unique_page_count_after(
             const std::vector<wal_page_builder>& pages,
-            uint32_t lba_size,
+            uint32_t lba_shift,
             uint32_t start_offset,
             uint32_t byte_len) noexcept;
 
@@ -705,17 +721,12 @@ namespace apps::inconel::front {
         std::optional<wal::wal_stream_state> wal_;
         wal::wal_append_config wal_config_{};
         std::unique_ptr<memory::lba_dma_page_pool> wal_frame_pool_;
-        bool wal_tail_page_valid_ = false;
-        uint64_t wal_tail_page_index_ = 0;
-        std::vector<char> wal_tail_page_;
-        std::vector<char> pending_wal_tail_page_;
-        std::optional<pending_wal_tail> pending_wal_tail_;
         uint64_t next_wal_plan_id_ = 1;
     };
 
     namespace _front_insert {
         struct req {
-            core::front_fragment fragment;
+            borrowed_front_fragment fragment;
             std::span<const core::canonical_entry> canonical_entries;
             std::move_only_function<void()> cb;
             std::move_only_function<void(std::exception_ptr)> fail;
@@ -724,7 +735,7 @@ namespace apps::inconel::front {
         struct op {
             constexpr static bool front_insert_op = true;
             front_sched* sched = nullptr;
-            core::front_fragment fragment;
+            const core::front_fragment* fragment = nullptr;
             std::span<const core::canonical_entry> canonical_entries;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
@@ -733,14 +744,14 @@ namespace apps::inconel::front {
 
         struct sender {
             front_sched* sched = nullptr;
-            core::front_fragment fragment;
+            const core::front_fragment* fragment = nullptr;
             std::span<const core::canonical_entry> canonical_entries;
 
             sender(front_sched* s,
-                   core::front_fragment f,
+                   const core::front_fragment& f,
                    std::span<const core::canonical_entry> entries)
                 : sched(s)
-                , fragment(std::move(f))
+                , fragment(&f)
                 , canonical_entries(entries) {}
 
             sender(sender&&) noexcept = default;
@@ -751,7 +762,7 @@ namespace apps::inconel::front {
             auto make_op() {
                 return op{
                     .sched = sched,
-                    .fragment = std::move(fragment),
+                    .fragment = fragment,
                     .canonical_entries = canonical_entries,
                 };
             }
@@ -1033,7 +1044,7 @@ namespace apps::inconel::front {
 
     namespace _front_wal_prepare {
         struct req {
-            core::front_fragment fragment;
+            borrowed_front_fragment fragment;
             std::span<const core::canonical_entry> canonical_entries;
             wal::wal_fragment_cursor cursor;
             std::move_only_function<void(wal::wal_prepare_result&&)> cb;
@@ -1043,7 +1054,7 @@ namespace apps::inconel::front {
         struct op {
             constexpr static bool front_wal_prepare_op = true;
             front_sched* sched = nullptr;
-            core::front_fragment fragment;
+            const core::front_fragment* fragment = nullptr;
             std::span<const core::canonical_entry> canonical_entries;
             wal::wal_fragment_cursor cursor;
 
@@ -1053,16 +1064,16 @@ namespace apps::inconel::front {
 
         struct sender {
             front_sched* sched = nullptr;
-            core::front_fragment fragment;
+            const core::front_fragment* fragment = nullptr;
             std::span<const core::canonical_entry> canonical_entries;
             wal::wal_fragment_cursor cursor;
 
             sender(front_sched* s,
-                   core::front_fragment f,
+                   const core::front_fragment& f,
                    std::span<const core::canonical_entry> entries,
                    wal::wal_fragment_cursor c)
                 : sched(s)
-                , fragment(std::move(f))
+                , fragment(&f)
                 , canonical_entries(entries)
                 , cursor(c) {}
 
@@ -1074,7 +1085,7 @@ namespace apps::inconel::front {
             auto make_op() {
                 return op{
                     .sched = sched,
-                    .fragment = std::move(fragment),
+                    .fragment = fragment,
                     .canonical_entries = canonical_entries,
                     .cursor = cursor,
                 };
@@ -1121,6 +1132,7 @@ namespace apps::inconel::front {
     namespace _front_wal_commit {
         struct req {
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
             std::move_only_function<void(
                 std::optional<wal::sealed_segment_info>&&)> cb;
             std::move_only_function<void(std::exception_ptr)> fail;
@@ -1130,6 +1142,7 @@ namespace apps::inconel::front {
             constexpr static bool front_wal_commit_op = true;
             front_sched* sched = nullptr;
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
@@ -1138,8 +1151,26 @@ namespace apps::inconel::front {
         struct sender {
             front_sched* sched = nullptr;
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
 
-            auto make_op() { return op{.sched = sched, .plan_id = plan_id}; }
+            sender() = default;
+            sender(front_sched* s,
+                   uint64_t id,
+                   std::vector<wal::wal_frame_write> ws)
+                : sched(s), plan_id(id), writes(std::move(ws)) {}
+
+            sender(sender&&) noexcept = default;
+            sender& operator=(sender&&) noexcept = default;
+            sender(const sender&) = delete;
+            sender& operator=(const sender&) = delete;
+
+            auto make_op() {
+                return op{
+                    .sched = sched,
+                    .plan_id = plan_id,
+                    .writes = std::move(writes),
+                };
+            }
 
             template<typename ctx_t>
             auto connect() {
@@ -1152,6 +1183,7 @@ namespace apps::inconel::front {
     namespace _front_wal_abort {
         struct req {
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
             std::move_only_function<void()> cb;
             std::move_only_function<void(std::exception_ptr)> fail;
         };
@@ -1160,6 +1192,7 @@ namespace apps::inconel::front {
             constexpr static bool front_wal_abort_op = true;
             front_sched* sched = nullptr;
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
@@ -1168,8 +1201,26 @@ namespace apps::inconel::front {
         struct sender {
             front_sched* sched = nullptr;
             uint64_t plan_id = 0;
+            std::vector<wal::wal_frame_write> writes;
 
-            auto make_op() { return op{.sched = sched, .plan_id = plan_id}; }
+            sender() = default;
+            sender(front_sched* s,
+                   uint64_t id,
+                   std::vector<wal::wal_frame_write> ws)
+                : sched(s), plan_id(id), writes(std::move(ws)) {}
+
+            sender(sender&&) noexcept = default;
+            sender& operator=(sender&&) noexcept = default;
+            sender(const sender&) = delete;
+            sender& operator=(const sender&) = delete;
+
+            auto make_op() {
+                return op{
+                    .sched = sched,
+                    .plan_id = plan_id,
+                    .writes = std::move(writes),
+                };
+            }
 
             template<typename ctx_t>
             auto connect() {
@@ -1195,10 +1246,10 @@ namespace apps::inconel::front {
 
     inline _front_insert::sender
     front_sched::insert_memtable_entries(
-        core::front_fragment fragment,
+        const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries) {
         return _front_insert::sender{
-            this, std::move(fragment), canonical_entries};
+            this, fragment, canonical_entries};
     }
 
     inline _front_lookup::sender
@@ -1246,11 +1297,11 @@ namespace apps::inconel::front {
 
     inline _front_wal_prepare::sender
     front_sched::prepare_wal_fragment(
-        core::front_fragment fragment,
+        const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries,
         wal::wal_fragment_cursor cursor) {
         return _front_wal_prepare::sender{
-            this, std::move(fragment), canonical_entries, cursor};
+            this, fragment, canonical_entries, cursor};
     }
 
     inline _front_wal_install::sender
@@ -1262,19 +1313,19 @@ namespace apps::inconel::front {
     }
 
     inline _front_wal_commit::sender
-    front_sched::commit_wal_plan(uint64_t plan_id) {
+    front_sched::commit_wal_plan(
+        uint64_t plan_id,
+        std::vector<wal::wal_frame_write> writes) {
         return _front_wal_commit::sender{
-            .sched = this,
-            .plan_id = plan_id,
-        };
+            this, plan_id, std::move(writes)};
     }
 
     inline _front_wal_abort::sender
-    front_sched::abort_wal_plan(uint64_t plan_id) {
+    front_sched::abort_wal_plan(
+        uint64_t plan_id,
+        std::vector<wal::wal_frame_write> writes) {
         return _front_wal_abort::sender{
-            .sched = this,
-            .plan_id = plan_id,
-        };
+            this, plan_id, std::move(writes)};
     }
 
     inline void
@@ -1382,11 +1433,6 @@ namespace apps::inconel::front {
             geometry.lba_size,
             0,
             memory::make_heap_dma_page_allocator());
-        wal_tail_page_.assign(geometry.lba_size, char{0});
-        pending_wal_tail_page_.assign(geometry.lba_size, char{0});
-        wal_tail_page_valid_ = false;
-        wal_tail_page_index_ = 0;
-        pending_wal_tail_.reset();
         next_wal_plan_id_ = 1;
     }
 
@@ -1419,13 +1465,13 @@ namespace apps::inconel::front {
     inline uint32_t
     front_sched::unique_page_count_after(
         const std::vector<wal_page_builder>& pages,
-        uint32_t lba_size,
+        uint32_t lba_shift,
         uint32_t start_offset,
         uint32_t byte_len) noexcept {
         if (byte_len == 0) return static_cast<uint32_t>(pages.size());
-        const uint64_t first = start_offset / lba_size;
+        const uint64_t first = start_offset >> lba_shift;
         const uint64_t last =
-            (static_cast<uint64_t>(start_offset) + byte_len - 1) / lba_size;
+            (static_cast<uint64_t>(start_offset) + byte_len - 1) >> lba_shift;
 
         if (pages.empty()) {
             return static_cast<uint32_t>(last - first + 1);
@@ -1459,15 +1505,6 @@ namespace apps::inconel::front {
                 wal::wal_append_error_reason::fragment_cursor_out_of_range,
                 "front::front_sched: WAL fragment cursor out of range");
         }
-        for (uint32_t idx : fragment.entry_indices) {
-            if (idx >= canonical_entries.size()) {
-                throw wal::wal_append_error(
-                    wal::wal_append_error_reason::
-                        fragment_entry_index_out_of_range,
-                    "front::front_sched: WAL fragment entry index out of "
-                    "range");
-            }
-        }
         validate_active_present();
     }
 
@@ -1481,11 +1518,8 @@ namespace apps::inconel::front {
                 "front::front_sched: no active WAL segment");
         }
 
-        auto raw_frame = std::make_unique<memory::segmented_page_frame>();
-        const auto segment_base = wal::segment_base_paddr(
-            stream.geometry(), segment->id);
-        auto frame = wal_frame_pool_->get_typed_frame<
-            memory::segmented_page_frame>(
+        const auto segment_base = stream.segment_base();
+        auto frame = wal_frame_pool_->get_frame(
             memory::frame_id{
                 .base = format::paddr{
                     .device_id = segment_base.device_id,
@@ -1495,69 +1529,79 @@ namespace apps::inconel::front {
                 .dom = memory::frame_id::domain::wal_page,
             },
             memory::frame_state::dirty_append,
-            true);
+            false);
         if (!frame) {
             throw wal::wal_append_error(
                 wal::wal_append_error_reason::frame_allocation_failed,
                 "front::front_sched: failed to allocate WAL frame");
         }
 
-        *raw_frame = std::move(*frame);
-        if (wal_tail_page_valid_ && wal_tail_page_index_ == page_index) {
-            const auto dst = raw_frame->mutable_lba_bytes(0);
-            if (dst.size() != wal_tail_page_.size()) {
-                throw std::logic_error(
-                    "front::front_sched: WAL tail page size mismatch");
-            }
-            std::memcpy(dst.data(), wal_tail_page_.data(), dst.size());
-        }
-
-        return wal::wal_frame_write{
-            memory::pooled_frame_ptr<memory::segmented_page_frame>(
-                wal_frame_pool_.get(), raw_frame.release())};
+        return wal::wal_frame_write{wal_frame_pool_.get(), std::move(*frame)};
     }
 
     inline front_sched::wal_page_builder&
     front_sched::wal_page_for(std::vector<wal_page_builder>& pages,
-                              uint64_t page_index) {
+                              uint64_t page_index,
+                              uint32_t plan_start_offset) {
         if (!pages.empty() && pages.back().page_index == page_index) {
             return pages.back();
         }
-        if (pages.empty() || page_index > pages.back().page_index) {
-            pages.push_back(wal_page_builder{
-                .page_index = page_index,
-                .write = make_wal_page_write(page_index),
-            });
-            return pages.back();
+
+        for (auto it = pages.begin(); it != pages.end(); ++it) {
+            if (it->page_index == page_index) return *it;
         }
-        for (auto& page : pages) {
-            if (page.page_index == page_index) return page;
-        }
-        pages.push_back(wal_page_builder{
+
+        wal_page_builder next{
             .page_index = page_index,
             .write = make_wal_page_write(page_index),
-        });
-        return pages.back();
+        };
+        auto page_bytes = next.write.frame.mutable_lba_bytes(0);
+        auto& stream = require_wal();
+        if (auto tail = stream.tail_image_for(page_index)) {
+            if (tail->size() != page_bytes.size()) {
+                throw std::logic_error(
+                    "front::front_sched: WAL tail image size mismatch");
+            }
+            std::memcpy(page_bytes.data(), tail->data(), page_bytes.size());
+        } else {
+            const uint64_t page_start = page_index << stream.lba_shift();
+            if (page_start < plan_start_offset) {
+                const uint64_t prefix =
+                    std::min<uint64_t>(
+                        page_bytes.size(),
+                        static_cast<uint64_t>(plan_start_offset) - page_start);
+                std::memset(page_bytes.data(), 0, prefix);
+            }
+        }
+
+        auto insert_at = pages.end();
+        while (insert_at != pages.begin() &&
+               std::prev(insert_at)->page_index > page_index) {
+            --insert_at;
+        }
+        return *pages.insert(insert_at, std::move(next));
     }
 
     inline void
     front_sched::scatter_to_wal_pages(
         std::vector<wal_page_builder>& pages,
+        uint32_t plan_start_offset,
         uint32_t segment_offset,
         std::span<const char> bytes) {
         if (bytes.empty()) return;
 
         const auto& stream = require_wal();
         const uint32_t lba_size = stream.lba_size();
+        const uint32_t lba_mask = lba_size - 1;
         uint64_t copied = 0;
         while (copied < bytes.size()) {
             const uint64_t pos =
                 static_cast<uint64_t>(segment_offset) + copied;
-            const uint64_t page_index = pos / lba_size;
+            const uint64_t page_index = pos >> stream.lba_shift();
             const uint32_t page_offset =
-                static_cast<uint32_t>(pos % lba_size);
-            auto& page = wal_page_for(pages, page_index);
-            auto page_bytes = page.write.frame->mutable_lba_bytes(0);
+                static_cast<uint32_t>(pos & lba_mask);
+            auto& page = wal_page_for(pages, page_index, plan_start_offset);
+            auto page_bytes = page.write.frame.mutable_lba_bytes(0);
             const uint64_t n = std::min<uint64_t>(
                 page_bytes.size() - page_offset, bytes.size() - copied);
             std::memcpy(
@@ -1569,62 +1613,59 @@ namespace apps::inconel::front {
     inline void
     front_sched::scatter_wal_entry_parts(
         std::vector<wal_page_builder>& pages,
+        uint32_t plan_start_offset,
         uint32_t segment_offset,
         const format::wal_entry_parts& parts) {
         uint32_t off = segment_offset;
         scatter_to_wal_pages(
             pages,
+            plan_start_offset,
             off,
             std::span<const char>{
                 reinterpret_cast<const char*>(&parts.header),
                 sizeof(parts.header)});
         off += sizeof(parts.header);
-        scatter_to_wal_pages(pages, off, parts.value_ref_bytes);
+        scatter_to_wal_pages(pages, plan_start_offset, off, parts.value_ref_bytes);
         off += static_cast<uint32_t>(parts.value_ref_bytes.size());
-        scatter_to_wal_pages(pages, off, parts.key_bytes);
+        scatter_to_wal_pages(pages, plan_start_offset, off, parts.key_bytes);
         off += static_cast<uint32_t>(parts.key_bytes.size());
         scatter_to_wal_pages(
             pages,
+            plan_start_offset,
             off,
             std::span<const char>{
                 reinterpret_cast<const char*>(&parts.crc),
                 sizeof(parts.crc)});
     }
 
-    inline front_sched::pending_wal_tail
-    front_sched::make_pending_wal_tail(
-        const wal::wal_append_plan& plan) {
-        pending_wal_tail pending{
-            .plan_id = plan.plan_id,
-            .clear_on_commit = plan.kind == wal::wal_plan_kind::trailer,
-        };
+    inline void
+    front_sched::zero_wal_plan_suffix(std::vector<wal_page_builder>& pages,
+                                      uint32_t end_offset) {
+        if (pages.empty()) return;
+        const auto& stream = require_wal();
+        const uint32_t end_mod = end_offset & (stream.lba_size() - 1);
+        if (end_mod == 0) return;
 
-        if (!pending.clear_on_commit && !plan.writes.empty()) {
-            const auto* frame = plan.writes.back().frame.get();
-            const auto segment_base = wal::segment_base_paddr(
-                require_wal().geometry(), plan.segment);
-            if (frame->id.base.lba < segment_base.lba) {
-                throw std::logic_error(
-                    "front::front_sched: WAL frame below segment base");
-            }
-            pending.valid_tail = true;
-            pending.page_index = frame->id.base.lba - segment_base.lba;
-            const auto bytes = frame->lba_bytes(0);
-            if (bytes.size() != pending_wal_tail_page_.size()) {
-                throw std::logic_error(
-                    "front::front_sched: pending WAL tail size mismatch");
-            }
-            std::memcpy(
-                pending_wal_tail_page_.data(), bytes.data(), bytes.size());
+        auto bytes = pages.back().write.frame.mutable_lba_bytes(0);
+        if (end_mod > bytes.size()) {
+            throw std::logic_error(
+                "front::front_sched: WAL suffix offset exceeds page size");
         }
-        return pending;
+        std::memset(bytes.data() + end_mod, 0, bytes.size() - end_mod);
     }
 
     inline wal::wal_prepare_result
     front_sched::finalize_wal_plan(wal::wal_append_plan&& plan) {
-        auto pending_tail = make_pending_wal_tail(plan);
-        require_wal().begin_pending(plan);
-        pending_wal_tail_ = std::move(pending_tail);
+        auto& stream = require_wal();
+        std::span<const char> last_page_bytes{};
+        if (plan.kind != wal::wal_plan_kind::trailer) {
+            if (plan.writes.empty()) {
+                throw std::logic_error(
+                    "front::front_sched: WAL plan has no tail page");
+            }
+            last_page_bytes = plan.writes.back().frame.lba_bytes(0);
+        }
+        stream.begin_pending(plan, last_page_bytes);
         return wal::wal_prepare_ready{.plan = std::move(plan)};
     }
 
@@ -1640,6 +1681,7 @@ namespace apps::inconel::front {
         }
 
         std::vector<wal_page_builder> pages;
+        pages.reserve(wal_config_.max_pages_per_plan);
         const auto header = format::make_wal_segment_header(
             segment->id.index,
             segment->id.device_id,
@@ -1649,9 +1691,11 @@ namespace apps::inconel::front {
         scatter_to_wal_pages(
             pages,
             0,
+            0,
             std::span<const char>{
                 reinterpret_cast<const char*>(&header),
                 sizeof(header)});
+        zero_wal_plan_suffix(pages, format::WAL_SEGMENT_HEADER_SIZE);
 
         wal::wal_append_plan plan;
         plan.plan_id = next_wal_plan_id_++;
@@ -1685,20 +1729,24 @@ namespace apps::inconel::front {
         }
 
         const auto sealed = stream.make_sealed_info();
-        const uint32_t start = stream.write_offset();
+        const uint32_t write_end_field = stream.write_offset();
+        const uint32_t start = stream.usable_end_offset();
         const auto trailer = format::make_wal_sealed_trailer(
             segment->segment_gen,
-            start,
+            write_end_field,
             sealed.min_lsn,
             sealed.max_lsn);
 
         std::vector<wal_page_builder> pages;
+        pages.reserve(wal_config_.max_pages_per_plan);
         scatter_to_wal_pages(
             pages,
+            start,
             start,
             std::span<const char>{
                 reinterpret_cast<const char*>(&trailer),
                 sizeof(trailer)});
+        zero_wal_plan_suffix(pages, start + format::WAL_SEALED_TRAILER_SIZE);
 
         wal::wal_append_plan plan;
         plan.plan_id = next_wal_plan_id_++;
@@ -1754,11 +1802,19 @@ namespace apps::inconel::front {
         uint64_t proposed_max =
             stream.segment_empty() ? 0 : stream.segment_max_lsn();
         std::vector<wal_page_builder> pages;
+        pages.reserve(config.max_pages_per_plan);
 
         while (cursor_after.next_fragment_entry <
                fragment.entry_indices.size()) {
             const uint32_t entry_index =
                 fragment.entry_indices[cursor_after.next_fragment_entry];
+            if (entry_index >= canonical_entries.size()) {
+                throw wal::wal_append_error(
+                    wal::wal_append_error_reason::
+                        fragment_entry_index_out_of_range,
+                    "front::front_sched: WAL fragment entry index out of "
+                    "range");
+            }
             const auto& entry = canonical_entries[entry_index];
             if (entry.key.size() > wal::kMaxSupportedWalKeyBytes) {
                 throw wal::wal_append_error(
@@ -1806,13 +1862,14 @@ namespace apps::inconel::front {
             }
 
             const uint32_t page_count_after = unique_page_count_after(
-                pages, stream.lba_size(), offset, parts.total_len);
+                pages, stream.lba_shift(), offset, parts.total_len);
             if (planned > 0 &&
                 page_count_after > config.max_pages_per_plan) {
                 break;
             }
 
-            scatter_wal_entry_parts(pages, offset, parts);
+            scatter_wal_entry_parts(
+                pages, stream.write_offset(), offset, parts);
             offset += parts.total_len;
             ++planned;
             ++cursor_after.next_fragment_entry;
@@ -1829,6 +1886,7 @@ namespace apps::inconel::front {
         if (planned == 0) {
             return prepare_wal_trailer_plan(fragment, cursor);
         }
+        zero_wal_plan_suffix(pages, offset);
 
         wal::wal_append_plan plan;
         plan.plan_id = next_wal_plan_id_++;
@@ -1855,7 +1913,7 @@ namespace apps::inconel::front {
 
     inline wal::wal_prepare_result
     front_sched::prepare_wal_fragment_now(
-        core::front_fragment fragment,
+        const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries,
         wal::wal_fragment_cursor cursor,
         wal::wal_append_config config) {
@@ -1883,63 +1941,30 @@ namespace apps::inconel::front {
     inline void
     front_sched::install_wal_segment_now(wal::segment_runtime* segment) {
         require_wal().install_segment(segment);
-        wal_tail_page_valid_ = false;
-        wal_tail_page_index_ = 0;
-        pending_wal_tail_.reset();
     }
 
     inline std::optional<wal::sealed_segment_info>
     front_sched::commit_wal_plan_now(uint64_t plan_id) {
         auto& stream = require_wal();
-        if (!pending_wal_tail_) {
-            throw wal::wal_append_error(
-                wal::wal_append_error_reason::plan_not_pending,
-                "front::front_sched: no pending WAL tail");
-        }
-        if (pending_wal_tail_->plan_id != plan_id) {
-            throw wal::wal_append_error(
-                wal::wal_append_error_reason::plan_id_mismatch,
-                "front::front_sched: WAL tail plan mismatch");
-        }
-
-        auto sealed = stream.commit_pending(plan_id);
-        auto pending = std::move(*pending_wal_tail_);
-        pending_wal_tail_.reset();
-
-        if (pending.clear_on_commit || sealed.has_value()) {
-            wal_tail_page_valid_ = false;
-            wal_tail_page_index_ = 0;
-            std::fill(wal_tail_page_.begin(), wal_tail_page_.end(), char{0});
-        } else if (pending.valid_tail) {
-            wal_tail_page_valid_ = true;
-            wal_tail_page_index_ = pending.page_index;
-            std::swap(wal_tail_page_, pending_wal_tail_page_);
-        }
-        return sealed;
+        return stream.commit_pending(plan_id);
     }
 
     inline void
     front_sched::abort_wal_plan_now(uint64_t plan_id) {
         auto& stream = require_wal();
-        if (!pending_wal_tail_) {
-            throw wal::wal_append_error(
-                wal::wal_append_error_reason::plan_not_pending,
-                "front::front_sched: no pending WAL tail");
-        }
-        if (pending_wal_tail_->plan_id != plan_id) {
-            throw wal::wal_append_error(
-                wal::wal_append_error_reason::plan_id_mismatch,
-                "front::front_sched: WAL tail plan mismatch");
-        }
         stream.abort_pending(plan_id);
-        pending_wal_tail_.reset();
     }
 
     inline void
     front_sched::handle_insert(_front_insert::req* r) {
         std::unique_ptr<_front_insert::req> req(r);
         try {
-            validate_insert_request(req->fragment, req->canonical_entries);
+            if (!req->fragment) {
+                throw std::invalid_argument(
+                    "front::front_sched: insert fragment is null");
+            }
+            validate_insert_request(
+                req->fragment.get(), req->canonical_entries);
         } catch (...) {
             auto fail = std::move(req->fail);
             req.reset();
@@ -1949,7 +1974,8 @@ namespace apps::inconel::front {
             return;
         }
 
-        apply_insert_validated(req->fragment, req->canonical_entries);
+        apply_insert_validated(
+            req->fragment.get(), req->canonical_entries);
 
         auto cb = std::move(req->cb);
         req.reset();
@@ -2095,8 +2121,12 @@ namespace apps::inconel::front {
         std::unique_ptr<_front_wal_prepare::req> req(r);
         wal::wal_prepare_result result;
         try {
+            if (!req->fragment) {
+                throw std::invalid_argument(
+                    "front::front_sched: WAL fragment is null");
+            }
             result = prepare_wal_fragment_now(
-                std::move(req->fragment),
+                req->fragment.get(),
                 req->canonical_entries,
                 req->cursor,
                 wal_config_);
@@ -2268,7 +2298,7 @@ namespace apps::inconel::front {
     void
     _front_insert::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_insert(new req{
-            .fragment = std::move(fragment),
+            .fragment = fragment,
             .canonical_entries = canonical_entries,
             .cb = [ctx = ctx, scope = scope]() mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
@@ -2390,7 +2420,7 @@ namespace apps::inconel::front {
     void
     _front_wal_prepare::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_wal_prepare(new req{
-            .fragment = std::move(fragment),
+            .fragment = fragment,
             .canonical_entries = canonical_entries,
             .cursor = cursor,
             .cb = [ctx = ctx, scope = scope](
@@ -2425,6 +2455,7 @@ namespace apps::inconel::front {
     _front_wal_commit::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_wal_commit(new req{
             .plan_id = plan_id,
+            .writes = std::move(writes),
             .cb = [ctx = ctx, scope = scope](
                       std::optional<wal::sealed_segment_info>&& r) mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(
@@ -2442,6 +2473,7 @@ namespace apps::inconel::front {
     _front_wal_abort::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_wal_abort(new req{
             .plan_id = plan_id,
+            .writes = std::move(writes),
             .cb = [ctx = ctx, scope = scope]() mutable {
                 pump::core::op_pusher<pos + 1, scope_t>::push_value(ctx, scope);
             },

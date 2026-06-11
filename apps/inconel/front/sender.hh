@@ -14,10 +14,9 @@ namespace apps::inconel::front {
     [[nodiscard]] inline auto
     insert_memtable_entries(
         front_sched& sched,
-        core::front_fragment fragment,
+        const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries) {
-        return sched.insert_memtable_entries(
-            std::move(fragment), canonical_entries);
+        return sched.insert_memtable_entries(fragment, canonical_entries);
     }
 
     [[nodiscard]] inline auto
@@ -63,11 +62,11 @@ namespace apps::inconel::front {
     [[nodiscard]] inline auto
     prepare_wal_fragment(
         front_sched& sched,
-        core::front_fragment fragment,
+        const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries,
         wal::wal_fragment_cursor cursor) {
         return sched.prepare_wal_fragment(
-            std::move(fragment), canonical_entries, cursor);
+            fragment, canonical_entries, cursor);
     }
 
     [[nodiscard]] inline auto
@@ -76,13 +75,17 @@ namespace apps::inconel::front {
     }
 
     [[nodiscard]] inline auto
-    commit_wal_plan(front_sched& sched, uint64_t plan_id) {
-        return sched.commit_wal_plan(plan_id);
+    commit_wal_plan(front_sched& sched,
+                    uint64_t plan_id,
+                    std::vector<wal::wal_frame_write> writes = {}) {
+        return sched.commit_wal_plan(plan_id, std::move(writes));
     }
 
     [[nodiscard]] inline auto
-    abort_wal_plan(front_sched& sched, uint64_t plan_id) {
-        return sched.abort_wal_plan(plan_id);
+    abort_wal_plan(front_sched& sched,
+                   uint64_t plan_id,
+                   std::vector<wal::wal_frame_write> writes = {}) {
+        return sched.abort_wal_plan(plan_id, std::move(writes));
     }
 
 }  // namespace apps::inconel::front

@@ -70,6 +70,12 @@ wal::segment_geometry make_geom(uint32_t count = 2, uint64_t base_lba = 1000,
   };
 }
 
+void begin_pending_with_zero_tail(wal::wal_stream_state &stream,
+                                  const wal::wal_append_plan &plan) {
+  std::vector<char> page(stream.lba_size(), char{0});
+  stream.begin_pending(plan, page);
+}
+
 template <typename T, typename SenderBuilder>
 T submit_wal_and_drive(wal::wal_space_sched &sched,
                        SenderBuilder &&build_sender) {
@@ -134,7 +140,7 @@ wal::sealed_segment_info seal_active(wal::segment_geometry geom,
   header.segment_gen = seg->segment_gen;
   header.start_offset = 0;
   header.end_offset = format::WAL_SEGMENT_HEADER_SIZE;
-  stream.begin_pending(header);
+  begin_pending_with_zero_tail(stream, header);
   CHECK(!stream.commit_pending(header.plan_id).has_value());
 
   wal::wal_append_plan first;
@@ -147,7 +153,7 @@ wal::sealed_segment_info seal_active(wal::segment_geometry geom,
   first.end_offset = first.start_offset + 64;
   first.min_lsn = min_lsn;
   first.max_lsn = min_lsn;
-  stream.begin_pending(first);
+  begin_pending_with_zero_tail(stream, first);
   CHECK(!stream.commit_pending(first.plan_id).has_value());
 
   if (max_lsn != min_lsn) {
@@ -161,7 +167,7 @@ wal::sealed_segment_info seal_active(wal::segment_geometry geom,
     second.end_offset = second.start_offset + 64;
     second.min_lsn = min_lsn;
     second.max_lsn = max_lsn;
-    stream.begin_pending(second);
+    begin_pending_with_zero_tail(stream, second);
     CHECK(!stream.commit_pending(second.plan_id).has_value());
   }
   return stream.make_sealed_info();
@@ -178,14 +184,12 @@ void geometry_validation_and_base_address_use_wal_base() {
   CHECK(wal::trailer_reserved_bytes(geom) == 512);
   CHECK(wal::segment_usable_end_offset(geom) == 4096 - 512);
 
-  const uint32_t exact_fit_lba =
-      format::WAL_SEGMENT_HEADER_SIZE + wal::kMaxSupportedWalEntrySize;
-  const auto exact_fit = make_geom(1, 1000, exact_fit_lba * 2, exact_fit_lba);
-  wal::wal_space_sched exact_fit_sched(exact_fit);
-  CHECK(wal::segment_usable_end_offset(exact_fit) -
-            format::WAL_SEGMENT_HEADER_SIZE ==
+  const auto can_fit_max_entry = make_geom(1, 1000, 4096, 512);
+  wal::wal_space_sched fit_sched(can_fit_max_entry);
+  CHECK(wal::segment_usable_end_offset(can_fit_max_entry) -
+            format::WAL_SEGMENT_HEADER_SIZE >=
         wal::kMaxSupportedWalEntrySize);
-  CHECK(exact_fit_sched.try_alloc_segment_for_testing(0) != nullptr);
+  CHECK(fit_sched.try_alloc_segment_for_testing(0) != nullptr);
 
   expect_throws<std::invalid_argument>([] {
     wal::wal_space_sched sched(make_geom(0));
@@ -193,6 +197,13 @@ void geometry_validation_and_base_address_use_wal_base() {
   });
   expect_throws<std::invalid_argument>([] {
     wal::wal_space_sched sched(make_geom(1, 1000, 4097, 512));
+    (void)sched;
+  });
+  expect_throws<std::invalid_argument>([] {
+    const uint32_t non_power_lba =
+        format::WAL_SEGMENT_HEADER_SIZE + wal::kMaxSupportedWalEntrySize;
+    wal::wal_space_sched sched(
+        make_geom(1, 1000, non_power_lba * 2, non_power_lba));
     (void)sched;
   });
   expect_throws<std::invalid_argument>([] {
@@ -251,7 +262,7 @@ void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
   header.segment_gen = seg->segment_gen;
   header.start_offset = 0;
   header.end_offset = format::WAL_SEGMENT_HEADER_SIZE;
-  stream.begin_pending(header);
+  begin_pending_with_zero_tail(stream, header);
   CHECK(stream.write_offset() == 0);
   CHECK(!stream.header_committed());
   CHECK(!stream.commit_pending(header.plan_id).has_value());
@@ -269,13 +280,13 @@ void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
   pending.end_offset = pending.start_offset + 128;
   pending.min_lsn = 10;
   pending.max_lsn = 10;
-  stream.begin_pending(pending);
+  begin_pending_with_zero_tail(stream, pending);
   CHECK(stream.write_offset() == format::WAL_SEGMENT_HEADER_SIZE);
   CHECK(seg->min_lsn == std::numeric_limits<uint64_t>::max());
   stream.abort_pending(pending.plan_id);
   CHECK(stream.write_offset() == format::WAL_SEGMENT_HEADER_SIZE);
 
-  stream.begin_pending(pending);
+  begin_pending_with_zero_tail(stream, pending);
   CHECK(!stream.commit_pending(pending.plan_id).has_value());
 
   wal::wal_append_plan second;
@@ -288,7 +299,7 @@ void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
   second.end_offset = second.start_offset + 256;
   second.min_lsn = 10;
   second.max_lsn = 12;
-  stream.begin_pending(second);
+  begin_pending_with_zero_tail(stream, second);
   CHECK(!stream.commit_pending(second.plan_id).has_value());
 
   CHECK(stream.write_offset() == format::WAL_SEGMENT_HEADER_SIZE + 128 + 256);

@@ -1,6 +1,7 @@
 #ifndef APPS_INCONEL_CORE_WAL_STREAM_HH
 #define APPS_INCONEL_CORE_WAL_STREAM_HH
 
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -96,6 +97,10 @@ inline void validate_segment_geometry(const segment_geometry &geometry) {
   if (geometry.lba_size == 0) {
     throw std::invalid_argument(
         "wal::segment_geometry: lba_size must be nonzero");
+  }
+  if (!std::has_single_bit(geometry.lba_size)) {
+    throw std::invalid_argument(
+        "wal::segment_geometry: lba_size must be a power of two");
   }
   if (geometry.wal_segment_size == 0) {
     throw std::invalid_argument(

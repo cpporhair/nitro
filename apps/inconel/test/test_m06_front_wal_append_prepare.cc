@@ -256,13 +256,12 @@ apply_plan_bytes(const wal::segment_geometry& geom,
                  std::vector<char>& segment_bytes) {
     const auto base = wal::segment_base_paddr(geom, plan.segment);
     for (const auto& write : plan.writes) {
-        const auto* frame = write.frame.get();
-        CHECK(frame != nullptr);
-        CHECK(frame->id.base.lba >= base.lba);
-        const uint64_t page_index = frame->id.base.lba - base.lba;
+        const auto& frame = write.frame;
+        CHECK(frame.id.base.lba >= base.lba);
+        const uint64_t page_index = frame.id.base.lba - base.lba;
         const uint64_t offset = page_index * geom.lba_size;
         CHECK(offset + geom.lba_size <= segment_bytes.size());
-        const auto src = frame->lba_bytes(0);
+        const auto src = frame.lba_bytes(0);
         CHECK(src.size() == geom.lba_size);
         std::memcpy(segment_bytes.data() + offset, src.data(), src.size());
     }

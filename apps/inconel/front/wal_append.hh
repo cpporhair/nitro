@@ -1,9 +1,13 @@
 #ifndef APPS_INCONEL_FRONT_WAL_APPEND_HH
 #define APPS_INCONEL_FRONT_WAL_APPEND_HH
 
+#include <algorithm>
+#include <bit>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -17,8 +21,8 @@
 namespace apps::inconel::wal {
 
 struct wal_append_config {
-  uint32_t max_fua_inflight = 4;
-  uint32_t max_pages_per_plan = 4;
+  uint32_t max_fua_inflight = 16;
+  uint32_t max_pages_per_plan = 16;
 };
 
 inline void validate_wal_append_config(const wal_append_config &cfg) {
@@ -43,30 +47,52 @@ enum class wal_plan_kind : uint8_t {
 };
 
 struct wal_frame_write {
-  memory::pooled_frame_ptr<memory::segmented_page_frame> frame;
+  memory::lba_dma_page_pool *pool = nullptr;
+  memory::segmented_page_frame frame;
   memory::frame_write_desc desc{};
 
   wal_frame_write() = default;
-  wal_frame_write(memory::pooled_frame_ptr<memory::segmented_page_frame> f,
+  wal_frame_write(memory::lba_dma_page_pool *p,
+                  memory::segmented_page_frame &&f,
                   uint32_t flags = 0) noexcept
-      : frame(std::move(f)), desc{.frame = frame.get(), .flags = flags} {}
+      : pool(p), frame(std::move(f)), desc{.frame = &frame, .flags = flags} {}
 
   wal_frame_write(wal_frame_write &&rhs) noexcept
-      : frame(std::move(rhs.frame)), desc(rhs.desc) {
-    desc.frame = frame.get();
+      : pool(rhs.pool), frame(std::move(rhs.frame)), desc(rhs.desc) {
+    desc.frame = pool != nullptr ? &frame : nullptr;
+    rhs.pool = nullptr;
+    rhs.desc.frame = nullptr;
   }
 
   wal_frame_write &operator=(wal_frame_write &&rhs) noexcept {
     if (this != &rhs) {
+      reset();
+      pool = rhs.pool;
       frame = std::move(rhs.frame);
       desc = rhs.desc;
-      desc.frame = frame.get();
+      desc.frame = pool != nullptr ? &frame : nullptr;
+      rhs.pool = nullptr;
+      rhs.desc.frame = nullptr;
     }
     return *this;
   }
 
+  ~wal_frame_write() { reset(); }
+
   wal_frame_write(const wal_frame_write &) = delete;
   wal_frame_write &operator=(const wal_frame_write &) = delete;
+
+private:
+  void reset() noexcept {
+    if (pool != nullptr) {
+      try {
+        pool->put_frame(std::move(frame));
+      } catch (...) {
+      }
+    }
+    pool = nullptr;
+    desc.frame = nullptr;
+  }
 };
 
 struct wal_append_plan {
@@ -142,6 +168,9 @@ public:
       : stream_id_(stream_id), geometry_(geometry) {
     validate_segment_geometry(geometry_);
     trailer_reserved_bytes_ = trailer_reserved_bytes(geometry_);
+    lba_shift_ = std::countr_zero(geometry_.lba_size);
+    committed_tail_page_.assign(geometry_.lba_size, char{0});
+    pending_tail_page_.assign(geometry_.lba_size, char{0});
   }
 
   [[nodiscard]] uint32_t stream_id() const noexcept { return stream_id_; }
@@ -180,6 +209,21 @@ public:
     return geometry_.lba_size;
   }
 
+  [[nodiscard]] uint32_t lba_shift() const noexcept { return lba_shift_; }
+
+  [[nodiscard]] format::paddr segment_base() const noexcept {
+    return segment_base_;
+  }
+
+  [[nodiscard]] std::optional<std::span<const char>>
+  tail_image_for(uint64_t page_index) const noexcept {
+    if (!committed_tail_valid_ || committed_tail_index_ != page_index) {
+      return std::nullopt;
+    }
+    return std::span<const char>{
+        committed_tail_page_.data(), committed_tail_page_.size()};
+  }
+
   [[nodiscard]] bool segment_empty() const noexcept {
     return seg_min_lsn_ == std::numeric_limits<uint64_t>::max();
   }
@@ -196,6 +240,10 @@ public:
     if (has_pending_plan()) {
       throw std::logic_error(
           "wal::wal_stream_state: cannot install with pending plan");
+    }
+    if (active_seg_ != nullptr) {
+      throw std::logic_error(
+          "wal::wal_stream_state: cannot install over active segment");
     }
     if (seg == nullptr) {
       throw std::invalid_argument(
@@ -218,12 +266,17 @@ public:
     }
 
     active_seg_ = seg;
+    segment_base_ = segment_base_paddr(geometry_, seg->id);
     write_offset_ = 0;
     header_committed_ = false;
     seg_min_lsn_ = std::numeric_limits<uint64_t>::max();
     seg_max_lsn_ = 0;
     active_seg_->min_lsn = seg_min_lsn_;
     active_seg_->max_lsn = seg_max_lsn_;
+    committed_tail_valid_ = false;
+    committed_tail_index_ = 0;
+    pending_tail_valid_ = false;
+    pending_tail_index_ = 0;
   }
 
   [[nodiscard]] bool can_fit_entry(uint32_t encoded_len) const noexcept {
@@ -270,7 +323,8 @@ public:
     };
   }
 
-  void begin_pending(const wal_append_plan &plan) {
+  void begin_pending(const wal_append_plan &plan,
+                     std::span<const char> last_page_bytes) {
     if (pending_.has_value()) {
       throw wal_append_error(
           wal_append_error_reason::pending_plan_exists,
@@ -281,10 +335,54 @@ public:
                              "wal::wal_stream_state: no active segment");
     }
     if (plan.stream_id != stream_id_ || !(plan.segment == active_seg_->id) ||
-        plan.segment_gen != active_seg_->segment_gen ||
-        plan.start_offset != write_offset_) {
+        plan.segment_gen != active_seg_->segment_gen) {
       throw std::logic_error("wal::wal_stream_state: plan does not match "
                              "committed cursor");
+    }
+    const uint32_t usable_end = usable_end_offset();
+    switch (plan.kind) {
+    case wal_plan_kind::header:
+      if (header_committed_ || plan.start_offset != 0 ||
+          plan.end_offset != format::WAL_SEGMENT_HEADER_SIZE ||
+          plan.sealed_on_commit.has_value()) {
+        throw std::logic_error(
+            "wal::wal_stream_state: invalid header plan");
+      }
+      break;
+    case wal_plan_kind::entries:
+      if (!header_committed_ || plan.start_offset != write_offset_ ||
+          plan.end_offset > usable_end || plan.end_offset <= plan.start_offset ||
+          plan.sealed_on_commit.has_value()) {
+        throw std::logic_error(
+            "wal::wal_stream_state: invalid entries plan");
+      }
+      break;
+    case wal_plan_kind::trailer:
+      if (plan.start_offset != usable_end ||
+          plan.end_offset !=
+              usable_end + format::WAL_SEALED_TRAILER_SIZE ||
+          !plan.sealed_on_commit.has_value()) {
+        throw std::logic_error(
+            "wal::wal_stream_state: invalid trailer plan");
+      }
+      break;
+    }
+
+    const bool snapshot_tail = plan.kind != wal_plan_kind::trailer;
+    if (snapshot_tail && last_page_bytes.size() != geometry_.lba_size) {
+      throw std::logic_error(
+          "wal::wal_stream_state: pending tail snapshot size mismatch");
+    }
+    if (snapshot_tail) {
+      std::memcpy(
+          pending_tail_page_.data(), last_page_bytes.data(),
+          pending_tail_page_.size());
+      pending_tail_valid_ = true;
+      pending_tail_index_ =
+          static_cast<uint64_t>(plan.end_offset - 1) >> lba_shift_;
+    } else {
+      pending_tail_valid_ = false;
+      pending_tail_index_ = 0;
     }
 
     pending_ = pending_plan{
@@ -294,6 +392,9 @@ public:
         .proposed_min_lsn = plan.min_lsn,
         .proposed_max_lsn = plan.max_lsn,
         .sealed = plan.sealed_on_commit,
+        .pending_tail_valid = pending_tail_valid_,
+        .pending_tail_index = pending_tail_index_,
+        .clear_tail_on_commit = plan.kind == wal_plan_kind::trailer,
     };
   }
 
@@ -326,6 +427,7 @@ public:
     case wal_plan_kind::trailer:
       sealed = pending_->sealed;
       active_seg_ = nullptr;
+      segment_base_ = {};
       write_offset_ = 0;
       header_committed_ = false;
       seg_min_lsn_ = std::numeric_limits<uint64_t>::max();
@@ -333,6 +435,18 @@ public:
       break;
     }
 
+    if (pending_->clear_tail_on_commit || sealed.has_value()) {
+      committed_tail_valid_ = false;
+      committed_tail_index_ = 0;
+      std::fill(
+          committed_tail_page_.begin(), committed_tail_page_.end(), char{0});
+    } else if (pending_->pending_tail_valid) {
+      std::swap(committed_tail_page_, pending_tail_page_);
+      committed_tail_valid_ = true;
+      committed_tail_index_ = pending_->pending_tail_index;
+    }
+    pending_tail_valid_ = false;
+    pending_tail_index_ = 0;
     pending_.reset();
     return sealed;
   }
@@ -346,6 +460,8 @@ public:
       throw wal_append_error(wal_append_error_reason::plan_id_mismatch,
                              "wal::wal_stream_state: pending plan mismatch");
     }
+    pending_tail_valid_ = false;
+    pending_tail_index_ = 0;
     pending_.reset();
   }
 
@@ -357,16 +473,27 @@ private:
     uint64_t proposed_min_lsn = 0;
     uint64_t proposed_max_lsn = 0;
     std::optional<sealed_segment_info> sealed;
+    bool pending_tail_valid = false;
+    uint64_t pending_tail_index = 0;
+    bool clear_tail_on_commit = false;
   };
 
   uint32_t stream_id_;
   segment_geometry geometry_;
   segment_runtime *active_seg_ = nullptr;
+  uint32_t lba_shift_ = 0;
+  format::paddr segment_base_{};
   uint32_t write_offset_ = 0;
   uint32_t trailer_reserved_bytes_ = 0;
   bool header_committed_ = false;
   uint64_t seg_min_lsn_ = std::numeric_limits<uint64_t>::max();
   uint64_t seg_max_lsn_ = 0;
+  std::vector<char> committed_tail_page_;
+  bool committed_tail_valid_ = false;
+  uint64_t committed_tail_index_ = 0;
+  std::vector<char> pending_tail_page_;
+  bool pending_tail_valid_ = false;
+  uint64_t pending_tail_index_ = 0;
   std::optional<pending_plan> pending_;
 };
 

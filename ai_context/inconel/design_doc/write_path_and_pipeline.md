@@ -452,6 +452,10 @@ switch_segment()
 2. `wal_space_sched` 的 alloc 操作是轻量的（dequeue from free pool 或 bump head）
 3. 换段开销主要是 seal trailer 写入（一次非 FUA write）
 
+front WAL append 按 plan 粒度串行(见 044/045)。同一 front 上不同 batch
+的 entries 可能按 plan 交错出现在同一 segment 内;这不改变 recovery 契约
+——重组只按 `lsn + entry_count`(概要 §11.2 约束 4),段内顺序不承载语义。
+
 ### 7.4 Backpressure
 
 如果 `wal_space_sched` 无法分配新 segment（free pool 空、alloc head 到顶）：

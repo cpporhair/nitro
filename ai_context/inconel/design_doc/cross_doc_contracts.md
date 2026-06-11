@@ -17,7 +17,7 @@
 | `capture_flush_frontier` | `()` → `flush_frontier { durable_lsn, old_guard }` | RSM §2.3, FF §2.2/8.1 |
 | `frontier_switch` | `(old_guard, new_manifest, retired, flushed_gens_by_front)` → `void` | RSM §2.3, FF §4.2/8.1 |
 | `install_cat` | `(new_publish_catalog)` → `void` | RSM §2.3, FF §4.2 |
-| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
+| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7;M06 起由 front `prepare_wal_fragment / install_wal_segment / commit_wal_plan / abort_wal_plan` + L3 `write_path::write_wal_fragment` 实现(044/045);本行保留为概念签名。 |
 | `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
 | `batch_lookup` | `(keys[], read_lsn, front_read_set)` → `batch_lookup_results[]` | RSM §3.4/3.7, RAP §5.1-5.3 |
 | **`lookup_memtable`** | **`(key, read_lsn, front_read_set)`** → `variant<value_ref, tombstone, miss>` | **RSM §3.4/3.7, RAP §4.2/4.3/5.3, OV §8.1/14.2** |

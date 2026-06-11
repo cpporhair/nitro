@@ -85,6 +85,7 @@ apps/inconel/
 | `canonical_entry` | `op_type`, `key`, `value`, `allocated_vr` | coord(产出), front/value(消费) |
 | `batch_ctx` | `batch_lsn`, `entry_count`, `canonical_entries[]`, `fragments[]` | coord(产出), pipeline(携带) |
 | `fragment` | `owner`, `batch_lsn`, `entry_count`, `entries[]` | coord(构造), front(消费) |
+| WAL segment carrier | segment_id, wal_segment_state, segment_runtime, segment_alloc_entry, sealed_segment_info, segment_geometry + 几何 helpers | wal(分配/回收), front(append), recovery(future) |
 
 #### Scheduler 注册表与路由
 
@@ -179,6 +180,11 @@ DMA 内存池和统一帧抽象。所有做 I/O 的 scheduler 共同使用。
 | Range scan | `scan_memtable(begin, end, read_lsn, front_read_set)` → `scan_result_set` |
 | Flush 支持 | `collect_eligible_gens(durable_lsn)` → eligible_gens[]，`release_gens(gen_ids[])` |
 | WAL segment rotation | 当前 segment 写满时向 wal_space_sched 申请新 segment |
+
+`front/wal_append.hh` 为 front 内部组件头(WAL stream
+state、append plan、frame write carrier、append error),经
+`front/sender.hh` 间接可达;其余模块不得直接 include。该文件允许依赖
+`memory/`(L2 依赖 L1,合法)。
 
 **Owner 状态**：`front_state { owner_id, active, imms[], wal_stream }`
 

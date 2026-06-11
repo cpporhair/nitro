@@ -1604,7 +1604,8 @@ WAL area 是一个共享容量池，但 live append point 不是共享的。
 换段时：
 
 1. 当前 segment 进入 `SEALED`。
-2. 如有机会，补写 sealed trailer。
+2. 在段尾 `TRAILER_RESERVED` 固定区写 sealed trailer(仅为 recovery
+   hint,其缺失不影响已 FUA entries 的持久性)。
 3. 旧 segment 连同其 `min_lsn/max_lsn` 进入待回收集合。
 4. 再申请新 segment，写入 segment header，继续追加。
 

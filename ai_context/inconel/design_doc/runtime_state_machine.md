@@ -584,7 +584,7 @@ struct wal_stream_state {
 ```text
 1. active_seg->st = SEALED
 2. active_seg->max_lsn = seg_max_lsn
-3. 写 sealed trailer（如有剩余空间）：
+3. 在段尾 `TRAILER_RESERVED` 固定区写 sealed trailer:
    trailer = {
        segment_gen = active_seg->segment_gen,
        write_end   = write_offset,

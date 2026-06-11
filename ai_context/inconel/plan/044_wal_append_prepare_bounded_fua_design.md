@@ -122,6 +122,11 @@ M06 裁决：
 
 这是 M06 的核心正确性要求。
 
+### 3.5 sealed trailer 位置
+
+sealed trailer 位置:044 初版与 ODF §3.4 /
+RW §3 / 042 §11.4 冲突且未记录;045 裁决以 ODF 为准,本节为更正记录。
+
 ## 4. WAL Byte Layout
 
 M06 保持 ODF v1 layout，不引入 incompatible layout。
@@ -435,7 +440,9 @@ Entry 可以跨 LBA/page，但不能跨 segment。
 当 active segment 没有空间容纳下一 entry 加 trailer reserved：
 
 1. front prepare 一个 trailer plan。
-2. trailer 写在 committed write offset。
+2. trailer 写入段尾固定 `TRAILER_RESERVED` 区(起始 `usable_end =
+   wal_segment_size - TRAILER_RESERVED`);`trailer.write_end` 字段记录最后一条
+   committed entry 之后的字节偏移。位置裁决见 045 §4.1。
 3. issue trailer page FUA。
 4. commit trailer plan：
    - 旧 active segment 在 front 侧变为 sealed/inactive。

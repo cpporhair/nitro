@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -180,7 +181,8 @@ namespace apps::inconel::front {
             , owner_id_(owner_id)
             , front_count_(front_count)
             , next_local_gen_epoch_(next_local_gen_epoch)
-            , active_(std::move(initial_active)) {
+            , active_(std::move(initial_active))
+            , wal_pending_prepare_capacity_(queue_depth) {
             validate_constructor_state(queue_depth);
         }
 
@@ -700,6 +702,15 @@ namespace apps::inconel::front {
         void handle_wal_install(_front_wal_install::req* r);
         void handle_wal_commit(_front_wal_commit::req* r);
         void handle_wal_abort(_front_wal_abort::req* r);
+        void run_wal_prepare(std::unique_ptr<_front_wal_prepare::req> req);
+        void fail_wal_prepare(std::unique_ptr<_front_wal_prepare::req> req,
+                              std::exception_ptr ep);
+        void drain_wal_pending_prepares();
+
+        [[nodiscard]] bool wal_busy() const noexcept {
+            return (wal_ && wal_->has_pending_plan()) ||
+                   wal_awaiting_segment_;
+        }
 
         pump::core::per_core::queue<_front_insert::req*> insert_q_;
         pump::core::per_core::queue<_front_lookup::req*> lookup_q_;
@@ -721,6 +732,9 @@ namespace apps::inconel::front {
         std::optional<wal::wal_stream_state> wal_;
         wal::wal_append_config wal_config_{};
         std::unique_ptr<memory::lba_dma_page_pool> wal_frame_pool_;
+        bool wal_awaiting_segment_ = false;
+        std::deque<_front_wal_prepare::req*> wal_pending_prepares_;
+        std::size_t wal_pending_prepare_capacity_ = 0;
         uint64_t next_wal_plan_id_ = 1;
     };
 
@@ -1242,6 +1256,7 @@ namespace apps::inconel::front {
         while (auto item = wal_install_q_.try_dequeue()) delete *item;
         while (auto item = wal_commit_q_.try_dequeue()) delete *item;
         while (auto item = wal_abort_q_.try_dequeue()) delete *item;
+        for (auto* req : wal_pending_prepares_) delete req;
     }
 
     inline _front_insert::sender
@@ -2119,6 +2134,25 @@ namespace apps::inconel::front {
     inline void
     front_sched::handle_wal_prepare(_front_wal_prepare::req* r) {
         std::unique_ptr<_front_wal_prepare::req> req(r);
+        if (wal_busy()) {
+            if (wal_pending_prepares_.size() >=
+                wal_pending_prepare_capacity_) {
+                fail_wal_prepare(
+                    std::move(req),
+                    std::make_exception_ptr(wal::wal_append_error(
+                        wal::wal_append_error_reason::prepare_queue_full,
+                        "front::front_sched: WAL prepare queue full")));
+                return;
+            }
+            wal_pending_prepares_.push_back(req.release());
+            return;
+        }
+        run_wal_prepare(std::move(req));
+    }
+
+    inline void
+    front_sched::run_wal_prepare(
+        std::unique_ptr<_front_wal_prepare::req> req) {
         wal::wal_prepare_result result;
         try {
             if (!req->fragment) {
@@ -2131,14 +2165,13 @@ namespace apps::inconel::front {
                 req->cursor,
                 wal_config_);
         } catch (...) {
-            auto fail = std::move(req->fail);
-            req.reset();
-            if (fail) {
-                fail(std::current_exception());
-            }
+            fail_wal_prepare(std::move(req), std::current_exception());
             return;
         }
 
+        if (std::holds_alternative<wal::wal_prepare_needs_segment>(result)) {
+            wal_awaiting_segment_ = true;
+        }
         auto cb = std::move(req->cb);
         req.reset();
         if (cb) {
@@ -2147,10 +2180,36 @@ namespace apps::inconel::front {
     }
 
     inline void
+    front_sched::fail_wal_prepare(
+        std::unique_ptr<_front_wal_prepare::req> req,
+        std::exception_ptr ep) {
+        auto fail = std::move(req->fail);
+        req.reset();
+        if (fail) {
+            fail(std::move(ep));
+        }
+    }
+
+    inline void
+    front_sched::drain_wal_pending_prepares() {
+        while (!wal_busy() && !wal_pending_prepares_.empty()) {
+            std::unique_ptr<_front_wal_prepare::req> req(
+                wal_pending_prepares_.front());
+            wal_pending_prepares_.pop_front();
+            run_wal_prepare(std::move(req));
+        }
+    }
+
+    inline void
     front_sched::handle_wal_install(_front_wal_install::req* r) {
         std::unique_ptr<_front_wal_install::req> req(r);
         try {
+            if (!wal_awaiting_segment_) {
+                throw std::logic_error(
+                    "front::front_sched: WAL install without awaiting segment");
+            }
             install_wal_segment_now(req->segment);
+            wal_awaiting_segment_ = false;
         } catch (...) {
             auto fail = std::move(req->fail);
             req.reset();
@@ -2162,6 +2221,7 @@ namespace apps::inconel::front {
 
         auto cb = std::move(req->cb);
         req.reset();
+        drain_wal_pending_prepares();
         if (cb) {
             cb();
         }
@@ -2184,6 +2244,9 @@ namespace apps::inconel::front {
 
         auto cb = std::move(req->cb);
         req.reset();
+        if (!result.has_value()) {
+            drain_wal_pending_prepares();
+        }
         if (cb) {
             cb(std::move(result));
         }
@@ -2205,6 +2268,7 @@ namespace apps::inconel::front {
 
         auto cb = std::move(req->cb);
         req.reset();
+        drain_wal_pending_prepares();
         if (cb) {
             cb();
         }

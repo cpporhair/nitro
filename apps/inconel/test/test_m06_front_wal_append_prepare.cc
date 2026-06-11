@@ -299,13 +299,23 @@ install_new_segment(front::front_sched& front_sched,
 }
 
 using pipeline_result = std::variant<bool, std::exception_ptr>;
+using root_context_t = decltype(pump::core::make_root_context());
+using prepare_probe_result =
+    std::variant<wal::wal_prepare_result, std::exception_ptr>;
+
+struct pipeline_submission {
+    root_context_t ctx;
+    std::future<pipeline_result> fut;
+};
+
+struct prepare_submission {
+    root_context_t ctx;
+    std::future<prepare_probe_result> fut;
+};
 
 template <typename SenderBuilder>
-pipeline_result
-submit_wal_pipeline_and_drive(front::front_sched& front_sched,
-                              wal::wal_space_sched& wal_space,
-                              test_fake_nvme::scheduler& fake_nvme,
-                              SenderBuilder&& build_sender) {
+pipeline_submission
+submit_wal_pipeline(SenderBuilder&& build_sender) {
     auto ctx = pump::core::make_root_context();
     auto promise = std::make_shared<std::promise<pipeline_result>>();
     auto fut = promise->get_future();
@@ -325,8 +335,43 @@ submit_wal_pipeline_and_drive(front::front_sched& front_sched,
         })
         >> pump::sender::submit(ctx);
 
+    return pipeline_submission{.ctx = std::move(ctx), .fut = std::move(fut)};
+}
+
+prepare_submission
+submit_prepare(front::front_sched& front_sched,
+               const core::front_fragment& fragment,
+               std::span<const core::canonical_entry> canonical_entries,
+               wal::wal_fragment_cursor cursor) {
+    auto ctx = pump::core::make_root_context();
+    auto promise = std::make_shared<std::promise<prepare_probe_result>>();
+    auto fut = promise->get_future();
+
+    front::prepare_wal_fragment(
+        front_sched, fragment, canonical_entries, cursor)
+        >> pump::sender::then([promise](wal::wal_prepare_result&& result) {
+            promise->set_value(std::move(result));
+        })
+        >> pump::sender::any_exception([promise](std::exception_ptr ep) {
+            promise->set_value(std::move(ep));
+            return pump::sender::just();
+        })
+        >> pump::sender::submit(ctx);
+
+    return prepare_submission{.ctx = std::move(ctx), .fut = std::move(fut)};
+}
+
+template <typename SenderBuilder>
+pipeline_result
+submit_wal_pipeline_and_drive(front::front_sched& front_sched,
+                              wal::wal_space_sched& wal_space,
+                              test_fake_nvme::scheduler& fake_nvme,
+                              SenderBuilder&& build_sender) {
+    auto submission =
+        submit_wal_pipeline(std::forward<SenderBuilder>(build_sender));
+
     for (uint32_t i = 0;
-         fut.wait_for(std::chrono::milliseconds(0)) !=
+         submission.fut.wait_for(std::chrono::milliseconds(0)) !=
              std::future_status::ready &&
          i < 4096;
          ++i) {
@@ -336,10 +381,10 @@ submit_wal_pipeline_and_drive(front::front_sched& front_sched,
         std::this_thread::yield();
     }
 
-    CHECK(fut.wait_for(std::chrono::milliseconds(0)) ==
+    CHECK(submission.fut.wait_for(std::chrono::milliseconds(0)) ==
           std::future_status::ready);
     CHECK(fake_nvme.idle());
-    return fut.get();
+    return submission.fut.get();
 }
 
 void
@@ -685,6 +730,160 @@ l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua() {
 }
 
 void
+m06_concurrent_fragments_serialize_through_wal_gate() {
+    auto geom = make_geom(4, 8000, 4096, 512);
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom);
+    test_fake_nvme::scheduler fake_nvme;
+
+    auto ctx_a = make_ctx(
+        {{.op = core::write_op_type::put, .key = "gate-a", .value = "v"}},
+        21);
+    auto ctx_b = make_ctx(
+        {{.op = core::write_op_type::put, .key = "gate-b", .value = "v"}},
+        22);
+    const auto& frag_a = only_fragment(ctx_a);
+    const auto& frag_b = only_fragment(ctx_b);
+
+    auto sub_a = submit_wal_pipeline([&] {
+        return write_path::write_wal_fragment(
+            front_sched, wal_space, &fake_nvme, frag_a, canonical_span(ctx_a));
+    });
+    auto sub_b = submit_wal_pipeline([&] {
+        return write_path::write_wal_fragment(
+            front_sched, wal_space, &fake_nvme, frag_b, canonical_span(ctx_b));
+    });
+
+    for (uint32_t i = 0;
+         (sub_a.fut.wait_for(std::chrono::milliseconds(0)) !=
+              std::future_status::ready ||
+          sub_b.fut.wait_for(std::chrono::milliseconds(0)) !=
+              std::future_status::ready) &&
+         i < 8192;
+         ++i) {
+        (void)front_sched.advance();
+        (void)wal_space.advance();
+        (void)fake_nvme.advance_one();
+        std::this_thread::yield();
+    }
+
+    CHECK(sub_a.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    CHECK(sub_b.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    CHECK(fake_nvme.idle());
+    expect_pipeline_ok(sub_a.fut.get());
+    expect_pipeline_ok(sub_b.fut.get());
+}
+
+void
+m06_prepare_fifo_wakes_after_rotation_install() {
+    auto geom = make_geom(3, 9000, 4096, 512);
+    wal::wal_append_config config{
+        .max_fua_inflight = 2,
+        .max_pages_per_plan = 64,
+    };
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom, config);
+    test_fake_nvme::scheduler fake_nvme;
+
+    std::vector<core::raw_batch_op> large_ops;
+    for (uint32_t i = 0; i < 4; ++i) {
+        large_ops.push_back(core::raw_batch_op{
+            .op = core::write_op_type::put,
+            .key = std::string(900, static_cast<char>('k' + i)),
+            .value = "v",
+        });
+    }
+    auto ctx_a = make_ctx(std::move(large_ops), 23);
+    auto ctx_b = make_ctx(
+        {{.op = core::write_op_type::put, .key = "fifo-b", .value = "v"}},
+        24);
+    const auto& frag_a = only_fragment(ctx_a);
+    const auto& frag_b = only_fragment(ctx_b);
+
+    auto sub_a = submit_wal_pipeline([&] {
+        return write_path::write_wal_fragment(
+            front_sched, wal_space, &fake_nvme, frag_a, canonical_span(ctx_a));
+    });
+
+    auto sub_b = submit_wal_pipeline([&] {
+        return write_path::write_wal_fragment(
+            front_sched, wal_space, &fake_nvme, frag_b, canonical_span(ctx_b));
+    });
+
+    for (uint32_t i = 0;
+         (sub_a.fut.wait_for(std::chrono::milliseconds(0)) !=
+              std::future_status::ready ||
+          sub_b.fut.wait_for(std::chrono::milliseconds(0)) !=
+              std::future_status::ready) &&
+         i < 8192;
+         ++i) {
+        (void)front_sched.advance();
+        (void)wal_space.advance();
+        (void)fake_nvme.advance_one();
+        std::this_thread::yield();
+    }
+
+    CHECK(sub_a.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    CHECK(sub_b.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    expect_pipeline_ok(sub_a.fut.get());
+    expect_pipeline_ok(sub_b.fut.get());
+}
+
+void
+m06_prepare_queue_full_fails_with_explicit_reason() {
+    auto geom = make_geom(2, 10000, 4096, 512);
+    wal::wal_space_sched wal_space(geom, 1);
+    front::front_sched front_sched(0, 1, geom, {}, 2);
+    install_new_segment(front_sched, wal_space, 0);
+
+    auto ctx_busy = make_ctx(
+        {{.op = core::write_op_type::put, .key = "busy", .value = "v"}},
+        25);
+    const auto& busy_fragment = only_fragment(ctx_busy);
+    auto header = take_ready(front_sched.prepare_wal_fragment_for_testing(
+        busy_fragment, canonical_span(ctx_busy), {}));
+
+    auto ctx_a = make_ctx(
+        {{.op = core::write_op_type::put, .key = "queued", .value = "v"}},
+        26);
+    auto ctx_b = make_ctx(
+        {{.op = core::write_op_type::put, .key = "overflow", .value = "v"}},
+        27);
+    auto ctx_c = make_ctx(
+        {{.op = core::write_op_type::put, .key = "overflow-2", .value = "v"}},
+        28);
+    auto sub_a = submit_prepare(
+        front_sched, only_fragment(ctx_a), canonical_span(ctx_a), {});
+    (void)front_sched.advance();
+    CHECK(sub_a.fut.wait_for(std::chrono::milliseconds(0)) !=
+          std::future_status::ready);
+
+    auto sub_b = submit_prepare(
+        front_sched, only_fragment(ctx_b), canonical_span(ctx_b), {});
+    (void)front_sched.advance();
+    CHECK(sub_b.fut.wait_for(std::chrono::milliseconds(0)) !=
+          std::future_status::ready);
+    auto sub_c = submit_prepare(
+        front_sched, only_fragment(ctx_c), canonical_span(ctx_c), {});
+    (void)front_sched.advance();
+    CHECK(sub_c.fut.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    auto result = sub_c.fut.get();
+    CHECK(std::holds_alternative<std::exception_ptr>(result));
+    try {
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+    } catch (const wal::wal_append_error& e) {
+        CHECK(e.reason() == wal::wal_append_error_reason::prepare_queue_full);
+    }
+
+    front_sched.abort_wal_plan_for_testing(header.plan_id);
+}
+
+void
 l3_write_wal_fragment_false_aborts_and_throws() {
     auto geom = make_geom(2, 6000, 4096, 512);
     wal::wal_space_sched wal_space(geom, 1);
@@ -809,6 +1008,9 @@ main() {
     segment_rotation_writes_trailer_then_new_header();
     abort_after_fua_failure_keeps_cursor_and_memtable_unchanged();
     l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua();
+    m06_concurrent_fragments_serialize_through_wal_gate();
+    m06_prepare_fifo_wakes_after_rotation_install();
+    m06_prepare_queue_full_fails_with_explicit_reason();
     l3_write_wal_fragment_false_aborts_and_throws();
     l3_write_wal_fragment_exception_aborts_and_throws();
     write_path_uses_bounded_fua_concurrent();

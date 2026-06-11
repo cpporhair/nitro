@@ -147,6 +147,7 @@ enum class wal_append_error_reason : uint8_t {
   device_failure,
   plan_not_pending,
   plan_id_mismatch,
+  prepare_queue_full,
 };
 
 class wal_append_error : public std::runtime_error {

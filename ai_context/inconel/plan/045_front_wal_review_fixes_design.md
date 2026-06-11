@@ -39,7 +39,10 @@
 1. `apps/inconel/test/test_m06_front_wal_append_prepare.cc`
 2. `apps/inconel/test/test_m04_wal_space_scheduler.cc`
 3. `apps/inconel/test/test_m03_coord_scheduler_assign_publish_release.cc`
-4. `apps/inconel/test/test_m05_front_scheduler_memtable_owner.cc`(仅当 §5.G 改动触发编译/断言失败时,按声明意图修)
+4. `apps/inconel/test/test_m05_front_scheduler_memtable_owner.cc`(当 §5.F/§5.G
+   改动触发编译/断言失败时,按声明意图机械适配。追认记录 2026-06-11:初版
+   只写了 §5.G,Phase F 回调单通道签名变更必然波及其白盒 req 用例;实施时
+   的机械适配(断言意图零变化)经终审复核后追认为本条授权范围)
 
 明确不做:M07+ 的任何功能、value 模块改动、recovery 实现、M08/M09 pipeline、
 runtime builder、`memory/frame.hh` 的容器类型变更(§5.C.7 标注的可选项除外,

@@ -513,7 +513,7 @@ front_sched[0] 队列：
 
 ### 8.3 WAL 交错
 
-不同 batch 的 WAL entries 在同一 segment 中是**顺序排列**的（不交错），因为同一 front_sched 顺序处理 fragments。
+不同 batch 的 WAL entries 在同一 segment 中默认是**顺序排列**的，因为同一 front_sched 顺序处理 fragments;自 M06 引入 plan 粒度串行化后,该形态放宽为可按 plan 交错,见本节末尾补充。
 
 但同一 batch 的 entries 可以散落在不同 front_scheds 的不同 segments 中（概要 §11.2 约束 4）。Recovery 按 `lsn + entry_count` 重组，不依赖 segment 内连续性。
 

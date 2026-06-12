@@ -438,6 +438,8 @@ M09 的详细设计文档是 `048_production_write_batch_pipeline_design.md`。
 
 ### M10：Point GET Live Read
 
+M10 的详细设计文档是 `049_point_get_live_read_design.md`。
+
 对应旧 step：
 
 1. Step 25：Point GET 的 memtable-only 路径
@@ -464,6 +466,9 @@ M09 的详细设计文档是 `048_production_write_batch_pipeline_design.md`。
    tree-miss 完整读语义。若 M10 需要对 memtable miss 给出对外完成语义，必须在
    详细设计中裁决是接入当前 tree path、返回显式 miss，还是扩大本步范围；不得用
    “后续接入”掩盖用户可见语义缺口。
+   （049 §4.1 裁决：接入当前 tree path，point_get 落 OV §8.1 完整语义，
+   对外只有 found / not_found；tree-hit 分支由 node-cache 预热测试在
+   m10 target 内驱动，未留未测 production 分支。）
 
 完成测试：
 

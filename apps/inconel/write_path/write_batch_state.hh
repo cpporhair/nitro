@@ -105,18 +105,26 @@ namespace apps::inconel::write_path {
         state.phase = next;
     }
 
-    inline void
-    require_release_allowed(const write_batch_state& state, const char* site) {
+    [[nodiscard]] inline bool
+    release_allowed(const write_batch_state& state) noexcept {
         switch (state.phase) {
         case write_batch_phase::assigned:
         case write_batch_phase::value_durable:
         case write_batch_phase::wal_durable:
-            return;
+            return true;
         case write_batch_phase::memtable_applying:
         case write_batch_phase::memtable_applied:
         case write_batch_phase::published:
         case write_batch_phase::released:
-            break;
+            return false;
+        }
+        return false;
+    }
+
+    inline void
+    require_release_allowed(const write_batch_state& state, const char* site) {
+        if (release_allowed(state)) {
+            return;
         }
         throw std::logic_error(
             write_batch_phase_error(site,

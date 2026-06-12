@@ -24,6 +24,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "pump/core/compute_sender_type.hh"
@@ -214,6 +215,21 @@ namespace apps::inconel::coord {
     namespace _coord_publish { struct req; struct sender; }
     namespace _coord_release { struct req; struct sender; }
     namespace _coord_read    { struct req; struct sender; }
+    namespace _coord_close_gate { struct req; struct sender; }
+    namespace _coord_install_cat { struct req; struct sender; }
+    namespace _coord_open_gate { struct req; struct sender; }
+    namespace _coord_enter_memtable { struct req; struct sender; }
+
+    namespace _coord_event {
+        using request = std::variant<
+            _coord_publish::req*,
+            _coord_release::req*,
+            _coord_read::req*,
+            _coord_close_gate::req*,
+            _coord_install_cat::req*,
+            _coord_open_gate::req*,
+            _coord_enter_memtable::req*>;
+    }
 
     struct coord_sched {
         explicit
@@ -224,9 +240,7 @@ namespace apps::inconel::coord {
                     std::size_t queue_depth = 1024,
                     std::size_t pending_assign_capacity = 0)
             : assign_q_(queue_depth)
-            , publish_q_(queue_depth)
-            , release_q_(queue_depth)
-            , read_q_(queue_depth)
+            , event_q_(queue_depth)
             , cats_(validate_initial_cat(initial_cat,
                                          front_count,
                                          next_lsn,
@@ -269,6 +283,18 @@ namespace apps::inconel::coord {
 
         [[nodiscard]] _coord_read::sender
         acquire_read_handle();
+
+        [[nodiscard]] _coord_close_gate::sender
+        close_gate();
+
+        [[nodiscard]] _coord_install_cat::sender
+        install_cat(std::shared_ptr<const core::publish_catalog> cat);
+
+        [[nodiscard]] _coord_open_gate::sender
+        open_gate();
+
+        [[nodiscard]] _coord_enter_memtable::sender
+        enter_memtable_phase(uint64_t batch_lsn);
 
         [[nodiscard]] core::batch_ctx
         assign_batch_lsn_for_testing(core::client_batch_buffer&& input) {
@@ -354,6 +380,10 @@ namespace apps::inconel::coord {
         void schedule_publish(_coord_publish::req* r);
         void schedule_release(_coord_release::req* r);
         void schedule_read(_coord_read::req* r);
+        void schedule_close_gate(_coord_close_gate::req* r);
+        void schedule_install_cat(_coord_install_cat::req* r);
+        void schedule_open_gate(_coord_open_gate::req* r);
+        void schedule_enter_memtable(_coord_enter_memtable::req* r);
 
         bool advance();
 
@@ -362,9 +392,7 @@ namespace apps::inconel::coord {
 
       private:
         static constexpr uint32_t kMaxAssignPerAdvance = 64;
-        static constexpr uint32_t kMaxPublishPerAdvance = 256;
-        static constexpr uint32_t kMaxReleasePerAdvance = 256;
-        static constexpr uint32_t kMaxReadPerAdvance = 128;
+        static constexpr uint32_t kMaxEventPerAdvance = 512;
 
         static std::shared_ptr<const core::publish_catalog>
         validate_initial_cat(
@@ -415,6 +443,10 @@ namespace apps::inconel::coord {
                     "coord::coord_sched: replacement CAT front_count mismatch");
             }
             const auto current = cats_.current_cat();
+            if (cat->epoch <= cat_epoch_) {
+                throw std::logic_error(
+                    "coord::coord_sched: replacement CAT epoch must advance");
+            }
             const uint64_t visible =
                 current->durable_lsn.load(std::memory_order_acquire);
             const uint64_t replacement_visible =
@@ -465,6 +497,21 @@ namespace apps::inconel::coord {
 
         void
         handle_read(_coord_read::req* r);
+
+        void
+        handle_close_gate(_coord_close_gate::req* r);
+
+        void
+        handle_install_cat(_coord_install_cat::req* r);
+
+        void
+        handle_open_gate(_coord_open_gate::req* r);
+
+        void
+        handle_enter_memtable(_coord_enter_memtable::req* r);
+
+        void
+        handle_event(_coord_event::request event);
 
         void
         resolve_terminal_lsn(uint64_t lsn) {
@@ -519,10 +566,8 @@ namespace apps::inconel::coord {
             }
         }
 
-        pump::core::per_core::queue<_coord_assign::req*>  assign_q_;
-        pump::core::per_core::queue<_coord_publish::req*> publish_q_;
-        pump::core::per_core::queue<_coord_release::req*> release_q_;
-        pump::core::per_core::queue<_coord_read::req*>    read_q_;
+        pump::core::per_core::queue<_coord_assign::req*> assign_q_;
+        pump::core::per_core::queue<_coord_event::request> event_q_;
 
         core::catalog_store cats_;
         ready_window        ready_;
@@ -672,11 +717,144 @@ namespace apps::inconel::coord {
         };
     }
 
+    namespace _coord_close_gate {
+
+        struct req {
+            std::move_only_function<void(
+                core::owner_outcome<
+                    std::shared_ptr<const core::publish_catalog>>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_close_gate_op = true;
+            coord_sched* sched;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+
+            auto make_op() {
+                return op{.sched = sched};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
+    namespace _coord_install_cat {
+
+        struct req {
+            std::shared_ptr<const core::publish_catalog> cat;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_install_cat_op = true;
+            coord_sched* sched;
+            std::shared_ptr<const core::publish_catalog> cat;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+            std::shared_ptr<const core::publish_catalog> cat;
+
+            sender(coord_sched* s,
+                   std::shared_ptr<const core::publish_catalog> c)
+                : sched(s), cat(std::move(c)) {}
+
+            sender(sender&&) noexcept = default;
+            sender& operator=(sender&&) noexcept = default;
+            sender(const sender&) = delete;
+            sender& operator=(const sender&) = delete;
+
+            auto make_op() {
+                return op{.sched = sched, .cat = std::move(cat)};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
+    namespace _coord_open_gate {
+
+        struct req {
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_open_gate_op = true;
+            coord_sched* sched;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+
+            auto make_op() {
+                return op{.sched = sched};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
+    namespace _coord_enter_memtable {
+
+        struct req {
+            uint64_t batch_lsn;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_enter_memtable_op = true;
+            coord_sched* sched;
+            uint64_t batch_lsn;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+            uint64_t batch_lsn;
+
+            auto make_op() {
+                return op{.sched = sched, .batch_lsn = batch_lsn};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
     inline coord_sched::~coord_sched() {
         while (auto item = assign_q_.try_dequeue()) delete *item;
-        while (auto item = publish_q_.try_dequeue()) delete *item;
-        while (auto item = release_q_.try_dequeue()) delete *item;
-        while (auto item = read_q_.try_dequeue()) delete *item;
+        while (auto item = event_q_.try_dequeue()) {
+            std::visit([](auto* r) { delete r; }, *item);
+        }
         for (auto* r : pending_assigns_) delete r;
     }
 
@@ -698,6 +876,30 @@ namespace apps::inconel::coord {
     inline _coord_read::sender
     coord_sched::acquire_read_handle() {
         return _coord_read::sender{.sched = this};
+    }
+
+    inline _coord_close_gate::sender
+    coord_sched::close_gate() {
+        return _coord_close_gate::sender{.sched = this};
+    }
+
+    inline _coord_install_cat::sender
+    coord_sched::install_cat(
+        std::shared_ptr<const core::publish_catalog> cat) {
+        return _coord_install_cat::sender{this, std::move(cat)};
+    }
+
+    inline _coord_open_gate::sender
+    coord_sched::open_gate() {
+        return _coord_open_gate::sender{.sched = this};
+    }
+
+    inline _coord_enter_memtable::sender
+    coord_sched::enter_memtable_phase(uint64_t batch_lsn) {
+        return _coord_enter_memtable::sender{
+            .sched = this,
+            .batch_lsn = batch_lsn,
+        };
     }
 
     inline void
@@ -729,7 +931,7 @@ namespace apps::inconel::coord {
 
     inline void
     coord_sched::schedule_publish(_coord_publish::req* r) {
-        if (!publish_q_.try_enqueue(r)) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
             delete r;
             throw std::runtime_error("coord::coord_sched: publish queue full");
         }
@@ -737,7 +939,7 @@ namespace apps::inconel::coord {
 
     inline void
     coord_sched::schedule_release(_coord_release::req* r) {
-        if (!release_q_.try_enqueue(r)) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
             delete r;
             throw std::runtime_error("coord::coord_sched: release queue full");
         }
@@ -745,9 +947,45 @@ namespace apps::inconel::coord {
 
     inline void
     coord_sched::schedule_read(_coord_read::req* r) {
-        if (!read_q_.try_enqueue(r)) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
             delete r;
             throw std::runtime_error("coord::coord_sched: read queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_close_gate(_coord_close_gate::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: close_gate queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_install_cat(_coord_install_cat::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: install_cat queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_open_gate(_coord_open_gate::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: open_gate queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_enter_memtable(_coord_enter_memtable::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: enter_memtable queue full");
         }
     }
 
@@ -879,6 +1117,129 @@ namespace apps::inconel::coord {
         }
     }
 
+    inline void
+    coord_sched::handle_close_gate(_coord_close_gate::req* r) {
+        std::unique_ptr<_coord_close_gate::req> req(r);
+        std::shared_ptr<const core::publish_catalog> cat;
+        try {
+            if (!gate_.is_open()) {
+                throw std::logic_error(
+                    "coord::coord_sched: close_gate on a closed gate");
+            }
+            gate_.close();
+            cat = cats_.current_cat();
+        } catch (...) {
+            auto cb = std::move(req->cb);
+            req.reset();
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
+            }
+            return;
+        }
+
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<
+               std::shared_ptr<const core::publish_catalog>>{std::move(cat)});
+        }
+    }
+
+    inline void
+    coord_sched::handle_install_cat(_coord_install_cat::req* r) {
+        std::unique_ptr<_coord_install_cat::req> req(r);
+        try {
+            validate_replacement_cat(req->cat);
+            cat_epoch_ = req->cat->epoch;
+            cats_.install_cat(std::move(req->cat));
+        } catch (...) {
+            auto cb = std::move(req->cb);
+            req.reset();
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
+            }
+            return;
+        }
+
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<void>{});
+        }
+    }
+
+    inline void
+    coord_sched::handle_open_gate(_coord_open_gate::req* r) {
+        std::unique_ptr<_coord_open_gate::req> req(r);
+        try {
+            if (gate_.is_open()) {
+                throw std::logic_error(
+                    "coord::coord_sched: open_gate on an open gate");
+            }
+            apply_pending_gate_prefix(gate_.open_and_take_pending());
+            drain_pending_assigns();
+        } catch (...) {
+            auto cb = std::move(req->cb);
+            req.reset();
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
+            }
+            return;
+        }
+
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<void>{});
+        }
+    }
+
+    inline void
+    coord_sched::handle_enter_memtable(_coord_enter_memtable::req* r) {
+        std::unique_ptr<_coord_enter_memtable::req> req(r);
+        // This handle intentionally performs no state mutation. Its value is
+        // the execution-domain boundary: the caller's continuation dispatches
+        // every memtable fragment while this coord event is still being
+        // advanced, so it is ordered against close_gate's seal fan-out.
+        (void)req->batch_lsn;
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<void>{});
+        }
+    }
+
+    inline void
+    coord_sched::handle_event(_coord_event::request event) {
+        std::visit(
+            [this](auto* r) {
+                using req_t = std::remove_pointer_t<decltype(r)>;
+                if constexpr (std::is_same_v<req_t, _coord_publish::req>) {
+                    handle_publish(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_release::req>) {
+                    handle_release(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_read::req>) {
+                    handle_read(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_close_gate::req>) {
+                    handle_close_gate(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_install_cat::req>) {
+                    handle_install_cat(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_open_gate::req>) {
+                    handle_open_gate(r);
+                } else {
+                    static_assert(
+                        std::is_same_v<req_t, _coord_enter_memtable::req>);
+                    handle_enter_memtable(r);
+                }
+            },
+            event);
+    }
+
     inline bool
     coord_sched::advance() {
         bool progress = false;
@@ -890,24 +1251,10 @@ namespace apps::inconel::coord {
             progress = true;
         }
 
-        for (uint32_t i = 0; i < kMaxPublishPerAdvance; ++i) {
-            auto item = publish_q_.try_dequeue();
+        for (uint32_t i = 0; i < kMaxEventPerAdvance; ++i) {
+            auto item = event_q_.try_dequeue();
             if (!item) break;
-            handle_publish(*item);
-            progress = true;
-        }
-
-        for (uint32_t i = 0; i < kMaxReleasePerAdvance; ++i) {
-            auto item = release_q_.try_dequeue();
-            if (!item) break;
-            handle_release(*item);
-            progress = true;
-        }
-
-        for (uint32_t i = 0; i < kMaxReadPerAdvance; ++i) {
-            auto item = read_q_.try_dequeue();
-            if (!item) break;
-            handle_read(*item);
+            handle_event(*item);
             progress = true;
         }
 
@@ -948,6 +1295,43 @@ namespace apps::inconel::coord {
         sched->schedule_read(new req{
             .cb = core::make_owner_pusher<
                 pos, scope_t, core::read_handle>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_close_gate::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_close_gate(new req{
+            .cb = core::make_owner_pusher<
+                pos,
+                scope_t,
+                std::shared_ptr<const core::publish_catalog>>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_install_cat::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_install_cat(new req{
+            .cat = std::move(cat),
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_open_gate::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_open_gate(new req{
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_enter_memtable::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_enter_memtable(new req{
+            .batch_lsn = batch_lsn,
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
 
@@ -1032,6 +1416,88 @@ namespace pump::core {
         consteval static uint32_t count_value() { return 1; }
         consteval static auto get_value_type_identity() {
             return std::type_identity<apps::inconel::core::read_handle>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_close_gate_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_close_gate::sender> {
+        consteval static uint32_t count_value() { return 1; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<
+                std::shared_ptr<
+                    const apps::inconel::core::publish_catalog>>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_install_cat_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_install_cat::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_open_gate_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_open_gate::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_enter_memtable_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_enter_memtable::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
         }
     };
 

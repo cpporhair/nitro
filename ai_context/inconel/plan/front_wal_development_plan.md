@@ -480,6 +480,8 @@ M10 的详细设计文档是 `049_point_get_live_read_design.md`。
 
 ### M11：Runtime Topology + Operation Surface
 
+M11 的详细设计文档是 `050_runtime_topology_operation_surface_design.md`。
+
 对应旧 step：
 
 1. Step 25A：runtime owner registry / topology

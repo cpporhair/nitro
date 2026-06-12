@@ -22,13 +22,71 @@
 #include "pump/sender/then.hh"
 #include "pump/sender/visit.hh"
 
+#include "../core/batch_carrier.hh"
 #include "../front/sender.hh"
 #include "../nvme/frame_io.hh"
+#include "../runtime/facade.hh"
+#include "../value/sender.hh"
 #include "../wal/sender.hh"
 
 namespace apps::inconel::write_path {
 
     using namespace pump::sender;
+
+    template <typename NvmeProvider = value::local_nvme_provider>
+    inline auto
+    persist_put_values(core::batch_ctx& ctx, NvmeProvider nvme = {}) {
+        using skip_variant = std::variant<std::true_type, std::false_type>;
+        return just(ctx.put_entry_indices.empty()
+                    ? skip_variant{std::true_type{}}
+                    : skip_variant{std::false_type{}})
+            >> visit()
+            >> flat_map([&ctx, nvme]<typename Flag>(Flag&&) mutable {
+                using flag_t = std::decay_t<Flag>;
+                if constexpr (std::is_same_v<flag_t, std::true_type>) {
+                    return just(true);
+                } else {
+                    const uint32_t max_len = rt::value()->max_body_len();
+                    for (uint32_t idx : ctx.put_entry_indices) {
+                        if (ctx.canonical_entries[idx].value.size() > max_len) {
+                            throw value::value_persist_error(
+                                value::value_persist_error_reason::oversized_value,
+                                "write_path::persist_put_values: value body exceeds max_body_len");
+                        }
+                    }
+
+                    std::vector<value::put_entry> puts;
+                    puts.reserve(ctx.put_entry_indices.size());
+                    for (uint32_t idx : ctx.put_entry_indices) {
+                        auto& entry = ctx.canonical_entries[idx];
+                        puts.push_back(value::put_entry{
+                            .body   = entry.value,
+                            .out_vr = &entry.allocated_vr,
+                        });
+                    }
+
+                    return just()
+                        >> push_context(std::move(puts))
+                        >> get_context<std::vector<value::put_entry>>()
+                        >> flat_map([nvme](
+                                std::vector<value::put_entry>& puts) mutable {
+                            return value::persist_put_values(
+                                std::span<value::put_entry>(
+                                    puts.data(), puts.size()),
+                                nvme);
+                        })
+                        >> then([](bool ok) {
+                            if (!ok) {
+                                throw value::value_persist_error(
+                                    value::value_persist_error_reason::round_failed,
+                                    "write_path::persist_put_values: value persist round failed");
+                            }
+                            return true;
+                        })
+                        >> pop_context();
+                }
+            });
+    }
 
     struct wal_plan_issue_result {
         uint64_t plan_id = 0;

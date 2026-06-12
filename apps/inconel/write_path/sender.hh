@@ -5,6 +5,7 @@
 #include <exception>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -12,6 +13,7 @@
 
 #include "pump/coro/coro.hh"
 #include "pump/sender/any_exception.hh"
+#include "pump/sender/concurrent.hh"
 #include "pump/sender/flat.hh"
 #include "pump/sender/generate.hh"
 #include "pump/sender/get_context.hh"
@@ -22,12 +24,14 @@
 #include "pump/sender/then.hh"
 #include "pump/sender/visit.hh"
 
+#include "../coord/sender.hh"
 #include "../core/batch_carrier.hh"
 #include "../front/sender.hh"
 #include "../nvme/frame_io.hh"
 #include "../runtime/facade.hh"
 #include "../value/sender.hh"
 #include "../wal/sender.hh"
+#include "./write_batch_state.hh"
 
 namespace apps::inconel::write_path {
 
@@ -396,6 +400,279 @@ namespace apps::inconel::write_path {
                         })
                         >> pop_context();
                 }
+            });
+    }
+
+    [[nodiscard]] inline std::span<const core::canonical_entry>
+    entries_span(const core::batch_ctx& ctx) noexcept {
+        return {ctx.canonical_entries.data(), ctx.canonical_entries.size()};
+    }
+
+    inline void
+    require_batch_front_topology(const write_batch_state& state,
+                                 std::span<front::front_sched* const> fronts,
+                                 const char* site) {
+        if (fronts.empty()) {
+            throw std::invalid_argument(
+                std::string(site) + ": fronts must be non-empty");
+        }
+
+        for (std::size_t i = 0; i < fronts.size(); ++i) {
+            if (fronts[i] == nullptr) {
+                throw std::invalid_argument(
+                    std::string(site) + ": front scheduler is null");
+            }
+        }
+
+        for (const auto& fragment : state.ctx.fragments) {
+            if (fragment.owner >= fronts.size()) {
+                throw std::invalid_argument(
+                    std::string(site) + ": fragment owner is out of range");
+            }
+        }
+    }
+
+    template <typename nvme_sched_t>
+    inline void
+    require_batch_wal_topology(
+        const write_batch_state& state,
+        std::span<front::front_sched* const> fronts,
+        std::span<nvme_sched_t* const> nvme_by_owner,
+        const char* site) {
+        require_batch_front_topology(state, fronts, site);
+        if (nvme_by_owner.size() != fronts.size()) {
+            throw std::invalid_argument(
+                std::string(site) +
+                ": nvme_by_owner size must match fronts size");
+        }
+        for (std::size_t i = 0; i < nvme_by_owner.size(); ++i) {
+            if (nvme_by_owner[i] == nullptr) {
+                throw std::invalid_argument(
+                    std::string(site) + ": nvme scheduler is null");
+            }
+        }
+    }
+
+    template <typename nvme_sched_t>
+    inline auto
+    write_batch_value_phase(write_batch_state& state,
+                            nvme_sched_t nvme_provider) {
+        return just()
+            >> then([&state]() {
+                require_write_batch_phase(
+                    state,
+                    write_batch_phase::assigned,
+                    "write_batch_value_phase");
+            })
+            >> flat_map([&state, nvme_provider]() mutable {
+                return persist_put_values(state.ctx, nvme_provider);
+            })
+            >> then([&state](bool ok) {
+                advance_write_batch_phase(
+                    state,
+                    write_batch_phase::assigned,
+                    write_batch_phase::value_durable,
+                    "write_batch_value_phase");
+                return ok;
+            });
+    }
+
+    inline auto
+    write_batch_value_phase(write_batch_state& state) {
+        return write_batch_value_phase(state, value::local_nvme_provider{});
+    }
+
+    template <typename nvme_sched_t>
+    inline auto
+    write_batch_wal_phase(
+        write_batch_state& state,
+        std::span<front::front_sched* const> fronts,
+        wal::wal_space_sched& wal_space,
+        std::span<nvme_sched_t* const> nvme_by_owner) {
+        return just()
+            >> then([&state, fronts, nvme_by_owner]() {
+                require_write_batch_phase(
+                    state,
+                    write_batch_phase::value_durable,
+                    "write_batch_wal_phase");
+                require_batch_wal_topology(
+                    state,
+                    fronts,
+                    nvme_by_owner,
+                    "write_batch_wal_phase");
+            })
+            >> flat_map([&state, fronts, &wal_space, nvme_by_owner]() {
+                const std::size_t fragment_count = state.ctx.fragments.size();
+                return just()
+                    >> loop(fragment_count)
+                    >> concurrent (fragment_count)
+                    >> flat_map([&state,
+                                  fronts,
+                                  &wal_space,
+                                  nvme_by_owner](std::size_t idx) {
+                        const auto& fragment = state.ctx.fragments[idx];
+                        const auto owner =
+                            static_cast<std::size_t>(fragment.owner);
+                        return write_wal_fragment(
+                                *fronts[owner],
+                                wal_space,
+                                nvme_by_owner[owner],
+                                fragment,
+                                entries_span(state.ctx))
+                            >> then([](bool) {
+                                return std::exception_ptr{};
+                            })
+                            >> any_exception([](std::exception_ptr ep) {
+                                return just(std::move(ep));
+                            });
+                    })
+                    >> reduce(
+                        std::exception_ptr{},
+                        [](std::exception_ptr& first,
+                           std::exception_ptr ep) {
+                            if (!first && ep) {
+                                first = std::move(ep);
+                            }
+                        });
+            })
+            >> then([&state](std::exception_ptr first) {
+                if (first) {
+                    std::rethrow_exception(first);
+                }
+                advance_write_batch_phase(
+                    state,
+                    write_batch_phase::value_durable,
+                    write_batch_phase::wal_durable,
+                    "write_batch_wal_phase");
+                return true;
+            });
+    }
+
+    inline auto
+    write_batch_memtable_phase(write_batch_state& state,
+                               std::span<front::front_sched* const> fronts) {
+        return just()
+            >> then([&state, fronts]() {
+                require_write_batch_phase(
+                    state,
+                    write_batch_phase::wal_durable,
+                    "write_batch_memtable_phase");
+                require_batch_front_topology(
+                    state,
+                    fronts,
+                    "write_batch_memtable_phase");
+                advance_write_batch_phase(
+                    state,
+                    write_batch_phase::wal_durable,
+                    write_batch_phase::memtable_applying,
+                    "write_batch_memtable_phase");
+            })
+            >> flat_map([&state, fronts]() {
+                const std::size_t fragment_count = state.ctx.fragments.size();
+                return just()
+                    >> loop(fragment_count)
+                    >> concurrent (fragment_count)
+                    >> flat_map([&state, fronts](std::size_t idx) {
+                        const auto& fragment = state.ctx.fragments[idx];
+                        const auto owner =
+                            static_cast<std::size_t>(fragment.owner);
+                        return front::insert_memtable_entries(
+                                *fronts[owner],
+                                fragment,
+                                entries_span(state.ctx))
+                            >> then([]() {
+                                return std::exception_ptr{};
+                            })
+                            >> any_exception([](std::exception_ptr ep) {
+                                return just(std::move(ep));
+                            });
+                    })
+                    >> reduce(
+                        std::exception_ptr{},
+                        [](std::exception_ptr& first,
+                           std::exception_ptr ep) {
+                            if (!first && ep) {
+                                first = std::move(ep);
+                            }
+                        });
+            })
+            >> then([&state](std::exception_ptr first) {
+                if (first) {
+                    std::rethrow_exception(first);
+                }
+                advance_write_batch_phase(
+                    state,
+                    write_batch_phase::memtable_applying,
+                    write_batch_phase::memtable_applied,
+                    "write_batch_memtable_phase");
+                return true;
+            });
+    }
+
+    inline auto
+    write_batch_publish(coord::coord_sched& coord_sched,
+                        write_batch_state& state) {
+        return just()
+            >> then([&state]() {
+                require_write_batch_phase(
+                    state,
+                    write_batch_phase::memtable_applied,
+                    "write_batch_publish");
+            })
+            >> flat_map([&coord_sched, &state]() {
+                return coord::publish_batch(coord_sched, state.ctx.batch_lsn);
+            })
+            >> then([&state]() {
+                advance_write_batch_phase(
+                    state,
+                    write_batch_phase::memtable_applied,
+                    write_batch_phase::published,
+                    "write_batch_publish");
+                return true;
+            });
+    }
+
+    inline auto
+    write_batch_release(coord::coord_sched& coord_sched,
+                        write_batch_state& state) {
+        return just()
+            >> then([&state]() {
+                require_release_allowed(state, "write_batch_release");
+            })
+            >> flat_map([&coord_sched, &state]() {
+                return coord::release_batch(coord_sched, state.ctx.batch_lsn);
+            })
+            >> then([&state]() {
+                switch (state.phase) {
+                case write_batch_phase::assigned:
+                    advance_write_batch_phase(
+                        state,
+                        write_batch_phase::assigned,
+                        write_batch_phase::released,
+                        "write_batch_release");
+                    break;
+                case write_batch_phase::value_durable:
+                    advance_write_batch_phase(
+                        state,
+                        write_batch_phase::value_durable,
+                        write_batch_phase::released,
+                        "write_batch_release");
+                    break;
+                case write_batch_phase::wal_durable:
+                    advance_write_batch_phase(
+                        state,
+                        write_batch_phase::wal_durable,
+                        write_batch_phase::released,
+                        "write_batch_release");
+                    break;
+                case write_batch_phase::memtable_applying:
+                case write_batch_phase::memtable_applied:
+                case write_batch_phase::published:
+                case write_batch_phase::released:
+                    require_release_allowed(state, "write_batch_release");
+                    break;
+                }
+                return true;
             });
     }
 

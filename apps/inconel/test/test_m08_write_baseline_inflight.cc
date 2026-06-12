@@ -909,6 +909,54 @@ expect_visible_value(const write_fixture& fx,
     CHECK(same_value_ref(hit.durable, expected));
 }
 
+bool
+front_memtable_has_key(const write_fixture& fx, std::string_view key) {
+    const auto owner = owner_for_key(key, fx.front_count);
+    const auto& table = fx.front_storage[owner]->active_for_testing()->table;
+    return table.find(key) != table.end();
+}
+
+void
+expect_memtable_data_ver(const write_fixture& fx,
+                         std::string_view key,
+                         uint64_t data_ver) {
+    const auto owner = owner_for_key(key, fx.front_count);
+    const auto& table = fx.front_storage[owner]->active_for_testing()->table;
+    auto it = table.find(key);
+    CHECK(it != table.end());
+    bool found = false;
+    for (const auto& entry : it->second) {
+        if (entry.data_ver == data_ver) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+}
+
+std::unique_ptr<write_path::write_batch_state>
+single_put_to_wal(write_fixture& fx,
+                  std::string key,
+                  std::string value) {
+    auto state = std::make_unique<write_path::write_batch_state>(
+        fx.assign_state({
+            {.op = core::write_op_type::put,
+             .key = std::move(key),
+             .value = std::move(value)},
+        }));
+    fx.run_value(*state);
+    fx.run_wal(*state);
+    CHECK(state->phase == write_path::write_batch_phase::wal_durable);
+    return state;
+}
+
+void
+finish_published(write_fixture& fx, write_path::write_batch_state& state) {
+    fx.run_memtable(state);
+    fx.run_publish(state);
+    CHECK(state.phase == write_path::write_batch_phase::published);
+}
+
 void
 m08_baseline_single_batch_put_delete_full_path() {
     write_fixture fx(3);
@@ -1064,6 +1112,101 @@ m08_state_owns_ctx_without_second_copy() {
     CHECK(restored.phase == write_path::write_batch_phase::assigned);
 }
 
+void
+m08_inflight_parks_after_wal_without_publish() {
+    write_fixture fx;
+    std::vector<std::string> keys{
+        key_for_owner(0, fx.front_count, "park-a"),
+        key_for_owner(1, fx.front_count, "park-b"),
+        key_for_owner(0, fx.front_count, "park-c"),
+    };
+
+    std::vector<std::unique_ptr<write_path::write_batch_state>> parked;
+    parked.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        parked.push_back(single_put_to_wal(
+            fx, keys[i], "value-" + std::to_string(i)));
+        CHECK(parked.back()->ctx.batch_lsn == i + 1);
+    }
+
+    CHECK(fx.visible_lsn() == 0);
+    for (const auto& front_sched : fx.front_storage) {
+        CHECK(front_sched->active_for_testing()->table.empty());
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        CHECK(parked[i]->phase == write_path::write_batch_phase::wal_durable);
+        expect_miss(fx.lookup_visible(keys[i]));
+    }
+
+    const auto wal_entries = collect_all_wal_entries(fx);
+    CHECK(wal_entries.size() == keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        const auto& wal_entry = find_wal_entry(wal_entries, keys[i]);
+        CHECK(wal_entry.op_type == format::wal_op_type::put);
+        CHECK(wal_entry.lsn == i + 1);
+    }
+}
+
+void
+m08_out_of_order_finish_advances_durable_lsn_gap_free() {
+    write_fixture fx;
+    const std::string key1 = key_for_owner(0, fx.front_count, "finish-a");
+    const std::string key2 = key_for_owner(1, fx.front_count, "finish-b");
+    const std::string key3 = key_for_owner(0, fx.front_count, "finish-c");
+
+    auto first = single_put_to_wal(fx, key1, "v1");
+    auto second = single_put_to_wal(fx, key2, "v2");
+    auto third = single_put_to_wal(fx, key3, "v3");
+
+    const auto first_ref = find_entry(first->ctx, key1).allocated_vr;
+    const auto second_ref = find_entry(second->ctx, key2).allocated_vr;
+    const auto third_ref = find_entry(third->ctx, key3).allocated_vr;
+
+    finish_published(fx, *first);
+    CHECK(fx.visible_lsn() == 1);
+    expect_visible_value(fx, key1, first_ref);
+    expect_miss(fx.lookup_visible(key2));
+    expect_miss(fx.lookup_visible(key3));
+
+    finish_published(fx, *third);
+    CHECK(fx.visible_lsn() == 1);
+    expect_memtable_data_ver(fx, key3, third->ctx.batch_lsn);
+    CHECK(third->ctx.batch_lsn > fx.visible_lsn());
+    expect_miss(fx.lookup_visible(key3));
+
+    finish_published(fx, *second);
+    CHECK(fx.visible_lsn() == 3);
+    expect_visible_value(fx, key1, first_ref);
+    expect_visible_value(fx, key2, second_ref);
+    expect_visible_value(fx, key3, third_ref);
+}
+
+void
+m08_release_parked_fills_hole_without_visibility() {
+    write_fixture fx;
+    const std::string released_key =
+        key_for_owner(0, fx.front_count, "release-a");
+    const std::string published_key =
+        key_for_owner(1, fx.front_count, "release-b");
+
+    auto released = single_put_to_wal(fx, released_key, "drop");
+    auto published = single_put_to_wal(fx, published_key, "keep");
+    const auto published_ref = find_entry(published->ctx,
+                                          published_key).allocated_vr;
+
+    finish_published(fx, *published);
+    CHECK(fx.visible_lsn() == 0);
+    expect_miss(fx.lookup_visible(released_key));
+    expect_miss(fx.lookup_visible(published_key));
+
+    fx.run_release(*released);
+    CHECK(released->phase == write_path::write_batch_phase::released);
+    CHECK(fx.visible_lsn() == 2);
+    expect_miss(fx.lookup_visible(released_key));
+    CHECK(!front_memtable_has_key(fx, released_key));
+    expect_visible_value(fx, published_key, published_ref);
+}
+
 }  // namespace
 
 int
@@ -1071,5 +1214,8 @@ main() {
     m08_baseline_single_batch_put_delete_full_path();
     m08_delete_only_batch_full_path();
     m08_state_owns_ctx_without_second_copy();
+    m08_inflight_parks_after_wal_without_publish();
+    m08_out_of_order_finish_advances_durable_lsn_gap_free();
+    m08_release_parked_fills_hole_without_visibility();
     return 0;
 }

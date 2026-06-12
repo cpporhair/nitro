@@ -465,7 +465,7 @@ submit_result(SenderBuilder&& build_sender) {
                     promise->set_value(*caught);
                 } else {
                     promise->set_value(
-                        T(std::forward<decltype(value)>(value)));
+                        T(std::move(value)));
                 }
             })
         >> pump::sender::submit(ctx);
@@ -494,6 +494,7 @@ struct write_fixture {
     core::data_area_heads heads{};
     m10_fake_nvme::scheduler nvme;
     value_sched_t value_sched;
+    value_sched_t* extra_value_sched = nullptr;
     fake_nvme_provider provider;
     wal::segment_geometry geom;
     wal::wal_space_sched wal_space;
@@ -613,6 +614,9 @@ struct write_fixture {
         bool progress = false;
         progress |= coord->advance();
         progress |= value_sched.advance();
+        if (extra_value_sched != nullptr) {
+            progress |= extra_value_sched->advance();
+        }
         for (auto& front_sched : front_storage) {
             progress |= front_sched->advance();
         }
@@ -644,6 +648,58 @@ struct write_fixture {
         auto sub = submit_point_get(key);
         drive_until_ready(sub);
         return sub.fut.get();
+    }
+
+    write_path::write_batch_state
+    assign_state(std::vector<core::raw_batch_op> ops) {
+        auto input = make_input(std::move(ops));
+        auto sub = submit_result<core::batch_ctx>(
+            [this, input = std::move(input)]() mutable {
+                return coord::assign_batch_lsn(*coord, std::move(input));
+            });
+        drive_until_ready(sub);
+        return write_path::write_batch_state(
+            expect_ok<core::batch_ctx>(sub.fut.get()));
+    }
+
+    template <typename SenderBuilder>
+    op_result<bool>
+    run_bool_result(SenderBuilder&& build_sender,
+                    bool advance_nvme = true) {
+        auto sub = submit_result<bool>(
+            std::forward<SenderBuilder>(build_sender));
+        drive_until_ready(sub, advance_nvme);
+        return sub.fut.get();
+    }
+
+    void expect_bool_ok(op_result<bool>&& result) {
+        CHECK(std::holds_alternative<bool>(result));
+        CHECK(std::get<bool>(result));
+    }
+
+    void run_value(write_path::write_batch_state& state) {
+        expect_bool_ok(run_bool_result([&]() {
+            return write_path::write_batch_value_phase(state, provider);
+        }));
+    }
+
+    void run_wal(write_path::write_batch_state& state) {
+        expect_bool_ok(run_bool_result([&]() {
+            return write_path::write_batch_wal_phase(
+                state, fronts(), wal_space, nvmes());
+        }));
+    }
+
+    void run_memtable(write_path::write_batch_state& state) {
+        expect_bool_ok(run_bool_result([&]() {
+            return write_path::write_batch_memtable_phase(state, fronts());
+        }));
+    }
+
+    void run_publish(write_path::write_batch_state& state) {
+        expect_bool_ok(run_bool_result([&]() {
+            return write_path::write_batch_publish(*coord, state);
+        }));
     }
 
     [[nodiscard]] uint64_t visible_lsn() const {
@@ -757,6 +813,98 @@ m10_cross_front_point_get() {
         expect_ok<pipeline::point_get_result>(fx.run_point_get(missing1)));
 }
 
+void
+m10_unpublished_write_invisible_then_visible() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "unpublished");
+
+    auto state = fx.assign_state({
+        {.op = core::write_op_type::put, .key = key, .value = "parked-body"},
+    });
+    CHECK(state.ctx.batch_lsn == 1);
+    fx.run_value(state);
+    fx.run_wal(state);
+    CHECK(state.phase == write_path::write_batch_phase::wal_durable);
+    CHECK(fx.visible_lsn() == 0);
+
+    auto before = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_not_found(before);
+
+    fx.run_memtable(state);
+    fx.run_publish(state);
+    CHECK(state.phase == write_path::write_batch_phase::published);
+    CHECK(fx.visible_lsn() == 1);
+
+    auto after = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_found(after, "parked-body");
+}
+
+void
+m10_memtable_hit_reads_value_from_nvme_when_cache_cold() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "cold-cache");
+    const std::string body = "cold-cache-body";
+
+    (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put, .key = key, .value = body},
+    }));
+
+    core::data_area_heads cold_heads{};
+    write_fixture::value_sched_t cold_value_sched(
+        std::span<const uint32_t>(fx.class_sizes.data(), fx.class_sizes.size()),
+        kLbaSize,
+        format::paddr{0, 10000},
+        format::paddr{0, 200000},
+        &cold_heads,
+        core::segmented_clock_cache(128),
+        kQuantumBytes,
+        kGroupSizeLbas,
+        2048,
+        memory::make_heap_dma_page_allocator(),
+        4096,
+        -1,
+        value::value_io_policy{});
+    core::registry::value_alloc_sched = &cold_value_sched;
+    fx.extra_value_sched = &cold_value_sched;
+
+    const uint32_t reads_before = fx.nvme.reads.calls;
+    auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_found(got, body);
+    CHECK(fx.nvme.reads.calls > reads_before);
+}
+
+void
+m10_compose_without_submit_has_no_owner_side_effect() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "compose-only");
+
+    const uint32_t calls_before = fx.nvme.total_calls();
+    {
+        auto sender = fx.compose_point_get(key);
+        (void)sender;
+    }
+
+    CHECK(fx.nvme.total_calls() == calls_before);
+    CHECK(fx.visible_lsn() == 0);
+    CHECK(!fx.advance_all());
+}
+
+void
+m10_point_get_unaffected_by_closed_gate() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "closed-gate");
+
+    (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put, .key = key, .value = "gate-body"},
+    }));
+    CHECK(fx.visible_lsn() == 1);
+
+    fx.coord->close_gate_for_testing();
+    auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_found(got, "gate-body");
+    fx.coord->open_gate_for_testing();
+}
+
 }  // namespace
 
 int
@@ -766,5 +914,9 @@ main() {
     m10_delete_returns_not_found();
     m10_missing_key_not_found_via_empty_tree();
     m10_cross_front_point_get();
+    m10_unpublished_write_invisible_then_visible();
+    m10_memtable_hit_reads_value_from_nvme_when_cache_cold();
+    m10_compose_without_submit_has_no_owner_side_effect();
+    m10_point_get_unaffected_by_closed_gate();
     return 0;
 }

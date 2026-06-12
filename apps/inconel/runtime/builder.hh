@@ -261,6 +261,61 @@ namespace apps::inconel::runtime {
                 "runtime::build_runtime: profile.shadow_slots_per_range is 0");
         }
 
+        // WAL area parameters (M11 / ODF §2.2, §3.6, §6, §7). These
+        // are disk-format fields sourced from format_profile; runtime
+        // options must not grow an independent WAL layout surface.
+        if (profile.wal_segment_size == 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.wal_segment_size is 0");
+        }
+        if (profile.wal_segment_size % profile.lba_size != 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.wal_segment_size is not "
+                "an integral multiple of profile.lba_size");
+        }
+        if (profile.wal_segment_count == 0) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.wal_segment_count is 0");
+        }
+        if (profile.wal_base_paddr.device_id !=
+            profile.value_data_area_base.device_id) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile WAL base device_id does "
+                "not match value_data_area_base device_id");
+        }
+        if (profile.wal_base_paddr.lba < 2) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile.wal_base_paddr.lba is "
+                "inside the superblock area");
+        }
+        {
+            const uint64_t wal_segment_lbas =
+                static_cast<uint64_t>(profile.wal_segment_size)
+                / profile.lba_size;
+            if (profile.wal_segment_count >
+                (std::numeric_limits<uint64_t>::max()
+                 - profile.wal_base_paddr.lba) / wal_segment_lbas) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile WAL area overflows LBA "
+                    "address space");
+            }
+            const uint64_t wal_end_lba =
+                profile.wal_base_paddr.lba
+                + static_cast<uint64_t>(profile.wal_segment_count)
+                    * wal_segment_lbas;
+            if (wal_end_lba > profile.value_data_area_base.lba) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: profile WAL area overlaps the "
+                    "data area");
+            }
+        }
+        if (!format::profile_wal_segment_can_fit_v1_max_entry(
+                profile.lba_size, profile.wal_segment_size)) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: profile WAL segment cannot fit the "
+                "v1 maximum WAL entry");
+        }
+
         // INC-051 / 037 plan §"Allocation Quantum" + §"Group 分片". Both
         // fields are disk-format truth (recovery rebuilds value_space_manager
         // partial metadata from them); reject any drift before the runtime

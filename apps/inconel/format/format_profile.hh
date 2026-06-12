@@ -2,9 +2,11 @@
 #define APPS_INCONEL_FORMAT_FORMAT_PROFILE_HH
 
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "./types.hh"
+#include "./wal.hh"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // format_profile — bring-up-era single source of truth for the subset of
@@ -20,8 +22,8 @@
 //     must go through a dedicated harness, not through public options.
 //
 // Out of scope for v1:
-//   - Superblock / WAL / tree page parameters. They already live in their own
-//     format headers (`format/superblock.hh`, `format/wal.hh`, `format/tree_page.hh`).
+//   - Superblock POD and tree page byte layout. They already live in their own
+//     format headers (`format/superblock.hh`, `format/tree_page.hh`).
 //   - Dynamic profile loading. Once INC-031 (superblock POD) and INC-035
 //     (format/recovery) land, the live runtime will populate the same fields
 //     from the superblock it just read, and this constant will degrade to
@@ -71,6 +73,15 @@ namespace apps::inconel::format {
         // and `profile_is_self_consistent` below must reject it.
         uint32_t tree_page_size;
         uint32_t shadow_slots_per_range;
+
+        // ── WAL area parameters (M11 / ODF §2.2, §3.6, §6, §7) ──
+        //
+        // These mirror the superblock fields with the same names. Runtime
+        // builder code constructs `wal::segment_geometry` from this profile;
+        // WAL layout is disk format, not a deployment knob.
+        paddr    wal_base_paddr;
+        uint32_t wal_segment_size;
+        uint32_t wal_segment_count;
 
         // ── value-space parameters (INC-051, 037 plan) ──
         //
@@ -124,6 +135,26 @@ namespace apps::inconel::format {
     // can be rewritten to any other LBA-aligned page size without touching
     // this predicate.
 
+    [[nodiscard]] constexpr uint64_t
+    profile_wal_trailer_reserved_bytes(uint32_t lba_size) noexcept {
+        if (lba_size == 0) return 0;
+        return ((static_cast<uint64_t>(WAL_SEALED_TRAILER_SIZE) + lba_size - 1)
+                / lba_size)
+               * lba_size;
+    }
+
+    [[nodiscard]] constexpr bool
+    profile_wal_segment_can_fit_v1_max_entry(uint32_t lba_size,
+                                             uint32_t wal_segment_size) noexcept {
+        const uint64_t trailer_reserved =
+            profile_wal_trailer_reserved_bytes(lba_size);
+        const uint64_t max_entry = wal_put_entry_size(1024);
+        return static_cast<uint64_t>(wal_segment_size) >
+               static_cast<uint64_t>(WAL_SEGMENT_HEADER_SIZE)
+                   + trailer_reserved
+                   + max_entry;
+    }
+
     constexpr bool
     profile_is_self_consistent(const format_profile& p) noexcept {
         if (p.lba_size == 0) return false;
@@ -153,6 +184,30 @@ namespace apps::inconel::format {
         if (p.tree_page_size == 0) return false;
         if (p.tree_page_size % p.lba_size != 0) return false;
         if (p.shadow_slots_per_range == 0) return false;
+
+        // ── WAL parameters (M11 / ODF §2.2, §3.6, §6, §7) ──
+        if (p.wal_segment_size == 0) return false;
+        if (p.wal_segment_size % p.lba_size != 0) return false;
+        if (p.wal_segment_count == 0) return false;
+        if (p.wal_base_paddr.device_id != p.value_data_area_base.device_id)
+            return false;
+        if (p.wal_base_paddr.lba < 2) return false;
+        const uint64_t wal_segment_lbas =
+            static_cast<uint64_t>(p.wal_segment_size) / p.lba_size;
+        if (wal_segment_lbas == 0) return false;
+        if (p.wal_segment_count >
+            (std::numeric_limits<uint64_t>::max() - p.wal_base_paddr.lba)
+                / wal_segment_lbas) {
+            return false;
+        }
+        const uint64_t wal_end_lba =
+            p.wal_base_paddr.lba
+            + static_cast<uint64_t>(p.wal_segment_count) * wal_segment_lbas;
+        if (wal_end_lba > p.value_data_area_base.lba) return false;
+        if (!profile_wal_segment_can_fit_v1_max_entry(
+                p.lba_size, p.wal_segment_size)) {
+            return false;
+        }
 
         // ── value-space parameters (INC-051) ──
         // Currently the only legal quantum is 64 B (037 §"Allocation
@@ -208,6 +263,13 @@ namespace apps::inconel::format {
         // them.
         .tree_page_size         = 4096,
         .shadow_slots_per_range = 1,
+        // WAL bootstrap geometry. wal_base starts after the two
+        // superblock slots plus six reserved metadata pages (ODF §7).
+        // 32 segments × 256 KiB = [LBA 8, 2056), safely below
+        // value_data_area_base.lba 4000.
+        .wal_base_paddr         = paddr{0, 8},
+        .wal_segment_size       = 256u * 1024u,
+        .wal_segment_count      = 32,
         // INC-051: production defaults. quantum 64 B is the only legal
         // value today; group size 256 MiB at 4 KiB lba_size = 65536 LBAs.
         .value_space_quantum_bytes    = 64,

@@ -244,6 +244,11 @@ namespace apps::inconel::front {
                         uint64_t read_lsn,
                         core::front_read_set frs);
 
+        [[nodiscard]] _front_lookup::sender
+        lookup_memtable(std::string_view key,
+                        uint64_t read_lsn,
+                        const core::front_read_set* frs);
+
         [[nodiscard]] _front_batch_lookup::sender
         batch_lookup(std::span<const std::string_view> keys,
                      uint64_t read_lsn,
@@ -812,7 +817,8 @@ namespace apps::inconel::front {
         struct req {
             std::string_view key;
             uint64_t read_lsn = 0;
-            core::front_read_set frs;
+            core::front_read_set owned;
+            const core::front_read_set* borrowed = nullptr;
             std::move_only_function<void(
                 core::owner_outcome<core::memtable_lookup_result>&&)> cb;
         };
@@ -822,7 +828,8 @@ namespace apps::inconel::front {
             front_sched* sched = nullptr;
             std::string_view key;
             uint64_t read_lsn = 0;
-            core::front_read_set frs;
+            core::front_read_set owned;
+            const core::front_read_set* borrowed = nullptr;
 
             template<uint32_t pos, typename ctx_t, typename scope_t>
             void start(ctx_t& ctx, scope_t& scope);
@@ -832,13 +839,27 @@ namespace apps::inconel::front {
             front_sched* sched = nullptr;
             std::string_view key;
             uint64_t read_lsn = 0;
-            core::front_read_set frs;
+            core::front_read_set owned;
+            const core::front_read_set* borrowed = nullptr;
 
             sender(front_sched* s,
                    std::string_view k,
                    uint64_t lsn,
                    core::front_read_set snapshot)
-                : sched(s), key(k), read_lsn(lsn), frs(std::move(snapshot)) {}
+                : sched(s)
+                , key(k)
+                , read_lsn(lsn)
+                , owned(std::move(snapshot))
+                , borrowed(nullptr) {}
+
+            sender(front_sched* s,
+                   std::string_view k,
+                   uint64_t lsn,
+                   const core::front_read_set* snapshot)
+                : sched(s)
+                , key(k)
+                , read_lsn(lsn)
+                , borrowed(snapshot) {}
 
             sender(sender&&) noexcept = default;
             sender& operator=(sender&&) noexcept = default;
@@ -850,7 +871,8 @@ namespace apps::inconel::front {
                     .sched = sched,
                     .key = key,
                     .read_lsn = read_lsn,
-                    .frs = std::move(frs),
+                    .owned = std::move(owned),
+                    .borrowed = borrowed,
                 };
             }
 
@@ -1289,6 +1311,17 @@ namespace apps::inconel::front {
                                  core::front_read_set frs) {
         return _front_lookup::sender{
             this, key, read_lsn, std::move(frs)};
+    }
+
+    inline _front_lookup::sender
+    front_sched::lookup_memtable(std::string_view key,
+                                 uint64_t read_lsn,
+                                 const core::front_read_set* frs) {
+        if (frs == nullptr) {
+            throw std::invalid_argument(
+                "front::front_sched: lookup borrowed front_read_set is null");
+        }
+        return _front_lookup::sender{this, key, read_lsn, frs};
     }
 
     inline _front_batch_lookup::sender
@@ -2020,7 +2053,9 @@ namespace apps::inconel::front {
         std::unique_ptr<_front_lookup::req> req(r);
         core::memtable_lookup_result result;
         try {
-            result = lookup_memtable_now(req->key, req->read_lsn, req->frs);
+            const core::front_read_set* frs =
+                req->borrowed != nullptr ? req->borrowed : &req->owned;
+            result = lookup_memtable_now(req->key, req->read_lsn, *frs);
         } catch (...) {
             auto cb = std::move(req->cb);
             req.reset();
@@ -2396,7 +2431,8 @@ namespace apps::inconel::front {
         sched->schedule_lookup(new req{
             .key = key,
             .read_lsn = read_lsn,
-            .frs = std::move(frs),
+            .owned = std::move(owned),
+            .borrowed = borrowed,
             .cb = core::make_owner_pusher<
                 pos, scope_t, core::memtable_lookup_result>(ctx, scope),
         });

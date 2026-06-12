@@ -27,6 +27,17 @@ namespace apps::inconel::front {
         return sched.lookup_memtable(key, read_lsn, std::move(frs));
     }
 
+    // Borrowed-snapshot entry for read pipelines that already pin the owning
+    // PRS through a read_handle context node. `frs` must remain valid until
+    // this sender completes; front does not extend its lifetime.
+    [[nodiscard]] inline auto
+    lookup_memtable(front_sched& sched,
+                    std::string_view key,
+                    uint64_t read_lsn,
+                    const core::front_read_set* frs) {
+        return sched.lookup_memtable(key, read_lsn, frs);
+    }
+
     [[nodiscard]] inline auto
     batch_lookup(front_sched& sched,
                  std::span<const std::string_view> keys,

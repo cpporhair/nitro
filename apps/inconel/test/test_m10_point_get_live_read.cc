@@ -30,12 +30,15 @@
 #include "apps/inconel/core/page_cache.hh"
 #include "apps/inconel/core/read_catalog.hh"
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
 #include "apps/inconel/core/tree_geometry.hh"
 #include "apps/inconel/core/tree_manifest.hh"
+#include "apps/inconel/core/tree_read_domain.hh"
 #include "apps/inconel/format/value_object.hh"
 #include "apps/inconel/format/wal.hh"
 #include "apps/inconel/front/sender.hh"
 #include "apps/inconel/pipeline/point_get.hh"
+#include "apps/inconel/tree/page_builder.hh"
 #include "apps/inconel/value/sender.hh"
 #include "apps/inconel/wal/sender.hh"
 #include "apps/inconel/write_path/write_batch.hh"
@@ -410,6 +413,32 @@ make_cat_from_active(
         std::move(prs), durable_lsn, epoch);
 }
 
+std::shared_ptr<const core::publish_catalog>
+make_cat_with_manifest(
+    const std::vector<std::shared_ptr<core::memtable_gen>>& active,
+    std::shared_ptr<const core::tree_manifest> manifest,
+    uint64_t durable_lsn,
+    uint64_t epoch) {
+    auto fronts = std::make_shared<std::vector<core::front_read_set>>();
+    fronts->reserve(active.size());
+    for (const auto& gen : active) {
+        fronts->push_back(core::front_read_set{.active = gen, .imms = {}});
+    }
+    std::shared_ptr<const std::vector<core::front_read_set>> fronts_const =
+        fronts;
+
+    auto guard = std::make_shared<core::checkpoint_guard>();
+    guard->manifest = std::move(manifest);
+    auto prs = std::make_shared<core::published_read_set>(
+        core::published_read_set{
+            .tree_guard = std::move(guard),
+            .fronts = std::move(fronts_const),
+            .epoch = epoch,
+        });
+    return std::make_shared<core::publish_catalog>(
+        std::move(prs), durable_lsn, epoch);
+}
+
 std::span<const core::raw_batch_op>
 op_span(const std::vector<core::raw_batch_op>& ops) {
     return {ops.data(), ops.size()};
@@ -498,12 +527,20 @@ struct write_fixture {
     fake_nvme_provider provider;
     wal::segment_geometry geom;
     wal::wal_space_sched wal_space;
+    core::tree_geometry tree_geom{
+        .lba_size = 4096,
+        .tree_page_size = 4096,
+        .shadow_slots_per_range = 1,
+    };
     std::vector<std::shared_ptr<core::memtable_gen>> active_gens;
     std::vector<std::unique_ptr<front::front_sched>> front_storage;
     std::vector<front::front_sched*> front_ptrs;
     std::vector<m10_fake_nvme::scheduler*> nvme_ptrs;
     std::shared_ptr<const core::publish_catalog> initial_cat;
     std::unique_ptr<coord::coord_sched> coord;
+    std::shared_ptr<const core::shard_partition_map> tree_partitions;
+    std::unique_ptr<core::tree_read_domain<core::segmented_clock_cache>>
+        tree_domain;
 
     explicit write_fixture(uint32_t front_count_in = 2,
                            std::size_t front_queue_depth = 1024,
@@ -617,6 +654,9 @@ struct write_fixture {
         if (extra_value_sched != nullptr) {
             progress |= extra_value_sched->advance();
         }
+        if (tree_domain) {
+            progress |= tree_domain->advance();
+        }
         for (auto& front_sched : front_storage) {
             progress |= front_sched->advance();
         }
@@ -705,7 +745,152 @@ struct write_fixture {
     [[nodiscard]] uint64_t visible_lsn() const {
         return coord->acquire_read_handle_for_testing().read_lsn;
     }
+
+    [[nodiscard]] core::memtable_lookup_result
+    lookup_visible(std::string_view key) const {
+        const auto rh = coord->acquire_read_handle_for_testing();
+        const auto owner = owner_for_key(key, front_count);
+        return front_storage[owner]->lookup_memtable_for_testing(
+            key, rh.read_lsn, (*rh.cat->prs->fronts)[owner]);
+    }
+
+    void ensure_tree_domain() {
+        if (tree_domain) return;
+
+        core::leaf_order_index empty_order;
+        auto partitions = std::make_shared<const core::shard_partition_map>(
+            core::build_initial_shard_partition_map(empty_order, 1));
+        core::registry::install_shard_partitions(partitions);
+        tree_partitions = partitions;
+
+        tree_domain =
+            std::make_unique<core::tree_read_domain<
+                core::segmented_clock_cache>>(
+                0,
+                tree_partitions,
+                core::segmented_clock_cache(128),
+                &tree_geom,
+                128,
+                memory::make_heap_dma_page_allocator(),
+                4096,
+                -1);
+        core::registry::tree_read_domains.list.push_back(tree_domain.get());
+        core::registry::tree_read_domains.by_core[0] = tree_domain.get();
+    }
+
+    [[nodiscard]] std::vector<std::shared_ptr<core::memtable_gen>>
+    make_empty_active_gens(uint64_t local_epoch = 20) const {
+        std::vector<std::shared_ptr<core::memtable_gen>> out;
+        out.reserve(front_count);
+        for (uint32_t i = 0; i < front_count; ++i) {
+            out.push_back(front::make_front_memtable_gen(
+                i, front_count, local_epoch, core::memtable_gen::state::active));
+        }
+        return out;
+    }
+
+    void install_tree_cat(
+        std::shared_ptr<const core::tree_manifest> manifest,
+        const std::vector<std::shared_ptr<core::memtable_gen>>& fronts_snapshot,
+        uint64_t durable_lsn,
+        uint64_t epoch) {
+        coord->install_cat_for_testing(make_cat_with_manifest(
+            fronts_snapshot, std::move(manifest), durable_lsn, epoch));
+    }
 };
+
+const format::value_ref&
+expect_value_ref(const core::memtable_lookup_result& result) {
+    CHECK(std::holds_alternative<core::memtable_value_hit>(result));
+    return std::get<core::memtable_value_hit>(result).durable;
+}
+
+struct tree_leaf_fixture {
+    std::shared_ptr<const core::tree_manifest> manifest;
+    std::vector<char> leaf_image;
+};
+
+tree_leaf_fixture
+make_tree_leaf_fixture(write_fixture& fx,
+                       std::string_view key,
+                       std::optional<format::value_ref> vr,
+                       uint64_t data_ver) {
+    fx.ensure_tree_domain();
+
+    tree_leaf_fixture out;
+    out.leaf_image.assign(fx.tree_geom.tree_page_size, char{0});
+
+    tree::leaf_page_builder builder;
+    builder.init(out.leaf_image.data(), fx.tree_geom.tree_page_size);
+    if (vr.has_value()) {
+        CHECK(builder.add_value(key, data_ver, *vr));
+    } else {
+        CHECK(builder.add_tombstone(key, data_ver));
+    }
+    builder.finalize();
+
+    const format::paddr root_range_base{0, 500000};
+    core::leaf_order_index order;
+    order.spans.push_back(core::leaf_span{
+        .fence_lower_off = 0,
+        .fence_upper_off = 0,
+        .fence_lower_len = 0,
+        .fence_upper_len = 0,
+        .leaf_range_base = root_range_base,
+    });
+
+    core::tree_manifest manifest;
+    manifest.root_range_base = root_range_base;
+    manifest.root_slot = fx.tree_geom.slot_paddr(root_range_base, 0);
+    manifest.slot_map.emplace(root_range_base, 0);
+    manifest.geom = &fx.tree_geom;
+    manifest.leaf_order = std::move(order);
+    out.manifest =
+        std::make_shared<const core::tree_manifest>(std::move(manifest));
+    return out;
+}
+
+void
+preheat_tree_leaf(write_fixture& fx,
+                  std::string_view key,
+                  const tree_leaf_fixture& leaf) {
+    fx.ensure_tree_domain();
+
+    std::string_view keys[] = {key};
+    auto state = tree::make_lookup_state(
+        std::span<const std::string_view>(keys, 1), leaf.manifest.get());
+    auto* sched = fx.tree_domain->lookup_sched;
+
+    auto read_sub = submit_result<tree::batch_decision>([&]() {
+        return sched->process(state);
+    });
+    fx.drive_until_ready(read_sub);
+    auto decision = expect_ok<tree::batch_decision>(read_sub.fut.get());
+    CHECK(std::holds_alternative<tree::decision_need_read>(decision));
+    auto frames = std::move(std::get<tree::decision_need_read>(decision).frames);
+    CHECK(!frames.empty());
+    for (auto* frame : frames) {
+        frame->copy_from_contiguous(leaf.leaf_image.data(),
+                                    leaf.leaf_image.size());
+    }
+
+    auto cache_sub = submit_result<bool>(
+        [sched, frames = std::move(frames)]() mutable {
+            return sched->submit_cache(std::move(frames));
+        });
+    fx.drive_until_ready(cache_sub);
+    CHECK(expect_ok<bool>(cache_sub.fut.get()));
+
+    auto done_sub = submit_result<tree::batch_decision>([&]() {
+        return sched->process(state);
+    });
+    fx.drive_until_ready(done_sub);
+    auto done = expect_ok<tree::batch_decision>(done_sub.fut.get());
+    CHECK(std::holds_alternative<tree::decision_done>(done));
+    CHECK(state.all_done);
+    CHECK(state.entries.size() == 1);
+    CHECK(state.entries[0].resolved);
+}
 
 void
 expect_found(const pipeline::point_get_result& r, std::string_view body) {
@@ -905,6 +1090,96 @@ m10_point_get_unaffected_by_closed_gate() {
     fx.coord->open_gate_for_testing();
 }
 
+void
+m10_tree_hit_value_via_manifest() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "tree-hit");
+    const std::string body = "tree-value-body";
+
+    (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put, .key = key, .value = body},
+    }));
+    const auto vr = expect_value_ref(fx.lookup_visible(key));
+
+    auto leaf = make_tree_leaf_fixture(fx, key, vr, 1);
+    preheat_tree_leaf(fx, key, leaf);
+    CHECK(fx.visible_lsn() == 1);
+    fx.install_tree_cat(
+        leaf.manifest, fx.make_empty_active_gens(), fx.visible_lsn(), 2);
+
+    auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_found(got, body);
+}
+
+void
+m10_tree_tombstone_not_found() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "tree-tombstone");
+    const std::string seed_key =
+        key_for_owner(1, fx.front_count, "tree-tombstone-seed");
+
+    (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put, .key = seed_key, .value = "seed"},
+    }));
+    CHECK(fx.visible_lsn() == 1);
+
+    auto leaf = make_tree_leaf_fixture(fx, key, std::nullopt, fx.visible_lsn());
+    preheat_tree_leaf(fx, key, leaf);
+    fx.install_tree_cat(
+        leaf.manifest, fx.make_empty_active_gens(), fx.visible_lsn(), 2);
+
+    auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+    expect_not_found(got);
+}
+
+void
+m10_memtable_winner_shadows_tree() {
+    {
+        write_fixture fx;
+        const std::string key =
+            key_for_owner(0, fx.front_count, "shadow-delete");
+        const std::string body = "tree-shadowed-by-delete";
+
+        (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+            {.op = core::write_op_type::put, .key = key, .value = body},
+        }));
+        const auto vr = expect_value_ref(fx.lookup_visible(key));
+        auto leaf = make_tree_leaf_fixture(fx, key, vr, 1);
+        preheat_tree_leaf(fx, key, leaf);
+
+        (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+            {.op = core::write_op_type::del, .key = key, .value = ""},
+        }));
+        CHECK(fx.visible_lsn() == 2);
+        fx.install_tree_cat(leaf.manifest, fx.active_gens, fx.visible_lsn(), 3);
+
+        auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+        expect_not_found(got);
+    }
+
+    {
+        write_fixture fx;
+        const std::string key =
+            key_for_owner(0, fx.front_count, "shadow-put");
+
+        (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+            {.op = core::write_op_type::put, .key = key, .value = "tree-v1"},
+        }));
+        const auto vr = expect_value_ref(fx.lookup_visible(key));
+        auto leaf = make_tree_leaf_fixture(fx, key, vr, 1);
+        preheat_tree_leaf(fx, key, leaf);
+
+        (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+            {.op = core::write_op_type::put, .key = key, .value = "mem-v2"},
+        }));
+        CHECK(fx.visible_lsn() == 2);
+        fx.install_tree_cat(leaf.manifest, fx.active_gens, fx.visible_lsn(), 3);
+
+        auto got = expect_ok<pipeline::point_get_result>(fx.run_point_get(key));
+        expect_found(got, "mem-v2");
+    }
+}
+
 }  // namespace
 
 int
@@ -918,5 +1193,8 @@ main() {
     m10_memtable_hit_reads_value_from_nvme_when_cache_cold();
     m10_compose_without_submit_has_no_owner_side_effect();
     m10_point_get_unaffected_by_closed_gate();
+    m10_tree_hit_value_via_manifest();
+    m10_tree_tombstone_not_found();
+    m10_memtable_winner_shadows_tree();
     return 0;
 }

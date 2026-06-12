@@ -162,6 +162,12 @@ target_include_directories(inconel_test_m09_production_write_batch PRIVATE ${CMA
 target_link_libraries(inconel_test_m09_production_write_batch PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m10_point_get_live_read
+        apps/inconel/test/test_m10_point_get_live_read.cc)
+target_include_directories(inconel_test_m10_point_get_live_read PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m10_point_get_live_read PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

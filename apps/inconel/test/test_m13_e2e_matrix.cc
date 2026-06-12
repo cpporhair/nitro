@@ -616,6 +616,267 @@ void m13_delete_read_not_found() {
 
 }  // namespace
 
+// ════════════════════════════════════════════════════════════════
+// Phase D — multicore harness + matrix 12 + seal-interleave probe.
+// Real threads drive rt::run per core; clients submit from their own
+// per_core producer lanes (this_core_id outside the runtime core set).
+// ════════════════════════════════════════════════════════════════
+
+#include <pthread.h>
+
+#include <algorithm>
+#include <atomic>
+
+#include "apps/inconel/runtime/run.hh"
+
+namespace {
+
+void pin_to_core(unsigned core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    const int rc = pthread_setaffinity_np(
+        pthread_self(), sizeof(cpuset), &cpuset);
+    CHECK(rc == 0);
+}
+
+struct multicore_fixture {
+    e2e_fixture fx;
+    std::vector<std::thread> runtime_threads;
+
+    explicit multicore_fixture(std::vector<uint32_t> cores_in = {0, 1, 2, 3})
+        : fx(std::move(cores_in)) {
+        runtime_threads.reserve(fx.cores.size());
+        for (uint32_t core : fx.cores) {
+            runtime_threads.emplace_back([this, core]() {
+                pin_to_core(core);
+                rt::run(fx.rt, core);
+            });
+        }
+    }
+
+    ~multicore_fixture() {
+        stop();
+    }
+
+    void stop() {
+        for (uint32_t core : fx.cores) {
+            fx.rt->is_running_by_core[core].store(false);
+        }
+        for (auto& t : runtime_threads) {
+            if (t.joinable()) t.join();
+        }
+        runtime_threads.clear();
+        // Post-stop, the main thread becomes the single-threaded driver
+        // again (inspection helpers, drain leftovers).
+        pump::core::this_core_id = 0;
+    }
+
+    // Submit-and-wait from a client thread. The runtime cores make the
+    // progress; the client only blocks on the future (bounded wait).
+    template <typename T>
+    static T await(submission<T>& sub, uint32_t timeout_ms = 30000) {
+        const auto status =
+            sub.fut.wait_for(std::chrono::milliseconds(timeout_ms));
+        CHECK(status == std::future_status::ready);
+        return expect_ok<T>(sub.fut.get());
+    }
+};
+
+// Windowed concurrent writer: keeps at most `window` batches in flight
+// so per-front WAL prepare backpressure (production default capacity 64)
+// is never the limiting factor of the test.
+struct client_stats {
+    std::vector<uint64_t> acked_lsns;
+    std::vector<std::string> keys;
+};
+
+client_stats
+run_write_client(e2e_fixture& fx,
+                 uint32_t client_core_id,
+                 std::string_view prefix,
+                 uint32_t batches,
+                 uint32_t window,
+                 bool two_front_batches) {
+    pump::core::this_core_id = client_core_id;
+
+    client_stats stats;
+    stats.acked_lsns.reserve(batches);
+
+    std::vector<submission<write_path::write_batch_result>> inflight;
+    std::vector<std::vector<std::string>> inflight_keys;
+
+    auto drain_one = [&]() {
+        auto result = multicore_fixture::await(inflight.front());
+        stats.acked_lsns.push_back(result.batch_lsn);
+        for (auto& k : inflight_keys.front()) {
+            stats.keys.push_back(std::move(k));
+        }
+        inflight.erase(inflight.begin());
+        inflight_keys.erase(inflight_keys.begin());
+    };
+
+    for (uint32_t i = 0; i < batches; ++i) {
+        std::vector<core::raw_batch_op> ops;
+        std::vector<std::string> keys;
+        if (two_front_batches) {
+            keys.push_back(key_for_owner(
+                0, fx.front_count(),
+                std::string(prefix) + "-a" + std::to_string(i)));
+            keys.push_back(key_for_owner(
+                1 % fx.front_count(), fx.front_count(),
+                std::string(prefix) + "-b" + std::to_string(i)));
+        } else {
+            keys.push_back(std::string(prefix) + "-" + std::to_string(i));
+        }
+        for (auto& k : keys) {
+            ops.push_back({.op = core::write_op_type::put,
+                           .key = k,
+                           .value = "v-" + k});
+        }
+        inflight.push_back(submit_result<write_path::write_batch_result>(
+            [&fx, input = fx.make_input(std::move(ops))]() mutable {
+                return rt::write_batch(std::move(input));
+            }));
+        inflight_keys.push_back(std::move(keys));
+        if (inflight.size() >= window) drain_one();
+    }
+    while (!inflight.empty()) drain_one();
+    return stats;
+}
+
+// ── matrix 12: concurrent write batches from multiple client cores ─
+
+void m13_multicore_concurrent_writes() {
+    multicore_fixture mc({0, 1, 2, 3});
+    constexpr uint32_t kPerClient = 100;
+
+    client_stats s1;
+    client_stats s2;
+    std::thread c1([&]() {
+        s1 = run_write_client(mc.fx, 20, "mc-c1", kPerClient, 16, false);
+    });
+    std::thread c2([&]() {
+        s2 = run_write_client(mc.fx, 21, "mc-c2", kPerClient, 16, false);
+    });
+    c1.join();
+    c2.join();
+
+    std::vector<uint64_t> all;
+    all.insert(all.end(), s1.acked_lsns.begin(), s1.acked_lsns.end());
+    all.insert(all.end(), s2.acked_lsns.begin(), s2.acked_lsns.end());
+    CHECK(all.size() == 2 * kPerClient);
+    std::sort(all.begin(), all.end());
+    for (uint64_t i = 0; i < all.size(); ++i) {
+        CHECK(all[i] == i + 1);  // gap-free, no duplicates
+    }
+
+    // Reads against the live multicore runtime.
+    pump::core::this_core_id = 22;
+    for (const auto& key : s1.keys) {
+        auto sub = submit_result<pipeline::point_get_result>(
+            [&key]() { return rt::point_get(key); });
+        expect_found(multicore_fixture::await(sub), "v-" + key);
+    }
+    for (const auto& key : s2.keys) {
+        auto sub = submit_result<pipeline::point_get_result>(
+            [&key]() { return rt::point_get(key); });
+        expect_found(multicore_fixture::await(sub), "v-" + key);
+    }
+
+    mc.stop();
+    CHECK(mc.fx.visible_lsn() == 2 * kPerClient);
+}
+
+// ── seal-interleave probe: M12's no-split invariant under real
+//    concurrency. Every two-front batch must land in the same seal
+//    era on both fronts. ──
+
+// Era of the gen (counted from the oldest) holding `key` at `lsn`.
+std::optional<std::size_t>
+gen_era_of(front::front_sched* front, std::string_view key, uint64_t lsn) {
+    auto in_gen = [&](const std::shared_ptr<core::memtable_gen>& gen) {
+        if (!gen) return false;
+        auto it = gen->table.find(key);
+        if (it == gen->table.end()) return false;
+        for (const auto& entry : it->second) {
+            if (entry.data_ver == lsn) return true;
+        }
+        return false;
+    };
+
+    std::vector<std::shared_ptr<core::memtable_gen>> old_to_new;
+    const auto imms = front->imms_for_testing();  // newest → oldest
+    for (auto it = imms.rbegin(); it != imms.rend(); ++it) {
+        old_to_new.push_back(*it);
+    }
+    old_to_new.push_back(front->active_for_testing());
+
+    for (std::size_t era = 0; era < old_to_new.size(); ++era) {
+        if (in_gen(old_to_new[era])) return era;
+    }
+    return std::nullopt;
+}
+
+void m13_multicore_seal_interleave_no_split_batches() {
+    multicore_fixture mc({0, 1, 2, 3});
+    constexpr uint32_t kBatches = 120;
+    constexpr uint32_t kSeals = 3;
+
+    client_stats writer_stats;
+    std::thread writer([&]() {
+        writer_stats = run_write_client(
+            mc.fx, 20, "si", kBatches, 16, /*two_front_batches=*/true);
+    });
+
+    std::thread sealer([&]() {
+        pump::core::this_core_id = 21;
+        for (uint32_t i = 0; i < kSeals; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            auto sub = submit_result<pipeline::seal_round_result>(
+                []() { return rt::seal_once(); });
+            auto seal = multicore_fixture::await(sub);
+            CHECK(seal.cat1 != nullptr);
+        }
+    });
+
+    writer.join();
+    sealer.join();
+    mc.stop();
+
+    // Post-run, single-threaded inspection: every acked two-front batch
+    // sits in the same seal era on both fronts (no split generation).
+    CHECK(writer_stats.acked_lsns.size() == kBatches);
+    CHECK(writer_stats.keys.size() == 2 * kBatches);
+
+    auto* front0 = core::registry::front_at(0);
+    auto* front1 = core::registry::front_at(
+        1 % core::registry::front_count());
+    const std::size_t imms0 = front0->imms_for_testing().size();
+    CHECK(imms0 == kSeals);
+
+    for (uint32_t i = 0; i < kBatches; ++i) {
+        const uint64_t lsn = writer_stats.acked_lsns[i];
+        const auto& k0 = writer_stats.keys[2 * i];
+        const auto& k1 = writer_stats.keys[2 * i + 1];
+
+        const auto era0 = gen_era_of(front0, k0, lsn);
+        const auto era1 = gen_era_of(front1, k1, lsn);
+        CHECK(era0.has_value());
+        CHECK(era1.has_value());
+        CHECK(*era0 == *era1);
+    }
+
+    // All data remains readable post-stop via the snapshot lookups.
+    for (uint32_t i = 0; i < kBatches; ++i) {
+        const auto& k0 = writer_stats.keys[2 * i];
+        auto result = mc.fx.lookup_visible(k0);
+        CHECK(std::holds_alternative<core::memtable_value_hit>(result));
+    }
+}
+
+}  // namespace
+
 int main() {
     m13_single_put_value_on_device();
     m13_multi_key_fanout_two_fronts();
@@ -628,5 +889,7 @@ int main() {
     m13_point_get_after_write();
     m13_overwrite_read_latest();
     m13_delete_read_not_found();
+    m13_multicore_concurrent_writes();
+    m13_multicore_seal_interleave_no_split_batches();
     return 0;
 }

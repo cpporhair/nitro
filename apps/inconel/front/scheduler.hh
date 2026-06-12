@@ -183,6 +183,7 @@ namespace apps::inconel::front {
             , front_count_(front_count)
             , next_local_gen_epoch_(next_local_gen_epoch)
             , active_(std::move(initial_active))
+            , queue_depth_(queue_depth)
             , wal_pending_prepare_capacity_(queue_depth) {
             validate_constructor_state(queue_depth);
         }
@@ -753,6 +754,7 @@ namespace apps::inconel::front {
         uint32_t front_count_;
         uint64_t next_local_gen_epoch_;
         std::shared_ptr<core::memtable_gen> active_;
+        std::size_t queue_depth_ = 0;
         std::vector<std::shared_ptr<core::memtable_gen>> imms_;
         std::optional<wal::wal_stream_state> wal_;
         wal::wal_append_config wal_config_{};
@@ -761,6 +763,15 @@ namespace apps::inconel::front {
         std::deque<_front_wal_prepare::req*> wal_pending_prepares_;
         std::size_t wal_pending_prepare_capacity_ = 0;
         uint64_t next_wal_plan_id_ = 1;
+
+        [[nodiscard]] static std::size_t
+        resolve_wal_pending_prepare_capacity(
+            wal::wal_append_config config,
+            std::size_t queue_depth) noexcept {
+            return config.pending_prepare_capacity != 0
+                ? config.pending_prepare_capacity
+                : queue_depth;
+        }
     };
 
     namespace _front_insert {
@@ -1492,6 +1503,8 @@ namespace apps::inconel::front {
         wal::validate_wal_append_config(config);
         wal_.emplace(owner_id_, geometry);
         wal_config_ = config;
+        wal_pending_prepare_capacity_ =
+            resolve_wal_pending_prepare_capacity(config, queue_depth_);
         wal_frame_pool_ = std::make_unique<memory::lba_dma_page_pool>(
             geometry.lba_size,
             geometry.lba_size,

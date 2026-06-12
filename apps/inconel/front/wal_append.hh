@@ -23,6 +23,9 @@ namespace apps::inconel::wal {
 struct wal_append_config {
   uint32_t max_fua_inflight = 16;
   uint32_t max_pages_per_plan = 16;
+  // 0 keeps the historical coupling to front queue_depth. Non-zero sets
+  // an independent soft backpressure capacity for pending WAL prepares.
+  uint32_t pending_prepare_capacity = 0;
 };
 
 inline void validate_wal_append_config(const wal_append_config &cfg) {
@@ -34,6 +37,8 @@ inline void validate_wal_append_config(const wal_append_config &cfg) {
     throw std::invalid_argument(
         "wal::wal_append_config: max_pages_per_plan must be nonzero");
   }
+  // pending_prepare_capacity == 0 is a valid "follow queue_depth" setting,
+  // not an invalid sentinel.
 }
 
 struct wal_fragment_cursor {

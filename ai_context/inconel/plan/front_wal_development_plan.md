@@ -364,6 +364,8 @@ M07 的详细设计文档是 `046_value_persist_read_adapter_design.md`。
 
 ### M08：Write Baseline + Inflight Semantics
 
+M08 的详细设计文档是 `047_write_baseline_inflight_design.md`。
+
 对应旧 step：
 
 1. Step 22：单 batch baseline 写路径
@@ -378,8 +380,10 @@ M07 的详细设计文档是 `046_value_persist_read_adapter_design.md`。
 
 当前分支落点：
 
-1. `apps/inconel/pipeline/write_batch_state.hh`
-2. whitebox pipeline tests
+1. `apps/inconel/write_path/write_batch_state.hh`（047 裁决：按
+   `code_modules.md` 关键约束，写请求组合层在 `write_path/` 而非
+   `pipeline/`；phase senders 落 `write_path/sender.hh`）
+2. whitebox pipeline tests（`inconel_test_m08_write_baseline_inflight`）
 
 必须重构：
 

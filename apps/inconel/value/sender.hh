@@ -70,7 +70,7 @@ namespace apps::inconel::value {
                 if constexpr (std::is_same_v<alt_t, trim_batch>) {
                     uint64_t batch_id = alt.batch_id;
                     return just()
-                        >> as_stream(alt.trims)
+                        >> as_stream(std::span<format::trim_desc>{alt.trims})
                         >> concurrent(alt.max_trim_inflight)
                         >> flat_map([nvme](format::trim_desc d) mutable {
                             return nvme()->trim(d.lba, d.num_lbas);

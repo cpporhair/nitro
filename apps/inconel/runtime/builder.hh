@@ -138,6 +138,15 @@ namespace apps::inconel::runtime {
         }
     }
 
+    [[nodiscard]] inline memory::dma_page_allocator
+    make_runtime_dma_page_allocator() noexcept {
+#ifdef INCONEL_NVME_MOCK_BACKEND
+        return memory::make_heap_dma_page_allocator();
+#else
+        return memory::make_spdk_dma_page_allocator();
+#endif
+    }
+
     [[nodiscard]] inline uint32_t
     resolve_optional_core(int32_t configured,
                           uint32_t fallback,
@@ -864,7 +873,7 @@ namespace apps::inconel::runtime {
                     TreeCache(opts.tree_cache_capacity),
                     &kBootstrapTreeGeometry,
                     opts.tree_queue_depth,
-                    memory::make_spdk_dma_page_allocator(),
+                    make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,
                     opts.nvme_numa_id);
             }
@@ -881,7 +890,7 @@ namespace apps::inconel::runtime {
                     profile.value_space_quantum_bytes,
                     profile.value_space_group_size_lbas,
                     opts.value_queue_depth,
-                    memory::make_spdk_dma_page_allocator(),
+                    make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,
                     opts.nvme_numa_id,
                     opts.value_io_policy);
@@ -900,7 +909,7 @@ namespace apps::inconel::runtime {
                     profile.value_data_area_base,
                     shared_heads.get(),
                     opts.tree_queue_depth,
-                    memory::make_spdk_dma_page_allocator(),
+                    make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,
                     opts.nvme_numa_id);
                 core::registry::tree_sched_singleton_ptr = tsched;

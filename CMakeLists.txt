@@ -150,6 +150,12 @@ target_include_directories(inconel_test_m07_value_persist_read_adapter PRIVATE $
 target_link_libraries(inconel_test_m07_value_persist_read_adapter PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m08_write_baseline_inflight
+        apps/inconel/test/test_m08_write_baseline_inflight.cc)
+target_include_directories(inconel_test_m08_write_baseline_inflight PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m08_write_baseline_inflight PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

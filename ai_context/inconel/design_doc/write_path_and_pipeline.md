@@ -141,6 +141,7 @@ write_memtable_fragment(frag)
 1. `write_memtable_fragment` 只能在该 batch 的 all-WAL reduce 成功后才启动。
 2. 因此 `value` / `WAL` 失败都仍然发生在 memtable phase 之前，可以走 `release_batch(batch_lsn)`。
 3. 一旦进入 `write_memtable_fragment`，该 batch 的失败语义就不再是 release，而是 fatal。
+4. memtable fan-out 的**投递**必须经 coord 串行点（`coord::enter_memtable_phase(batch_lsn)`，纯 sequencing handle）：其 continuation 在 coord 上完成该 batch 全部 memtable fragments 的入队，与 seal 的 `seal_active` fan-out 派发（close_gate continuation）在 coord 队列上全序——这是 §9.2 层 1 / 概要 §7.1 补充不变量 4 的机制落点（M12 / plan 051 §4.1）。§2.1 伪码链未画出这一跳，以本条为准。
 
 ## 3. Canonicalization 算法
 

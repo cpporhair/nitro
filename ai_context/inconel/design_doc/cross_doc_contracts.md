@@ -19,6 +19,7 @@
 | `install_cat` | `(new_publish_catalog)` → `void` | RSM §2.3, FF §4.2 |
 | `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7;M06 起由 front `prepare_wal_fragment / install_wal_segment / commit_wal_plan / abort_wal_plan` + L3 `write_path::write_wal_fragment` 实现(044/045);本行保留为概念签名。 |
 | `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
+| `enter_memtable_phase` | `(batch_lsn)` → `void`（纯串行点：无 owner 状态变更；其 continuation 在 coord 上派发该 batch 的全部 memtable fragments，与 `close_gate` continuation 的 seal_active 派发在 coord 队列全序——OV §7.1 不变量 4 的机制落点） | WP §2.3 冻结约束 4, OV §7.1；051 §4.1/§5.1 |
 | `batch_lookup` | `(keys[], read_lsn, front_read_set)` → `batch_lookup_results[]` | RSM §3.4/3.7, RAP §5.1-5.3 |
 | **`lookup_memtable`** | **`(key, read_lsn, front_read_set)`** → `variant<value_ref, tombstone, miss>` | **RSM §3.4/3.7, RAP §4.2/4.3/5.3, OV §8.1/14.2** |
 | **`scan_memtable`** | **`(begin, end, read_lsn, front_read_set)`** → `scan_result_set` | **RSM §3.4, RAP §6.2/6.3, OV §14.4** |
@@ -112,9 +113,9 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 
 ### 写路径
 ```
-coord_sched(assign_lsn) → value_alloc_sched(persist_put_values) → fan-out front_scheds(write_wal_fragment) → reduce → fan-out front_scheds(write_memtable_fragment) → reduce → coord_sched(publish_batch/release_batch)
+coord_sched(assign_lsn) → value_alloc_sched(persist_put_values) → fan-out front_scheds(write_wal_fragment) → reduce → coord_sched(enter_memtable_phase) → fan-out front_scheds(write_memtable_fragment) → reduce → coord_sched(publish_batch/release_batch)
 ```
-出现点：OV §1.8/7.1/14.1, WP §1/2.1
+出现点：OV §1.8/7.1/14.1, WP §1/2.1/§2.3 冻结约束 4（enter_memtable_phase 串行点为 M12/051 §4.1 机制落点）
 
 ### 读路径 (Point GET)
 ```

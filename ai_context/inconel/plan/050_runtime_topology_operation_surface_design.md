@@ -686,6 +686,8 @@ TODO/stub/step-phase 标识符、无残留进程）通过。
    实测后若成压力走框架层议题（惰性 lane / 按角色容量裁剪）。
 2. `rt::write_batch` 带 I/O 全链 e2e：§13.4 声明边界，M13
    mock-device 分层关闭。
+   （2026-06-12 已关闭：052 phase C/D，m13 矩阵 1-12 经
+   `rt::write_batch` 带 I/O 全链 + 多核并发。）
 3. ODF §3.6 v1 MAX_KEY_LEN 的具名 policy 常量（§18.1.1 cosmetic）。
 4. 047 §17.4.1（queue_depth 双用途）由本文 §5.2 关闭；049 §17.4
    其余项维持。不新增 known_issues 条目。

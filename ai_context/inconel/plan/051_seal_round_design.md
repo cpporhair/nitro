@@ -608,6 +608,9 @@ Release `inconel_test_m01..m12` 12/12 PASS；`build_asan` 全 target
 1. **M13 关闭项**：不跨代机制的真并发行使（多核矩阵）、
    `rt::write_batch` 带 I/O 全链、seal→collect→真实 tree-local
    flush 全桥（§13.4 边界）。
+   （2026-06-12 已全部关闭：052 phase D 的 seal 交错探针（120 跨
+   front batch × 3 轮真并发 seal 逐批代纪一致）+ phase E 矩阵 13
+   真实 flush 全桥与 tree 读回。）
 2. seal 自动阈值触发 + 仪表面（§4.2 延期，待部署 workload 数据）。
 3. coord 事件队列合并后的跨事件公平性（512 统一预算 vs 旧分型
    预算）：当前无饥饿证据，留真实负载观察，不预改。

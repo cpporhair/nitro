@@ -551,6 +551,8 @@ M12 的详细设计文档是 `051_seal_round_design.md`。
 
 ### M13：E2E Test Harness / Device Verification / Multicore
 
+M13 的详细设计文档是 `052_e2e_harness_mock_device_multicore_design.md`。
+
 对应旧 step：
 
 1. Step 26L：mock NVMe owner / scheduler boundary reset
@@ -623,3 +625,34 @@ M12 的详细设计文档是 `051_seal_round_design.md`。
 11. seal/collect/release 能把真实 front sealed gens 接给当前 tree-local flush。
 
 未满足以上任一项时，不能把前端迁移闭环标为完成。
+
+### 迁移完成对账（2026-06-12，M13/052 land 后）
+
+§6 十一条逐条勾验（背书证据）：
+
+1. M01-M13 设计/实现/测试证据 ✅（039-052 设计文档 + 各 step 实现
+   提交 + `inconel_test_m01..m13` Release/ASAN 13/13 全绿）。
+2. 完整语义切片、无"后续再做"缺口 ✅（各设计文档"冲突与裁决"节有
+   全部例外的裁决记录；M11/M12 声明的 in-gate 边界已由 M13 关闭，
+   见 050 §18.4 / 051 §17.4 / 052 §12.3）。
+3. 039 只冻结 M01 ✅。
+4. write_batch 全链提交语义 ✅（m08/m09 + m13 矩阵 1-7）。
+5. point_get 经 read_handle PRS + front memtable + value read ✅
+   （m10 + m13 矩阵 8-11；tree 路径读回见 m13 矩阵 13）。
+6. publish/release gap-free durable_lsn ✅（m03/m08/m09 + m13 矩阵
+   12 多核 200 并发批 1..200 无洞）。
+7. WAL bytes 可 decode（044 裁决格式）✅（m06/m09 + m13 矩阵 6 自
+   mock 盘字节解码对账）。
+8. memtable 不保存 hot value ✅（INC-055 M01 收口；m02/m05/m10）。
+9. value/WAL fan-out bounded ✅（M06/M07 bounded issue + 047 §7
+   三层 budget）。
+10. mock e2e 覆盖 PUT/DEL/overwrite/multi-front/failure release/
+    multicore/point_get-after-write ✅（m13 矩阵 1-12；failure
+    release 的 e2e 级注入在 m09 fake 层，mock 故障注入按 052 §12.5
+    watch-item 另立）。
+11. seal/collect/release 接 tree-local flush ✅（m12 fold bridge +
+    m13 矩阵 13 真实 flush 全桥 + tree 读回）。
+
+**front/WAL/coord 迁移线（M01-M13）就此闭环。**后续主线：recovery
+迁移、flush/frontier-switch 正式编排（coord::frontier_switch /
+capture_flush_frontier handles）、真盘 front/WAL smoke（052 §12.5）。

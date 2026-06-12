@@ -166,8 +166,7 @@ namespace apps::inconel::value {
             >> with_context(__fwd__(alt), vr)([nvme]() mutable {
                 return get_context<read_miss>()
                     >> flat_map([nvme](read_miss &rm) mutable {
-                        return ::apps::inconel::nvme::read_frame(
-                            nvme(), rm.frame.get());
+                        return nvme()->read_frame(rm.frame.get());
                     })
                     >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
                     >> get_context<read_miss, value_ref>()

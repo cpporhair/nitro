@@ -53,6 +53,28 @@ namespace apps::inconel::nvme {
 
     template <typename sched_t, typename item_t, typename get_desc_t>
     inline auto
+    read_frame_range_bounded(sched_t* sched,
+                             std::span<item_t> reads,
+                             uint32_t max_inflight,
+                             get_desc_t&& get_desc) {
+        assert(sched != nullptr);
+        assert(max_inflight != 0);
+        return pump::sender::just()
+            >> pump::sender::as_stream(std::span<item_t>{reads})
+            >> pump::sender::concurrent(max_inflight)
+            >> pump::sender::flat_map(
+                [sched,
+                 get_desc = std::forward<get_desc_t>(get_desc)](
+                    item_t& item) mutable {
+                    auto desc = get_desc(item);
+                    assert(desc.frame != nullptr);
+                    return sched->read_frame(desc.frame);
+                })
+            >> pump::sender::all();
+    }
+
+    template <typename sched_t, typename item_t, typename get_desc_t>
+    inline auto
     write_frame_range_bounded(sched_t* sched,
                               std::span<item_t> writes,
                               uint32_t max_inflight,

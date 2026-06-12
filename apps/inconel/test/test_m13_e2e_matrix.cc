@@ -877,6 +877,216 @@ void m13_multicore_seal_interleave_no_split_batches() {
 
 }  // namespace
 
+
+
+// ════════════════════════════════════════════════════════════════
+// Phase E — matrix 13: seal → collect → REAL tree_local_flush on the
+// mock device → manual frontier switch (production coord/front
+// senders) → rt::point_get reads back through the TREE path.
+// ════════════════════════════════════════════════════════════════
+
+#include "apps/inconel/core/checkpoint_guard.hh"
+#include "apps/inconel/format/layout_plan.hh"
+#include "apps/inconel/format/superblock_builder.hh"
+#include "apps/inconel/tree/sender.hh"
+
+namespace {
+
+// Bootstrap-format the mock device: superblock A (gen 1) + B (gen 0),
+// fields verbatim from the runtime's bootstrap profile (the root-change
+// flush path read-modify-writes these slots).
+void format_mock_superblocks(nvme::runtime_device& device) {
+    const auto& p = format::kBootstrapFormatProfile;
+
+    format::layout_plan plan{};
+    plan.lba_size = p.lba_size;
+    plan.namespace_size = kNamespaceLbas * static_cast<uint64_t>(kLbaSize);
+    plan.total_lbas = kNamespaceLbas;
+    plan.wal_base_paddr = p.wal_base_paddr;
+    plan.wal_segment_size = p.wal_segment_size;
+    plan.wal_segment_count = p.wal_segment_count;
+    plan.wal_segment_lbas = p.wal_segment_size / p.lba_size;
+    plan.data_area_base_paddr = p.value_data_area_base;
+    plan.data_area_end_paddr = p.value_data_area_end;
+    plan.tree_page_size = p.tree_page_size;
+    plan.shadow_slots_per_range = p.shadow_slots_per_range;
+    plan.value_class_count = p.value_class_count;
+    for (uint8_t i = 0; i < p.value_class_count; ++i) {
+        plan.value_class_sizes[i] = p.value_class_sizes[i];
+    }
+    plan.value_space_quantum_bytes = p.value_space_quantum_bytes;
+    plan.value_space_group_size_lbas = p.value_space_group_size_lbas;
+
+    const auto sb_a = format::build_superblock(plan, /*generation=*/1);
+    const auto sb_b = format::build_superblock(plan, /*generation=*/0);
+
+    std::vector<char> page(kLbaSize, 0);
+    std::memcpy(page.data(), &sb_a, sizeof(sb_a));
+    CHECK(device.write_bytes(0, std::span<const char>(page.data(),
+                                                      page.size())));
+    std::fill(page.begin(), page.end(), 0);
+    std::memcpy(page.data(), &sb_b, sizeof(sb_b));
+    CHECK(device.write_bytes(1, std::span<const char>(page.data(),
+                                                      page.size())));
+}
+
+format::superblock
+read_mock_superblock(nvme::runtime_device& device, uint64_t lba) {
+    std::vector<char> page(kLbaSize);
+    CHECK(device.read_bytes(lba, std::span<char>(page.data(), page.size())));
+    format::superblock sb{};
+    std::memcpy(&sb, page.data(), sizeof(sb));
+    return sb;
+}
+
+void m13_flush_bridge_tree_readback() {
+    e2e_fixture fx;
+    format_mock_superblocks(fx.device);
+
+    // ── live writes across both fronts ──
+    struct kv { std::string key; std::string body; };
+    std::vector<kv> data;
+    for (uint32_t i = 0; i < 4; ++i) {
+        data.push_back({key_for_owner(0, fx.front_count(),
+                                      "fl-a" + std::to_string(i)),
+                        "body-a" + std::to_string(i)});
+        data.push_back({key_for_owner(1, fx.front_count(),
+                                      "fl-b" + std::to_string(i)),
+                        "body-b" + std::to_string(i)});
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+        (void)expect_ok<write_path::write_batch_result>(fx.run_write({
+            {.op = core::write_op_type::put,
+             .key = data[2 * i].key,
+             .value = data[2 * i].body},
+            {.op = core::write_op_type::put,
+             .key = data[2 * i + 1].key,
+             .value = data[2 * i + 1].body},
+        }));
+    }
+    const uint64_t durable = fx.visible_lsn();
+    CHECK(durable == 4);
+
+    // ── seal, then collect eligible gens through production senders ──
+    auto seal = expect_ok<pipeline::seal_round_result>(fx.run_seal());
+    auto cat1 = seal.cat1;
+    CHECK(cat1 != nullptr);
+
+    tree::tree_flush_request req{
+        .base_guard = cat1->prs->tree_guard,
+        .sealed_gens = {},
+        .recovery_safe_lsn = 0,
+    };
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        auto sub = submit_result<
+            std::vector<std::shared_ptr<core::memtable_gen>>>(
+            [owner, &fx]() {
+                return front::collect_eligible_gens(
+                    *core::registry::front_at(owner), fx.visible_lsn());
+            });
+        fx.drive_until_ready(sub);
+        auto gens = expect_ok<
+            std::vector<std::shared_ptr<core::memtable_gen>>>(sub.fut.get());
+        CHECK(gens.size() == 1);
+        req.sealed_gens.push_back(std::move(gens[0]));
+    }
+
+    // ── the REAL tree-local flush over the mock device ──
+    auto flush_sub = submit_result<tree::tree_flush_result>([&req]() {
+        return tree::tree_local_flush(std::move(req));
+    });
+    fx.drive_until_ready(flush_sub);
+    auto result = expect_ok<tree::tree_flush_result>(flush_sub.fut.get());
+
+    CHECK(result.st == tree::flush_stage_status::ok);
+    CHECK(result.new_manifest != nullptr);
+    CHECK(result.new_manifest->has_root());
+    CHECK(result.flushed_max_lsn == durable);
+    CHECK(result.flushed_gens_by_front.size() == fx.front_count());
+
+    // Bootstrap flush retires nothing from the (empty) base tree.
+    CHECK(result.retired.old_slots.empty());
+    CHECK(result.retired.old_ranges.empty());
+    CHECK(result.retired.old_tree_values.empty());
+
+    // Root-change flush must have advanced the on-device superblock.
+    const auto sb0 = read_mock_superblock(fx.device, 0);
+    const auto sb1 = read_mock_superblock(fx.device, 1);
+    const auto& newest = sb0.generation >= sb1.generation ? sb0 : sb1;
+    CHECK(format::inspect_superblock(newest) ==
+          format::superblock_status::ok);
+    CHECK(newest.generation == 2);
+    CHECK(newest.root_base_paddr.lba != 0);
+
+    // ── manual frontier switch from production pieces (the dedicated
+    //    coord::frontier_switch handle is future work; the test composes
+    //    install_cat + release_gens directly) ──
+    auto guard1 = std::make_shared<core::checkpoint_guard>();
+    guard1->manifest = result.new_manifest;
+
+    auto fronts2 = std::make_shared<std::vector<core::front_read_set>>();
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        fronts2->push_back(core::front_read_set{
+            .active = core::registry::front_at(owner)->active_for_testing(),
+            .imms = {},
+        });
+    }
+    std::shared_ptr<const std::vector<core::front_read_set>> fronts2c =
+        fronts2;
+    auto prs2 = std::make_shared<const core::published_read_set>(
+        core::published_read_set{
+            .tree_guard = std::move(guard1),
+            .fronts = std::move(fronts2c),
+            .epoch = cat1->epoch + 1,
+        });
+    auto cat2 = std::make_shared<const core::publish_catalog>(
+        prs2,
+        cat1->durable_lsn.load(std::memory_order_acquire),
+        cat1->epoch + 1);
+
+    {
+        auto sub = submit_result<bool>([&]() {
+            return coord::install_cat(
+                       *core::registry::coord_sched_singleton(), cat2)
+                >> pump::sender::then([]() { return true; });
+        });
+        fx.drive_until_ready(sub);
+        CHECK(expect_ok<bool>(sub.fut.get()));
+    }
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        std::vector<uint64_t> ids;
+        for (const auto& [front_idx, gens] : result.flushed_gens_by_front) {
+            if (front_idx != owner) continue;
+            for (const auto& gen : gens) ids.push_back(gen->gen_id);
+        }
+        CHECK(!ids.empty());
+        auto sub = submit_result<bool>([&, owner]() {
+            return front::release_gens(
+                       *core::registry::front_at(owner), std::move(ids))
+                >> pump::sender::then([]() { return true; });
+        });
+        fx.drive_until_ready(sub);
+        CHECK(expect_ok<bool>(sub.fut.get()));
+    }
+
+    // ── read back through the TREE path: new CAT has empty imms, so
+    //    every key memtable-misses and resolves via manifest → mock
+    //    device tree pages → value pages ──
+    for (const auto& [key, body] : data) {
+        CHECK(std::holds_alternative<core::memtable_miss>(
+            fx.lookup_visible(key)));
+        expect_found(expect_ok<pipeline::point_get_result>(
+                         fx.run_point_get(key)),
+                     body);
+    }
+    const std::string missing =
+        key_for_owner(0, fx.front_count(), "fl-missing");
+    expect_not_found(expect_ok<pipeline::point_get_result>(
+        fx.run_point_get(missing)));
+}
+
+}  // namespace
+
 int main() {
     m13_single_put_value_on_device();
     m13_multi_key_fanout_two_fronts();
@@ -891,5 +1101,6 @@ int main() {
     m13_delete_read_not_found();
     m13_multicore_concurrent_writes();
     m13_multicore_seal_interleave_no_split_batches();
+    m13_flush_bridge_tree_readback();
     return 0;
 }

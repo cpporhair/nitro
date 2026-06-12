@@ -168,6 +168,12 @@ target_include_directories(inconel_test_m10_point_get_live_read PRIVATE ${CMAKE_
 target_link_libraries(inconel_test_m10_point_get_live_read PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_m11_runtime_topology_operations
+        apps/inconel/test/test_m11_runtime_topology_operations.cc)
+target_include_directories(inconel_test_m11_runtime_topology_operations PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_m11_runtime_topology_operations PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

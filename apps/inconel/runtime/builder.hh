@@ -1,6 +1,8 @@
 #ifndef APPS_INCONEL_RUNTIME_BUILDER_HH
 #define APPS_INCONEL_RUNTIME_BUILDER_HH
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -8,6 +10,7 @@
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include "env/runtime/share_nothing.hh"
 #include "pump/core/lock_free_queue.hh"
@@ -16,15 +19,19 @@
 #include "../core/registry.hh"
 #include "../core/data_area_heads.hh"
 #include "../core/leaf_order.hh"
+#include "../core/read_catalog.hh"
 #include "../core/shard_partition_builder.hh"
 #include "../core/tree_geometry.hh"
 #include "../core/tree_read_domain.hh"
+#include "../coord/scheduler.hh"
 #include "../format/format_profile.hh"
 #include "../format/types.hh"
+#include "../front/scheduler.hh"
 #include "../memory/spdk_dma_page_allocator.hh"
 #include "../nvme/runtime_scheduler.hh"
 #include "../tree/scheduler.hh"
 #include "../value/scheduler.hh"
+#include "../wal/scheduler.hh"
 #include "./facade.hh"
 
 namespace apps::inconel::runtime {
@@ -60,7 +67,10 @@ namespace apps::inconel::runtime {
         nvme::runtime_scheduler,
         core::tree_read_domain<TreeCache>,
         value::value_alloc_sched<ValueCache>,
-        tree::tree_sched
+        tree::tree_sched,
+        coord::coord_sched,
+        front::front_sched,
+        wal::wal_space_sched
     >;
 
     // ── Bootstrap tree geometry ──
@@ -82,6 +92,242 @@ namespace apps::inconel::runtime {
         .tree_page_size         = format::kBootstrapFormatProfile.tree_page_size,
         .shadow_slots_per_range = format::kBootstrapFormatProfile.shadow_slots_per_range,
     };
+
+    [[nodiscard]] inline wal::segment_geometry
+    wal_geometry_from_profile(const format::format_profile& profile) {
+        return wal::segment_geometry{
+            .wal_base_paddr    = profile.wal_base_paddr,
+            .wal_segment_size  = profile.wal_segment_size,
+            .lba_size          = profile.lba_size,
+            .wal_segment_count = profile.wal_segment_count,
+        };
+    }
+
+    struct front_topology_options {
+        std::span<const uint32_t> cores;
+        std::span<const uint32_t> front_cores;
+        int32_t coord_core = -1;
+        int32_t wal_space_core = -1;
+        wal::segment_geometry wal_geometry;
+        const core::tree_geometry* tree_geometry = nullptr;
+        std::size_t front_queue_depth = 1024;
+        std::size_t coord_queue_depth = 1024;
+        std::size_t coord_ready_window = 65536;
+        wal::wal_append_config front_wal_config =
+            { .pending_prepare_capacity = 64 };
+    };
+
+    struct front_topology {
+        std::vector<uint32_t> front_cores;
+        std::vector<front::front_sched*> fronts;
+        coord::coord_sched* coord = nullptr;
+        wal::wal_space_sched* wal_space = nullptr;
+        uint32_t coord_core = 0;
+        uint32_t wal_space_core = 0;
+    };
+
+    [[nodiscard]] inline bool
+    span_contains(std::span<const uint32_t> xs, uint32_t value) noexcept {
+        return std::find(xs.begin(), xs.end(), value) != xs.end();
+    }
+
+    inline void
+    validate_runtime_queue_depth(const char* name, std::size_t depth) {
+        if (depth < 2 || !std::has_single_bit(depth)) {
+            throw std::invalid_argument(name);
+        }
+    }
+
+    [[nodiscard]] inline uint32_t
+    resolve_optional_core(int32_t configured,
+                          uint32_t fallback,
+                          const char* what) {
+        if (configured == -1) {
+            return fallback;
+        }
+        if (configured < -1) {
+            throw std::invalid_argument(what);
+        }
+        return static_cast<uint32_t>(configured);
+    }
+
+    [[nodiscard]] inline std::vector<uint32_t>
+    resolve_front_cores(const front_topology_options& opts) {
+        if (opts.cores.empty()) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: cores is empty");
+        }
+
+        std::vector<uint32_t> out;
+        if (opts.front_cores.empty()) {
+            out.assign(opts.cores.begin(), opts.cores.end());
+        } else {
+            out.assign(opts.front_cores.begin(), opts.front_cores.end());
+        }
+        if (out.empty()) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: front_cores is empty");
+        }
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            if (!span_contains(opts.cores, out[i])) {
+                throw std::invalid_argument(
+                    "runtime::build_front_topology: front_cores contains "
+                    "a core not in cores");
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (out[j] == out[i]) {
+                    throw std::invalid_argument(
+                        "runtime::build_front_topology: front_cores contains "
+                        "a duplicate");
+                }
+            }
+        }
+        return out;
+    }
+
+    inline void
+    validate_tree_geometry_for_front_topology(const core::tree_geometry* geom) {
+        if (geom == nullptr) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: tree_geometry is null");
+        }
+        if (geom->lba_size == 0) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: tree_geometry.lba_size is 0");
+        }
+        if (geom->tree_page_size == 0 ||
+            geom->tree_page_size % geom->lba_size != 0) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: invalid tree_page_size");
+        }
+        if (geom->shadow_slots_per_range == 0) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: shadow_slots_per_range is 0");
+        }
+    }
+
+    [[nodiscard]] inline front_topology
+    build_front_topology(const front_topology_options& opts) {
+        auto front_cores = resolve_front_cores(opts);
+        const uint32_t coord_core =
+            resolve_optional_core(
+                opts.coord_core,
+                opts.cores.front(),
+                "runtime::build_front_topology: coord_core is below -1");
+        const uint32_t wal_space_core =
+            resolve_optional_core(
+                opts.wal_space_core,
+                coord_core,
+                "runtime::build_front_topology: wal_space_core is below -1");
+
+        if (!span_contains(opts.cores, coord_core)) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: coord_core is not in cores");
+        }
+        if (!span_contains(opts.cores, wal_space_core)) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: wal_space_core is not in cores");
+        }
+        validate_runtime_queue_depth(
+            "runtime::build_front_topology: front_queue_depth must be a "
+            "power of two and >= 2",
+            opts.front_queue_depth);
+        validate_runtime_queue_depth(
+            "runtime::build_front_topology: coord_queue_depth must be a "
+            "power of two and >= 2",
+            opts.coord_queue_depth);
+        wal::validate_segment_geometry(opts.wal_geometry);
+        validate_tree_geometry_for_front_topology(opts.tree_geometry);
+        wal::validate_wal_append_config(opts.front_wal_config);
+
+        if (!core::registry::front_scheds.list.empty() ||
+            core::registry::coord_sched_singleton_ptr != nullptr ||
+            core::registry::wal_space_sched_singleton_ptr != nullptr) {
+            throw std::logic_error(
+                "runtime::build_front_topology: registry already has a "
+                "front/coord/wal topology");
+        }
+
+        const uint32_t max_core =
+            *std::max_element(opts.cores.begin(), opts.cores.end());
+        if (core::registry::front_scheds.by_core.size() <= max_core) {
+            core::registry::front_scheds.by_core.resize(
+                static_cast<std::size_t>(max_core) + 1, nullptr);
+        }
+
+        const uint32_t front_count =
+            static_cast<uint32_t>(front_cores.size());
+        std::vector<std::shared_ptr<core::memtable_gen>> active_gens;
+        active_gens.reserve(front_count);
+        for (uint32_t owner = 0; owner < front_count; ++owner) {
+            active_gens.push_back(front::make_front_memtable_gen(
+                owner, front_count, 0, core::memtable_gen::state::active));
+        }
+
+        auto manifest = std::make_shared<const core::tree_manifest>(
+            core::tree_manifest::empty(opts.tree_geometry));
+        auto guard = std::make_shared<core::checkpoint_guard>();
+        guard->manifest = std::move(manifest);
+
+        std::vector<core::front_read_set> front_sets;
+        front_sets.reserve(front_count);
+        for (const auto& gen : active_gens) {
+            front_sets.push_back(core::front_read_set{
+                .active = gen,
+                .imms = {},
+            });
+        }
+        auto prs_fronts =
+            std::make_shared<const std::vector<core::front_read_set>>(
+                std::move(front_sets));
+        auto prs = std::make_shared<const core::published_read_set>(
+            core::published_read_set{
+                .tree_guard = std::move(guard),
+                .fronts = std::move(prs_fronts),
+                .epoch = 1,
+            });
+        auto cat = std::make_shared<const core::publish_catalog>(
+            prs, 0, 1);
+
+        front_topology topology;
+        topology.front_cores = std::move(front_cores);
+        topology.fronts.resize(front_count, nullptr);
+        topology.coord_core = coord_core;
+        topology.wal_space_core = wal_space_core;
+
+        pump::core::this_core_id = wal_space_core;
+        topology.wal_space = new wal::wal_space_sched(
+            opts.wal_geometry, front_count);
+        core::registry::wal_space_sched_singleton_ptr = topology.wal_space;
+
+        core::registry::front_scheds.list.assign(front_count, nullptr);
+        for (uint32_t owner = 0; owner < front_count; ++owner) {
+            const uint32_t home_core = topology.front_cores[owner];
+            pump::core::this_core_id = home_core;
+            auto* fs = new front::front_sched(
+                owner,
+                front_count,
+                active_gens[owner],
+                1,
+                opts.wal_geometry,
+                opts.front_wal_config,
+                opts.front_queue_depth);
+            topology.fronts[owner] = fs;
+            core::registry::front_scheds.list[owner] = fs;
+            core::registry::front_scheds.by_core[home_core] = fs;
+        }
+
+        pump::core::this_core_id = coord_core;
+        topology.coord = new coord::coord_sched(
+            std::move(cat),
+            front_count,
+            1,
+            opts.coord_ready_window,
+            opts.coord_queue_depth);
+        core::registry::coord_sched_singleton_ptr = topology.coord;
+
+        return topology;
+    }
 
     // ── Build context ──
     //
@@ -122,6 +368,14 @@ namespace apps::inconel::runtime {
         std::span<const uint32_t> read_domain_cores = {};
         int32_t                   value_core        = -1;
         int32_t                   owner_core        = -1;
+        std::span<const uint32_t> front_cores       = {};
+        int32_t                   coord_core        = -1;
+        int32_t                   wal_space_core    = -1;
+        std::size_t               front_queue_depth = 1024;
+        std::size_t               coord_queue_depth = 1024;
+        std::size_t               coord_ready_window = 65536;
+        wal::wal_append_config    front_wal_config =
+            { .pending_prepare_capacity = 64 };
 
         // tree cache capacity (entries). Applies to tree_lookup_sched<TreeCache>.
         // Minimum legal value depends on the cache impl: clock_cache requires
@@ -420,6 +674,18 @@ namespace apps::inconel::runtime {
                 "runtime::build_runtime: opts.owner_core is not a member "
                 "of opts.cores");
         }
+        if (opts.coord_core >= 0 &&
+            !core_in_set(static_cast<uint32_t>(opts.coord_core))) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.coord_core is not a member "
+                "of opts.cores");
+        }
+        if (opts.wal_space_core >= 0 &&
+            !core_in_set(static_cast<uint32_t>(opts.wal_space_core))) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.wal_space_core is not a member "
+                "of opts.cores");
+        }
         for (size_t i = 0; i < opts.read_domain_cores.size(); ++i) {
             uint32_t c = opts.read_domain_cores[i];
             if (!core_in_set(c)) {
@@ -432,6 +698,21 @@ namespace apps::inconel::runtime {
                     throw std::invalid_argument(
                         "runtime::build_runtime: opts.read_domain_cores "
                         "contains a duplicate");
+                }
+            }
+        }
+        for (size_t i = 0; i < opts.front_cores.size(); ++i) {
+            uint32_t c = opts.front_cores[i];
+            if (!core_in_set(c)) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: opts.front_cores contains a "
+                    "core not in opts.cores");
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (opts.front_cores[j] == c) {
+                    throw std::invalid_argument(
+                        "runtime::build_runtime: opts.front_cores contains "
+                        "a duplicate");
                 }
             }
         }
@@ -528,6 +809,25 @@ namespace apps::inconel::runtime {
             core::registry::install_shard_partitions(bootstrap_map);
         }
 
+        // ── Step 3b: front / coord / WAL topology ───────────────────
+        //
+        // PUMP add_core_schedulers() is a one-shot tuple install per core,
+        // so the front stack must be fully constructed before the per-core
+        // loop below. The loop then passes all seven scheduler classes in a
+        // single call for each core.
+        auto front_topo = build_front_topology(front_topology_options{
+            .cores = opts.cores,
+            .front_cores = opts.front_cores,
+            .coord_core = opts.coord_core,
+            .wal_space_core = opts.wal_space_core,
+            .wal_geometry = wal_geometry_from_profile(profile),
+            .tree_geometry = &kBootstrapTreeGeometry,
+            .front_queue_depth = opts.front_queue_depth,
+            .coord_queue_depth = opts.coord_queue_depth,
+            .coord_ready_window = opts.coord_ready_window,
+            .front_wal_config = opts.front_wal_config,
+        });
+
         // ── Step 4: per-core scheduler construction ─────────────────
         using value_sched_t = value::value_alloc_sched<ValueCache>;
         value_sched_t* value_sched_singleton = nullptr;
@@ -609,10 +909,29 @@ namespace apps::inconel::runtime {
                     tsched->state.alloc.head.lba, std::memory_order_relaxed);
             }
 
+            coord::coord_sched* coord_sched =
+                core == front_topo.coord_core ? front_topo.coord : nullptr;
+            front::front_sched* front_sched =
+                core < core::registry::front_scheds.by_core.size()
+                    ? core::registry::front_scheds.by_core[core]
+                    : nullptr;
+            wal::wal_space_sched* wal_space_sched =
+                core == front_topo.wal_space_core
+                    ? front_topo.wal_space
+                    : nullptr;
+
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
-            // nvme, tree_read_domain, value_alloc, tree_sched.
+            // nvme, tree_read_domain, value_alloc, tree_sched, coord,
+            // front, wal_space.
             rt->add_core_schedulers(
-                core, nvme_sched, read_domain, value_sched, tsched);
+                core,
+                nvme_sched,
+                read_domain,
+                value_sched,
+                tsched,
+                coord_sched,
+                front_sched,
+                wal_space_sched);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme_sched);
@@ -621,6 +940,19 @@ namespace apps::inconel::runtime {
                 core::registry::tree_read_domains.list.push_back(read_domain);
                 core::registry::tree_read_domains.by_core[core] = read_domain;
             }
+        }
+
+        core::registry::nvme_by_front_owner.assign(
+            front_topo.fronts.size(), nullptr);
+        for (std::size_t owner = 0; owner < front_topo.fronts.size(); ++owner) {
+            const uint32_t front_core = front_topo.front_cores[owner];
+            auto* nvme_for_owner = core::registry::nvme_scheds.by_core[front_core];
+            if (nvme_for_owner == nullptr) {
+                throw std::logic_error(
+                    "runtime::build_runtime: front owner has no home-core "
+                    "nvme scheduler");
+            }
+            core::registry::nvme_by_front_owner[owner] = nvme_for_owner;
         }
 
         // Suppress unused-variable warnings when the helper singletons
@@ -644,18 +976,25 @@ namespace apps::inconel::runtime {
 
     // ── tear_down: free schedulers + clear registry ──
     //
-    // Destroy order (030 §2.3 ownership graph): tree_sched →
-    // tree_read_domain → value → nvme. `tree_sched` still goes first
-    // because its destructor is trivial and we want the order stable
-    // across later phases that add real reclaim_q plumbing. Each
+    // Destroy order: coord → fronts → wal_space → tree_sched →
+    // tree_read_domain → value → nvme. The front stack has no destructor
+    // dependency on tree/value/nvme; deleting coord first releases the CAT
+    // pin chain before front-owned active gens go away. Each
     // `tree_read_domain<TreeCache>` owns its lookup and worker via
-    // unique_ptr, so deleting the read_domain retires both arms —
-    // there are no separate delete loops for the sub-schedulers (030
-    // §2.3 ownership graph / §2.7 registry).
+    // unique_ptr, so deleting the read_domain retires both arms.
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
+        if (core::registry::coord_sched_singleton_ptr) {
+            delete core::registry::coord_sched_singleton_ptr;
+        }
+        for (auto* fs : core::registry::front_scheds.list) {
+            delete fs;
+        }
+        if (core::registry::wal_space_sched_singleton_ptr) {
+            delete core::registry::wal_space_sched_singleton_ptr;
+        }
         if (core::registry::tree_sched_singleton_ptr) {
             delete core::registry::tree_sched_singleton_ptr;
         }

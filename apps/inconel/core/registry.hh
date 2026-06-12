@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -27,6 +28,14 @@ namespace apps::inconel::core {
 
 namespace apps::inconel::coord {
     struct coord_sched;
+}
+
+namespace apps::inconel::front {
+    class front_sched;
+}
+
+namespace apps::inconel::wal {
+    class wal_space_sched;
 }
 
 namespace apps::inconel::core::registry {
@@ -91,6 +100,19 @@ namespace apps::inconel::core::registry {
     // coord_sched_singleton().
     inline coord::coord_sched* coord_sched_singleton_ptr = nullptr;
 
+    struct front_list {
+        std::vector<front::front_sched*> list;     // owner_id -> instance
+        std::vector<front::front_sched*> by_core;  // core_id -> instance/null
+    };
+    inline front_list front_scheds;
+
+    inline wal::wal_space_sched* wal_space_sched_singleton_ptr = nullptr;
+
+    // owner_id -> that front owner's home-core nvme scheduler. The builder
+    // fills this once after all per-core nvme schedulers exist; operations
+    // borrow it as a span and never rebuild it per request.
+    inline std::vector<nvme::runtime_scheduler*> nvme_by_front_owner;
+
     // Globally installed `shard_partition_map` (step 030 §2.7). A
     // `shared_ptr<const>` lets a future heat-driven rebuild
     // (issue 2 decision B1, out of scope in step 030) swap the map
@@ -101,22 +123,6 @@ namespace apps::inconel::core::registry {
     inline std::shared_ptr<const shard_partition_map>
         current_shard_partitions_ptr;
 
-    // ── Future scheduler slots (placeholder, not implemented yet) ──
-    //
-    // Singletons:
-    //   inline wal::scheduler*         wal_space_sched   = nullptr;
-    //
-    // Per-shard:
-    //   struct front_list {
-    //       std::vector<front::scheduler*> list;
-    //       std::vector<front::scheduler*> by_core;
-    //   };
-    //   inline front_list front_scheds;
-    //
-    // Adding a new scheduler kind = adding a field here + a constructor block
-    // in builder.hh + the type to PUMP runtime's template list. Nothing else
-    // changes.
-
     // ── Initialization helper ──
     //
     // Resize by_core arrays to a given core count. Called by builder before
@@ -126,6 +132,7 @@ namespace apps::inconel::core::registry {
     init_capacity(uint32_t max_cores) {
         nvme_scheds.by_core.assign(max_cores, nullptr);
         tree_read_domains.by_core.assign(max_cores, nullptr);
+        front_scheds.by_core.assign(max_cores, nullptr);
     }
 
     inline void
@@ -134,6 +141,10 @@ namespace apps::inconel::core::registry {
         nvme_scheds.by_core.clear();
         tree_read_domains.list.clear();
         tree_read_domains.by_core.clear();
+        front_scheds.list.clear();
+        front_scheds.by_core.clear();
+        wal_space_sched_singleton_ptr = nullptr;
+        nvme_by_front_owner.clear();
         value_alloc_sched = nullptr;
         data_area_heads_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
@@ -173,6 +184,49 @@ namespace apps::inconel::core::registry {
         assert(coord_sched_singleton_ptr &&
                "coord::coord_sched not registered");
         return coord_sched_singleton_ptr;
+    }
+
+    inline front::front_sched*
+    front_at(uint32_t owner) {
+        if (owner >= front_scheds.list.size() ||
+            front_scheds.list[owner] == nullptr) {
+            panic_inconsistency("core::registry::front_at",
+                "front owner %u is not registered",
+                static_cast<unsigned>(owner));
+        }
+        return front_scheds.list[owner];
+    }
+
+    inline uint32_t
+    front_count() {
+        return static_cast<uint32_t>(front_scheds.list.size());
+    }
+
+    inline std::span<front::front_sched* const>
+    fronts_span() {
+        if (front_scheds.list.empty()) {
+            panic_inconsistency("core::registry::fronts_span",
+                "front scheduler list is empty");
+        }
+        return {front_scheds.list.data(), front_scheds.list.size()};
+    }
+
+    inline wal::wal_space_sched*
+    wal_space_singleton() {
+        if (wal_space_sched_singleton_ptr == nullptr) {
+            panic_inconsistency("core::registry::wal_space_singleton",
+                "wal::wal_space_sched not registered");
+        }
+        return wal_space_sched_singleton_ptr;
+    }
+
+    inline std::span<nvme::runtime_scheduler* const>
+    nvme_by_front_owner_span() {
+        if (nvme_by_front_owner.empty()) {
+            panic_inconsistency("core::registry::nvme_by_front_owner_span",
+                "nvme_by_front_owner is empty");
+        }
+        return {nvme_by_front_owner.data(), nvme_by_front_owner.size()};
     }
 
     // ── Per-core fast access (current core) ──

@@ -7,6 +7,7 @@
 #include "../core/batch_carrier.hh"
 #include "../core/registry.hh"
 #include "../pipeline/point_get.hh"
+#include "../pipeline/seal_round.hh"
 #include "../value/sender.hh"
 #include "../write_path/write_batch.hh"
 #include "./facade.hh"
@@ -34,6 +35,13 @@ namespace apps::inconel::rt {
             core::registry::fronts_span(),
             key,
             value_nvme);
+    }
+
+    [[nodiscard]] inline auto
+    seal_once() {
+        return pipeline::seal_round(
+            *core::registry::coord_sched_singleton(),
+            core::registry::fronts_span());
     }
 
 }  // namespace apps::inconel::rt

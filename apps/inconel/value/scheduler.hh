@@ -52,6 +52,12 @@ namespace apps::inconel::value {
         value_ref*       out_vr;
     };
 
+    struct value_io_policy {
+        uint32_t max_write_inflight = 32;
+        uint32_t max_read_inflight  = 32;
+        uint32_t max_trim_inflight  = 16;
+    };
+
     // prepare_persist sender output. The variant lets the pipeline split
     // into a leader branch (NVMe writes + commit), a prefill branch
     // (non-resident partial pages need a read first), and a follower
@@ -60,16 +66,19 @@ namespace apps::inconel::value {
     struct persist_leader {
         uint64_t                           round_id;
         std::span<memory::frame_write_desc> writes;
+        uint32_t                           max_write_inflight;
     };
 
     struct persist_prefill {
         uint64_t                          round_id;
         std::span<memory::frame_read_desc> reads;
+        uint32_t                          max_read_inflight;
     };
 
     struct trim_batch {
         uint64_t             batch_id;
         std::span<trim_desc> trims;
+        uint32_t             max_trim_inflight;
     };
 
     struct trim_idle {};
@@ -414,9 +423,12 @@ namespace apps::inconel::value {
         pump::core::per_core::queue<_value_reclaim::req*>       reclaim_q_;
         pump::core::per_core::queue<_value_trim_prepare::req*>  trim_prepare_q_;
         pump::core::per_core::queue<_value_trim_complete::req*> trim_complete_q_;
+        const value_io_policy                                   io_policy_;
+        uint32_t                                                max_body_len_ = 0;
 
         explicit
-        value_alloc_sched_base(size_t queue_depth = 2048)
+        value_alloc_sched_base(size_t          queue_depth = 2048,
+                               value_io_policy io_policy = {})
             : persist_q_(queue_depth)
             , finalize_q_(queue_depth)
             , continue_q_(queue_depth)
@@ -424,7 +436,32 @@ namespace apps::inconel::value {
             , fill_q_(queue_depth)
             , reclaim_q_(queue_depth)
             , trim_prepare_q_(queue_depth)
-            , trim_complete_q_(queue_depth) {}
+            , trim_complete_q_(queue_depth)
+            , io_policy_(io_policy) {
+            validate_io_policy_(io_policy_);
+        }
+
+        [[nodiscard]] const value_io_policy& io_policy() const noexcept {
+            return io_policy_;
+        }
+
+        [[nodiscard]] uint32_t max_body_len() const noexcept {
+            return max_body_len_;
+        }
+
+        static void
+        validate_io_policy_(const value_io_policy& policy) {
+            if (policy.max_write_inflight == 0 ||
+                policy.max_read_inflight == 0 ||
+                policy.max_trim_inflight == 0) {
+                core::panic_inconsistency(
+                    "value::value_alloc_sched_base::ctor",
+                    "value_io_policy fields must be non-zero (write=%u read=%u trim=%u)",
+                    static_cast<unsigned>(policy.max_write_inflight),
+                    static_cast<unsigned>(policy.max_read_inflight),
+                    static_cast<unsigned>(policy.max_trim_inflight));
+            }
+        }
 
         // ── enqueue helpers (called by op::start) ──
 
@@ -619,8 +656,9 @@ namespace apps::inconel::value {
                           memory::dma_page_allocator frame_allocator =
                               memory::make_heap_dma_page_allocator(),
                           uint32_t                  frame_alignment = 4096,
-                          int                       frame_numa_id = -1)
-            : value_alloc_sched_base(queue_depth)
+                          int                       frame_numa_id = -1,
+                          value_io_policy           io_policy = {})
+            : value_alloc_sched_base(queue_depth, io_policy)
             , readonly_cache_(std::move(cache))
             , shared_heads_(shared_heads)
             , data_area_end_lba_(data_area_end.lba)
@@ -672,6 +710,20 @@ namespace apps::inconel::value {
                 }
                 class_table_.push_back(ci);
             }
+            uint32_t largest_class_size = 0;
+            for (const auto& ci : class_table_) {
+                largest_class_size = std::max(largest_class_size, ci.class_size);
+            }
+            if (largest_class_size <= sizeof(format::value_object_header)) {
+                core::panic_inconsistency(
+                    "value::value_alloc_sched::ctor",
+                    "largest value class too small for value object header (class=%u header=%u)",
+                    static_cast<unsigned>(largest_class_size),
+                    static_cast<unsigned>(sizeof(format::value_object_header)));
+            }
+            max_body_len_ =
+                largest_class_size -
+                static_cast<uint32_t>(sizeof(format::value_object_header));
 
             value_space_manager_config cfg{};
             cfg.lba_size                    = lba_size_;
@@ -1188,9 +1240,10 @@ namespace apps::inconel::value {
             auto* stored = it->second.get();
             leader_item->cb(prepare_persist_result{
                 persist_prefill{
-                    rid,
-                    std::span<memory::frame_read_desc>(
+                    .round_id = rid,
+                    .reads    = std::span<memory::frame_read_desc>(
                         stored->reads.data(), stored->reads.size()),
+                    .max_read_inflight = io_policy().max_read_inflight,
                 }
             });
             delete leader_item;
@@ -1220,7 +1273,11 @@ namespace apps::inconel::value {
             auto* stored = it->second.get();
             auto writes_span = freeze_round_for_writeback(*stored);
             leader_item->cb(prepare_persist_result{
-                persist_leader{rid, writes_span}
+                persist_leader{
+                    .round_id           = rid,
+                    .writes             = writes_span,
+                    .max_write_inflight = io_policy().max_write_inflight,
+                }
             });
             delete leader_item;
 
@@ -1291,7 +1348,11 @@ namespace apps::inconel::value {
             auto writes_span = freeze_round_for_writeback(*rnd);
 
             const uint64_t lowest_fresh = rnd->lowest_fresh_lba;
-            item->cb(persist_leader{rnd->id, writes_span});
+            item->cb(persist_leader{
+                .round_id           = rnd->id,
+                .writes             = writes_span,
+                .max_write_inflight = io_policy().max_write_inflight,
+            });
             delete item;
 
             if (lowest_fresh < value_low_watermark_lba_) {
@@ -1685,8 +1746,9 @@ namespace apps::inconel::value {
 
             item->cb(prepare_trim_result{
                 trim_batch{
-                    .batch_id = batch_id,
-                    .trims    = trims_span,
+                    .batch_id          = batch_id,
+                    .trims             = trims_span,
+                    .max_trim_inflight = io_policy().max_trim_inflight,
                 }
             });
             delete item;
@@ -2025,7 +2087,8 @@ namespace apps::inconel::value {
                           memory::dma_page_allocator frame_allocator =
                               memory::make_heap_dma_page_allocator(),
                           uint32_t                  frame_alignment = 4096,
-                          int                       frame_numa_id = -1)
+                          int                       frame_numa_id = -1,
+                          value_io_policy           io_policy = {})
             : base(class_sizes,
                    lba_size,
                    data_area_base,
@@ -2037,7 +2100,8 @@ namespace apps::inconel::value {
                    queue_depth,
                    std::move(frame_allocator),
                    frame_alignment,
-                   frame_numa_id) {}
+                   frame_numa_id,
+                   io_policy) {}
     };
 
     template <>
@@ -2057,7 +2121,8 @@ namespace apps::inconel::value {
                           memory::dma_page_allocator frame_allocator =
                               memory::make_heap_dma_page_allocator(),
                           uint32_t                  frame_alignment = 4096,
-                          int                       frame_numa_id = -1)
+                          int                       frame_numa_id = -1,
+                          value_io_policy           io_policy = {})
             : base(class_sizes,
                    lba_size,
                    data_area_base,
@@ -2069,7 +2134,8 @@ namespace apps::inconel::value {
                    queue_depth,
                    std::move(frame_allocator),
                    frame_alignment,
-                   frame_numa_id) {}
+                   frame_numa_id,
+                   io_policy) {}
     };
 
     // ── value_alloc_sched_base sender factory deferred definitions ─────────

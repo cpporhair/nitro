@@ -139,6 +139,7 @@ namespace apps::inconel::runtime {
         // them keep the previous constructor defaults.
         size_t                    tree_queue_depth = 2048;
         size_t                    value_queue_depth = 2048;
+        value::value_io_policy    value_io_policy = {};
 
         // Real NVMe scheduler queue knobs. The device/qpair lifecycle is owned
         // by nvme::real_device; these tune the per-core PUMP scheduler and
@@ -527,7 +528,8 @@ namespace apps::inconel::runtime {
                     opts.value_queue_depth,
                     memory::make_spdk_dma_page_allocator(),
                     opts.nvme_dma_alignment,
-                    opts.nvme_numa_id);
+                    opts.nvme_numa_id,
+                    opts.value_io_policy);
                 core::registry::value_alloc_sched = value_sched;
                 value_sched_singleton = value_sched;
                 // value_head_lba is published by value_alloc_sched's ctor

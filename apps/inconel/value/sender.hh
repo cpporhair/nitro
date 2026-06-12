@@ -2,6 +2,7 @@
 #define APPS_INCONEL_VALUE_SENDER_HH
 
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -29,19 +30,50 @@ namespace apps::inconel::value {
     using namespace pump::sender;
     using format::value_ref;
 
+    // 046 §7.4 thread constraint: leader, prefill, and read-miss NVMe
+    // continuations run after the value owner callback has published its
+    // carrier. Do not insert cross-core `on(...)` hops in those continuations,
+    // and do not resolve NvmeProvider at top-level sender construction time.
+    struct local_nvme_provider {
+        nvme::runtime_scheduler* operator()() const {
+            return rt::local_nvme();
+        }
+    };
+
+    enum class value_persist_error_reason {
+        oversized_value,
+        round_failed,
+    };
+
+    class value_persist_error : public std::runtime_error {
+    public:
+        value_persist_error(value_persist_error_reason reason,
+                            std::string                message)
+            : std::runtime_error(std::move(message))
+            , reason_(reason) {}
+
+        [[nodiscard]] value_persist_error_reason reason() const noexcept {
+            return reason_;
+        }
+
+    private:
+        value_persist_error_reason reason_;
+    };
+
+    template <typename NvmeProvider = local_nvme_provider>
     inline auto
-    drain_trim_pending() {
+    drain_trim_pending(NvmeProvider nvme = {}) {
         return rt::value()->prepare_trim_batch()
             >> visit()
-            >> flat_map([]<typename T>(T&& alt) {
+            >> flat_map([nvme]<typename T>(T&& alt) mutable {
                 using alt_t = std::decay_t<T>;
                 if constexpr (std::is_same_v<alt_t, trim_batch>) {
                     uint64_t batch_id = alt.batch_id;
                     return just()
                         >> as_stream(alt.trims)
-                        >> concurrent()
-                        >> flat_map([](format::trim_desc d) {
-                            return rt::local_nvme()->trim(d.lba, d.num_lbas);
+                        >> concurrent(alt.max_trim_inflight)
+                        >> flat_map([nvme](format::trim_desc d) mutable {
+                            return nvme()->trim(d.lba, d.num_lbas);
                         })
                         >> all()
                         >> flat_map([batch_id](bool trim_ok) {
@@ -53,46 +85,43 @@ namespace apps::inconel::value {
             });
     }
 
+    template <typename NvmeProvider>
     inline auto
-    on_persist_leader(persist_leader&& alt) {
+    on_persist_leader(persist_leader&& alt, NvmeProvider nvme) {
         uint64_t rid = alt.round_id;
-        return just()
-            >> as_stream(__mov__(alt.writes))
-            >> concurrent()
-            >> flat_map([](memory::frame_write_desc d) {
-                d.flags |= nvme::IO_FLAGS_FUA;
-                return nvme::write_frame(rt::local_nvme(), d);
-            })
-            >> all()
+        return ::apps::inconel::nvme::write_frame_range_bounded_fua(
+                nvme(),
+                alt.writes,
+                alt.max_write_inflight,
+                [](memory::frame_write_desc& d) { return d; })
             >> flat_map([rid](bool nvme_ok) {
                 return rt::value()->finalize_persist(rid, nvme_ok)
                     >> forward_value(nvme_ok);
             });
     }
 
+    template <typename NvmeProvider>
     inline auto
-    on_persist_prefill(persist_prefill&& alt) {
+    on_persist_prefill(persist_prefill&& alt, NvmeProvider nvme) {
         uint64_t rid = alt.round_id;
-        return just()
-            >> as_stream(__mov__(alt.reads))
-            >> concurrent()
-            >> flat_map([](memory::frame_read_desc d) {
-                return nvme::read_frame(rt::local_nvme(), d);
-            })
-            >> all()
+        return ::apps::inconel::nvme::read_frame_range_bounded(
+                nvme(),
+                alt.reads,
+                alt.max_read_inflight,
+                [](memory::frame_read_desc& d) { return d; })
             >> flat_map([rid](bool read_ok) {
                 return rt::value()->continue_persist(rid, read_ok);
             })
-            >> flat_map([](persist_leader&& leader) {
-                return on_persist_leader(__mov__(leader));
+            >> flat_map([nvme](persist_leader&& leader) mutable {
+                return on_persist_leader(__mov__(leader), nvme);
             });
     }
 
-    // ── persist_values ──
+    // ── persist_put_values ──
     //
     // Wraps the prepare/finalize round + NVMe FUA dispatch into a single
     // top-level sender that the caller can pipe straight into a `then`
-    // (`value::persist_values(entries) >> then(...) >> submit(ctx)`).
+    // (`value::persist_put_values(entries) >> then(...) >> submit(ctx)`).
     //
     // No scheduler pointer on the API — the value scheduler is a
     // singleton, resolved internally via `rt::value()`. Every Inconel
@@ -113,30 +142,32 @@ namespace apps::inconel::value {
     // Both branches must produce the same final value_type (bool here);
     // their sender types can differ — flat() accepts arbitrary senders.
 
+    template <typename NvmeProvider = local_nvme_provider>
     inline auto
-    persist_values(std::span<put_entry> entries) {
+    persist_put_values(std::span<put_entry> entries, NvmeProvider nvme = {}) {
         return rt::value()->prepare_persist(entries)
             >> visit()
-            >> flat_map([]<typename T>(T &&alt) {
+            >> flat_map([nvme]<typename T>(T &&alt) mutable {
                 using alt_t = std::decay_t<T>;
                 if constexpr (std::is_same_v<alt_t, persist_leader>) {
-                    return on_persist_leader(__fwd__(alt));
+                    return on_persist_leader(__fwd__(alt), nvme);
                 } else if constexpr (std::is_same_v<alt_t, persist_prefill>) {
-                    return on_persist_prefill(__fwd__(alt));
+                    return on_persist_prefill(__fwd__(alt), nvme);
                 } else {
                     return just(static_cast<bool>(alt.ok));
                 }
             });
     }
 
+    template <typename NvmeProvider>
     inline auto
-    on_read_miss(value_ref vr, read_miss&& alt) {
+    on_read_miss(value_ref vr, read_miss&& alt, NvmeProvider nvme) {
         return just()
-            >> with_context(__fwd__(alt), vr)([]() {
+            >> with_context(__fwd__(alt), vr)([nvme]() mutable {
                 return get_context<read_miss>()
-                    >> flat_map([](read_miss &rm) {
-                        return nvme::read_frame(
-                            rt::local_nvme(), rm.frame.get());
+                    >> flat_map([nvme](read_miss &rm) mutable {
+                        return ::apps::inconel::nvme::read_frame(
+                            nvme(), rm.frame.get());
                     })
                     >> false_to_exception(std::runtime_error("value::read_value: NVMe read failed"))
                     >> get_context<read_miss, value_ref>()
@@ -154,16 +185,17 @@ namespace apps::inconel::value {
     //
     //   value::read_value(vr) >> then(callback) >> submit(ctx);
 
+    template <typename NvmeProvider = local_nvme_provider>
     inline auto
-    read_value(value_ref vr) {
+    read_value(value_ref vr, NvmeProvider nvme = {}) {
         return rt::value()->prepare_read(vr)
             >> visit()
-            >> flat_map([vr](auto &&alt) {
+            >> flat_map([vr, nvme](auto &&alt) mutable {
                 using T = std::decay_t<decltype(alt)>;
                 if constexpr (std::is_same_v<T, read_hit>) {
                     return just() >> forward_value(__mov__(alt.body));
                 } else {
-                    return on_read_miss(vr, __fwd__(alt));
+                    return on_read_miss(vr, __fwd__(alt), nvme);
                 }
             });
     }

@@ -885,14 +885,12 @@ reader_main(uint32_t         reader_idx,
 // `round_ops`; build_sealed_gen walks the ops span in parallel with a
 // running `put_idx` counter to pair entries with durables.
 
-// Persist in fixed-size chunks so we stay well below the per-core NVMe
-// queue capacity. `value::persist_values` fans out
-// one `nvme->write` per write_desc inside the leader pipeline via an
-// unbounded `concurrent()`, so a single monolithic call with >2k put
-// entries overflows the queue. Chunking at the harness level keeps
-// this bounded without touching production senders; the durables
-// array is filled shard-by-shard through the per-entry `out_vr`
-// pointers, so the caller still sees one contiguous result.
+// Persist in fixed-size chunks so this harness stays comfortably below
+// per-core NVMe queue capacity. M07 bounds production value persist IO,
+// but the e2e harness keeps this conservative chunking until real-disk
+// coverage replaces the fallback. The durables array is filled
+// shard-by-shard through per-entry `out_vr` pointers, so the caller still
+// sees one contiguous result.
 constexpr std::size_t kPersistChunkPuts = 1024;
 
 std::vector<format::value_ref>
@@ -922,9 +920,9 @@ persist_put_values(std::span<const round_op> round_ops) {
         std::span<value::put_entry> chunk(
             entries.data() + issued, chunk_size);
         const bool ok = submit_and_wait<bool>([chunk]() {
-            return value::persist_values(chunk);
+            return value::persist_put_values(chunk);
         });
-        CHECK(ok && "value::persist_values returned ok=false");
+        CHECK(ok && "value::persist_put_values returned ok=false");
         issued += chunk_size;
     }
     return durables;
@@ -1193,7 +1191,7 @@ struct indexed_value_ref {
 // Concurrent readback for the live-value subset of `samples`. Returns
 // a vector aligned to `live_samples`: `readbacks[k]` is the body that
 // `live_samples[k].vr` resolves to. Writing to disjoint indices of a
-// pre-sized vector matches the `value::persist_values` codebase
+// pre-sized vector matches the `value::persist_put_values` codebase
 // pattern (as_stream → concurrent → flat_map → all, with results
 // going to caller-owned state) and sidesteps the INC-041 worry about
 // `concurrent + reduce` accumulator contracts: the accumulator is

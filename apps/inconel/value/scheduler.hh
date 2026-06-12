@@ -1310,7 +1310,7 @@ namespace apps::inconel::value {
                 auto failure = std::make_exception_ptr(std::runtime_error(
                     "value::persist: nonresident_partial prefill read failed"));
                 // Followers were never cb'd — they're still suspended in
-                // their persist_values pipelines. Notify each with
+                // their persist_put_values pipelines. Notify each with
                 // persist_follower{ok=false} (matches the leader-failure
                 // semantics handle_finalize uses). Failing them via
                 // f->fail(...) would also work but persist_follower{false}

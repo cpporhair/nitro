@@ -330,6 +330,8 @@ M06 的详细设计文档是 `044_wal_append_prepare_bounded_fua_design.md`。
 
 ### M07：Value Persist / Read Adapter
 
+M07 的详细设计文档是 `046_value_persist_read_adapter_design.md`。
+
 对应旧 step：
 
 1. Step 19：`value_alloc_sched`

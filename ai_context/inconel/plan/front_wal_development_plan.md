@@ -399,6 +399,8 @@ M08 的详细设计文档是 `047_write_baseline_inflight_design.md`。
 
 ### M09：Production Write Batch Sender Pipeline
 
+M09 的详细设计文档是 `048_production_write_batch_pipeline_design.md`。
+
 对应旧 step：
 
 1. Step 24A：写路径 scheduler / pipeline success-path 化
@@ -413,8 +415,10 @@ M08 的详细设计文档是 `047_write_baseline_inflight_design.md`。
 
 当前分支落点：
 
-1. `apps/inconel/pipeline/write_batch.hh`
-2. `apps/inconel/runtime/operations/` 或当前分支等价 public operation surface
+1. `apps/inconel/write_path/write_batch.hh`（048 裁决：与 M08 同因，
+   写请求组合层在 `write_path/`）
+2. public operation surface 留 M11（048 §15.2：write_batch 保持底层
+   显式拓扑签名，facade 包装届时另做）
 
 必须重构：
 

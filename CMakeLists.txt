@@ -187,6 +187,12 @@ target_compile_definitions(inconel_test_m13_e2e_matrix PRIVATE INCONEL_NVME_MOCK
 target_link_libraries(inconel_test_m13_e2e_matrix PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_profile_m13 apps/inconel/test/profile_m13.cc)
+target_include_directories(inconel_profile_m13 PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(inconel_profile_m13 PRIVATE INCONEL_NVME_MOCK_BACKEND)
+target_link_libraries(inconel_profile_m13 PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # AiSAQ tools
 add_executable(aisaq_gen_test apps/aisaq/tools/gen_test_index.cc)
 target_link_libraries(aisaq_gen_test PRIVATE pthread)

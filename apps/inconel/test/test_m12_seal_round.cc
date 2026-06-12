@@ -30,11 +30,13 @@
 #include "apps/inconel/core/page_cache.hh"
 #include "apps/inconel/core/read_catalog.hh"
 #include "apps/inconel/core/registry.hh"
+#include "apps/inconel/core/shard_partition_builder.hh"
 #include "apps/inconel/core/tree_geometry.hh"
 #include "apps/inconel/format/format_profile.hh"
 #include "apps/inconel/front/sender.hh"
 #include "apps/inconel/nvme/frame_io.hh"
 #include "apps/inconel/runtime/builder.hh"
+#include "apps/inconel/tree/owner_scheduler.hh"
 #include "apps/inconel/value/sender.hh"
 #include "apps/inconel/write_path/write_batch.hh"
 #include "pump/core/compute_sender_type.hh"
@@ -467,6 +469,36 @@ expect_found(const pipeline::point_get_result& r, std::string_view body) {
     CHECK(r.value == body);
 }
 
+void
+expect_entry_in_gen(const std::shared_ptr<core::memtable_gen>& gen,
+                    std::string_view key,
+                    uint64_t lsn) {
+    CHECK(gen != nullptr);
+    const auto* entry = core::find_visible_entry(*gen, key, lsn);
+    CHECK(entry != nullptr);
+    CHECK(entry->k == core::memtable_entry::kind::value);
+    CHECK(entry->data_ver == lsn);
+}
+
+void
+expect_no_entry_in_gen(const std::shared_ptr<core::memtable_gen>& gen,
+                       std::string_view key,
+                       uint64_t lsn) {
+    CHECK(gen != nullptr);
+    CHECK(core::find_visible_entry(*gen, key, lsn) == nullptr);
+}
+
+bool
+contains_gen_id(const std::vector<std::shared_ptr<core::memtable_gen>>& gens,
+                uint64_t gen_id) {
+    return std::any_of(
+        gens.begin(),
+        gens.end(),
+        [gen_id](const std::shared_ptr<core::memtable_gen>& gen) {
+            return gen && gen->gen_id == gen_id;
+        });
+}
+
 std::shared_ptr<const core::publish_catalog>
 build_cat_from_fronts(std::shared_ptr<const core::publish_catalog> old_cat,
                       std::vector<core::front_read_set> fronts) {
@@ -484,6 +516,21 @@ build_cat_from_fronts(std::shared_ptr<const core::publish_catalog> old_cat,
         old_cat->durable_lsn.load(std::memory_order_acquire);
     return std::make_shared<const core::publish_catalog>(
         std::move(prs), durable, epoch);
+}
+
+tree::flush_fold_result
+run_tree_flush_fold(tree::tree_sched& sched,
+                    tree::tree_flush_request req) {
+    auto sub = submit_result<tree::flush_fold_result>(
+        [&sched, req = std::move(req)]() mutable {
+            return sched.submit_flush_fold(std::move(req));
+        });
+    for (uint32_t i = 0; !ready(sub.fut) && i < 200000; ++i) {
+        const bool progress = sched.advance();
+        if (!progress) std::this_thread::yield();
+    }
+    CHECK(ready(sub.fut));
+    return expect_ok<tree::flush_fold_result>(sub.fut.get());
 }
 
 struct topology_fixture {
@@ -669,6 +716,14 @@ struct topology_fixture {
         })));
     }
 
+    void run_enter_memtable(write_path::write_batch_state& state) {
+        CHECK(expect_ok<bool>(run_bool_result([&]() {
+            return coord::enter_memtable_phase(
+                       *topology.coord, state.ctx.batch_lsn)
+                >> pump::sender::then([]() { return true; });
+        })));
+    }
+
     void run_memtable(write_path::write_batch_state& state) {
         CHECK(expect_ok<bool>(run_bool_result([&]() {
             return write_path::write_batch_memtable_phase(
@@ -770,6 +825,38 @@ struct topology_fixture {
             const bool progress = advance_all(advance_nvme);
             if (!progress) std::this_thread::yield();
         }
+    }
+
+    template <typename Predicate>
+    void drive_until(Predicate&& pred,
+                     bool advance_nvme = true,
+                     uint32_t limit = 200000) {
+        for (uint32_t i = 0; !pred() && i < limit; ++i) {
+            const bool progress = advance_all(advance_nvme);
+            if (!progress) std::this_thread::yield();
+        }
+        CHECK(pred());
+    }
+
+    op_result<std::vector<std::shared_ptr<core::memtable_gen>>>
+    run_collect(uint32_t owner, uint64_t durable_lsn) {
+        auto sub =
+            submit_result<std::vector<std::shared_ptr<core::memtable_gen>>>(
+                [this, owner, durable_lsn]() {
+                    return front::collect_eligible_gens(
+                        *topology.fronts[owner], durable_lsn);
+                });
+        drive_until_ready(sub);
+        return sub.fut.get();
+    }
+
+    void run_release(uint32_t owner, std::vector<uint64_t> gen_ids) {
+        CHECK(expect_ok<bool>(run_bool_result(
+            [this, owner, gen_ids = std::move(gen_ids)]() mutable {
+                return front::release_gens(
+                           *topology.fronts[owner], std::move(gen_ids))
+                    >> pump::sender::then([]() { return true; });
+            })));
     }
 
     [[nodiscard]] uint64_t visible_lsn() const {
@@ -926,6 +1013,307 @@ void m12_seal_round_compose_without_submit_no_side_effect() {
     }
 }
 
+void m12_batch_lands_wholly_in_old_gens() {
+    topology_fixture fx({0, 1}, {}, 0, 0);
+    const std::string k0 = key_for_owner(0, fx.front_count(), "old-a");
+    const std::string k1 = key_for_owner(1, fx.front_count(), "old-b");
+
+    std::vector<std::shared_ptr<core::memtable_gen>> old_active;
+    for (auto* fs : fx.topology.fronts) {
+        old_active.push_back(fs->active_for_testing());
+    }
+
+    auto wr = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = k0, .value = "old0"},
+        {.op = core::write_op_type::put, .key = k1, .value = "old1"},
+    }));
+
+    auto seal = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+    auto cat1 = seal.cat1;
+    CHECK(cat1 != nullptr);
+    CHECK(cat1->durable_lsn.load(std::memory_order_acquire) ==
+          wr.batch_lsn);
+
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        const auto& frs = (*cat1->prs->fronts)[owner];
+        CHECK(frs.active == fx.topology.fronts[owner]->active_for_testing());
+        CHECK(!frs.imms.empty());
+        CHECK(frs.imms[0] == old_active[owner]);
+        CHECK(fx.topology.fronts[owner]->imms_for_testing()[0] ==
+              old_active[owner]);
+    }
+
+    const uint32_t o0 = owner_for_key(k0, fx.front_count());
+    const uint32_t o1 = owner_for_key(k1, fx.front_count());
+    expect_entry_in_gen(old_active[o0], k0, wr.batch_lsn);
+    expect_entry_in_gen(old_active[o1], k1, wr.batch_lsn);
+    expect_no_entry_in_gen(
+        fx.topology.fronts[o0]->active_for_testing(), k0, wr.batch_lsn);
+    expect_no_entry_in_gen(
+        fx.topology.fronts[o1]->active_for_testing(), k1, wr.batch_lsn);
+
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k0)),
+                 "old0");
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k1)),
+                 "old1");
+}
+
+void m12_batch_lands_wholly_in_new_gens() {
+    topology_fixture fx({0, 1}, {}, 0, 0);
+    const std::string k0 = key_for_owner(0, fx.front_count(), "new-a");
+    const std::string k1 = key_for_owner(1, fx.front_count(), "new-b");
+
+    std::vector<std::shared_ptr<core::memtable_gen>> old_active;
+    for (auto* fs : fx.topology.fronts) {
+        old_active.push_back(fs->active_for_testing());
+    }
+
+    auto state = fx.assign_state({
+        {.op = core::write_op_type::put, .key = k0, .value = "new0"},
+        {.op = core::write_op_type::put, .key = k1, .value = "new1"},
+    });
+    fx.run_value(state);
+
+    fx.nvme.hold_call(m12_fake_nvme::op_kind::write,
+                      fx.nvme.writes.calls + 1);
+    auto wal_sub = submit_result<bool>([&]() {
+        return write_path::write_batch_wal_phase(
+            state,
+            core::registry::fronts_span(),
+            *fx.topology.wal_space,
+            fx.nvmes());
+    });
+    fx.drive_until([&]() { return fx.nvme.has_held(); });
+
+    auto seal = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+    auto cat1 = seal.cat1;
+    CHECK(cat1 != nullptr);
+    CHECK(cat1->durable_lsn.load(std::memory_order_acquire) == 0);
+
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        const auto& frs = (*cat1->prs->fronts)[owner];
+        CHECK(!frs.imms.empty());
+        CHECK(frs.imms[0] == old_active[owner]);
+    }
+
+    CHECK(fx.nvme.release_held());
+    fx.drive_until_ready(wal_sub);
+    CHECK(expect_ok<bool>(wal_sub.fut.get()));
+
+    fx.run_enter_memtable(state);
+    fx.run_memtable(state);
+    fx.run_publish(state);
+
+    const uint64_t batch_lsn = state.ctx.batch_lsn;
+    CHECK(fx.visible_lsn() == batch_lsn);
+    CHECK(cat1->durable_lsn.load(std::memory_order_acquire) ==
+          batch_lsn);
+
+    const uint32_t o0 = owner_for_key(k0, fx.front_count());
+    const uint32_t o1 = owner_for_key(k1, fx.front_count());
+    expect_entry_in_gen(
+        fx.topology.fronts[o0]->active_for_testing(), k0, batch_lsn);
+    expect_entry_in_gen(
+        fx.topology.fronts[o1]->active_for_testing(), k1, batch_lsn);
+    expect_no_entry_in_gen(old_active[o0], k0, batch_lsn);
+    expect_no_entry_in_gen(old_active[o1], k1, batch_lsn);
+
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k0)),
+                 "new0");
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k1)),
+                 "new1");
+}
+
+void m12_collect_bridge_feeds_flush_fold() {
+    topology_fixture fx({0, 1}, {}, 0, 0);
+    const std::string k0 = key_for_owner(0, fx.front_count(), "fold-a");
+    const std::string k1 = key_for_owner(1, fx.front_count(), "fold-b");
+
+    auto wr = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = k0, .value = "fold0"},
+        {.op = core::write_op_type::put, .key = k1, .value = "fold1"},
+    }));
+    auto cat0 = fx.topology.coord->acquire_read_handle_for_testing().cat;
+    auto seal = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+    auto cat1 = seal.cat1;
+    const uint64_t durable =
+        cat1->durable_lsn.load(std::memory_order_acquire);
+    CHECK(durable == wr.batch_lsn);
+
+    tree::tree_flush_request req{
+        .base_guard = cat0->prs->tree_guard,
+        .sealed_gens = {},
+        .recovery_safe_lsn = 0,
+    };
+
+    for (uint32_t owner = 0; owner < fx.front_count(); ++owner) {
+        auto gens =
+            expect_ok<std::vector<std::shared_ptr<core::memtable_gen>>>(
+                fx.run_collect(owner, durable));
+        CHECK(gens.size() == 1);
+        CHECK(gens[0]->st == core::memtable_gen::state::sealed);
+        CHECK(gens[0]->max_lsn == durable);
+        req.sealed_gens.push_back(std::move(gens[0]));
+    }
+    CHECK(req.sealed_gens.size() == fx.front_count());
+
+    core::leaf_order_index empty_order;
+    core::registry::install_shard_partitions(
+        std::make_shared<const core::shard_partition_map>(
+            core::build_initial_shard_partition_map(empty_order, 1)));
+
+    tree::tree_sched owner_tree(&fx.tree_geom);
+    auto folded = run_tree_flush_fold(owner_tree, std::move(req));
+    CHECK(folded.st == tree::flush_stage_status::ok);
+    CHECK(folded.round_id.v != 0);
+    CHECK(folded.recovery_safe_lsn == 0);
+    CHECK(folded.base_manifest == cat0->prs->tree_guard->manifest.get());
+    CHECK(!folded.partitions.empty());
+
+    bool saw0 = false;
+    bool saw1 = false;
+    for (const auto& part : folded.partitions) {
+        for (const auto& group : part.groups) {
+            if (group.key == k0) {
+                saw0 = true;
+                CHECK(group.winner_data_ver == wr.batch_lsn);
+                CHECK(group.winner_kind == core::memtable_entry::kind::value);
+            }
+            if (group.key == k1) {
+                saw1 = true;
+                CHECK(group.winner_data_ver == wr.batch_lsn);
+                CHECK(group.winner_kind == core::memtable_entry::kind::value);
+            }
+        }
+    }
+    CHECK(saw0);
+    CHECK(saw1);
+}
+
+void m12_release_gens_keeps_pinned_gen_alive() {
+    topology_fixture fx({0, 1}, {}, 0, 0);
+    const std::string key = key_for_owner(0, fx.front_count(), "pin");
+    const uint32_t owner = owner_for_key(key, fx.front_count());
+
+    auto wr = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = key, .value = "pin-v"},
+    }));
+
+    auto old = fx.topology.coord->acquire_read_handle_for_testing();
+    auto old_gen = (*old.cat->prs->fronts)[owner].active;
+    CHECK(old_gen != nullptr);
+    std::weak_ptr<core::memtable_gen> weak = old_gen;
+
+    auto seal = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+    auto cat1 = seal.cat1;
+    CHECK(contains_gen_id(fx.topology.fronts[owner]->imms_for_testing(),
+                          old_gen->gen_id));
+
+    fx.run_release(owner, {old_gen->gen_id});
+    CHECK(!contains_gen_id(fx.topology.fronts[owner]->imms_for_testing(),
+                           old_gen->gen_id));
+
+    std::vector<core::front_read_set> current_sets;
+    current_sets.reserve(fx.front_count());
+    for (auto* fs : fx.topology.fronts) {
+        current_sets.push_back(core::front_read_set{
+            .active = fs->active_for_testing(),
+            .imms = fs->imms_for_testing(),
+        });
+    }
+    auto cat2 = build_cat_from_fronts(cat1, std::move(current_sets));
+    fx.run_install_cat(cat2);
+    auto newest = fx.topology.coord->acquire_read_handle_for_testing();
+    CHECK(newest.cat == cat2);
+
+    auto lookup = fx.topology.fronts[owner]->lookup_memtable_for_testing(
+        key, old.read_lsn, (*old.cat->prs->fronts)[owner]);
+    CHECK(std::holds_alternative<core::memtable_value_hit>(lookup));
+
+    seal.cat1.reset();
+    cat1.reset();
+    cat2.reset();
+    newest = {};
+    old_gen.reset();
+    CHECK(!weak.expired());
+
+    old = {};
+    CHECK(weak.expired());
+    CHECK(wr.batch_lsn == 1);
+}
+
+void m12_multiple_seals_accumulate_imms_newest_first() {
+    topology_fixture fx({0, 1}, {}, 0, 0);
+    const std::string k0 = key_for_owner(0, fx.front_count(), "multi-g0");
+    const std::string k1 = key_for_owner(0, fx.front_count(), "multi-g1");
+    const std::string k2 = key_for_owner(0, fx.front_count(), "multi-g2");
+    const uint32_t owner = owner_for_key(k0, fx.front_count());
+
+    std::vector<std::shared_ptr<core::memtable_gen>> gen0;
+    for (auto* fs : fx.topology.fronts) {
+        gen0.push_back(fs->active_for_testing());
+    }
+
+    auto wr0 = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = k0, .value = "g0"},
+    }));
+    auto seal1 = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+
+    std::vector<std::shared_ptr<core::memtable_gen>> gen1;
+    for (auto* fs : fx.topology.fronts) {
+        gen1.push_back(fs->active_for_testing());
+    }
+    for (uint32_t i = 0; i < fx.front_count(); ++i) {
+        const auto& frs = (*seal1.cat1->prs->fronts)[i];
+        CHECK(frs.active == gen1[i]);
+        CHECK(frs.imms.size() == 1);
+        CHECK(frs.imms[0] == gen0[i]);
+    }
+
+    auto wr1 = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = k1, .value = "g1"},
+    }));
+    auto seal2 = expect_ok<pipeline::seal_round_result>(fx.run_rt_seal());
+    CHECK(seal2.cat1->epoch == seal1.cat1->epoch + 1);
+
+    for (uint32_t i = 0; i < fx.front_count(); ++i) {
+        const auto& local_imms = fx.topology.fronts[i]->imms_for_testing();
+        CHECK(local_imms.size() == 2);
+        CHECK(local_imms[0] == gen1[i]);
+        CHECK(local_imms[1] == gen0[i]);
+
+        const auto& frs = (*seal2.cat1->prs->fronts)[i];
+        CHECK(frs.active == fx.topology.fronts[i]->active_for_testing());
+        CHECK(frs.imms.size() == 2);
+        CHECK(frs.imms[0] == gen1[i]);
+        CHECK(frs.imms[1] == gen0[i]);
+    }
+
+    auto gen2 = fx.topology.fronts[owner]->active_for_testing();
+    auto wr2 = expect_ok<write_path::write_batch_result>(fx.run_l3_write({
+        {.op = core::write_op_type::put, .key = k2, .value = "g2"},
+    }));
+
+    expect_entry_in_gen(gen0[owner], k0, wr0.batch_lsn);
+    expect_entry_in_gen(gen1[owner], k1, wr1.batch_lsn);
+    expect_entry_in_gen(gen2, k2, wr2.batch_lsn);
+    CHECK(fx.visible_lsn() == wr2.batch_lsn);
+
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k0)),
+                 "g0");
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k1)),
+                 "g1");
+    expect_found(expect_ok<pipeline::point_get_result>(
+                     fx.run_rt_point_get(k2)),
+                 "g2");
+}
+
 }  // namespace
 
 int main() {
@@ -933,5 +1321,10 @@ int main() {
     m12_publish_parked_while_gate_closed_lands_on_cat1();
     m12_concurrent_seal_once_second_fails_fast();
     m12_seal_round_compose_without_submit_no_side_effect();
+    m12_batch_lands_wholly_in_old_gens();
+    m12_batch_lands_wholly_in_new_gens();
+    m12_collect_bridge_feeds_flush_fold();
+    m12_release_gens_keeps_pinned_gen_alive();
+    m12_multiple_seals_accumulate_imms_newest_first();
     return 0;
 }

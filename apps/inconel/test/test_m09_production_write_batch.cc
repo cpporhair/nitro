@@ -1096,6 +1096,75 @@ m09_wal_failure_releases_and_memtable_invisible() {
 }
 
 void
+m09_release_of_failed_earlier_batch_unblocks_later_success() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "held-fail");
+    const std::string later_key =
+        key_for_owner(1, fx.front_count, "held-later");
+
+    fx.nvme.hold_call(test_fake_nvme::op_kind::write, 1);
+    auto failed = fx.submit_write({
+        {.op = core::write_op_type::del, .key = failed_key, .value = ""},
+    });
+
+    for (uint32_t i = 0; !fx.nvme.has_held() && i < 200000; ++i) {
+        const bool progress = fx.advance_all();
+        if (!progress) std::this_thread::yield();
+    }
+    CHECK(fx.nvme.has_held());
+    CHECK(!ready(failed.fut));
+    CHECK(fx.visible_lsn() == 0);
+
+    auto later = fx.submit_write({
+        {.op = core::write_op_type::put, .key = later_key, .value = "keep"},
+    });
+    fx.drive_until_ready(later);
+    auto later_result =
+        expect_ok<write_path::write_batch_result>(later.fut.get());
+    CHECK(later_result.batch_lsn == 2);
+    CHECK(fx.visible_lsn() == 0);
+    expect_miss(fx.lookup_visible(later_key));
+    CHECK(!ready(failed.fut));
+
+    CHECK(fx.nvme.release_held(
+        test_fake_nvme::held_completion::fail_with_false));
+    fx.drive_until_ready(failed);
+    expect_wal_error(
+        failed.fut.get(),
+        wal::wal_append_error_reason::device_failure);
+    CHECK(fx.visible_lsn() == 2);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+    expect_miss(fx.lookup_visible(failed_key));
+    expect_memtable_data_ver(fx, later_key, later_result.batch_lsn);
+}
+
+void
+m09_pre_lsn_failure_propagates_without_lsn_or_release() {
+    write_fixture fx;
+    core::client_batch_buffer bad;
+    bad.bytes.push_back(std::byte{0x01});
+
+    auto failed = fx.submit_write_buffer(std::move(bad));
+    fx.drive_until_ready(failed);
+    expect_error<std::invalid_argument>(failed.fut.get());
+    CHECK(fx.visible_lsn() == 0);
+    CHECK(fx.nvme.total_calls() == 0);
+    for (const auto& front_sched : fx.front_storage) {
+        CHECK(front_sched->active_for_testing()->table.empty());
+    }
+
+    const std::string key = key_for_owner(0, fx.front_count, "after-bad");
+    auto result = expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put, .key = key, .value = "ok"},
+    }));
+    CHECK(result.batch_lsn == 1);
+    CHECK(result.entry_count == 1);
+    CHECK(fx.visible_lsn() == 1);
+    expect_memtable_data_ver(fx, key, result.batch_lsn);
+}
+
+void
 m09_compose_without_submit_has_no_owner_side_effect() {
     write_fixture fx;
     const std::string discarded_key =
@@ -1124,6 +1193,28 @@ m09_compose_without_submit_has_no_owner_side_effect() {
     CHECK(result.entry_count == 1);
     CHECK(fx.visible_lsn() == 1);
     expect_memtable_data_ver(fx, key, result.batch_lsn);
+}
+
+void
+m09_failure_classification_unit() {
+    std::exception_ptr none;
+    CHECK(!write_path::is_releasable_write_failure(none));
+    CHECK(write_path::is_releasable_write_failure(
+        std::make_exception_ptr(value::value_persist_error(
+            value::value_persist_error_reason::round_failed,
+            "value"))));
+    CHECK(write_path::is_releasable_write_failure(
+        std::make_exception_ptr(wal::wal_append_error(
+            wal::wal_append_error_reason::device_failure,
+            "wal"))));
+    CHECK(!write_path::is_releasable_write_failure(
+        std::make_exception_ptr(std::logic_error("logic"))));
+    CHECK(!write_path::is_releasable_write_failure(
+        std::make_exception_ptr(std::invalid_argument("invalid"))));
+    CHECK(!write_path::is_releasable_write_failure(
+        std::make_exception_ptr(std::runtime_error("runtime"))));
+    CHECK(!write_path::is_releasable_write_failure(
+        std::make_exception_ptr(42)));
 }
 
 void
@@ -1167,7 +1258,10 @@ main() {
     m09_concurrent_batches_publish_gap_free();
     m09_value_failure_releases_and_stays_invisible();
     m09_wal_failure_releases_and_memtable_invisible();
+    m09_release_of_failed_earlier_batch_unblocks_later_success();
+    m09_pre_lsn_failure_propagates_without_lsn_or_release();
     m09_compose_without_submit_has_no_owner_side_effect();
+    m09_failure_classification_unit();
     m09_oversized_value_fails_with_release();
     return 0;
 }

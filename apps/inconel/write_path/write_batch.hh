@@ -98,7 +98,14 @@ namespace apps::inconel::write_path {
                         return write_batch_wal_phase(
                             state, fronts, wal_space, nvme_by_owner);
                     })
-                    >> flat_map([&state, fronts](bool) {
+                    >> flat_map([&coord_sched, &state](bool) {
+                        // M12/051 §4.1: memtable fan-out dispatch must run
+                        // from coord's event queue, ordered against
+                        // close_gate's seal_active fan-out dispatch.
+                        return coord::enter_memtable_phase(
+                            coord_sched, state.ctx.batch_lsn);
+                    })
+                    >> flat_map([&state, fronts]() {
                         return write_batch_memtable_phase(state, fronts);
                     })
                     >> flat_map([&coord_sched, &state](bool) {

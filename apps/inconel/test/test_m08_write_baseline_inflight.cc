@@ -603,6 +603,34 @@ expect_error(op_result<T>&& result) {
     CHECK(false);
 }
 
+void
+expect_value_error(op_result<bool>&& result,
+                   value::value_persist_error_reason reason) {
+    CHECK(std::holds_alternative<std::exception_ptr>(result));
+    try {
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+    } catch (const value::value_persist_error& e) {
+        CHECK(e.reason() == reason);
+        return;
+    } catch (...) {
+    }
+    CHECK(false);
+}
+
+void
+expect_wal_error(op_result<bool>&& result,
+                 wal::wal_append_error_reason reason) {
+    CHECK(std::holds_alternative<std::exception_ptr>(result));
+    try {
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+    } catch (const wal::wal_append_error& e) {
+        CHECK(e.reason() == reason);
+        return;
+    } catch (...) {
+    }
+    CHECK(false);
+}
+
 template <typename Exc, typename Fn>
 void
 expect_throws(Fn&& fn) {
@@ -734,17 +762,19 @@ struct write_fixture {
             expect_ok<core::batch_ctx>(sub.fut.get()));
     }
 
-    void run_value(write_path::write_batch_state& state) {
-        auto sub = submit_result<bool>([&]() {
-            return write_path::write_batch_value_phase(state, provider);
-        });
-        drive_until_ready(sub);
-        expect_bool_ok(sub.fut.get());
+    template <typename SenderBuilder>
+    op_result<bool>
+    run_bool_result(SenderBuilder&& build_sender,
+                    bool advance_nvme = true) {
+        auto sub = submit_result<bool>(
+            std::forward<SenderBuilder>(build_sender));
+        drive_until_ready(sub, advance_nvme);
+        return sub.fut.get();
     }
 
-    void run_wal(write_path::write_batch_state& state,
-                 bool advance_nvme = true) {
-        auto sub = submit_result<bool>([&]() {
+    submission<bool>
+    submit_wal(write_path::write_batch_state& state) {
+        return submit_result<bool>([&]() {
             return write_path::write_batch_wal_phase(
                 state,
                 std::span<front::front_sched* const>(
@@ -753,35 +783,66 @@ struct write_fixture {
                 std::span<test_fake_nvme::scheduler* const>(
                     nvme_ptrs.data(), nvme_ptrs.size()));
         });
-        drive_until_ready(sub, advance_nvme);
-        expect_bool_ok(sub.fut.get());
     }
 
-    void run_memtable(write_path::write_batch_state& state) {
-        auto sub = submit_result<bool>([&]() {
+    op_result<bool>
+    value_result(write_path::write_batch_state& state) {
+        return run_bool_result([&]() {
+            return write_path::write_batch_value_phase(state, provider);
+        });
+    }
+
+    op_result<bool>
+    wal_result(write_path::write_batch_state& state,
+               bool advance_nvme = true) {
+        auto sub = submit_wal(state);
+        drive_until_ready(sub, advance_nvme);
+        return sub.fut.get();
+    }
+
+    op_result<bool>
+    memtable_result(write_path::write_batch_state& state) {
+        return run_bool_result([&]() {
             return write_path::write_batch_memtable_phase(
                 state,
                 std::span<front::front_sched* const>(
                     front_ptrs.data(), front_ptrs.size()));
         });
-        drive_until_ready(sub);
-        expect_bool_ok(sub.fut.get());
+    }
+
+    op_result<bool>
+    publish_result(write_path::write_batch_state& state) {
+        return run_bool_result([&]() {
+            return write_path::write_batch_publish(*coord, state);
+        });
+    }
+
+    op_result<bool>
+    release_result(write_path::write_batch_state& state) {
+        return run_bool_result([&]() {
+            return write_path::write_batch_release(*coord, state);
+        });
+    }
+
+    void run_value(write_path::write_batch_state& state) {
+        expect_bool_ok(value_result(state));
+    }
+
+    void run_wal(write_path::write_batch_state& state,
+                 bool advance_nvme = true) {
+        expect_bool_ok(wal_result(state, advance_nvme));
+    }
+
+    void run_memtable(write_path::write_batch_state& state) {
+        expect_bool_ok(memtable_result(state));
     }
 
     void run_publish(write_path::write_batch_state& state) {
-        auto sub = submit_result<bool>([&]() {
-            return write_path::write_batch_publish(*coord, state);
-        });
-        drive_until_ready(sub);
-        expect_bool_ok(sub.fut.get());
+        expect_bool_ok(publish_result(state));
     }
 
     void run_release(write_path::write_batch_state& state) {
-        auto sub = submit_result<bool>([&]() {
-            return write_path::write_batch_release(*coord, state);
-        });
-        drive_until_ready(sub);
-        expect_bool_ok(sub.fut.get());
+        expect_bool_ok(release_result(state));
     }
 
     [[nodiscard]] uint64_t visible_lsn() const {
@@ -1207,6 +1268,192 @@ m08_release_parked_fills_hole_without_visibility() {
     expect_visible_value(fx, published_key, published_ref);
 }
 
+void
+m08_wal_failure_maps_to_release_and_unblocks_later_batch() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "wal-fail");
+    auto failed = fx.assign_state({
+        {.op = core::write_op_type::put,
+         .key = failed_key,
+         .value = "bad"},
+    });
+    fx.run_value(failed);
+
+    fx.nvme.fail_kind = test_fake_nvme::op_kind::write;
+    fx.nvme.fail_call = fx.nvme.writes.calls + 1;
+    fx.nvme.fail_with_false = true;
+    expect_wal_error(
+        fx.wal_result(failed),
+        wal::wal_append_error_reason::device_failure);
+    CHECK(failed.phase == write_path::write_batch_phase::value_durable);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+
+    fx.run_release(failed);
+    CHECK(failed.phase == write_path::write_batch_phase::released);
+    CHECK(fx.visible_lsn() == 1);
+    fx.nvme.clear_failure();
+
+    const std::string retry_key =
+        key_for_owner(0, fx.front_count, "wal-retry");
+    auto retry = single_put_to_wal(fx, retry_key, "ok");
+    const auto retry_ref = find_entry(retry->ctx, retry_key).allocated_vr;
+    finish_published(fx, *retry);
+    CHECK(fx.visible_lsn() == 2);
+    expect_visible_value(fx, retry_key, retry_ref);
+}
+
+void
+m08_value_failure_maps_to_release() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "value-fail");
+    auto failed = fx.assign_state({
+        {.op = core::write_op_type::put,
+         .key = failed_key,
+         .value = std::string(3000, 'v')},
+    });
+
+    fx.nvme.fail_kind = test_fake_nvme::op_kind::write;
+    fx.nvme.fail_call = 1;
+    fx.nvme.fail_with_false = true;
+    expect_value_error(
+        fx.value_result(failed),
+        value::value_persist_error_reason::round_failed);
+    CHECK(failed.phase == write_path::write_batch_phase::assigned);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+
+    fx.run_release(failed);
+    CHECK(failed.phase == write_path::write_batch_phase::released);
+    CHECK(fx.visible_lsn() == 1);
+    fx.nvme.clear_failure();
+
+    const std::string retry_key =
+        key_for_owner(0, fx.front_count, "value-retry");
+    auto retry = single_put_to_wal(fx, retry_key, "ok");
+    const auto retry_ref = find_entry(retry->ctx, retry_key).allocated_vr;
+    finish_published(fx, *retry);
+    CHECK(fx.visible_lsn() == 2);
+    expect_visible_value(fx, retry_key, retry_ref);
+}
+
+void
+m08_prepare_queue_full_overflow_releases_without_blocking_others() {
+    write_fixture fx(1, 2);
+    const std::string key1 = key_for_owner(0, fx.front_count, "fifo-a");
+    const std::string key2 = key_for_owner(0, fx.front_count, "fifo-b");
+    const std::string key3 = key_for_owner(0, fx.front_count, "fifo-c");
+    const std::string key4 = key_for_owner(0, fx.front_count, "fifo-d");
+
+    auto first = fx.assign_state({
+        {.op = core::write_op_type::del, .key = key1, .value = ""},
+    });
+    auto second = fx.assign_state({
+        {.op = core::write_op_type::del, .key = key2, .value = ""},
+    });
+    auto third = fx.assign_state({
+        {.op = core::write_op_type::del, .key = key3, .value = ""},
+    });
+    auto overflow = fx.assign_state({
+        {.op = core::write_op_type::del, .key = key4, .value = ""},
+    });
+    fx.run_value(first);
+    fx.run_value(second);
+    fx.run_value(third);
+    fx.run_value(overflow);
+
+    auto sub1 = fx.submit_wal(first);
+    for (uint32_t i = 0; fx.nvme.writes.active == 0 && i < 1024; ++i) {
+        (void)fx.advance_all(false);
+        std::this_thread::yield();
+    }
+    CHECK(fx.nvme.writes.active > 0);
+    CHECK(!ready(sub1.fut));
+
+    auto sub2 = fx.submit_wal(second);
+    bool moved_to_pending = false;
+    for (uint32_t i = 0; !moved_to_pending && i < 1024; ++i) {
+        moved_to_pending = fx.front_storage[0]->advance();
+        std::this_thread::yield();
+    }
+    CHECK(moved_to_pending);
+    CHECK(!ready(sub2.fut));
+
+    auto sub3 = fx.submit_wal(third);
+    moved_to_pending = false;
+    for (uint32_t i = 0; !moved_to_pending && i < 1024; ++i) {
+        moved_to_pending = fx.front_storage[0]->advance();
+        std::this_thread::yield();
+    }
+    CHECK(moved_to_pending);
+    CHECK(!ready(sub3.fut));
+
+    auto sub4 = fx.submit_wal(overflow);
+    fx.drive_until_ready(sub4, false);
+    expect_wal_error(
+        sub4.fut.get(),
+        wal::wal_append_error_reason::prepare_queue_full);
+    CHECK(overflow.phase == write_path::write_batch_phase::value_durable);
+    fx.run_release(overflow);
+    CHECK(overflow.phase == write_path::write_batch_phase::released);
+    CHECK(fx.visible_lsn() == 0);
+
+    fx.drive_until_ready(sub1);
+    expect_bool_ok(sub1.fut.get());
+    CHECK(first.phase == write_path::write_batch_phase::wal_durable);
+    fx.drive_until_ready(sub2);
+    expect_bool_ok(sub2.fut.get());
+    CHECK(second.phase == write_path::write_batch_phase::wal_durable);
+    fx.drive_until_ready(sub3);
+    expect_bool_ok(sub3.fut.get());
+    CHECK(third.phase == write_path::write_batch_phase::wal_durable);
+
+    finish_published(fx, first);
+    CHECK(fx.visible_lsn() == 1);
+    finish_published(fx, second);
+    CHECK(fx.visible_lsn() == 2);
+    finish_published(fx, third);
+    CHECK(fx.visible_lsn() == 4);
+    expect_tombstone(fx.lookup_visible(key1));
+    expect_tombstone(fx.lookup_visible(key2));
+    expect_tombstone(fx.lookup_visible(key3));
+    expect_miss(fx.lookup_visible(key4));
+}
+
+void
+m08_release_after_memtable_phase_starts_is_rejected() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "late-release");
+    auto state = single_put_to_wal(fx, key, "body");
+    fx.run_memtable(*state);
+    CHECK(state->phase == write_path::write_batch_phase::memtable_applied);
+    CHECK(fx.visible_lsn() == 0);
+
+    expect_error<std::logic_error>(fx.release_result(*state));
+    CHECK(state->phase == write_path::write_batch_phase::memtable_applied);
+    CHECK(fx.visible_lsn() == 0);
+
+    fx.run_publish(*state);
+    CHECK(fx.visible_lsn() == 1);
+}
+
+void
+m08_publish_before_memtable_applied_is_rejected() {
+    write_fixture fx;
+    const std::string key = key_for_owner(0, fx.front_count, "early-publish");
+    auto state = single_put_to_wal(fx, key, "body");
+    CHECK(state->phase == write_path::write_batch_phase::wal_durable);
+
+    expect_error<std::logic_error>(fx.publish_result(*state));
+    CHECK(state->phase == write_path::write_batch_phase::wal_durable);
+    CHECK(fx.visible_lsn() == 0);
+
+    const auto value_ref = find_entry(state->ctx, key).allocated_vr;
+    finish_published(fx, *state);
+    CHECK(fx.visible_lsn() == 1);
+    expect_visible_value(fx, key, value_ref);
+}
+
 }  // namespace
 
 int
@@ -1217,5 +1464,10 @@ main() {
     m08_inflight_parks_after_wal_without_publish();
     m08_out_of_order_finish_advances_durable_lsn_gap_free();
     m08_release_parked_fills_hole_without_visibility();
+    m08_wal_failure_maps_to_release_and_unblocks_later_batch();
+    m08_value_failure_maps_to_release();
+    m08_prepare_queue_full_overflow_releases_without_blocking_others();
+    m08_release_after_memtable_phase_starts_is_rejected();
+    m08_publish_before_memtable_applied_is_rejected();
     return 0;
 }

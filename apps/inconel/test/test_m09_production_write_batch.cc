@@ -575,6 +575,36 @@ expect_error(op_result<T>&& result) {
     CHECK(false);
 }
 
+template <typename T>
+void
+expect_value_error(op_result<T>&& result,
+                   value::value_persist_error_reason reason) {
+    CHECK(std::holds_alternative<std::exception_ptr>(result));
+    try {
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+    } catch (const value::value_persist_error& e) {
+        CHECK(e.reason() == reason);
+        return;
+    } catch (...) {
+    }
+    CHECK(false);
+}
+
+template <typename T>
+void
+expect_wal_error(op_result<T>&& result,
+                 wal::wal_append_error_reason reason) {
+    CHECK(std::holds_alternative<std::exception_ptr>(result));
+    try {
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+    } catch (const wal::wal_append_error& e) {
+        CHECK(e.reason() == reason);
+        return;
+    } catch (...) {
+    }
+    CHECK(false);
+}
+
 struct write_fixture {
     using value_sched_t = value::value_alloc_sched<core::segmented_clock_cache>;
 
@@ -849,6 +879,15 @@ front_memtable_has_key(const write_fixture& fx, std::string_view key) {
     return table.find(key) != table.end();
 }
 
+bool
+wal_has_key(const write_fixture& fx, std::string_view key) {
+    const auto entries = collect_all_wal_entries(fx);
+    for (const auto& entry : entries) {
+        if (entry.key == key) return true;
+    }
+    return false;
+}
+
 void
 expect_memtable_data_ver(const write_fixture& fx,
                          std::string_view key,
@@ -986,6 +1025,77 @@ m09_concurrent_batches_publish_gap_free() {
 }
 
 void
+m09_value_failure_releases_and_stays_invisible() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "value-fail");
+
+    fx.nvme.fail_kind = test_fake_nvme::op_kind::write;
+    fx.nvme.fail_call = 1;
+    fx.nvme.fail_with_false = true;
+    expect_value_error(
+        fx.run_write({
+            {.op = core::write_op_type::put,
+             .key = failed_key,
+             .value = std::string(3000, 'v')},
+        }),
+        value::value_persist_error_reason::round_failed);
+    CHECK(fx.visible_lsn() == 1);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+    expect_miss(fx.lookup_visible(failed_key));
+    CHECK(!wal_has_key(fx, failed_key));
+    fx.nvme.clear_failure();
+
+    const std::string retry_key =
+        key_for_owner(0, fx.front_count, "value-retry");
+    auto retry = expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put,
+         .key = retry_key,
+         .value = "ok"},
+    }));
+    CHECK(retry.batch_lsn == 2);
+    CHECK(fx.visible_lsn() == 2);
+    expect_miss(fx.lookup_visible(failed_key));
+    expect_memtable_data_ver(fx, retry_key, retry.batch_lsn);
+}
+
+void
+m09_wal_failure_releases_and_memtable_invisible() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "wal-fail");
+
+    fx.nvme.fail_kind = test_fake_nvme::op_kind::write;
+    fx.nvme.fail_call = 2;
+    fx.nvme.fail_with_false = true;
+    expect_wal_error(
+        fx.run_write({
+            {.op = core::write_op_type::put,
+             .key = failed_key,
+             .value = std::string(3000, 'w')},
+        }),
+        wal::wal_append_error_reason::device_failure);
+    CHECK(fx.nvme.writes.calls > 1);
+    CHECK(fx.visible_lsn() == 1);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+    expect_miss(fx.lookup_visible(failed_key));
+    CHECK(!wal_has_key(fx, failed_key));
+    fx.nvme.clear_failure();
+
+    const std::string retry_key =
+        key_for_owner(0, fx.front_count, "wal-retry");
+    auto retry = expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put,
+         .key = retry_key,
+         .value = "ok"},
+    }));
+    CHECK(retry.batch_lsn == 2);
+    CHECK(fx.visible_lsn() == 2);
+    expect_miss(fx.lookup_visible(failed_key));
+    expect_memtable_data_ver(fx, retry_key, retry.batch_lsn);
+}
+
+void
 m09_compose_without_submit_has_no_owner_side_effect() {
     write_fixture fx;
     const std::string discarded_key =
@@ -1016,12 +1126,48 @@ m09_compose_without_submit_has_no_owner_side_effect() {
     expect_memtable_data_ver(fx, key, result.batch_lsn);
 }
 
+void
+m09_oversized_value_fails_with_release() {
+    write_fixture fx;
+    const std::string failed_key =
+        key_for_owner(0, fx.front_count, "oversized");
+    const uint32_t writes_before = fx.nvme.writes.calls;
+
+    expect_value_error(
+        fx.run_write({
+            {.op = core::write_op_type::put,
+             .key = failed_key,
+             .value = std::string(20000, 'x')},
+        }),
+        value::value_persist_error_reason::oversized_value);
+    CHECK(fx.nvme.writes.calls == writes_before);
+    CHECK(fx.visible_lsn() == 1);
+    CHECK(!front_memtable_has_key(fx, failed_key));
+    expect_miss(fx.lookup_visible(failed_key));
+    CHECK(!wal_has_key(fx, failed_key));
+
+    const std::string retry_key =
+        key_for_owner(0, fx.front_count, "oversized-retry");
+    auto retry = expect_ok<write_path::write_batch_result>(fx.run_write({
+        {.op = core::write_op_type::put,
+         .key = retry_key,
+         .value = "ok"},
+    }));
+    CHECK(retry.batch_lsn == 2);
+    CHECK(fx.visible_lsn() == 2);
+    expect_miss(fx.lookup_visible(failed_key));
+    expect_memtable_data_ver(fx, retry_key, retry.batch_lsn);
+}
+
 }  // namespace
 
 int
 main() {
     m09_success_path_matches_baseline_semantics();
     m09_concurrent_batches_publish_gap_free();
+    m09_value_failure_releases_and_stays_invisible();
+    m09_wal_failure_releases_and_memtable_invisible();
     m09_compose_without_submit_has_no_owner_side_effect();
+    m09_oversized_value_fails_with_release();
     return 0;
 }

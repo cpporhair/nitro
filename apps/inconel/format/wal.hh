@@ -354,19 +354,11 @@ namespace apps::inconel::format {
 
     [[nodiscard]] inline uint32_t
     wal_entry_parts_crc(const wal_entry_parts& parts) noexcept {
-        absl::crc32c_t crc = absl::ComputeCrc32c(
-            absl::string_view(
-                reinterpret_cast<const char*>(&parts.header),
-                sizeof(parts.header)));
-        crc = absl::ExtendCrc32c(
-            crc,
-            absl::string_view(
-                parts.value_ref_bytes.data(),
-                parts.value_ref_bytes.size()));
-        crc = absl::ExtendCrc32c(
-            crc,
-            absl::string_view(parts.key_bytes.data(), parts.key_bytes.size()));
-        return static_cast<uint32_t>(crc);
+        crc32c_stream s;
+        s.update(&parts.header, sizeof(parts.header));
+        s.update(parts.value_ref_bytes.data(), parts.value_ref_bytes.size());
+        s.update(parts.key_bytes.data(), parts.key_bytes.size());
+        return s.finish();
     }
 
     [[nodiscard]] inline wal_entry_parts

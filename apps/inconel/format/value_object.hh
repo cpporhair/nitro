@@ -11,6 +11,7 @@
 #include <absl/crc/crc32c.h>
 #include <absl/strings/string_view.h>
 
+#include "./crc32c.hh"
 #include "./types.hh"
 
 namespace apps::inconel::format {
@@ -54,8 +55,7 @@ namespace apps::inconel::format {
         value_object_header hdr{};
         hdr.magic    = VALUE_MAGIC;
         hdr.body_len = static_cast<uint32_t>(body.size());
-        hdr.body_crc = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(body.data(), body.size())));
+        hdr.body_crc = crc32c(body.data(), body.size());
 
         std::memcpy(slot.data(), &hdr, sizeof(hdr));
         std::memcpy(slot.data() + sizeof(hdr), body.data(), body.size());
@@ -84,8 +84,7 @@ namespace apps::inconel::format {
         }
 
         const char* body_ptr = slot.data() + sizeof(hdr);
-        uint32_t computed = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(body_ptr, expected_body_len)));
+        uint32_t computed = crc32c(body_ptr, expected_body_len);
         if (computed != hdr.body_crc) {
             r.status = value_decode_status::bad_crc;
             return r;
@@ -290,8 +289,7 @@ namespace apps::inconel::format {
         value_object_header hdr{};
         hdr.magic    = VALUE_MAGIC;
         hdr.body_len = static_cast<uint32_t>(body.size());
-        hdr.body_crc = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(body.data(), body.size())));
+        hdr.body_crc = crc32c(body.data(), body.size());
 
         return copy_value_slot_from(
                    frame, slot_offset, slot_bytes,
@@ -329,17 +327,16 @@ namespace apps::inconel::format {
             return value_decode_status::bad_body_len;
         }
 
-        absl::crc32c_t crc{0};
+        crc32c_stream s;
         const uint64_t body_offset = slot_offset + sizeof(hdr);
         if (!detail::visit_segmented_const_bytes(
                 frame, body_offset, expected_body_len,
                 [&](const char* src, uint64_t n) noexcept {
-                    crc = absl::ExtendCrc32c(
-                        crc, absl::string_view(src, static_cast<size_t>(n)));
+                    s.update(src, static_cast<size_t>(n));
                 })) {
             return value_decode_status::truncated;
         }
-        if (static_cast<uint32_t>(crc) != hdr.body_crc) {
+        if (s.finish() != hdr.body_crc) {
             return value_decode_status::bad_crc;
         }
 

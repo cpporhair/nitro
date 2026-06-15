@@ -107,6 +107,15 @@ namespace apps::inconel::write_path {
         std::optional<wal::sealed_segment_info> sealed;
     };
 
+    struct wal_fragment_write_state;
+
+    // Adopt a durable WAL completion into the fragment loop state. Shared by the
+    // leader path (after its own FUA + commit) and the follower path (the front
+    // owner reported the group plan already durable — no I/O on this branch).
+    [[nodiscard]] inline bool
+    apply_wal_completion_to_state(wal_fragment_write_state& state,
+                                  wal_plan_completion completion);
+
     struct wal_commit_after_issue {
         front::front_sched* sched = nullptr;
         uint64_t plan_id = 0;
@@ -262,6 +271,17 @@ namespace apps::inconel::write_path {
         bool done = false;
     };
 
+    [[nodiscard]] inline bool
+    apply_wal_completion_to_state(wal_fragment_write_state& state,
+                                  wal_plan_completion completion) {
+        state.cursor = completion.cursor_after;
+        state.done = completion.fragment_done;
+        if (completion.sealed.has_value()) {
+            state.sealed_for_alloc = std::move(completion.sealed);
+        }
+        return true;
+    }
+
     inline pump::coro::return_yields<bool>
     wal_fragment_not_done(const wal_fragment_write_state& state) {
         while (!state.done && state.fragment != nullptr &&
@@ -322,22 +342,32 @@ namespace apps::inconel::write_path {
                                               wal::wal_prepare_needs_segment>) {
                                 return allocate_and_install_wal_segment(
                                     state, std::move(alt));
+                            } else if constexpr (std::is_same_v<
+                                              alt_t,
+                                              wal::wal_prepare_committed>) {
+                                // Follower: the leader's group FUA already made
+                                // these WAL bytes durable. No I/O, no commit;
+                                // just adopt the durable cursor (054 §11.1/§12).
+                                return just(apply_wal_completion_to_state(
+                                    state,
+                                    wal_plan_completion{
+                                        .cursor_after = alt.cursor_after,
+                                        .fragment_done = alt.fragment_done,
+                                        .sealed = std::move(alt.sealed),
+                                    }));
                             } else {
                                 static_assert(std::is_same_v<
-                                    alt_t, wal::wal_prepare_ready>);
+                                    alt_t, wal::wal_prepare_issue_plan>);
+                                // Leader: issue the only physical plan, then
+                                // commit/abort it on the front owner.
                                 return issue_and_finish_wal_plan(
                                         state.front_sched,
                                         nvme_sched,
                                         std::move(alt.plan))
                                     >> then([&state](
                                             wal_plan_completion&& completion) {
-                                        state.cursor = completion.cursor_after;
-                                        state.done = completion.fragment_done;
-                                        if (completion.sealed.has_value()) {
-                                            state.sealed_for_alloc =
-                                                std::move(completion.sealed);
-                                        }
-                                        return true;
+                                        return apply_wal_completion_to_state(
+                                            state, std::move(completion));
                                     });
                             }
                         });

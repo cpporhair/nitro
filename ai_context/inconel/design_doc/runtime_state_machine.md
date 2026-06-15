@@ -597,6 +597,28 @@ struct wal_stream_state {
 4. sealed_segs.push_back(active_seg)
 ```
 
+#### Entry group commit（唯一在飞 physical plan + logical waiters，INC-057 / 054）
+
+实现上 WAL stream 任一时刻只有**一个在飞 physical `wal_append_plan`**(保证同一
+tail LBA 只有一个 full-page image 在飞,避免整页覆写在设备上乱序覆盖已写 entry)。
+front owner 在 idle 时把 `wal_pending_prepares_` FIFO 里已排队的多个 prepare
+按 FIFO 合并进这一个 plan:
+
+```text
+plan.participants[0]            = leader（发 FUA、commit/abort 的 caller）
+plan.participants[1..]         = followers（logical waiters）
+front_sched.wal_pending_group_  = { plan_id, waiters[] }   // 仅当有 follower 时存在
+```
+
+- leader prepare 立即返回 `wal_prepare_issue_plan`,走 issue FUA → commit/abort。
+- follower prepare callback 被 park 在 `wal_pending_group_`,**不返回到 L3**;
+  leader `commit` 时 front owner fan-out `wal_prepare_committed{cursor_after,
+  fragment_done}` 唤醒(无 I/O),`abort`/FUA failure 时 fan-out 同一 WAL device
+  failure,所有 participant 都停在 memtable 前走 release。
+- 唤醒后 front owner `drain_wal_pending_prepares()` 用 FIFO 残余 prepare 组下一个
+  group。header/trailer/needs_segment 仍单 participant(不 group)。
+- tail page snapshot(`begin_pending`)每个 group 只做一次,而不是每 batch 一次。
+
 ## 4. Tree Domain（`tree_sched` + `tree_read_domain × K`）
 
 tree 域拆成两类 runtime 对象：

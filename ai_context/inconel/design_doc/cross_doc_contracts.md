@@ -17,7 +17,7 @@
 | `capture_flush_frontier` | `()` → `flush_frontier { durable_lsn, old_guard }` | RSM §2.3, FF §2.2/8.1 |
 | `frontier_switch` | `(old_guard, new_manifest, retired, flushed_gens_by_front)` → `void` | RSM §2.3, FF §4.2/8.1 |
 | `install_cat` | `(new_publish_catalog)` → `void` | RSM §2.3, FF §4.2 |
-| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7;M06 起由 front `prepare_wal_fragment / install_wal_segment / commit_wal_plan / abort_wal_plan` + L3 `write_path::write_wal_fragment` 实现(044/045);本行保留为概念签名。 |
+| `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7;M06 起由 front `prepare_wal_fragment / install_wal_segment / commit_wal_plan / abort_wal_plan` + L3 `write_path::write_wal_fragment` 实现(044/045);本行保留为概念签名。INC-057/054 起 `prepare_wal_fragment` 结果为 `variant<wal_prepare_issue_plan, wal_prepare_committed, wal_prepare_needs_segment>`:`issue_plan`=leader 发 FUA 并 commit/abort;`committed`=follower(group 内已被 leader FUA 落盘,只 adopt cursor,不碰 NVMe、不 commit);`needs_segment`=单 participant 触发 segment install。物理在飞 plan 恒为 1,group commit 只合并 logical participant。 |
 | `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
 | `enter_memtable_phase` | `(batch_lsn)` → `void`（纯串行点：无 owner 状态变更；其 continuation 在 coord 上派发该 batch 的全部 memtable fragments，与 `close_gate` continuation 的 seal_active 派发在 coord 队列全序——OV §7.1 不变量 4 的机制落点） | WP §2.3 冻结约束 4, OV §7.1；051 §4.1/§5.1 |
 | `batch_lookup` | `(keys[], read_lsn, front_read_set)` → `batch_lookup_results[]` | RSM §3.4/3.7, RAP §5.1-5.3 |

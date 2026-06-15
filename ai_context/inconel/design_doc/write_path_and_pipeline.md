@@ -522,6 +522,19 @@ front WAL append 按 plan 粒度串行(见 044/045)。同一 front 上不同 bat
 的 entries 可能按 plan 交错出现在同一 segment 内;这不改变 recovery 契约
 ——重组只按 `lsn + entry_count`(概要 §11.2 约束 4),段内顺序不承载语义。
 
+**WAL entry group commit（INC-057 / 054）**：front WAL 仍只允许**一个物理
+`wal_append_plan` 在飞**(同一 tail LBA 只有一个 full-page write 在飞,避免整页
+覆写乱序),但 front owner idle 时把同 front FIFO(`wal_pending_prepares_`)里
+**已经排队**的多个 fragment 的 entries 按 FIFO coalesce 进同一个 entry plan。
+plan 携带一组 `participants`:participant[0] 是 leader(发 FUA、commit/abort),
+其余 follower 的 prepare callback 被 park 在 front owner,leader commit 后按各自
+`cursor_after/fragment_done` 唤醒(`wal_prepare_committed`,不碰 NVMe),
+FUA 失败则 fan-out 同一 device failure 给 group 内全部 batch,**全部停在 memtable
+前走 release**。因此小 batch 的 WAL FUA 次数从「per-batch tail-page write」收敛
+到「per-group `ceil(total_group_wal_bytes / lba_size)`」量级。header/trailer/
+needs_segment 仍是单 participant(不 group,避免扩大 rotation failure fan-out)。
+段内仍可见跨 batch 交错,recovery 契约不变。
+
 ### 8.4 durable_lsn 推进
 
 publish_batch / release_batch 到达 coord_sched 的顺序可能乱序（batch_C 先于 batch_B 完成）。ready_bitmap 处理这种乱序：
@@ -850,17 +863,28 @@ batch_lsn = X，有 3 个 fragments：
 ```text
 瓶颈在按页 FUA 的次数和 NVMe FUA 延迟。
 
-对当前 v1 实现，单 front_sched 的上限更接近：
+WAL 侧：自 INC-057 / 054 起,front WAL 用 entry group commit——并发到达同一
+front 的多个 small batch 的 WAL entries 被 coalesce 进一个 plan、一次 commit。
+因此单 front_sched 的 WAL durable 上限不再是「每 batch 一次 tail FUA」,而接近：
 
-  1 / (avg_wal_pages_per_batch × FUA_latency)
+  group_size / (group_wal_pages × FUA_latency)
 
-value 路径同理也会受 `avg_value_pages_per_batch × FUA_latency` 影响。
+稳态下 group_size 随 FIFO 里已排队的并发 batch 自然增长(无 timer、不人为等待),
+小 batch 常被合到一页, group_wal_pages 趋近 ceil(Σbytes / lba_size)。
+
+value 路径仍受 `avg_value_pages_per_batch × FUA_latency` 影响(value 侧 leader-
+follower 合并见 §5,不在本步范围)。
 
 N 个 front_scheds 并行后，整体吞吐仍可线性扩展，但会更早打到设备侧 FUA IOPS 上限。
 
 但实际瓶颈可能在 NVMe IOPS（value writes + WAL writes）
 或 coord_sched 的 canonicalize+assign_lsn 序列化点。
 ```
+
+> 注（INC-057）：`pending_prepare_capacity` 是 front owner 的**排队背压容量**
+> (FIFO 满返回 `prepare_queue_full`),不是在飞 I/O 并发度。在飞物理 plan 恒为 1;
+> 吞吐放大来自 group commit 把已排队 prepare 合进同一 plan,不是多 plan 并行。
+> 详见 050 §5.2 的更正与 054。
 
 ### 12.3 优化方向
 

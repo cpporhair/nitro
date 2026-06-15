@@ -226,6 +226,10 @@ struct wal_append_config {
     //     调用点行为不变）；非 0 = WAL pending prepare FIFO 的独立
     //     软容量（045 §5.D 的 backpressure 闸门）。
     uint32_t pending_prepare_capacity = 0;
+    // INC-057 / 054：一个 coalesced entry plan 最多合并多少个 queued
+    //     prepare（group commit 的 participant fan-out 上限）。在飞物理
+    //     plan 恒为 1，本旋钮只限制一次 commit 唤醒的 fan-out 规模。
+    uint32_t max_participants_per_group = 16;
 };
 ```
 
@@ -241,13 +245,23 @@ abort；prepare FIFO 满 = 写过载 → `prepare_queue_full` → release →
 prepare 挂着一个 in-flight batch 的 value+WAL 资源）。
 
 production 默认（builder `build_options.front_wal_config` 默认值）：
-`pending_prepare_capacity = 64`。数字依据：页级 FUA 并发上限
-`max_fua_inflight = 16`，单 plan ≤ `max_pages_per_plan = 16` 页——
-喂满 FUA 管道只需 1-2 个 plan 在飞 + 少量排队；64 提供 4× 余量吸收
-batch 到达抖动，同时把单 front 最大排队 WAL 工作量约束在 64 个
-batch 的 fragment 范围内（对照 ready_window 65536 的全局在飞上限，
-单 front 背压远早于全局窗口耗尽，符合 047 §7 第 2 层先于第 1 层
-触发的设计取向）。该值是部署旋钮，非格式参数。
+`pending_prepare_capacity = 64`。
+
+> **更正（INC-057 / 054，2026-06-15）**：本节早期把 `pending_prepare_capacity`
+> 当成「喂满 FUA 管道所需的在飞 plan 数」来定容量,该依据**错误**。
+> `pending_prepare_capacity` 是 front owner 的**排队背压容量**——FIFO
+> (`wal_pending_prepares_`)满返回 `prepare_queue_full`,与在飞 I/O 并发度
+> **无关**。WAL 在飞物理 `wal_append_plan` 恒为 **1**(同一 tail LBA 不能有
+> 多个 full-page write 并发,否则整页覆写乱序会覆盖已写 entry);吞吐放大来自
+> INC-057 的 **entry group commit**——把 FIFO 里已排队的多个 prepare 的 entries
+> coalesce 进同一个 plan 一次 commit,而不是放多个 plan 在飞。
+
+数字依据(更正后)：64 把单 front 最大排队 WAL 工作量约束在 64 个 batch 的
+fragment 范围内(每个排队 prepare 挂着一个 in-flight batch 的 value+WAL 资源),
+对照 ready_window 65536 的全局在飞上限,单 front 背压远早于全局窗口耗尽,符合
+047 §7 第 2 层(写过载软背压)先于第 1 层(部署容量 fail-fast)触发的设计取向。
+该值是部署旋钮,非格式参数。一个 group 一次能合并多少 prepare 由
+`max_participants_per_group`(默认 16)单独控制,与排队容量正交。
 
 既有测试兼容性证据：m08 测试 9（依赖耦合形态构造 prepare 溢出）与
 m05/m06/m09/m10 全部不改而绿 = 0-默认等价性证据。
@@ -662,8 +676,9 @@ review 独立核对成立）。要点与接受的实现形态：
   非宿主核 tuple 空槽在 `rt::run()` 捕获期剔除为零成本；空转
   advance = per_core 位图探测级。
 - **prepare 容量解耦**：front ctor 一次三目 + 8B `queue_depth_`
-  成员；热路径零变化。production 默认 64 的数字依据（§5.2：FUA
-  管道 16×16 页 1-2 plan 喂满，4× 抖动余量）成立。
+  成员；热路径零变化。production 默认 64 是**排队背压**容量（§5.2 更正：
+  `pending_prepare_capacity` 不是在飞 I/O 并发度，在飞物理 plan 恒为 1；
+  64 约束单 front 最多 64 个 batch 资源排队，远早于 ready_window 65536）。
 - **容量核销**：registry 新容器 KB 级；初始 CAT 套件 < 1KB；
   front × N 的 per_core::queue 预分配（~11.6MB/front 虚拟）按 §12
   表登记为部署 watch-item，本步未对 pump 做任何改动。

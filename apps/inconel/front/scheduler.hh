@@ -139,6 +139,24 @@ namespace apps::inconel::front {
         }
     };
 
+    // A follower prepare req merged into the current in-flight WAL entry group.
+    // The front owner parks its prepare callback here until the leader commits
+    // (deliver `wal_prepare_committed`) or aborts (deliver a WAL device failure).
+    struct wal_group_parked_waiter {
+        wal::wal_fragment_cursor cursor_after{};
+        bool fragment_done = false;
+        std::move_only_function<void(
+            core::owner_outcome<wal::wal_prepare_result>&&)> cb;
+    };
+
+    // Logical waiters attached to the single in-flight physical plan `plan_id`.
+    // Only set when at least one follower was coalesced; a lone-participant
+    // plan leaves this empty and the leader drives completion directly.
+    struct wal_group_plan_state {
+        uint64_t plan_id = 0;
+        std::vector<wal_group_parked_waiter> waiters;
+    };
+
     class front_sched {
       public:
         front_sched(uint32_t owner_id,
@@ -407,6 +425,39 @@ namespace apps::inconel::front {
             wal::wal_frame_write write;
         };
 
+        // Accumulating state for a coalesced entry plan. Pages, append offset,
+        // proposed segment lsn range and participants grow as each fragment is
+        // merged in FIFO order; a lone-participant plan is just a group of one.
+        struct wal_entry_group_builder {
+            std::vector<wal_page_builder> pages;
+            uint32_t plan_start_offset = 0;   // == stream.write_offset() at start
+            uint32_t offset = 0;              // current append position
+            uint32_t usable_end = 0;          // segment usable end (excl trailer)
+            uint32_t entry_area = 0;          // usable_end - HEADER_SIZE
+            uint32_t segment_gen = 0;
+            uint32_t lba_shift = 0;
+            uint64_t proposed_min = 0;
+            uint64_t proposed_max = 0;
+            uint32_t entries_total = 0;
+            std::vector<wal::wal_plan_participant> participants;
+        };
+
+        enum class wal_group_append_status : uint8_t {
+            appended,             // merged >= 1 entry for this fragment
+            would_exceed_budget,  // page / participant budget reached
+            needs_rotation,       // next entry will not fit the segment tail
+            validation_error,     // fragment/entry rejected (see `error`)
+        };
+
+        struct wal_group_append_result {
+            wal_group_append_status status =
+                wal_group_append_status::validation_error;
+            wal::wal_fragment_cursor cursor_after{};
+            bool fragment_done = false;
+            uint32_t entries_appended = 0;
+            std::exception_ptr error{};
+        };
+
         void validate_constructor_state(std::size_t queue_depth) const {
             if (front_count_ == 0) {
                 throw std::invalid_argument(
@@ -538,12 +589,44 @@ namespace apps::inconel::front {
         prepare_wal_header_plan(const core::front_fragment& fragment,
                                 wal::wal_fragment_cursor cursor);
 
+        // Builds the seed fragment's plan. When `coalesce`, also merges queued
+        // followers from `wal_pending_prepares_` into one entry plan and parks
+        // their callbacks in `wal_pending_group_`. The returned issue_plan goes
+        // to the seed/leader. Single-participant when coalesce is false (test
+        // entry) or no follower fits.
         [[nodiscard]] wal::wal_prepare_result
-        prepare_wal_entry_plan(
+        prepare_wal_fragment_core(
             const core::front_fragment& fragment,
             std::span<const core::canonical_entry> canonical_entries,
             wal::wal_fragment_cursor cursor,
+            wal::wal_append_config config,
+            bool coalesce);
+
+        [[nodiscard]] wal_entry_group_builder
+        make_wal_entry_group_builder(wal::wal_append_config config);
+
+        [[nodiscard]] wal_group_append_result
+        try_append_fragment_to_wal_group(
+            wal_entry_group_builder& builder,
+            const core::front_fragment& fragment,
+            std::span<const core::canonical_entry> canonical_entries,
+            wal::wal_fragment_cursor cursor,
+            wal::wal_append_config config,
+            uint64_t waiter_id);
+
+        void drain_followers_into_wal_group(
+            wal_entry_group_builder& builder,
+            std::vector<wal_group_parked_waiter>& waiters,
             wal::wal_append_config config);
+
+        [[nodiscard]] wal::wal_append_plan
+        build_wal_entry_group_plan(wal_entry_group_builder& builder,
+                                   wal::wal_append_config config);
+
+        void wake_wal_group_committed(
+            uint64_t plan_id,
+            const std::optional<wal::sealed_segment_info>& sealed);
+        void fail_wal_group(uint64_t plan_id, std::exception_ptr ep);
 
         [[nodiscard]] wal::wal_prepare_result
         prepare_wal_trailer_plan(const core::front_fragment& fragment,
@@ -576,12 +659,6 @@ namespace apps::inconel::front {
 
         [[nodiscard]] static bool value_ref_is_valid(
             const format::value_ref& vr) noexcept;
-
-        [[nodiscard]] static uint32_t unique_page_count_after(
-            const std::vector<wal_page_builder>& pages,
-            uint32_t lba_shift,
-            uint32_t start_offset,
-            uint32_t byte_len) noexcept;
 
         void validate_insert_request(
             const core::front_fragment& fragment,
@@ -763,6 +840,10 @@ namespace apps::inconel::front {
         std::deque<_front_wal_prepare::req*> wal_pending_prepares_;
         std::size_t wal_pending_prepare_capacity_ = 0;
         uint64_t next_wal_plan_id_ = 1;
+        uint64_t next_wal_waiter_id_ = 1;
+        // Followers merged into the current in-flight entry plan. There is at
+        // most one in-flight physical plan, so at most one group at a time.
+        std::optional<wal_group_plan_state> wal_pending_group_;
 
         [[nodiscard]] static std::size_t
         resolve_wal_pending_prepare_capacity(
@@ -1539,29 +1620,6 @@ namespace apps::inconel::front {
                vr.byte_offset != 0 || vr.len != 0 || vr.flags != 0;
     }
 
-    inline uint32_t
-    front_sched::unique_page_count_after(
-        const std::vector<wal_page_builder>& pages,
-        uint32_t lba_shift,
-        uint32_t start_offset,
-        uint32_t byte_len) noexcept {
-        if (byte_len == 0) return static_cast<uint32_t>(pages.size());
-        const uint64_t first = start_offset >> lba_shift;
-        const uint64_t last =
-            (static_cast<uint64_t>(start_offset) + byte_len - 1) >> lba_shift;
-
-        if (pages.empty()) {
-            return static_cast<uint32_t>(last - first + 1);
-        }
-
-        uint64_t current_first = pages.front().page_index;
-        uint64_t current_last = pages.back().page_index;
-        uint64_t count = pages.size();
-        if (first < current_first) count += current_first - first;
-        if (last > current_last) count += last - current_last;
-        return static_cast<uint32_t>(count);
-    }
-
     inline void
     front_sched::validate_wal_fragment_request(
         const core::front_fragment& fragment,
@@ -1743,7 +1801,7 @@ namespace apps::inconel::front {
             last_page_bytes = plan.writes.back().frame.lba_bytes(0);
         }
         stream.begin_pending(plan, last_page_bytes);
-        return wal::wal_prepare_ready{.plan = std::move(plan)};
+        return wal::wal_prepare_issue_plan{.plan = std::move(plan)};
     }
 
     inline wal::wal_prepare_result
@@ -1848,12 +1906,8 @@ namespace apps::inconel::front {
         return finalize_wal_plan(std::move(plan));
     }
 
-    inline wal::wal_prepare_result
-    front_sched::prepare_wal_entry_plan(
-        const core::front_fragment& fragment,
-        std::span<const core::canonical_entry> canonical_entries,
-        wal::wal_fragment_cursor cursor,
-        wal::wal_append_config config) {
+    inline front_sched::wal_entry_group_builder
+    front_sched::make_wal_entry_group_builder(wal::wal_append_config config) {
         auto& stream = require_wal();
         auto* segment = stream.active_segment();
         if (segment == nullptr) {
@@ -1861,54 +1915,101 @@ namespace apps::inconel::front {
                 wal::wal_append_error_reason::no_active_segment,
                 "front::front_sched: no active WAL segment");
         }
-        if (cursor.next_fragment_entry >= fragment.entry_indices.size()) {
-            throw wal::wal_append_error(
-                wal::wal_append_error_reason::fragment_cursor_out_of_range,
-                "front::front_sched: WAL fragment is already complete");
-        }
-
-        const uint32_t usable_end = stream.usable_end_offset();
-        const uint32_t entry_area =
-            usable_end - format::WAL_SEGMENT_HEADER_SIZE;
-        uint32_t offset = stream.write_offset();
-        uint32_t planned = 0;
-        auto cursor_after = cursor;
-        uint64_t proposed_min =
+        wal_entry_group_builder builder;
+        builder.pages.reserve(config.max_pages_per_plan);
+        builder.plan_start_offset = stream.write_offset();
+        builder.offset = stream.write_offset();
+        builder.usable_end = stream.usable_end_offset();
+        builder.entry_area =
+            builder.usable_end - format::WAL_SEGMENT_HEADER_SIZE;
+        builder.segment_gen = segment->segment_gen;
+        builder.lba_shift = stream.lba_shift();
+        builder.proposed_min =
             stream.segment_empty() ? std::numeric_limits<uint64_t>::max()
                                    : stream.segment_min_lsn();
-        uint64_t proposed_max =
+        builder.proposed_max =
             stream.segment_empty() ? 0 : stream.segment_max_lsn();
-        std::vector<wal_page_builder> pages;
-        pages.reserve(config.max_pages_per_plan);
+        builder.entries_total = 0;
+        return builder;
+    }
 
-        while (cursor_after.next_fragment_entry <
+    // Measure-then-scatter: validate/measure how much of `fragment` (from
+    // `cursor`) fits the running group, then scatter exactly those entries.
+    // The builder is mutated only on `appended`, so a follower that fails
+    // validation or hits a budget/rotation boundary never corrupts the shared
+    // group image (INC-057 / 054 §8.3, §9). WAL append is contiguous, so the
+    // plan's page count is the closed range [plan_first_page, last_page].
+    inline front_sched::wal_group_append_result
+    front_sched::try_append_fragment_to_wal_group(
+        wal_entry_group_builder& builder,
+        const core::front_fragment& fragment,
+        std::span<const core::canonical_entry> canonical_entries,
+        wal::wal_fragment_cursor cursor,
+        wal::wal_append_config config,
+        uint64_t waiter_id) {
+        const auto fragment_done_at = [&](wal::wal_fragment_cursor c) {
+            return c.next_fragment_entry >= fragment.entry_indices.size();
+        };
+        if (fragment_done_at(cursor)) {
+            return wal_group_append_result{
+                .status = wal_group_append_status::validation_error,
+                .cursor_after = cursor,
+                .fragment_done = true,
+                .error = std::make_exception_ptr(wal::wal_append_error(
+                    wal::wal_append_error_reason::fragment_cursor_out_of_range,
+                    "front::front_sched: WAL fragment is already complete")),
+            };
+        }
+
+        const uint32_t plan_first_page =
+            builder.plan_start_offset >> builder.lba_shift;
+        uint32_t measure_offset = builder.offset;
+        auto measure_cursor = cursor;
+        std::vector<format::wal_entry_parts> measured;
+        uint64_t local_min = std::numeric_limits<uint64_t>::max();
+        uint64_t local_max = 0;
+        wal_group_append_status boundary =
+            wal_group_append_status::would_exceed_budget;
+        bool hit_boundary = false;
+
+        while (measure_cursor.next_fragment_entry <
                fragment.entry_indices.size()) {
             const uint32_t entry_index =
-                fragment.entry_indices[cursor_after.next_fragment_entry];
+                fragment.entry_indices[measure_cursor.next_fragment_entry];
             if (entry_index >= canonical_entries.size()) {
-                throw wal::wal_append_error(
-                    wal::wal_append_error_reason::
-                        fragment_entry_index_out_of_range,
-                    "front::front_sched: WAL fragment entry index out of "
-                    "range");
+                return wal_group_append_result{
+                    .status = wal_group_append_status::validation_error,
+                    .error = std::make_exception_ptr(wal::wal_append_error(
+                        wal::wal_append_error_reason::
+                            fragment_entry_index_out_of_range,
+                        "front::front_sched: WAL fragment entry index out of "
+                        "range")),
+                };
             }
             const auto& entry = canonical_entries[entry_index];
             if (entry.key.size() > wal::kMaxSupportedWalKeyBytes) {
-                throw wal::wal_append_error(
-                    wal::wal_append_error_reason::key_too_large,
-                    "front::front_sched: WAL key too large");
+                return wal_group_append_result{
+                    .status = wal_group_append_status::validation_error,
+                    .error = std::make_exception_ptr(wal::wal_append_error(
+                        wal::wal_append_error_reason::key_too_large,
+                        "front::front_sched: WAL key too large")),
+                };
             }
 
             format::wal_entry_parts parts;
             switch (entry.op) {
             case core::write_op_type::put:
                 if (!value_ref_is_valid(entry.allocated_vr)) {
-                    throw wal::wal_append_error(
-                        wal::wal_append_error_reason::invalid_value_ref,
-                        "front::front_sched: PUT WAL entry missing value_ref");
+                    return wal_group_append_result{
+                        .status = wal_group_append_status::validation_error,
+                        .error = std::make_exception_ptr(wal::wal_append_error(
+                            wal::wal_append_error_reason::invalid_value_ref,
+                            "front::front_sched: PUT WAL entry missing "
+                            "value_ref")),
+                    };
                 }
                 parts = format::make_wal_put_entry_parts_unchecked(
-                    segment->segment_gen,
+                    builder.segment_gen,
                     fragment.batch_lsn,
                     fragment.entry_count,
                     entry.key,
@@ -1916,84 +2017,188 @@ namespace apps::inconel::front {
                 break;
             case core::write_op_type::del:
                 parts = format::make_wal_delete_entry_parts_unchecked(
-                    segment->segment_gen,
+                    builder.segment_gen,
                     fragment.batch_lsn,
                     fragment.entry_count,
                     entry.key);
                 break;
             default:
-                throw wal::wal_append_error(
-                    wal::wal_append_error_reason::unsupported_op,
-                    "front::front_sched: unsupported WAL op");
+                return wal_group_append_result{
+                    .status = wal_group_append_status::validation_error,
+                    .error = std::make_exception_ptr(wal::wal_append_error(
+                        wal::wal_append_error_reason::unsupported_op,
+                        "front::front_sched: unsupported WAL op")),
+                };
             }
-            if (parts.total_len > entry_area) {
-                throw wal::wal_append_error(
-                    wal::wal_append_error_reason::entry_too_large_for_segment,
-                    "front::front_sched: WAL entry cannot fit a segment");
+            if (parts.total_len > builder.entry_area) {
+                return wal_group_append_result{
+                    .status = wal_group_append_status::validation_error,
+                    .error = std::make_exception_ptr(wal::wal_append_error(
+                        wal::wal_append_error_reason::
+                            entry_too_large_for_segment,
+                        "front::front_sched: WAL entry cannot fit a segment")),
+                };
             }
-            if (parts.total_len > usable_end - offset) {
-                if (planned == 0) {
-                    return prepare_wal_trailer_plan(fragment, cursor);
-                }
+            if (parts.total_len > builder.usable_end - measure_offset) {
+                boundary = wal_group_append_status::needs_rotation;
+                hit_boundary = true;
                 break;
             }
-
-            const uint32_t page_count_after = unique_page_count_after(
-                pages, stream.lba_shift(), offset, parts.total_len);
-            if (planned > 0 &&
+            const uint32_t last_page =
+                (measure_offset + parts.total_len - 1) >> builder.lba_shift;
+            const uint32_t page_count_after = last_page - plan_first_page + 1;
+            if ((builder.entries_total + measured.size()) > 0 &&
                 page_count_after > config.max_pages_per_plan) {
+                boundary = wal_group_append_status::would_exceed_budget;
+                hit_boundary = true;
                 break;
             }
 
+            measured.push_back(parts);
+            measure_offset += parts.total_len;
+            if (fragment.batch_lsn < local_min) local_min = fragment.batch_lsn;
+            if (fragment.batch_lsn > local_max) local_max = fragment.batch_lsn;
+            ++measure_cursor.next_fragment_entry;
+        }
+
+        if (measured.empty()) {
+            return wal_group_append_result{
+                .status = hit_boundary
+                              ? boundary
+                              : wal_group_append_status::would_exceed_budget,
+                .cursor_after = cursor,
+                .fragment_done = fragment_done_at(cursor),
+            };
+        }
+
+        // Commit the measured run into the shared group image.
+        for (const auto& parts : measured) {
             scatter_wal_entry_parts(
-                pages, stream.write_offset(), offset, parts);
-            offset += parts.total_len;
-            ++planned;
-            ++cursor_after.next_fragment_entry;
+                builder.pages, builder.plan_start_offset, builder.offset,
+                parts);
+            builder.offset += parts.total_len;
+        }
+        builder.entries_total += static_cast<uint32_t>(measured.size());
+        if (local_min < builder.proposed_min) builder.proposed_min = local_min;
+        if (local_max > builder.proposed_max) builder.proposed_max = local_max;
 
-            if (proposed_min == std::numeric_limits<uint64_t>::max() ||
-                fragment.batch_lsn < proposed_min) {
-                proposed_min = fragment.batch_lsn;
+        const bool done = fragment_done_at(measure_cursor);
+        builder.participants.push_back(wal::wal_plan_participant{
+            .waiter_id = waiter_id,
+            .cursor_before = cursor,
+            .cursor_after = measure_cursor,
+            .fragment_done = done,
+        });
+        return wal_group_append_result{
+            .status = wal_group_append_status::appended,
+            .cursor_after = measure_cursor,
+            .fragment_done = done,
+            .entries_appended = static_cast<uint32_t>(measured.size()),
+        };
+    }
+
+    // Coalesce queued followers (FIFO) into the seed's plan. A follower that
+    // hits a page/participant budget or a segment-rotation boundary is left at
+    // the FIFO head for a later group (FIFO fairness, 054 §13.1); a malformed
+    // follower fails its own callback and does not block the rest (054 §8.3).
+    inline void
+    front_sched::drain_followers_into_wal_group(
+        wal_entry_group_builder& builder,
+        std::vector<wal_group_parked_waiter>& waiters,
+        wal::wal_append_config config) {
+        while (builder.participants.size() <
+                   config.max_participants_per_group &&
+               !wal_pending_prepares_.empty()) {
+            _front_wal_prepare::req* peek = wal_pending_prepares_.front();
+            if (peek->fragment) {
+                auto res = try_append_fragment_to_wal_group(
+                    builder, peek->fragment.get(), peek->canonical_entries,
+                    peek->cursor, config, next_wal_waiter_id_);
+                if (res.status ==
+                        wal_group_append_status::would_exceed_budget ||
+                    res.status == wal_group_append_status::needs_rotation) {
+                    // Cannot merge now; preserve FIFO order for a later group.
+                    return;
+                }
+                wal_pending_prepares_.pop_front();
+                std::unique_ptr<_front_wal_prepare::req> owned(peek);
+                if (res.status ==
+                    wal_group_append_status::validation_error) {
+                    auto cb = std::move(owned->cb);
+                    owned.reset();
+                    if (cb) cb(std::unexpected(res.error));
+                    continue;
+                }
+                // appended
+                waiters.push_back(wal_group_parked_waiter{
+                    .cursor_after = res.cursor_after,
+                    .fragment_done = res.fragment_done,
+                    .cb = std::move(owned->cb),
+                });
+                owned.reset();
+                ++next_wal_waiter_id_;
+                continue;
             }
-            if (fragment.batch_lsn > proposed_max) {
-                proposed_max = fragment.batch_lsn;
+            // Null-fragment follower: drop with an error, keep draining.
+            wal_pending_prepares_.pop_front();
+            std::unique_ptr<_front_wal_prepare::req> owned(peek);
+            auto cb = std::move(owned->cb);
+            owned.reset();
+            if (cb) {
+                cb(std::unexpected(std::make_exception_ptr(
+                    std::invalid_argument(
+                        "front::front_sched: WAL follower fragment is null"))));
             }
         }
+    }
 
-        if (planned == 0) {
-            return prepare_wal_trailer_plan(fragment, cursor);
+    inline wal::wal_append_plan
+    front_sched::build_wal_entry_group_plan(wal_entry_group_builder& builder,
+                                            wal::wal_append_config config) {
+        auto& stream = require_wal();
+        auto* segment = stream.active_segment();
+        if (segment == nullptr) {
+            throw wal::wal_append_error(
+                wal::wal_append_error_reason::no_active_segment,
+                "front::front_sched: no active WAL segment");
         }
-        zero_wal_plan_suffix(pages, offset);
+        if (builder.participants.empty()) {
+            throw std::logic_error(
+                "front::front_sched: WAL entry group has no leader");
+        }
+        zero_wal_plan_suffix(builder.pages, builder.offset);
 
         wal::wal_append_plan plan;
         plan.plan_id = next_wal_plan_id_++;
         plan.kind = wal::wal_plan_kind::entries;
         plan.stream_id = stream.stream_id();
         plan.segment = segment->id;
-        plan.segment_gen = segment->segment_gen;
-        plan.start_offset = stream.write_offset();
-        plan.end_offset = offset;
-        plan.min_lsn = proposed_min;
-        plan.max_lsn = proposed_max;
-        plan.cursor_before = cursor;
-        plan.cursor_after = cursor_after;
-        plan.fragment_done =
-            cursor_after.next_fragment_entry >=
-            fragment.entry_indices.size();
+        plan.segment_gen = builder.segment_gen;
+        plan.start_offset = builder.plan_start_offset;
+        plan.end_offset = builder.offset;
+        plan.min_lsn = builder.proposed_min;
+        plan.max_lsn = builder.proposed_max;
+        // Leader-compat fields mirror participants[0] (the FUA issuer).
+        const auto& leader = builder.participants.front();
+        plan.cursor_before = leader.cursor_before;
+        plan.cursor_after = leader.cursor_after;
+        plan.fragment_done = leader.fragment_done;
         plan.config = config;
-        plan.writes.reserve(pages.size());
-        for (auto& page : pages) {
+        plan.writes.reserve(builder.pages.size());
+        for (auto& page : builder.pages) {
             plan.writes.push_back(std::move(page.write));
         }
-        return finalize_wal_plan(std::move(plan));
+        plan.participants = std::move(builder.participants);
+        return plan;
     }
 
     inline wal::wal_prepare_result
-    front_sched::prepare_wal_fragment_now(
+    front_sched::prepare_wal_fragment_core(
         const core::front_fragment& fragment,
         std::span<const core::canonical_entry> canonical_entries,
         wal::wal_fragment_cursor cursor,
-        wal::wal_append_config config) {
+        wal::wal_append_config config,
+        bool coalesce) {
         validate_wal_fragment_request(fragment, canonical_entries, cursor);
         wal::validate_wal_append_config(config);
         auto& stream = require_wal();
@@ -2011,8 +2216,73 @@ namespace apps::inconel::front {
         if (!stream.header_committed()) {
             return prepare_wal_header_plan(fragment, cursor);
         }
-        return prepare_wal_entry_plan(
-            fragment, canonical_entries, cursor, config);
+
+        auto builder = make_wal_entry_group_builder(config);
+        auto seed = try_append_fragment_to_wal_group(
+            builder, fragment, canonical_entries, cursor, config,
+            /*waiter_id=*/0);
+        switch (seed.status) {
+        case wal_group_append_status::validation_error:
+            std::rethrow_exception(seed.error);
+        case wal_group_append_status::needs_rotation:
+            // Empty group, seed's next entry needs a fresh segment: seal first.
+            return prepare_wal_trailer_plan(fragment, cursor);
+        case wal_group_append_status::would_exceed_budget:
+            // The first entry of an empty group is always admitted, so the seed
+            // cannot exceed the page budget here.
+            throw std::logic_error(
+                "front::front_sched: WAL seed exceeded budget with empty group");
+        case wal_group_append_status::appended:
+            break;
+        }
+
+        // Once a follower is drained out of the FIFO its callback only lives in
+        // `waiters`, so EVERYTHING from the drain through begin_pending must be
+        // covered: any throw here (frame allocation, scatter, finalize) has to
+        // release every already-merged follower with the same error, or its
+        // sender waits forever. The seed gets the same error via the rethrow
+        // (run_wal_prepare -> fail_wal_prepare). The currently-failing follower
+        // is still in the FIFO (drain pops only after try_append succeeds) and
+        // is retried by a later group once frame pressure clears.
+        std::vector<wal_group_parked_waiter> waiters;
+        wal::wal_append_plan plan;
+        try {
+            if (coalesce) {
+                drain_followers_into_wal_group(builder, waiters, config);
+            }
+            plan = build_wal_entry_group_plan(builder, config);
+            if (plan.writes.empty()) {
+                throw std::logic_error(
+                    "front::front_sched: WAL entry plan has no tail page");
+            }
+            // One tail snapshot per coalesced plan (054 §10).
+            stream.begin_pending(plan, plan.writes.back().frame.lba_bytes(0));
+        } catch (...) {
+            auto ep = std::current_exception();
+            for (auto& w : waiters) {
+                if (w.cb) w.cb(std::unexpected(ep));
+            }
+            throw;
+        }
+
+        if (!waiters.empty()) {
+            wal_pending_group_ = wal_group_plan_state{
+                .plan_id = plan.plan_id,
+                .waiters = std::move(waiters),
+            };
+        }
+        return wal::wal_prepare_issue_plan{.plan = std::move(plan)};
+    }
+
+    inline wal::wal_prepare_result
+    front_sched::prepare_wal_fragment_now(
+        const core::front_fragment& fragment,
+        std::span<const core::canonical_entry> canonical_entries,
+        wal::wal_fragment_cursor cursor,
+        wal::wal_append_config config) {
+        // Single-participant path (testing / cold start): no FIFO coalescing.
+        return prepare_wal_fragment_core(
+            fragment, canonical_entries, cursor, config, /*coalesce=*/false);
     }
 
     inline void
@@ -2227,11 +2497,14 @@ namespace apps::inconel::front {
                 throw std::invalid_argument(
                     "front::front_sched: WAL fragment is null");
             }
-            result = prepare_wal_fragment_now(
+            // The leader seed merges any already-queued followers from
+            // wal_pending_prepares_ into one physical plan (INC-057 / 054 §8).
+            result = prepare_wal_fragment_core(
                 req->fragment.get(),
                 req->canonical_entries,
                 req->cursor,
-                wal_config_);
+                wal_config_,
+                /*coalesce=*/true);
         } catch (...) {
             fail_wal_prepare(std::move(req), std::current_exception());
             return;
@@ -2256,6 +2529,47 @@ namespace apps::inconel::front {
         req.reset();
         if (cb) {
             cb(std::unexpected(std::move(ep)));
+        }
+    }
+
+    inline void
+    front_sched::wake_wal_group_committed(
+        uint64_t plan_id,
+        const std::optional<wal::sealed_segment_info>& sealed) {
+        // Only fan out to the group attached to THIS plan. There is one
+        // in-flight physical plan today so this always matches, but the guard
+        // keeps a future state-machine change from waking unrelated followers.
+        if (!wal_pending_group_.has_value() ||
+            wal_pending_group_->plan_id != plan_id) {
+            return;
+        }
+        auto group = std::move(*wal_pending_group_);
+        wal_pending_group_.reset();
+        for (auto& waiter : group.waiters) {
+            if (!waiter.cb) continue;
+            waiter.cb(core::owner_outcome<wal::wal_prepare_result>{
+                wal::wal_prepare_committed{
+                    .cursor_after = waiter.cursor_after,
+                    .fragment_done = waiter.fragment_done,
+                    // Entry-group commits never seal; followers only adopt the
+                    // durable cursor. Trailer/header stay single-participant.
+                    .sealed = sealed,
+                }});
+        }
+    }
+
+    inline void
+    front_sched::fail_wal_group(uint64_t plan_id, std::exception_ptr ep) {
+        if (!wal_pending_group_.has_value() ||
+            wal_pending_group_->plan_id != plan_id) {
+            return;
+        }
+        auto group = std::move(*wal_pending_group_);
+        wal_pending_group_.reset();
+        for (auto& waiter : group.waiters) {
+            if (waiter.cb) {
+                waiter.cb(std::unexpected(ep));
+            }
         }
     }
 
@@ -2299,18 +2613,27 @@ namespace apps::inconel::front {
     inline void
     front_sched::handle_wal_commit(_front_wal_commit::req* r) {
         std::unique_ptr<_front_wal_commit::req> req(r);
+        const uint64_t plan_id = req->plan_id;
         std::optional<wal::sealed_segment_info> result;
         try {
-            result = commit_wal_plan_now(req->plan_id);
+            result = commit_wal_plan_now(plan_id);
         } catch (...) {
+            // Commit invariant failure is a runtime bug; still wake any parked
+            // followers so they fail rather than strand (054 §14).
+            auto ep = std::current_exception();
+            fail_wal_group(plan_id, ep);
             auto cb = std::move(req->cb);
             req.reset();
             if (cb) {
-                cb(std::unexpected(std::current_exception()));
+                cb(std::unexpected(ep));
             }
             return;
         }
 
+        // The single physical plan is durable. Fan-out the same durable
+        // completion to every merged follower before recycling the leader
+        // frames and draining the next group (054 §11.1).
+        wake_wal_group_committed(plan_id, result);
         auto cb = std::move(req->cb);
         req.reset();
         if (!result.has_value()) {
@@ -2325,17 +2648,28 @@ namespace apps::inconel::front {
     inline void
     front_sched::handle_wal_abort(_front_wal_abort::req* r) {
         std::unique_ptr<_front_wal_abort::req> req(r);
+        const uint64_t plan_id = req->plan_id;
         try {
-            abort_wal_plan_now(req->plan_id);
+            abort_wal_plan_now(plan_id);
         } catch (...) {
+            auto ep = std::current_exception();
+            fail_wal_group(plan_id, ep);
             auto cb = std::move(req->cb);
             req.reset();
             if (cb) {
-                cb(std::unexpected(std::current_exception()));
+                cb(std::unexpected(ep));
             }
             return;
         }
 
+        // The committed cursor did not advance. Fan-out the WAL device failure
+        // to every merged follower so all batches in the group fail before the
+        // memtable phase and go through release (054 §11.2). The leader fails
+        // in its own L3 issue path after this abort acknowledges.
+        fail_wal_group(plan_id,
+                       std::make_exception_ptr(wal::wal_append_error(
+                           wal::wal_append_error_reason::device_failure,
+                           "front::front_sched: WAL group plan FUA failed")));
         auto cb = std::move(req->cb);
         req.reset();
         drain_wal_pending_prepares();

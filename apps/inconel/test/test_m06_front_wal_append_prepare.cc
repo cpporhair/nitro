@@ -241,8 +241,8 @@ only_fragment(const core::batch_ctx& ctx) {
 
 wal::wal_append_plan
 take_ready(wal::wal_prepare_result&& result) {
-    CHECK(std::holds_alternative<wal::wal_prepare_ready>(result));
-    return std::move(std::get<wal::wal_prepare_ready>(result).plan);
+    CHECK(std::holds_alternative<wal::wal_prepare_issue_plan>(result));
+    return std::move(std::get<wal::wal_prepare_issue_plan>(result).plan);
 }
 
 wal::wal_prepare_needs_segment

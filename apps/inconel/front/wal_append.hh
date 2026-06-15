@@ -26,6 +26,11 @@ struct wal_append_config {
   // 0 keeps the historical coupling to front queue_depth. Non-zero sets
   // an independent soft backpressure capacity for pending WAL prepares.
   uint32_t pending_prepare_capacity = 0;
+  // Upper bound on how many queued prepare reqs a single coalesced WAL entry
+  // plan may merge (group commit fan-out). The plan stays the only in-flight
+  // physical write unit; this only caps the participant fan-out woken per
+  // commit/abort and bounds one front's queued WAL work per group.
+  uint32_t max_participants_per_group = 16;
 };
 
 inline void validate_wal_append_config(const wal_append_config &cfg) {
@@ -36,6 +41,10 @@ inline void validate_wal_append_config(const wal_append_config &cfg) {
   if (cfg.max_pages_per_plan == 0) {
     throw std::invalid_argument(
         "wal::wal_append_config: max_pages_per_plan must be nonzero");
+  }
+  if (cfg.max_participants_per_group == 0) {
+    throw std::invalid_argument(
+        "wal::wal_append_config: max_participants_per_group must be nonzero");
   }
   // pending_prepare_capacity == 0 is a valid "follow queue_depth" setting,
   // not an invalid sentinel.
@@ -100,6 +109,17 @@ private:
   }
 };
 
+// One logical fragment merged into a coalesced entry plan. The leader (the
+// prepare caller that issues FUA) is participant[0] with waiter_id == 0; every
+// other participant is a follower whose prepare callback is parked on the front
+// owner until the leader commits/aborts the single physical plan.
+struct wal_plan_participant {
+  uint64_t waiter_id = 0;  // 0 == leader self
+  wal_fragment_cursor cursor_before{};
+  wal_fragment_cursor cursor_after{};
+  bool fragment_done = false;
+};
+
 struct wal_append_plan {
   wal_append_plan() = default;
   wal_append_plan(wal_append_plan &&) noexcept = default;
@@ -116,16 +136,30 @@ struct wal_append_plan {
   uint32_t end_offset = 0;
   uint64_t min_lsn = 0;
   uint64_t max_lsn = 0;
+  // Leader-compat fields: mirror participants[0] (the FUA issuer). New code
+  // drives per-fragment completion through `participants`; a single-participant
+  // plan still works through these legacy fields unchanged.
   wal_fragment_cursor cursor_before{};
   wal_fragment_cursor cursor_after{};
   bool fragment_done = false;
   wal_append_config config{};
   std::optional<sealed_segment_info> sealed_on_commit;
   std::vector<wal_frame_write> writes;
+  std::vector<wal_plan_participant> participants;
 };
 
-struct wal_prepare_ready {
+// Leader result: this caller owns the only physical plan, must issue its
+// bounded FUA writes, then commit/abort it on the front owner.
+struct wal_prepare_issue_plan {
   wal_append_plan plan;
+};
+
+// Follower result: the merged WAL bytes are already durable (the leader's FUA
+// committed). The caller does no I/O — it only adopts the logical completion.
+struct wal_prepare_committed {
+  wal_fragment_cursor cursor_after{};
+  bool fragment_done = false;
+  std::optional<sealed_segment_info> sealed;
 };
 
 struct wal_prepare_needs_segment {
@@ -134,7 +168,9 @@ struct wal_prepare_needs_segment {
 };
 
 using wal_prepare_result =
-    std::variant<wal_prepare_ready, wal_prepare_needs_segment>;
+    std::variant<wal_prepare_issue_plan,
+                 wal_prepare_committed,
+                 wal_prepare_needs_segment>;
 
 enum class wal_append_error_reason : uint8_t {
   no_wal_config,

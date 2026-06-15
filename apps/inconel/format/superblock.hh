@@ -6,9 +6,6 @@
 #include <cstring>
 #include <type_traits>
 
-#include <absl/crc/crc32c.h>
-#include <absl/strings/string_view.h>
-
 #include "./crc32c.hh"
 #include "./types.hh"
 

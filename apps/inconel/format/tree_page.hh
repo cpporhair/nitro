@@ -4,9 +4,6 @@
 #include <cstdint>
 #include <cstring>
 
-#include <absl/crc/crc32c.h>
-#include <absl/strings/string_view.h>
-
 #include "./crc32c.hh"
 #include "./types.hh"
 

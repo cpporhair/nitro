@@ -9,9 +9,6 @@
 #include <span>
 #include <string_view>
 
-#include <absl/crc/crc32c.h>
-#include <absl/strings/string_view.h>
-
 #include "./crc32c.hh"
 #include "./superblock.hh"
 #include "./types.hh"

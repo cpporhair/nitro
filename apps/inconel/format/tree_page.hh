@@ -7,6 +7,7 @@
 #include <absl/crc/crc32c.h>
 #include <absl/strings/string_view.h>
 
+#include "./crc32c.hh"
 #include "./types.hh"
 
 namespace apps::inconel::format {
@@ -157,13 +158,7 @@ namespace apps::inconel::format {
     tree_page_compute_crc(const void* page, uint32_t page_size) {
         constexpr uint32_t crc_field_offset = offsetof(tree_slot_header, page_crc);
         constexpr uint32_t crc_field_size   = sizeof(uint32_t);
-        auto crc = absl::ComputeCrc32c(
-            absl::string_view(static_cast<const char*>(page), crc_field_offset));
-        crc = absl::ExtendCrc32c(
-            crc,
-            absl::string_view(static_cast<const char*>(page) + crc_field_offset + crc_field_size,
-                              page_size - crc_field_offset - crc_field_size));
-        return static_cast<uint32_t>(crc);
+        return crc32c_skip(page, page_size, crc_field_offset, crc_field_size);
     }
 
     // ── tree page status ──

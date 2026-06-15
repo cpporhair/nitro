@@ -92,13 +92,11 @@ namespace apps::inconel::tree {
         extend_crc(const memory::segmented_page_frame& frame,
                    uint64_t offset,
                    uint64_t bytes,
-                   absl::crc32c_t& crc) noexcept {
+                   crc32c_stream& s) noexcept {
             return visit_segmented_const_bytes(
                 frame, offset, bytes,
                 [&](const char* src, uint64_t n) noexcept {
-                    crc = absl::ExtendCrc32c(
-                        crc,
-                        absl::string_view(src, static_cast<std::size_t>(n)));
+                    s.update(src, static_cast<std::size_t>(n));
                 });
         }
 
@@ -169,18 +167,18 @@ namespace apps::inconel::tree {
 
         constexpr uint32_t crc_field_offset = offsetof(tree_slot_header, page_crc);
         constexpr uint32_t crc_field_size = sizeof(uint32_t);
-        absl::crc32c_t crc{0};
-        if (!detail::extend_crc(frame, 0, crc_field_offset, crc)) {
+        crc32c_stream s;
+        if (!detail::extend_crc(frame, 0, crc_field_offset, s)) {
             return tree_page_status::bad_crc;
         }
         if (!detail::extend_crc(
                 frame,
                 crc_field_offset + crc_field_size,
                 page_size - crc_field_offset - crc_field_size,
-                crc)) {
+                s)) {
             return tree_page_status::bad_crc;
         }
-        if (hdr.page_crc != static_cast<uint32_t>(crc)) {
+        if (hdr.page_crc != s.finish()) {
             return tree_page_status::bad_crc;
         }
         return tree_page_status::ok;

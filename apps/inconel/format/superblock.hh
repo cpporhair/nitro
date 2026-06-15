@@ -9,6 +9,7 @@
 #include <absl/crc/crc32c.h>
 #include <absl/strings/string_view.h>
 
+#include "./crc32c.hh"
 #include "./types.hh"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,8 +111,7 @@ namespace apps::inconel::format {
     inline uint32_t
     superblock_compute_crc(const superblock& s) noexcept {
         constexpr uint32_t covered = offsetof(superblock, crc);
-        return static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(reinterpret_cast<const char*>(&s), covered)));
+        return crc32c(&s, covered);
     }
 
     // ── Reason-aware status ─────────────────────────────────────────────────

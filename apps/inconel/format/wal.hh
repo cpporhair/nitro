@@ -12,6 +12,7 @@
 #include <absl/crc/crc32c.h>
 #include <absl/strings/string_view.h>
 
+#include "./crc32c.hh"
 #include "./superblock.hh"
 #include "./types.hh"
 
@@ -129,15 +130,13 @@ namespace apps::inconel::format {
     inline uint32_t
     wal_segment_header_crc(const wal_segment_header& h) noexcept {
         constexpr uint32_t covered = offsetof(wal_segment_header, crc);
-        return static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(reinterpret_cast<const char*>(&h), covered)));
+        return crc32c(&h, covered);
     }
 
     inline uint32_t
     wal_sealed_trailer_crc(const wal_sealed_trailer& t) noexcept {
         constexpr uint32_t covered = offsetof(wal_sealed_trailer, crc);
-        return static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(reinterpret_cast<const char*>(&t), covered)));
+        return crc32c(&t, covered);
     }
 
     [[nodiscard]] inline wal_segment_header
@@ -573,8 +572,7 @@ namespace apps::inconel::format {
         }
 
         const uint32_t covered = hdr.total_len - crc_bytes;
-        const uint32_t computed = static_cast<uint32_t>(absl::ComputeCrc32c(
-            absl::string_view(src.data(), covered)));
+        const uint32_t computed = crc32c(src.data(), covered);
         uint32_t stored = 0;
         std::memcpy(&stored, src.data() + covered, crc_bytes);
         if (stored != computed)

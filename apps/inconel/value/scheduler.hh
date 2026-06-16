@@ -42,6 +42,34 @@ namespace apps::inconel::value {
     using format::value_ref;
 
     // ── Public input/output types ─────────────────────────────────────────
+
+    struct reclaim_stats {
+        std::atomic<uint64_t> reclaim_total_refs{0};
+        std::atomic<uint64_t> partial_into_dirty{0};
+        std::atomic<uint64_t> partial_into_open{0};
+        std::atomic<uint64_t> partial_into_allocatable{0};
+        std::atomic<uint64_t> partial_into_cache{0};
+        std::atomic<uint64_t> partial_into_hole{0};
+        std::atomic<uint64_t> partial_into_untracked{0};
+        std::atomic<uint64_t> whole_into_dirty{0};
+        std::atomic<uint64_t> whole_clears_existing{0};
+        std::atomic<uint64_t> whole_already_pending{0};
+        std::atomic<uint64_t> dropped_freed_mask_zero{0};
+    };
+
+    struct reclaim_stats_snapshot {
+        uint64_t reclaim_total_refs = 0;
+        uint64_t partial_into_dirty = 0;
+        uint64_t partial_into_open = 0;
+        uint64_t partial_into_allocatable = 0;
+        uint64_t partial_into_cache = 0;
+        uint64_t partial_into_hole = 0;
+        uint64_t partial_into_untracked = 0;
+        uint64_t whole_into_dirty = 0;
+        uint64_t whole_clears_existing = 0;
+        uint64_t whole_already_pending = 0;
+        uint64_t dropped_freed_mask_zero = 0;
+    };
     //
     // put_entry: caller-supplied entry. The body is borrowed (must outlive
     // the persist round). out_vr is filled in-place by the scheduler with
@@ -425,6 +453,7 @@ namespace apps::inconel::value {
         pump::core::per_core::queue<_value_trim_complete::req*> trim_complete_q_;
         const value_io_policy                                   io_policy_;
         uint32_t                                                max_body_len_ = 0;
+        reclaim_stats                                           reclaim_stats_;
 
         explicit
         value_alloc_sched_base(size_t          queue_depth = 2048,
@@ -447,6 +476,39 @@ namespace apps::inconel::value {
 
         [[nodiscard]] uint32_t max_body_len() const noexcept {
             return max_body_len_;
+        }
+
+        [[nodiscard]] reclaim_stats_snapshot
+        inspect_reclaim_stats() const noexcept {
+            return reclaim_stats_snapshot{
+                .reclaim_total_refs = reclaim_stats_.reclaim_total_refs.load(
+                    std::memory_order_relaxed),
+                .partial_into_dirty = reclaim_stats_.partial_into_dirty.load(
+                    std::memory_order_relaxed),
+                .partial_into_open = reclaim_stats_.partial_into_open.load(
+                    std::memory_order_relaxed),
+                .partial_into_allocatable =
+                    reclaim_stats_.partial_into_allocatable.load(
+                        std::memory_order_relaxed),
+                .partial_into_cache = reclaim_stats_.partial_into_cache.load(
+                    std::memory_order_relaxed),
+                .partial_into_hole = reclaim_stats_.partial_into_hole.load(
+                    std::memory_order_relaxed),
+                .partial_into_untracked =
+                    reclaim_stats_.partial_into_untracked.load(
+                        std::memory_order_relaxed),
+                .whole_into_dirty = reclaim_stats_.whole_into_dirty.load(
+                    std::memory_order_relaxed),
+                .whole_clears_existing =
+                    reclaim_stats_.whole_clears_existing.load(
+                        std::memory_order_relaxed),
+                .whole_already_pending =
+                    reclaim_stats_.whole_already_pending.load(
+                        std::memory_order_relaxed),
+                .dropped_freed_mask_zero =
+                    reclaim_stats_.dropped_freed_mask_zero.load(
+                        std::memory_order_relaxed),
+            };
         }
 
         static void
@@ -1556,6 +1618,8 @@ namespace apps::inconel::value {
 
         void
         handle_reclaim(_value_reclaim::req* item) {
+            reclaim_stats_.reclaim_total_refs.fetch_add(
+                item->dead_values.size(), std::memory_order_relaxed);
             // Group by page_base. Each page's release is one of three states:
             //   - dirty (currently in an inflight round) → defer until commit
             //   - quiescent → release now, then refresh resident_partial_
@@ -1571,10 +1635,12 @@ namespace apps::inconel::value {
                 if (dirty_round_pages_.contains(page_base)) {
                     // Defer until the dirty round completes — its commit /
                     // rollback path will replay these.
+                    bump_reclaim_dirty_stats_(refs);
                     auto& pending = deferred_releases_[page_base];
                     pending.insert(pending.end(), refs.begin(), refs.end());
                     continue;
                 }
+                bump_reclaim_immediate_stats_(refs);
                 immediate.insert(immediate.end(), refs.begin(), refs.end());
             }
 
@@ -1613,19 +1679,29 @@ namespace apps::inconel::value {
             absl::flat_hash_set<paddr> seen;
             for (const value_ref& vr : released) {
                 if (!seen.insert(vr.base).second) continue;
+                const uint64_t partial_refs =
+                    partial_ref_count_for_page_(released, vr.base);
                 if (space_->page_is_partial(vr.base)) {
-                    refresh_cached_partial_for_(vr.base);
+                    refresh_cached_partial_for_(vr.base, partial_refs);
                 } else {
+                    if (partial_refs != 0) {
+                        reclaim_stats_.partial_into_hole.fetch_add(
+                            partial_refs, std::memory_order_relaxed);
+                    }
                     evict_resident_for_(vr.base);
                 }
             }
         }
 
         void
-        refresh_cached_partial_for_(paddr page_base) {
+        refresh_cached_partial_for_(paddr page_base, uint64_t partial_refs) {
             // Resident write-reuse frame: just refresh manager-side score.
             if (auto rit = resident_partial_.find(page_base);
                 rit != resident_partial_.end()) {
+                if (partial_refs != 0) {
+                    reclaim_stats_.partial_into_open.fetch_add(
+                        partial_refs, std::memory_order_relaxed);
+                }
                 const uint64_t new_epoch = next_cache_epoch_++;
                 const uint64_t heat_seq  = next_heat_seq_++;
                 space_->erase_cached_partial(page_base, rit->second.cache_epoch);
@@ -1649,9 +1725,19 @@ namespace apps::inconel::value {
                 page_base, 1,
                 memory::frame_id::domain::value_page,
             });
-            if (!cached) return;  // not currently cached; manager-side
-                                  // partial node persists for future NRP
-                                  // selection under pressure mode.
+            if (!cached) {
+                if (partial_refs != 0) {
+                    reclaim_stats_.partial_into_untracked.fetch_add(
+                        partial_refs, std::memory_order_relaxed);
+                }
+                return;  // not currently cached; manager-side
+                         // partial node persists for future NRP
+                         // selection under pressure mode.
+            }
+            if (partial_refs != 0) {
+                reclaim_stats_.partial_into_cache.fetch_add(
+                    partial_refs, std::memory_order_relaxed);
+            }
 
             ensure_resident_partial_room_();
             const uint64_t epoch    = next_cache_epoch_++;
@@ -1703,9 +1789,57 @@ namespace apps::inconel::value {
                 deferred_releases_.erase(it);
             }
             if (batch.empty()) return;
+            bump_reclaim_immediate_stats_(batch);
             space_->release_values(
                 std::span<const value_ref>(batch.data(), batch.size()));
             refresh_caches_after_release_(batch);
+        }
+
+        [[nodiscard]] bool
+        reclaim_ref_is_whole_(const value_ref& vr) const noexcept {
+            return vr.len >= lba_size_;
+        }
+
+        void
+        bump_reclaim_dirty_stats_(std::span<const value_ref> refs) {
+            uint64_t whole = 0;
+            uint64_t partial = 0;
+            for (const auto& vr : refs) {
+                if (reclaim_ref_is_whole_(vr)) ++whole;
+                else ++partial;
+            }
+            if (whole != 0) {
+                reclaim_stats_.whole_into_dirty.fetch_add(
+                    whole, std::memory_order_relaxed);
+            }
+            if (partial != 0) {
+                reclaim_stats_.partial_into_dirty.fetch_add(
+                    partial, std::memory_order_relaxed);
+            }
+        }
+
+        void
+        bump_reclaim_immediate_stats_(std::span<const value_ref> refs) {
+            uint64_t whole = 0;
+            for (const auto& vr : refs) {
+                if (reclaim_ref_is_whole_(vr)) ++whole;
+            }
+            if (whole != 0) {
+                reclaim_stats_.whole_clears_existing.fetch_add(
+                    whole, std::memory_order_relaxed);
+            }
+        }
+
+        [[nodiscard]] uint64_t
+        partial_ref_count_for_page_(std::span<const value_ref> refs,
+                                    paddr page_base) const noexcept {
+            uint64_t count = 0;
+            for (const auto& vr : refs) {
+                if (vr.base == page_base && !reclaim_ref_is_whole_(vr)) {
+                    ++count;
+                }
+            }
+            return count;
         }
 
         // ════════════════════════════════════════════════════════════════

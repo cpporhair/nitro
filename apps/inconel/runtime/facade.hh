@@ -45,6 +45,11 @@ namespace apps::inconel::rt {
         return core::registry::value_sched();
     }
 
+    inline value::reclaim_stats_snapshot
+    value_reclaim_stats() {
+        return value()->inspect_reclaim_stats();
+    }
+
     inline tree::tree_sched*
     owner() {
         return core::registry::tree_sched_singleton();

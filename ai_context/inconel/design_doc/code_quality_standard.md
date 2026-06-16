@@ -50,6 +50,17 @@
 - 不允许把 pipeline object 本身当 mutable request state carrier
 - 不允许用 copy 掩盖 ownership 不清
 
+**DMA pool / frame-holder 析构序（058 e2e 顺出的 teardown double-free）**：
+RAII frame-holder（`pooled_frame_ptr` cache、`segmented_page_frame` 持有者）析构时会把 frame
+**还给其 DMA pool**（`lba_dma_page_pool`）。因此 **pool 必须 outlive 任何持有其 frame 的成员**：
+- 首选**声明序**——pool 声明在 frame-holder **之前**（C++ 逆序析构 → pool 后死、frame-holder 先死，
+  归还时 pool 仍在）。注意 holder 在子 struct 内时（如 `tree_sched.state.non_leaf_page_cache`），
+  pool 须声明在该**子 struct 成员**之前（`frame_pool` 在 `state` 前）。
+- 或**显式 dtor drain**——在析构 body 里 drain/clear holder（body 先于成员析构跑），把 frame 还给仍存活的 pool
+  （`value_alloc_sched` / `tree_lookup_sched` 用此）。
+- 二者择一即可，但**必须有其一**；新代码优先声明序（无运行期成本、不依赖记得 drain）。
+- review：凡同一 owner 持 `lba_dma_page_pool` + RAII frame cache/buffer，检查 pool 是否 outlive 全部 holder。
+
 ### 2.3 抽象边界
 
 抽象只有在满足下面至少一项时才算合理：

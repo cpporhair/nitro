@@ -199,6 +199,13 @@ target_compile_definitions(inconel_test_reclaim PRIVATE INCONEL_NVME_MOCK_BACKEN
 target_link_libraries(inconel_test_reclaim PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_steady_e2e
+        apps/inconel/test/test_steady_e2e.cc)
+target_include_directories(inconel_test_steady_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(inconel_test_steady_e2e PRIVATE INCONEL_NVME_MOCK_BACKEND)
+target_link_libraries(inconel_test_steady_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_flush_round
         apps/inconel/test/test_flush_round.cc)
 target_include_directories(inconel_test_flush_round PRIVATE ${CMAKE_SOURCE_DIR})

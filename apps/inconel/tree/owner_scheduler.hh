@@ -2377,8 +2377,12 @@ namespace apps::inconel::tree {
         const core::tree_geometry* geom = nullptr;
         core::wal_reclaim_frontier* wal_frontier = nullptr;
         std::vector<core::tree_read_domain_base*>* read_domains = nullptr;
-        tree_state                 state;
+        // frame_pool 必须声明在 state 之前 → 逆序析构时 state 先析构、frame_pool 后析构，
+        // 使 state 内所有 RAII frame-holder（non_leaf_page_cache 的 pooled_frame_ptr、
+        // active_merge 的 fetched/writeback frames）析构时把 frame 还给仍存活的 frame_pool。
+        // 反序会触发 teardown double-free（058 e2e 顺出）。见 code_quality_standard §2.2 池/缓存析构序。
         memory::lba_dma_page_pool  frame_pool;
+        tree_state                 state;
         core::reclaim_sink         sink_handle;
         pump::core::per_core::queue<_flush_fold::req*>               fold_q;
         pump::core::per_core::queue<_merge_step::req*>               merge_step_q;

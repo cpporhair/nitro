@@ -60,9 +60,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <expected>
+#include <functional>
 #include <memory>
 #include <utility>
 
+#include "pump/core/compute_sender_type.hh"
+#include "pump/core/context.hh"
+#include "pump/core/lock_free_queue.hh"
+#include "pump/core/op_pusher.hh"
+#include "pump/core/op_tuple_builder.hh"
+
+#include "./owner_callback.hh"
 #include "./page_cache.hh"        // cache_concept
 #include "./shard_partition.hh"
 #include "./tree_geometry.hh"
@@ -86,6 +96,47 @@ namespace apps::inconel::tree {
 }  // namespace apps::inconel::tree
 
 namespace apps::inconel::core {
+
+    struct tree_read_domain_base;
+
+    namespace _read_domain_invalidate {
+
+        struct req {
+            format::range_ref range{};
+            uint32_t page_lbas = 0;
+            std::move_only_function<void(owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool read_domain_invalidate_op = true;
+
+            tree_read_domain_base* sched = nullptr;
+            format::range_ref range{};
+            uint32_t page_lbas = 0;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_read_domain_base* sched = nullptr;
+            format::range_ref range{};
+            uint32_t page_lbas = 0;
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .range = range, .page_lbas = page_lbas };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _read_domain_invalidate
 
     // ── tree_read_domain_base ──────────────────────────────────────
     //
@@ -123,15 +174,37 @@ namespace apps::inconel::core {
         // through `lookup.get()` / `worker.get()` directly.
         tree::tree_lookup_sched_base* lookup_sched = nullptr;
         tree::tree_worker_sched_base* worker_sched = nullptr;
+        pump::core::per_core::queue<_read_domain_invalidate::req*>
+            invalidate_q;
 
         tree_read_domain_base(uint32_t rdi,
-                              std::shared_ptr<const shard_partition_map> parts)
-            : read_domain_index(rdi), partitions(std::move(parts)) {}
+                              std::shared_ptr<const shard_partition_map> parts,
+                              std::size_t queue_depth)
+            : read_domain_index(rdi)
+            , partitions(std::move(parts))
+            , invalidate_q(queue_depth) {}
 
         virtual bool advance() = 0;
-        virtual void invalidate_range(format::range_ref range,
-                                      const tree_geometry& geom) = 0;
         virtual ~tree_read_domain_base() = default;
+
+        void
+        schedule_invalidate(_read_domain_invalidate::req* r) {
+            if (!invalidate_q.try_enqueue(r)) {
+                delete r;
+                panic_inconsistency(
+                    "tree_read_domain_base::schedule_invalidate",
+                    "invalidate queue full");
+            }
+        }
+
+        auto
+        submit_invalidate_range(format::range_ref range, uint32_t page_lbas) {
+            return _read_domain_invalidate::sender{
+                .sched = this,
+                .range = range,
+                .page_lbas = page_lbas,
+            };
+        }
 
         // Non-copyable, non-movable — instances are owned via
         // unique_ptr and referenced by raw pointer from schedulers.
@@ -174,8 +247,8 @@ namespace apps::inconel::core {
         ~tree_read_domain() override;
 
         bool advance() override;
-        void invalidate_range(format::range_ref range,
-                              const tree_geometry& geom) override;
+        void handle_invalidate_range(format::range_ref range,
+                                     uint32_t page_lbas);
 
         // Runtime tuple driver. The PUMP share-nothing runner calls
         // `sched->advance(runtime)` on every registered object per
@@ -211,7 +284,7 @@ namespace apps::inconel::core {
         memory::dma_page_allocator                  frame_allocator,
         uint32_t                                    frame_alignment,
         int                                         frame_numa_id)
-        : tree_read_domain_base(rdi, std::move(parts))
+        : tree_read_domain_base(rdi, std::move(parts), queue_depth)
         , node_cache(std::move(cache))
         , lookup(std::make_unique<tree::tree_lookup_sched<Cache>>(
               this, geom, queue_depth, frame_allocator, frame_alignment,
@@ -232,9 +305,8 @@ namespace apps::inconel::core {
 
     template <cache_concept Cache>
     void
-    tree_read_domain<Cache>::invalidate_range(format::range_ref range,
-                                             const tree_geometry& geom) {
-        const uint32_t page_lbas = geom.page_lbas();
+    tree_read_domain<Cache>::handle_invalidate_range(format::range_ref range,
+                                                     uint32_t page_lbas) {
         for (uint32_t slot = 0; slot < range.slot_count; ++slot) {
             auto id = memory::frame_id{
                 .base = format::paddr{
@@ -257,9 +329,25 @@ namespace apps::inconel::core {
         // Drive both schedulers in one round. Either can make
         // progress independently — OR the flags so callers see
         // "progress happened" when at least one arm advanced.
+        bool invalidate_progress = false;
+        for (uint32_t i = 0; i < 64; ++i) {
+            auto item = invalidate_q.try_dequeue();
+            if (!item) {
+                break;
+            }
+            std::unique_ptr<_read_domain_invalidate::req> r(*item);
+            try {
+                handle_invalidate_range(r->range, r->page_lbas);
+                r->cb(owner_outcome<void>{});
+            } catch (...) {
+                r->cb(owner_outcome<void>{
+                    std::unexpected(std::current_exception())});
+            }
+            invalidate_progress = true;
+        }
         const bool lookup_progress = lookup->advance();
         const bool worker_progress = worker->advance();
-        return lookup_progress || worker_progress;
+        return invalidate_progress || lookup_progress || worker_progress;
     }
 
     template <>
@@ -309,5 +397,50 @@ namespace apps::inconel::core {
     };
 
 }  // namespace apps::inconel::core
+
+namespace apps::inconel::core {
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _read_domain_invalidate::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_invalidate(new _read_domain_invalidate::req{
+            .range = range,
+            .page_lbas = page_lbas,
+            .cb = make_owner_pusher<pos, scope_t, void>(ctx, scope),
+        });
+    }
+
+}  // namespace apps::inconel::core
+
+namespace pump::core {
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::read_domain_invalidate_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::core::_read_domain_invalidate::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 0;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+}  // namespace pump::core
 
 #endif  // APPS_INCONEL_CORE_TREE_READ_DOMAIN_HH

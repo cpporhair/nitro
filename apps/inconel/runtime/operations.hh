@@ -6,6 +6,7 @@
 
 #include "../core/batch_carrier.hh"
 #include "../core/registry.hh"
+#include "../pipeline/flush_round.hh"
 #include "../pipeline/point_get.hh"
 #include "../pipeline/seal_round.hh"
 #include "../value/sender.hh"
@@ -42,6 +43,14 @@ namespace apps::inconel::rt {
         return pipeline::seal_round(
             *core::registry::coord_sched_singleton(),
             core::registry::fronts_span());
+    }
+
+    [[nodiscard]] inline auto
+    flush_once() {
+        return pipeline::flush_round_once(
+            *core::registry::coord_sched_singleton(),
+            core::registry::fronts_span(),
+            *core::registry::tree_sched_singleton());
     }
 
 }  // namespace apps::inconel::rt

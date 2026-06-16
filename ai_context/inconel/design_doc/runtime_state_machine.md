@@ -965,17 +965,16 @@ build_leaf_candidates(req):
 推进条件：
 
 ```text
-if 所有 sealed WAL segments 都已回收（或无 sealed segments）:
-    wal_frontier = flush_max_lsn
-else:
-    wal_frontier = 所有 sealed WAL segments 中最小的 min_lsn - 1
-
-recovery_safe_lsn = min(
-    flush_max_lsn,               // tree 已经物化到这里
-    superblock_safe_lsn,         // 当前 on-disk superblock root 已能覆盖到这里
-    wal_frontier,                // 即使崩溃，比这更早的 WAL 已不会出现
-)
+flush_durable_frontier = min(flush_max_lsn, superblock_safe_lsn)   // WAL 段回收 eligibility 用此
+wal_frontier = wal_global_min_unreclaimed_lsn - 1   // 无未回收 WAL → flush_durable_frontier
+recovery_safe_lsn = min(flush_durable_frontier, wal_frontier)     // value/tombstone GC 用此
 ```
+
+> **实现裁决（056 §5.4 B3，2026-06-16）——两个 frontier，勿混**：
+> - **WAL 段回收**（`wal::reclaim_check`）的 eligibility frontier = `flush_durable_frontier = min(flush_max_lsn, superblock_safe_lsn)`，**不是** `recovery_safe_lsn`。若把含 `wal_frontier` 的 `recovery_safe_lsn` 喂回段回收会循环死锁（最旧未回收段 `min_lsn=ms`、`max_lsn≥ms>ms-1≥recovery_safe_lsn` → 永不满足 `max_lsn≤frontier` → 段永不回收 → frontier 冻结）。
+> - **`wal_frontier` 必须基于跨所有 stream、所有未回收 WAL 输入（sealed-未回收 + active 非空）的全局最低 LSN**，不能只看 sealed segments 的 min(min_lsn)——WAL 多 stream 无全局 LSN 序，慢 stream 的低 LSN 可能还在 active 段没 seal，只看 sealed 会让 frontier 偏高 → premature reclaim corruption。含 active 后 frontier 由最慢 stream 钳住，单调非降。
+> - wal 发布 `wal_global_min_unreclaimed_lsn` 到共享 atomic（`core::wal_reclaim_frontier`），tree `recompute_recovery_safe_lsn` acquire 读。
+> - 原 `wal_frontier = sealed segs 最小 min_lsn - 1` 的表述按此修正。
 
 `superblock_safe_lsn` 的语义是：
 

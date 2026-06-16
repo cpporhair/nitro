@@ -37,10 +37,12 @@
 | `persist_put_values` | `(batch PUT entries)` → `durable value_refs` | RSM §6.2, WP §2.1/5.4 |
 | `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
 | `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
-| `reclaim_values` | `(dead_value_refs[])` → `void` | RSM §6.7, FF §7.2 |
+| `reclaim_values` | `(dead_value_refs[])` → `void` | RSM §6.7, FF §7.2；056 reclaim consumer 的下游调用方 |
 | `drain_trim_pending` | `()` → `void` | RSM §6.8/§6.9 |
+| `reclaim_sink::post_retired / post_gen_losers` | `(retired_objects&& / losers&&)` → `void` | 056 §5.1。guard/gen 析构在任意线程 post `reclaim_task` 到 tree_sched（**mpmc** ingress，非 per_core）；core 抽象接口 + atomic 进程级 sink，teardown 先 null。impl `tree/owner_scheduler.hh` |
+| `tree_read_domain::invalidate_range` | `(range_ref, geom)` → `void`（**派到 read_domain owner core 执行**） | 056 §5.5。reclaim old_range 进 allocator 前的跨 shards barrier；tree_sched `loop>>concurrent>>flat_map(submit_invalidate_range)>>all()` fan-out + wait-all-acks；`node_cache.take()` 只在 read_domain 自己 core 跑（pin>0 panic）。impl `core/tree_read_domain.hh` |
 | `alloc_segment` | `(stream_id, sealed_info?)` → `segment_runtime*` | RSM §5.3, WP §7.2 |
-| `reclaim_check` | `(recovery_safe_lsn)` → `void` | RSM §5.4, RW §12.4 |
+| `reclaim_check` | `(flush_durable_frontier)` → `void` | RSM §5.4, RW §12.4；**056 修正：传 `flush_durable_frontier=min(flush_max_lsn,superblock_safe_lsn)`，不是 `recovery_safe_lsn`**——后者含 `wal_frontier` 会与段回收循环死锁（056 §5.4 B3）。production caller 在 `tree/sender.hh`（flush_durable_frontier 推进后驱动） |
 | `tree_lookup` | `(key, manifest)` → `variant<leaf_value, leaf_tombstone, absent>` | RSM §4.7, RAP §4.2 |
 
 > 缩写：OV=design_overview, RSM=runtime_state_machine, WP=write_path_and_pipeline, RAP=read_api_and_pipeline, FF=flush_and_frontier_switch, RW=recovery_and_wal_reclaim, RMC=runtime_memory_and_cache, CM=code_modules, ODF=on_disk_formats
@@ -150,6 +152,23 @@ coord_sched(capture_flush_frontier)             # 置 catalog_update_in_progress
 出现点：OV §9.4/14.6, FF §1.1/8.1；实现 055 §4（pipeline/flush_round.hh）。
 注：spec §8.1 的独立 `update_flush_max_lsn` 跳在当前实现中由 `tree_local_flush` 内联完成（055 §8）；`end_flush_round` 是 055 新增的串行化收尾跳，异常路径经 `any_exception → end_flush_round → rethrow` 保证清位。
 
+### Reclaim（056 step 2）
+```
+被动触发：reader 释放 read_handle / seal / flush 装 CAT2
+  → 旧 CAT refs→0 → PRS → fronts/gen + tree_guard(G0) refs→0
+  → ~checkpoint_guard()/~memtable_gen() post reclaim_task → tree_sched.reclaim_q (mpmc)
+主动消费：tree_sched.advance() drain reclaim_q（持 tree_mutation_gate token）
+  → old_ranges: fan-out 各 read_domain invalidate_range → all() (wait-acks) → owner 清 non_leaf_cache
+  → nvme TRIM (old_slots 逐 slot / old_ranges 整段) bounded
+  → tree_allocator.recycle(old_ranges)
+  → value: data_ver ≤ recovery_safe_lsn → reclaim_values(dead) bounded；否则 deferred_value_reclaim
+  → wal::reclaim_check(flush_durable_frontier) → wal 更新 global_min_unreclaimed_lsn cell
+  → recompute_recovery_safe_lsn(=min(flush_durable_frontier, wal_frontier)) → 扫 deferred
+  → release token
+```
+出现点：FF §5/§7, RSM §4.2/§4.4/§4.9/§8；实现 056（owner_scheduler.hh / tree_read_domain.hh / wal）。
+注：reclaim_round 与 flush 的 tree 阶段经 owner-local FIFO `tree_mutation_gate` 互斥（056 §5.8.3，与 coord `catalog_update_in_progress_` 正交）。
+
 ### Recovery
 ```
 read_superblock → traverse_tree(leaf_records) + scan_wal(entries) → merge(logical_winners) → flush_style_incremental_merge → nvme_flush → update_superblock → trim + rebuild_allocator → install_clean_runtime
@@ -185,6 +204,15 @@ read_superblock → traverse_tree(leaf_records) + scan_wal(entries) → merge(lo
 4. ❌ 引入盘面白名单之外的持久化元数据
 
 检测点：RW §1 (总览), RW §7 (增量 flush), RW §9.2 (value allocator)
+
+### 6.4 `reclaim_values` caller precondition（INC-052 trust boundary，056 §5.7）
+
+`value::reclaim_values` 对输入 blind trust（value 侧不做 liveness defense）。caller（056 reclaim consumer 及任何未来 dead-set 推导方）**必须**保证每条投入的 `value_ref` 三条全满足，缺一即可能 silent data corruption：
+1. **provenance**：由 flush/fold 判定已被 winner 覆盖（或 tombstone 取代）、不在 new manifest / 任何活跃 PRS —— 这是它进 `retired.old_tree_values` / `gen.loser_durable_refs` 的前提，不是 reclaim 阶段重新推导。
+2. **guard/gen 释放**：guard_retired 来自 G0 refs→0；gen-loser 来自 gen refs→0。
+3. **data_ver gate**：`data_ver ≤ recovery_safe_lsn`（含 wal_frontier）。
+
+仅 (2)+(3) 不足以单独证明任意输入 dead，必须叠加 (1)。value 侧只加可观测 counter（`reclaim_stats.partial_into_untracked` 稳态应 ≈0），**不加** liveness 校验。
 
 ## 7. 跨文档引用索引
 

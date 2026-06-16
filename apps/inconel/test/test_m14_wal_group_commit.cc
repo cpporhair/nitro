@@ -29,6 +29,7 @@
 #include "apps/inconel/core/batch_carrier.hh"
 #include "apps/inconel/front/sender.hh"
 #include "apps/inconel/format/wal.hh"
+#include "apps/inconel/test/wal_test_support.hh"
 #include "apps/inconel/wal/sender.hh"
 #include "apps/inconel/write_path/sender.hh"
 #include "pump/core/context.hh"
@@ -452,7 +453,7 @@ segment_base_lba(const wal::segment_geometry& geom, front::front_sched&) {
 void
 m14_wal_group_commit_single_lba_many_batches() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
     install_new_segment(front_sched, wal_space, 0);
@@ -550,7 +551,7 @@ m14_wal_group_commit_single_lba_many_batches() {
 void
 m14_wal_group_commit_followers_do_not_issue_nvme() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -620,7 +621,7 @@ m14_wal_group_commit_followers_do_not_issue_nvme() {
 void
 m14_wal_group_commit_fua_failure_releases_all_participants() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
     install_new_segment(front_sched, wal_space, 0);
@@ -716,7 +717,7 @@ m14_wal_group_commit_rotation_boundary_stops_group() {
     // Valid segment (must fit the max WAL entry), filled until only a small tail
     // remains. A short DELETE fits that tail; a long DELETE needs rotation.
     auto geom = make_geom(3, 21000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -805,7 +806,7 @@ m14_wal_group_commit_rotation_boundary_stops_group() {
 void
 m14_wal_group_commit_bad_follower_does_not_block_fifo() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -879,7 +880,7 @@ m14_wal_group_commit_bad_follower_does_not_block_fifo() {
 void
 m14_wal_group_commit_pool_return_on_front_commit() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
     install_new_segment(front_sched, wal_space, 0);

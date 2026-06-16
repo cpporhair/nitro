@@ -475,6 +475,7 @@ struct topology_fixture {
     value_sched_t value_sched;
     fake_nvme_provider provider;
     wal::segment_geometry geom;
+    core::wal_reclaim_frontier wal_frontier;
     core::tree_geometry tree_geom{
         .lba_size = 4096,
         .tree_page_size = 4096,
@@ -521,6 +522,7 @@ struct topology_fixture {
             .coord_core = coord_core,
             .wal_space_core = wal_space_core,
             .wal_geometry = geom,
+            .wal_reclaim_frontier = &wal_frontier,
             .tree_geometry = &tree_geom,
             .front_queue_depth = front_queue_depth,
             .coord_queue_depth = coord_queue_depth,
@@ -853,6 +855,7 @@ void m11_topology_validation_failures() {
         .shadow_slots_per_range = 1,
     };
     std::vector<uint32_t> cores{0, 1};
+    core::wal_reclaim_frontier wal_frontier;
     auto expect_invalid = [&](runtime::front_topology_options opts) {
         registry_scope scope(4);
         expect_throws<std::invalid_argument>([&]() {
@@ -869,6 +872,7 @@ void m11_topology_validation_failures() {
         .coord_core = 3,
         .wal_space_core = -1,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
     });
 
@@ -877,6 +881,7 @@ void m11_topology_validation_failures() {
         .cores = cores,
         .front_cores = bad_front,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
     });
 
@@ -885,6 +890,7 @@ void m11_topology_validation_failures() {
         .cores = cores,
         .front_cores = dup_front,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
     });
 
@@ -892,12 +898,14 @@ void m11_topology_validation_failures() {
         .cores = cores,
         .wal_space_core = 3,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
     });
 
     expect_invalid(runtime::front_topology_options{
         .cores = cores,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
         .front_queue_depth = 3,
     });
@@ -905,6 +913,7 @@ void m11_topology_validation_failures() {
     expect_invalid(runtime::front_topology_options{
         .cores = cores,
         .wal_geometry = valid_geom,
+        .wal_reclaim_frontier = &wal_frontier,
         .tree_geometry = &tree_geom,
         .coord_queue_depth = 1,
     });

@@ -24,6 +24,7 @@
 #include "apps/inconel/core/batch_carrier.hh"
 #include "apps/inconel/front/sender.hh"
 #include "apps/inconel/format/wal.hh"
+#include "apps/inconel/test/wal_test_support.hh"
 #include "apps/inconel/wal/sender.hh"
 #include "apps/inconel/write_path/sender.hh"
 #include "pump/core/context.hh"
@@ -494,7 +495,7 @@ expect_device_failure(const pipeline_result& result) {
 void
 put_delete_entries_decode_and_keep_global_count() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -548,7 +549,7 @@ put_delete_entries_decode_and_keep_global_count() {
 void
 fragment_entries_use_batch_global_entry_count() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 2);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 2);
 
     auto ctx = make_ctx(
         {
@@ -589,7 +590,7 @@ fragment_entries_use_batch_global_entry_count() {
 void
 entry_can_cross_lba_page_without_crossing_segment() {
     auto geom = make_geom(1, 2000, 2048, 128);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -624,7 +625,7 @@ entry_can_cross_lba_page_without_crossing_segment() {
 void
 m06_middle_pages_not_zeroed_but_suffix_zeroed() {
     auto geom = make_geom(1, 13000, 2048, 128);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -685,7 +686,7 @@ page_budget_bounds_prepare_without_splitting_single_entry() {
         .max_fua_inflight = 2,
         .max_pages_per_plan = 1,
     };
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, config);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -717,7 +718,7 @@ segment_rotation_writes_trailer_then_new_header() {
         .max_fua_inflight = 4,
         .max_pages_per_plan = 64,
     };
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, config);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -796,7 +797,7 @@ m06_trailer_at_fixed_tail_region_decodes_for_recovery_view() {
         .max_fua_inflight = 4,
         .max_pages_per_plan = 64,
     };
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, config);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -862,7 +863,7 @@ m06_trailer_at_fixed_tail_region_decodes_for_recovery_view() {
 void
 abort_after_fua_failure_keeps_cursor_and_memtable_unchanged() {
     auto geom = make_geom();
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -902,7 +903,7 @@ l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua() {
         .max_fua_inflight = 2,
         .max_pages_per_plan = 64,
     };
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, config);
     test_fake_nvme::scheduler fake_nvme;
 
@@ -947,7 +948,7 @@ l3_write_wal_fragment_allocates_rotates_and_issues_bounded_fua() {
 void
 m06_frames_return_to_pool_on_front_commit() {
     auto geom = make_geom(2, 12000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
 
@@ -1014,7 +1015,7 @@ m06_frames_return_to_pool_on_front_commit() {
 void
 m06_concurrent_fragments_serialize_through_wal_gate() {
     auto geom = make_geom(4, 8000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
 
@@ -1065,7 +1066,7 @@ m06_prepare_fifo_wakes_after_rotation_install() {
         .max_fua_inflight = 2,
         .max_pages_per_plan = 64,
     };
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, config);
     test_fake_nvme::scheduler fake_nvme;
 
@@ -1118,7 +1119,7 @@ m06_prepare_fifo_wakes_after_rotation_install() {
 void
 m06_prepare_queue_full_fails_with_explicit_reason() {
     auto geom = make_geom(2, 10000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom, {}, 2);
     install_new_segment(front_sched, wal_space, 0);
 
@@ -1168,7 +1169,7 @@ m06_prepare_queue_full_fails_with_explicit_reason() {
 void
 l3_write_wal_fragment_false_aborts_and_throws() {
     auto geom = make_geom(2, 6000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
     fake_nvme.fail_call = 2;
@@ -1208,7 +1209,7 @@ l3_write_wal_fragment_false_aborts_and_throws() {
 void
 l3_write_wal_fragment_exception_aborts_and_throws() {
     auto geom = make_geom(2, 7000, 4096, 512);
-    wal::wal_space_sched wal_space(geom, 1);
+    INCONEL_TEST_WAL_SPACE_SCHED(wal_space, geom, 1);
     front::front_sched front_sched(0, 1, geom);
     test_fake_nvme::scheduler fake_nvme;
     fake_nvme.fail_call = 2;

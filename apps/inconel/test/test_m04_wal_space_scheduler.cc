@@ -19,6 +19,7 @@
 #include "pump/sender/then.hh"
 
 #include "apps/inconel/front/wal_append.hh"
+#include "apps/inconel/test/wal_test_support.hh"
 #include "apps/inconel/wal/sender.hh"
 
 using namespace apps::inconel;
@@ -185,41 +186,41 @@ void geometry_validation_and_base_address_use_wal_base() {
   CHECK(wal::segment_usable_end_offset(geom) == 4096 - 512);
 
   const auto can_fit_max_entry = make_geom(1, 1000, 4096, 512);
-  wal::wal_space_sched fit_sched(can_fit_max_entry);
+  INCONEL_TEST_WAL_SPACE_SCHED(fit_sched, can_fit_max_entry);
   CHECK(wal::segment_usable_end_offset(can_fit_max_entry) -
             format::WAL_SEGMENT_HEADER_SIZE >=
         wal::kMaxSupportedWalEntrySize);
   CHECK(fit_sched.try_alloc_segment_for_testing(0) != nullptr);
 
   expect_throws<std::invalid_argument>([] {
-    wal::wal_space_sched sched(make_geom(0));
+    INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(0));
     (void)sched;
   });
   expect_throws<std::invalid_argument>([] {
-    wal::wal_space_sched sched(make_geom(1, 1000, 4097, 512));
+    INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(1, 1000, 4097, 512));
     (void)sched;
   });
   expect_throws<std::invalid_argument>([] {
     const uint32_t non_power_lba =
         format::WAL_SEGMENT_HEADER_SIZE + wal::kMaxSupportedWalEntrySize;
-    wal::wal_space_sched sched(
-        make_geom(1, 1000, non_power_lba * 2, non_power_lba));
+    INCONEL_TEST_WAL_SPACE_SCHED(
+        sched, make_geom(1, 1000, non_power_lba * 2, non_power_lba));
     (void)sched;
   });
   expect_throws<std::invalid_argument>([] {
     auto bad = make_geom(1);
     bad.wal_base_paddr.device_id = 1;
-    wal::wal_space_sched sched(bad);
+    INCONEL_TEST_WAL_SPACE_SCHED(sched, bad);
     (void)sched;
   });
   expect_throws<std::invalid_argument>([] {
-    wal::wal_space_sched sched(make_geom(1, 1000, 1024, 512));
+    INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(1, 1000, 1024, 512));
     (void)sched;
   });
 }
 
 void test_only_helper_can_observe_empty_pool_without_production_success() {
-  wal::wal_space_sched sched(make_geom(2), 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(2), 2);
 
   auto *a = sched.try_alloc_segment_for_testing(0);
   auto *b = sched.try_alloc_segment_for_testing(1);
@@ -240,7 +241,7 @@ void test_only_helper_can_observe_empty_pool_without_production_success() {
 
 void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
   auto geom = make_geom(1);
-  wal::wal_space_sched sched(geom, 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 2);
   auto *seg = sched.try_alloc_segment_for_testing(1);
 
   wal::wal_stream_state stream(1, geom);
@@ -317,7 +318,7 @@ void stream_state_tracks_offsets_fit_and_sealed_lsn_range() {
 
 void stream_state_rejects_install_over_active_segment() {
   auto geom = make_geom(2);
-  wal::wal_space_sched sched(geom, 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 2);
   auto *first = sched.try_alloc_segment_for_testing(0);
   auto *second = sched.try_alloc_segment_for_testing(0);
 
@@ -329,7 +330,7 @@ void stream_state_rejects_install_over_active_segment() {
 
 void sealed_segments_reclaim_to_free_pool_with_incremented_generation() {
   auto geom = make_geom(2, 7000);
-  wal::wal_space_sched sched(geom, 1);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 1);
 
   auto *first = sched.try_alloc_segment_for_testing(0);
   auto info = seal_active(geom, first, 0, 5, 7);
@@ -360,7 +361,7 @@ void sealed_segments_reclaim_to_free_pool_with_incremented_generation() {
 
 void pending_alloc_records_sealed_once_and_wakes_after_reclaim() {
   auto geom = make_geom(1);
-  wal::wal_space_sched sched(geom, 2, 8, 4);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 2, 8, 4);
 
   auto *seg = sched.try_alloc_segment_for_testing(0);
   auto info = seal_active(geom, seg, 0, 8, 8);
@@ -398,7 +399,7 @@ void pending_alloc_records_sealed_once_and_wakes_after_reclaim() {
   CHECK(sched.sealed_segment_count_for_testing() == 1);
 
   sched.schedule_reclaim(new wal::_wal_reclaim::req{
-      .recovery_safe_lsn = 8,
+      .flush_durable_frontier = 8,
       .cb = [&](core::owner_outcome<void>&& r) {
         if (r.has_value()) {
           reclaim_done = true;
@@ -421,7 +422,7 @@ void pending_alloc_records_sealed_once_and_wakes_after_reclaim() {
 
 void pending_alloc_fifo_order_is_driven_by_reclaim() {
   auto geom = make_geom(2);
-  wal::wal_space_sched sched(geom, 4, 8, 4);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 4, 8, 4);
 
   auto *first = sched.try_alloc_segment_for_testing(0);
   auto *second = sched.try_alloc_segment_for_testing(1);
@@ -464,7 +465,7 @@ void pending_alloc_fifo_order_is_driven_by_reclaim() {
 
 void duplicate_or_stale_sealed_info_goes_to_fail_without_second_record() {
   auto geom = make_geom(2);
-  wal::wal_space_sched sched(geom, 1);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 1);
 
   auto *first = sched.try_alloc_segment_for_testing(0);
   auto info = seal_active(geom, first, 0, 1, 1);
@@ -500,7 +501,7 @@ void duplicate_or_stale_sealed_info_goes_to_fail_without_second_record() {
 }
 
 void callback_exceptions_propagate_after_state_commit() {
-  wal::wal_space_sched sched(make_geom(1), 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(1), 2);
   uint32_t failures = 0;
 
   sched.schedule_alloc(new wal::_wal_alloc::req{
@@ -527,7 +528,7 @@ void callback_exceptions_propagate_after_state_commit() {
 
 void pending_callback_exceptions_propagate_out_of_reclaim_path() {
   auto geom = make_geom(1);
-  wal::wal_space_sched sched(geom, 1, 8, 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, geom, 1, 8, 2);
   auto *seg = sched.try_alloc_segment_for_testing(0);
   auto info = seal_active(geom, seg, 0, 6, 6);
   uint32_t failures = 0;
@@ -555,7 +556,7 @@ void pending_callback_exceptions_propagate_out_of_reclaim_path() {
 }
 
 void sender_facade_drives_wal_ops_through_pump() {
-  wal::wal_space_sched sched(make_geom(2), 2);
+  INCONEL_TEST_WAL_SPACE_SCHED(sched, make_geom(2), 2);
 
   auto *seg = submit_wal_and_drive<wal::segment_runtime *>(
       sched, [&] { return wal::alloc_segment(sched, 1); });

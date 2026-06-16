@@ -545,6 +545,7 @@ struct topology_fixture {
     value_sched_t value_sched;
     fake_nvme_provider provider;
     wal::segment_geometry geom;
+    core::wal_reclaim_frontier wal_frontier;
     core::tree_geometry tree_geom{
         .lba_size = 4096,
         .tree_page_size = 4096,
@@ -591,6 +592,7 @@ struct topology_fixture {
             .coord_core = coord_core,
             .wal_space_core = wal_space_core,
             .wal_geometry = geom,
+            .wal_reclaim_frontier = &wal_frontier,
             .tree_geometry = &tree_geom,
             .front_queue_depth = front_queue_depth,
             .coord_queue_depth = coord_queue_depth,
@@ -1166,7 +1168,12 @@ void m12_collect_bridge_feeds_flush_fold() {
         std::make_shared<const core::shard_partition_map>(
             core::build_initial_shard_partition_map(empty_order, 1)));
 
-    tree::tree_sched owner_tree(&fx.tree_geom);
+    std::vector<core::tree_read_domain_base*> read_domains;
+    tree::tree_sched owner_tree(&fx.tree_geom,
+                                format::paddr{0, 0},
+                                nullptr,
+                                &fx.wal_frontier,
+                                &read_domains);
     auto folded = run_tree_flush_fold(owner_tree, std::move(req));
     CHECK(folded.st == tree::flush_stage_status::ok);
     CHECK(folded.round_id.v != 0);

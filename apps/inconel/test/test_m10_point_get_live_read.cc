@@ -34,6 +34,7 @@
 #include "apps/inconel/core/tree_geometry.hh"
 #include "apps/inconel/core/tree_manifest.hh"
 #include "apps/inconel/core/tree_read_domain.hh"
+#include "apps/inconel/core/wal_reclaim_frontier.hh"
 #include "apps/inconel/format/value_object.hh"
 #include "apps/inconel/format/wal.hh"
 #include "apps/inconel/front/sender.hh"
@@ -526,6 +527,7 @@ struct write_fixture {
     value_sched_t* extra_value_sched = nullptr;
     fake_nvme_provider provider;
     wal::segment_geometry geom;
+    core::wal_reclaim_frontier wal_frontier;
     wal::wal_space_sched wal_space;
     core::tree_geometry tree_geom{
         .lba_size = 4096,
@@ -566,7 +568,7 @@ struct write_fixture {
               value::value_io_policy{})
         , provider{&nvme}
         , geom(geometry)
-        , wal_space(geom, front_count_in) {
+        , wal_space(geom, &wal_frontier, front_count_in) {
         CHECK(front_count > 0);
         core::registry::value_alloc_sched = &value_sched;
 

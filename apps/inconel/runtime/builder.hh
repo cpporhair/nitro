@@ -926,7 +926,7 @@ namespace apps::inconel::runtime {
                     opts.nvme_dma_alignment,
                     opts.nvme_numa_id);
                 core::registry::tree_sched_singleton_ptr = tsched;
-                core::set_reclaim_sink(tsched);
+                core::set_reclaim_sink(&tsched->sink_handle);
                 tsched_singleton = tsched;
                 shared_heads->tree_head_lba.store(
                     tsched->state.alloc.head.lba, std::memory_order_relaxed);

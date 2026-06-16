@@ -111,9 +111,9 @@ namespace apps::inconel::core {
     using retired_value_refs = absl::InlinedVector<retired_value_ref, 16>;
 
     struct reclaim_sink {
-        virtual ~reclaim_sink() = default;
-        virtual void post_retired(retired_objects&& retired) = 0;
-        virtual void post_gen_losers(retired_value_refs&& losers) = 0;
+        void* self = nullptr;
+        void (*post_retired)(void*, retired_objects&&) = nullptr;
+        void (*post_gen_losers)(void*, retired_value_refs&&) = nullptr;
     };
 
     inline std::atomic<reclaim_sink*> active_reclaim_sink_cell{nullptr};
@@ -250,7 +250,7 @@ namespace apps::inconel::core {
                 losers.push_back(std::move(ref));
             });
             if (auto* sink = active_reclaim_sink()) {
-                sink->post_gen_losers(std::move(losers));
+                sink->post_gen_losers(sink->self, std::move(losers));
             }
         }
     };

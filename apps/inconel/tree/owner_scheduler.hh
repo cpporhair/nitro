@@ -2357,7 +2357,7 @@ namespace apps::inconel::tree {
 
     }  // namespace _owner
 
-    struct tree_sched : core::reclaim_sink {
+    struct tree_sched {
         static constexpr uint32_t kMaxFoldOpsPerAdvance                   = 8;
         static constexpr uint32_t kMaxMergeStepOpsPerAdvance              = 16;
         static constexpr uint32_t kMaxMergeReadsDoneOpsPerAdvance         = 4;
@@ -2379,6 +2379,7 @@ namespace apps::inconel::tree {
         std::vector<core::tree_read_domain_base*>* read_domains = nullptr;
         tree_state                 state;
         memory::lba_dma_page_pool  frame_pool;
+        core::reclaim_sink         sink_handle;
         pump::core::per_core::queue<_flush_fold::req*>               fold_q;
         pump::core::per_core::queue<_merge_step::req*>               merge_step_q;
         pump::core::per_core::queue<_merge_reads_done::req*>         merge_reads_done_q;
@@ -2412,6 +2413,11 @@ namespace apps::inconel::tree {
                          frame_alignment,
                          frame_numa_id,
                          frame_allocator)
+            , sink_handle{
+                  .self = this,
+                  .post_retired = &tree_sched::post_retired_thunk,
+                  .post_gen_losers = &tree_sched::post_gen_losers_thunk,
+              }
             , fold_q(depth)
             , merge_step_q(depth)
             , merge_reads_done_q(depth)
@@ -2440,7 +2446,7 @@ namespace apps::inconel::tree {
             }
         }
 
-        ~tree_sched() override {
+        ~tree_sched() {
             while (auto item = state.reclaim_q.try_dequeue()) {
                 delete *item;
             }
@@ -2464,8 +2470,20 @@ namespace apps::inconel::tree {
             }
         }
 
+        static void
+        post_retired_thunk(void* self, core::retired_objects&& retired) {
+            static_cast<tree_sched*>(self)->post_retired_impl(
+                std::move(retired));
+        }
+
+        static void
+        post_gen_losers_thunk(void* self, core::retired_value_refs&& losers) {
+            static_cast<tree_sched*>(self)->post_gen_losers_impl(
+                std::move(losers));
+        }
+
         void
-        post_retired(core::retired_objects&& retired) override {
+        post_retired_impl(core::retired_objects&& retired) {
             auto* task = new core::reclaim_task{
                 .k = core::reclaim_task::kind::retired,
                 .retired = std::move(retired),
@@ -2480,7 +2498,7 @@ namespace apps::inconel::tree {
         }
 
         void
-        post_gen_losers(core::retired_value_refs&& losers) override {
+        post_gen_losers_impl(core::retired_value_refs&& losers) {
             auto* task = new core::reclaim_task{
                 .k = core::reclaim_task::kind::gen_losers,
                 .retired = {},

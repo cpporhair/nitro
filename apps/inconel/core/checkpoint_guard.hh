@@ -55,7 +55,7 @@ namespace apps::inconel::core {
                 return;
             }
             if (auto* sink = active_reclaim_sink()) {
-                sink->post_retired(std::move(retired));
+                sink->post_retired(sink->self, std::move(retired));
             }
         }
     };

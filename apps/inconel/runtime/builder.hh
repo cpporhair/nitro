@@ -920,6 +920,7 @@ namespace apps::inconel::runtime {
                     profile.value_data_area_base,
                     shared_heads.get(),
                     wal_reclaim_frontier.get(),
+                    &core::registry::tree_read_domains.list,
                     opts.tree_queue_depth,
                     make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,

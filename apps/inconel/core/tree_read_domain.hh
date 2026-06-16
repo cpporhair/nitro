@@ -129,6 +129,8 @@ namespace apps::inconel::core {
             : read_domain_index(rdi), partitions(std::move(parts)) {}
 
         virtual bool advance() = 0;
+        virtual void invalidate_range(format::range_ref range,
+                                      const tree_geometry& geom) = 0;
         virtual ~tree_read_domain_base() = default;
 
         // Non-copyable, non-movable — instances are owned via
@@ -172,6 +174,8 @@ namespace apps::inconel::core {
         ~tree_read_domain() override;
 
         bool advance() override;
+        void invalidate_range(format::range_ref range,
+                              const tree_geometry& geom) override;
 
         // Runtime tuple driver. The PUMP share-nothing runner calls
         // `sched->advance(runtime)` on every registered object per
@@ -225,6 +229,27 @@ namespace apps::inconel::core {
 
     template <cache_concept Cache>
     tree_read_domain<Cache>::~tree_read_domain() = default;
+
+    template <cache_concept Cache>
+    void
+    tree_read_domain<Cache>::invalidate_range(format::range_ref range,
+                                             const tree_geometry& geom) {
+        const uint32_t page_lbas = geom.page_lbas();
+        for (uint32_t slot = 0; slot < range.slot_count; ++slot) {
+            auto id = memory::frame_id{
+                .base = format::paddr{
+                    .device_id = range.base.device_id,
+                    .lba = range.base.lba +
+                           static_cast<uint64_t>(slot) * page_lbas,
+                },
+                .span_lbas = static_cast<uint16_t>(page_lbas),
+                .dom = memory::frame_id::domain::tree_node,
+            };
+            if (auto frame = node_cache.take(id)) {
+                lookup->free_frames_.push_back(*frame);
+            }
+        }
+    }
 
     template <cache_concept Cache>
     bool

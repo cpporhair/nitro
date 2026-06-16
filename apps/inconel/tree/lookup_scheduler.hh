@@ -13,13 +13,12 @@
 // ownership one level up (RSM §4.7 / RMC §6.1): the cache is now a
 // member of `core::tree_read_domain<Cache>` and this scheduler
 // accesses it via `read_domain_->node_cache` — still a direct
-// templated call, zero virtual dispatch (030 §6.1 decision A).
+// templated call, with no runtime class dispatch (030 §6.1 decision A).
 //
 // Step 030 also removes `read_domain_index` from the scheduler base
 // (030 §6.6 decision I1): the field lives on `tree_read_domain_base`
-// now. Diagnostics that need the index reach it via the derived
-// scheduler's virtual `read_domain_index()` getter, which resolves
-// to `read_domain_->read_domain_index`.
+// now. Step 057 stores the same index by value on this non-templated
+// queue carrier so diagnostics do not need a typed scheduler.
 //
 // File split (022 D12, §9): the op/sender/op_pusher/compute_sender_type
 // specializations for both `_tree_lookup` and `_cache_pages` live in
@@ -174,6 +173,7 @@ namespace apps::inconel::tree {
         // `unsupported_shape_change`) because a geometry mismatch is
         // a caller bug, not a data-shape case.
         const core::tree_geometry* expected_geom;
+        uint32_t read_domain_index_;
 
         pump::core::per_core::queue<_tree_lookup::req*> lookup_queue_;
         pump::core::per_core::queue<_cache_pages::req*> cache_queue_;
@@ -190,21 +190,18 @@ namespace apps::inconel::tree {
         uint32_t pending_lookups = 0;
 
         explicit
-        tree_lookup_sched_base(const core::tree_geometry* geom,
+        tree_lookup_sched_base(uint32_t rdi,
+                               const core::tree_geometry* geom,
                                size_t depth)
             : expected_geom(geom)
+            , read_domain_index_(rdi)
             , lookup_queue_(depth)
             , cache_queue_(depth) {}
 
-        virtual ~tree_lookup_sched_base() = default;
-
-        // read_domain_index lives on `tree_read_domain_base` (030 §6.6
-        // decision I1). The base exposes it via this virtual getter
-        // so non-templated diagnostic code inside `process()` can log
-        // the shard number without knowing the concrete `Cache`
-        // type. The call is on the panic path only — zero cost on
-        // the hot path.
-        virtual uint32_t read_domain_index() const noexcept = 0;
+        [[nodiscard]] uint32_t
+        read_domain_index() const noexcept {
+            return read_domain_index_;
+        }
 
         void schedule_lookup(_tree_lookup::req* r) {
             ++pending_lookups;
@@ -302,7 +299,7 @@ namespace apps::inconel::tree {
         // `read_domain_->node_cache`; the scheduler reaches through
         // for every pin/put/contains call. Template-specialized on
         // the same `Cache` as the read_domain, so the cache access
-        // inlines at every call site with no virtual dispatch
+        // inlines at every call site with no runtime class dispatch
         // (030 §6.1 decision A / §2.4).
         core::tree_read_domain<Cache>* read_domain_ = nullptr;
 
@@ -329,27 +326,23 @@ namespace apps::inconel::tree {
         // sit in the same `unique_ptr` tree so lifetime is structural.
         explicit
         tree_lookup_sched(core::tree_read_domain<Cache>* rd,
+                          uint32_t rdi,
                           const core::tree_geometry* geom,
                           size_t depth = 2048,
                           memory::dma_page_allocator frame_allocator =
                               memory::make_heap_dma_page_allocator(),
                           uint32_t frame_alignment = 4096,
                           int frame_numa_id = -1)
-            : tree_lookup_sched_base(geom, depth)
+            : tree_lookup_sched_base(rdi, geom, depth)
             , read_domain_(rd)
             , frame_pool_(geom->lba_size, frame_alignment, frame_numa_id,
                           frame_allocator) {}
 
-        ~tree_lookup_sched() override {
+        ~tree_lookup_sched() {
             for (auto* f : all_frames_) {
                 frame_pool_.put_frame(std::move(*f));
                 delete f;
             }
-        }
-
-        uint32_t
-        read_domain_index() const noexcept override {
-            return read_domain_->read_domain_index;
         }
 
         bool advance() {

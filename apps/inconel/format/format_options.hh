@@ -60,7 +60,7 @@ namespace apps::inconel::format {
         // ── INC-051 value-space format-time inputs ──
         //
         // Defaults match `kBootstrapFormatProfile` — production format
-        // commands MAY override `value_space_group_size_lbas`, but the
+        // commands MAY set `value_space_group_size_lbas`, but the
         // legal range is fixed by validate_layout (group_bytes ∈
         // [64 MiB, 1 GiB], power-of-two). `value_space_quantum_bytes` is
         // not a knob today (only 64 is supported); future versions that

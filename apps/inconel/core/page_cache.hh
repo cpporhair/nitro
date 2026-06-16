@@ -18,7 +18,7 @@ namespace apps::inconel::core {
     // clock_cache/slru_cache for legacy contiguous frames, and
     // segmented_clock_cache/segmented_slru_cache for LBA DMA frames.
     //
-    // Compile-time interface contract — no virtual dispatch, no variant
+    // Compile-time interface contract — no runtime class dispatch, no variant
     // visit, all calls are inlined directly at the use site.
     //
     // Ownership rules:

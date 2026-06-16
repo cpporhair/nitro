@@ -34,7 +34,7 @@
 //
 // Both schedulers are template-specialized on the SAME `Cache` type,
 // so when they reach into `read_domain_->node_cache.pin(...)` the call
-// site is inlined — zero virtual dispatch, matching the project's
+// site is inlined — zero runtime class dispatch, matching the project's
 // "极速 KV 引擎" performance target (030 §6.1 decision A).
 //
 // Registry stores `tree_read_domain_base*` (non-templated base) so
@@ -145,10 +145,9 @@ namespace apps::inconel::core {
     // only through the builder, test fixtures, or via the umbrella
     // scheduler facade (`tree/scheduler.hh`).
     //
-    // `advance()` is virtual — it sits on the per-core outer loop,
-    // is called once per round, and never appears on a hot-read
-    // path. The virtual dispatch cost is amortized across every
-    // lookup / worker operation processed in the round.
+    // The concrete `tree_read_domain<Cache>` owns the per-core
+    // advance loop. This base is a non-polymorphic routing and
+    // enqueue carrier for cache-agnostic registry users.
 
     struct tree_read_domain_base {
         uint32_t read_domain_index;
@@ -168,7 +167,7 @@ namespace apps::inconel::core {
         // `tree::lookup` fan-out in `tree/sender.hh`, the
         // `submit_flush_work` wrapper on the flush path, the
         // registry's per-shard lookup) reach the schedulers without
-        // knowing `Cache` — zero virtual dispatch on the routing
+        // knowing `Cache` — zero runtime class dispatch on the routing
         // path (030 §6.1 performance target). Application code with
         // a typed `tree_read_domain<Cache>*` handle still goes
         // through `lookup.get()` / `worker.get()` directly.
@@ -183,9 +182,6 @@ namespace apps::inconel::core {
             : read_domain_index(rdi)
             , partitions(std::move(parts))
             , invalidate_q(queue_depth) {}
-
-        virtual bool advance() = 0;
-        virtual ~tree_read_domain_base() = default;
 
         void
         schedule_invalidate(_read_domain_invalidate::req* r) {
@@ -244,9 +240,9 @@ namespace apps::inconel::core {
                          uint32_t                                    frame_alignment = 4096,
                          int                                         frame_numa_id = -1);
 
-        ~tree_read_domain() override;
+        ~tree_read_domain();
 
-        bool advance() override;
+        bool advance();
         void handle_invalidate_range(format::range_ref range,
                                      uint32_t page_lbas);
 
@@ -287,10 +283,10 @@ namespace apps::inconel::core {
         : tree_read_domain_base(rdi, std::move(parts), queue_depth)
         , node_cache(std::move(cache))
         , lookup(std::make_unique<tree::tree_lookup_sched<Cache>>(
-              this, geom, queue_depth, frame_allocator, frame_alignment,
+              this, rdi, geom, queue_depth, frame_allocator, frame_alignment,
               frame_numa_id))
         , worker(std::make_unique<tree::tree_worker_sched<Cache>>(
-              this, geom, queue_depth, frame_allocator, frame_alignment,
+              this, rdi, geom, queue_depth, frame_allocator, frame_alignment,
               frame_numa_id)) {
         // Publish base pointers after unique_ptrs are constructed.
         // Non-templated callers see the schedulers through the base

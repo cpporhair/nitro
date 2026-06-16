@@ -24,7 +24,7 @@
 // on `core::tree_read_domain<Cache>` (RSM §4.7). The worker reaches
 // it via `read_domain_->node_cache` — template-specialized on the
 // same `Cache`, so `process_flush_round` still receives a raw
-// `Cache*` and inlines cache access with no virtual dispatch
+// `Cache*` and inlines cache access with no runtime class dispatch
 // (030 §6.1 decision A). The previous `tree_lookup_sched_base*
 // paired_lookup` field is dropped (030 §2.4): it was only a
 // placeholder for a future read-throttle hook, never consulted; a
@@ -33,8 +33,8 @@
 //
 // Step 030 `read_domain_index` move (§6.6 decision I1): the field
 // lives on `tree_read_domain_base` now. The base's
-// `read_domain_index()` virtual getter returns the value from the
-// owning read_domain, used only on the diagnostic path in
+// `read_domain_index()` accessor now returns the value stored on the
+// non-templated queue carrier, used only on the diagnostic path in
 // `advance()`.
 
 #include <cstddef>
@@ -118,19 +118,17 @@ namespace apps::inconel::tree {
         static constexpr uint32_t kMaxFlushRoundOpsPerAdvance = 16;
 
         pump::core::per_core::queue<_flush_round::req*> flush_round_q;
+        uint32_t read_domain_index_;
 
         explicit
-        tree_worker_sched_base(std::size_t depth = 2048)
-            : flush_round_q(depth) {}
+        tree_worker_sched_base(uint32_t rdi, std::size_t depth = 2048)
+            : flush_round_q(depth)
+            , read_domain_index_(rdi) {}
 
-        virtual ~tree_worker_sched_base() = default;
-
-        // Mirror of `tree_lookup_sched_base::read_domain_index()`
-        // (030 §6.6 decision I1): the field lives on
-        // `tree_read_domain_base`, reached through the derived
-        // scheduler's back-reference. Used only on the diagnostic
-        // panic path in `advance()`.
-        virtual uint32_t read_domain_index() const noexcept = 0;
+        [[nodiscard]] uint32_t
+        read_domain_index() const noexcept {
+            return read_domain_index_;
+        }
 
         void
         schedule_flush_round(_flush_round::req* r) {
@@ -166,21 +164,17 @@ namespace apps::inconel::tree {
         // sit in the same `unique_ptr` tree.
         explicit
         tree_worker_sched(core::tree_read_domain<Cache>* rd,
+                          uint32_t rdi,
                           const core::tree_geometry*      geom,
                           std::size_t                    depth = 2048,
                           memory::dma_page_allocator     frame_allocator =
                               memory::make_heap_dma_page_allocator(),
                           uint32_t                       frame_alignment = 4096,
                           int                            frame_numa_id = -1)
-            : tree_worker_sched_base(depth)
+            : tree_worker_sched_base(rdi, depth)
             , read_domain_(rd)
             , frame_pool_(geom->lba_size, frame_alignment, frame_numa_id,
                           frame_allocator) {}
-
-        uint32_t
-        read_domain_index() const noexcept override {
-            return read_domain_->read_domain_index;
-        }
 
         bool
         advance() {

@@ -15,6 +15,7 @@
 #include "./panic.hh"
 #include "./shard_partition.hh"
 #include "./tree_manifest.hh"
+#include "./wal_reclaim_frontier.hh"
 #include "../nvme/runtime_scheduler.hh"
 #include "../tree/scheduler.hh"  // for tree::tree_lookup_sched_base
 #include "../value/scheduler.hh" // for value::value_alloc_sched_base
@@ -81,6 +82,7 @@ namespace apps::inconel::core::registry {
     // the builder.
     inline value::value_alloc_sched_base* value_alloc_sched = nullptr;
     inline std::shared_ptr<data_area_heads> data_area_heads_ptr;
+    inline std::shared_ptr<wal_reclaim_frontier> wal_reclaim_frontier_ptr;
 
     // tree::tree_sched is a global singleton introduced in step 023
     // (Phase 3 G5, D17/D18/D24). It owns the tree-local flush round
@@ -147,6 +149,7 @@ namespace apps::inconel::core::registry {
         nvme_by_front_owner.clear();
         value_alloc_sched = nullptr;
         data_area_heads_ptr.reset();
+        wal_reclaim_frontier_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
         coord_sched_singleton_ptr = nullptr;
         current_shard_partitions_ptr.reset();
@@ -168,6 +171,13 @@ namespace apps::inconel::core::registry {
     data_area_heads_singleton() {
         assert(data_area_heads_ptr && "core::data_area_heads not registered");
         return data_area_heads_ptr.get();
+    }
+
+    inline wal_reclaim_frontier*
+    wal_reclaim_frontier_singleton() {
+        assert(wal_reclaim_frontier_ptr &&
+               "core::wal_reclaim_frontier not registered");
+        return wal_reclaim_frontier_ptr.get();
     }
 
     // tree_sched_singleton() follows the same pattern as value_sched()

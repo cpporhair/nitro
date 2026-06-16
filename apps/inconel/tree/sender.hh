@@ -26,6 +26,7 @@
 // superblock update, and final round publication.
 
 #include <cstring>
+#include <memory>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -57,6 +58,7 @@
 #include "../nvme/frame_io.hh"
 #include "../nvme/runtime_scheduler.hh"
 #include "../runtime/facade.hh"
+#include "../wal/sender.hh"
 
 namespace apps::inconel::tree {
 
@@ -773,6 +775,24 @@ namespace apps::inconel::tree {
         rt::publish_shard_partitions(std::move(new_map));
     }
 
+    inline auto
+    reclaim_wal_after_flush(tree_flush_result&& result) {
+        auto result_holder =
+            std::make_shared<tree_flush_result>(std::move(result));
+        return rt::owner()->submit_recompute_recovery_frontier()
+            >> flat_map([](recovery_frontier_snapshot snapshot) {
+                return wal::reclaim_check(
+                    *core::registry::wal_space_singleton(),
+                    snapshot.flush_durable_frontier);
+            })
+            >> flat_map([]() {
+                return rt::owner()->submit_recompute_recovery_frontier();
+            })
+            >> then([result_holder](recovery_frontier_snapshot&&) {
+                return std::move(*result_holder);
+            });
+    }
+
     // Full owner-side flush transaction. Singleton-only — the owner
     // (`tree_sched`) is resolved internally via `rt::owner()`, so
     // callers only pass the request payload. See `runtime/facade.hh`.
@@ -818,6 +838,9 @@ namespace apps::inconel::tree {
                         // universal reference and forward on return.
                         rebuild_and_publish_shard_partitions(r);
                         return std::forward<decltype(r)>(r);
+                    })
+                    >> flat_map([](tree_flush_result&& r) {
+                        return reclaim_wal_after_flush(std::move(r));
                     });
             });
     }

@@ -37,6 +37,7 @@
 
 #include "../core/data_area_heads.hh"
 #include "../core/panic.hh"
+#include "../core/wal_reclaim_frontier.hh"
 #include "../format/superblock.hh"
 #include "../format/types.hh"
 #include "../memory/dma_page_pool.hh"
@@ -51,6 +52,11 @@ namespace apps::inconel::tree {
 
     struct reclaim_task;
     struct tree_sched;
+
+    struct recovery_frontier_snapshot {
+        uint64_t flush_durable_frontier = 0;
+        uint64_t recovery_safe_lsn = 0;
+    };
 
 }  // namespace apps::inconel::tree
 
@@ -540,6 +546,39 @@ namespace apps::inconel::tree {
         };
 
     }  // namespace _finalize_flush_round
+
+    namespace _recompute_recovery_frontier {
+
+        struct req {
+            std::move_only_function<void(recovery_frontier_snapshot&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool recompute_recovery_frontier_op = true;
+
+            tree_sched* sched;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched;
+
+            auto
+            make_op() {
+                return op{ .sched = sched };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _recompute_recovery_frontier
 
     namespace _owner {
 
@@ -2196,9 +2235,11 @@ namespace apps::inconel::tree {
         static constexpr uint32_t kMaxBeginUpdateSuperblockOpsPerAdvance  = 1;
         static constexpr uint32_t kMaxFinishUpdateSuperblockOpsPerAdvance = 1;
         static constexpr uint32_t kMaxFinalizeOpsPerAdvance               = 8;
+        static constexpr uint32_t kMaxRecoveryFrontierOpsPerAdvance       = 8;
         static constexpr uint32_t kWriteBatchConcurrency                  = 32;
 
         const core::tree_geometry* geom = nullptr;
+        core::wal_reclaim_frontier* wal_frontier = nullptr;
         tree_state                 state;
         memory::lba_dma_page_pool  frame_pool;
         pump::core::per_core::queue<_flush_fold::req*>               fold_q;
@@ -2208,6 +2249,7 @@ namespace apps::inconel::tree {
         pump::core::per_core::queue<_begin_update_superblock::req*>  begin_update_superblock_q;
         pump::core::per_core::queue<_finish_update_superblock::req*> finish_update_superblock_q;
         pump::core::per_core::queue<_finalize_flush_round::req*>     finalize_q;
+        pump::core::per_core::queue<_recompute_recovery_frontier::req*> recovery_frontier_q;
         // Serializes the superblock begin→finish pair: begin latches
         // the flag, finish clears it. The outer pipeline is expected
         // to issue read/mutate/FUA-write between the two seams.
@@ -2217,12 +2259,14 @@ namespace apps::inconel::tree {
         tree_sched(const core::tree_geometry* g = nullptr,
                    format::paddr              data_area_base = {0, 0},
                    core::data_area_heads*     shared_heads = nullptr,
+                   core::wal_reclaim_frontier* wal_frontier_cell = nullptr,
                    std::size_t                depth = 256,
                    memory::dma_page_allocator frame_allocator =
                        memory::make_heap_dma_page_allocator(),
                    uint32_t                   frame_alignment = 4096,
                    int                        frame_numa_id = -1)
             : geom(g)
+            , wal_frontier(wal_frontier_cell)
             , frame_pool(g ? g->lba_size : 4096,
                          frame_alignment,
                          frame_numa_id,
@@ -2234,7 +2278,12 @@ namespace apps::inconel::tree {
             , begin_update_superblock_q(depth)
             , finish_update_superblock_q(depth)
             , finalize_q(depth)
+            , recovery_frontier_q(depth)
         {
+            if (wal_frontier == nullptr) {
+                throw std::invalid_argument(
+                    "tree::tree_sched: wal reclaim frontier must not be null");
+            }
             state.alloc.head         = data_area_base;
             state.alloc.shared_heads = shared_heads;
             if (geom != nullptr) {
@@ -2279,6 +2328,15 @@ namespace apps::inconel::tree {
             finalize_q.try_enqueue(r);
         }
 
+        void
+        schedule_recovery_frontier(_recompute_recovery_frontier::req* r) {
+            if (!recovery_frontier_q.try_enqueue(r)) {
+                delete r;
+                throw std::runtime_error(
+                    "tree::tree_sched: recovery frontier queue full");
+            }
+        }
+
         auto
         submit_flush_fold(tree_flush_request args) {
             return _flush_fold::sender{ this, std::move(args) };
@@ -2314,9 +2372,33 @@ namespace apps::inconel::tree {
             return _finalize_flush_round::sender{ this, std::move(args) };
         }
 
+        auto
+        submit_recompute_recovery_frontier() {
+            return _recompute_recovery_frontier::sender{ this };
+        }
+
+        uint64_t
+        flush_durable_frontier() const {
+            return std::min(state.flush_max_lsn, state.superblock_safe_lsn);
+        }
+
         uint64_t
         recompute_recovery_safe_lsn() const {
-            return std::min(state.flush_max_lsn, state.superblock_safe_lsn);
+            const uint64_t fd = flush_durable_frontier();
+            const uint64_t global_min_unreclaimed =
+                wal_frontier->global_min_unreclaimed_lsn.load(
+                    std::memory_order_acquire);
+            if (global_min_unreclaimed == 0) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::recompute_recovery_safe_lsn",
+                    "global_min_unreclaimed_lsn must be positive");
+            }
+            const uint64_t wal_frontier_lsn =
+                global_min_unreclaimed ==
+                        core::wal_reclaim_frontier::no_unreclaimed_lsn
+                    ? fd
+                    : global_min_unreclaimed - 1;
+            return std::min(fd, wal_frontier_lsn);
         }
 
         memory::pooled_frame_ptr<memory::segmented_tree_frame>
@@ -2977,6 +3059,17 @@ namespace apps::inconel::tree {
             delete r;
         }
 
+        void
+        handle_recompute_recovery_frontier_req(
+            _recompute_recovery_frontier::req* r) {
+            state.recovery_safe_lsn = recompute_recovery_safe_lsn();
+            r->cb(recovery_frontier_snapshot{
+                .flush_durable_frontier = flush_durable_frontier(),
+                .recovery_safe_lsn = state.recovery_safe_lsn,
+            });
+            delete r;
+        }
+
         // Dequeues up to `max_ops` requests from `q` and dispatches
         // each via the per-req member handler. Returns true iff at
         // least one request was processed this tick. Stops early on
@@ -3050,6 +3143,12 @@ namespace apps::inconel::tree {
                 finalize_q, kMaxFinalizeOpsPerAdvance,
                 [this](_finalize_flush_round::req* r) {
                     handle_finalize_flush_round_req(r);
+                });
+
+            progress |= drain_queue(
+                recovery_frontier_q, kMaxRecoveryFrontierOpsPerAdvance,
+                [this](_recompute_recovery_frontier::req* r) {
+                    handle_recompute_recovery_frontier_req(r);
                 });
 
             return progress;
@@ -3143,6 +3242,19 @@ namespace apps::inconel::tree {
                     ctx, scope, std::move(r));
             },
         });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _recompute_recovery_frontier::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_recovery_frontier(
+            new _recompute_recovery_frontier::req{
+                [ctx = ctx, scope = scope](
+                    recovery_frontier_snapshot&& snapshot) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope, std::move(snapshot));
+                },
+            });
     }
 
 }  // namespace apps::inconel::tree
@@ -3325,6 +3437,34 @@ namespace pump::core {
         consteval static auto
         get_value_type_identity() {
             return std::type_identity<apps::inconel::tree::tree_flush_result>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::recompute_recovery_frontier_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_recompute_recovery_frontier::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::recovery_frontier_snapshot>{};
         }
     };
 

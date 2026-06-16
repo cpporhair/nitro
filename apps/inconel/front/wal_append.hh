@@ -2,6 +2,7 @@
 #define APPS_INCONEL_FRONT_WAL_APPEND_HH
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "../core/wal_stream.hh"
+#include "../core/wal_reclaim_frontier.hh"
 #include "../format/wal.hh"
 #include "../memory/dma_page_pool.hh"
 
@@ -313,7 +315,7 @@ public:
     header_committed_ = false;
     seg_min_lsn_ = std::numeric_limits<uint64_t>::max();
     seg_max_lsn_ = 0;
-    active_seg_->min_lsn = seg_min_lsn_;
+    active_seg_->min_lsn.store(seg_min_lsn_, std::memory_order_release);
     active_seg_->max_lsn = seg_max_lsn_;
     committed_tail_valid_ = false;
     committed_tail_index_ = 0;
@@ -462,8 +464,11 @@ public:
       seg_min_lsn_ = pending_->proposed_min_lsn;
       seg_max_lsn_ = pending_->proposed_max_lsn;
       if (active_seg_ != nullptr) {
-        active_seg_->min_lsn = seg_min_lsn_;
+        active_seg_->min_lsn.store(seg_min_lsn_, std::memory_order_release);
         active_seg_->max_lsn = seg_max_lsn_;
+        if (active_seg_->reclaim_frontier != nullptr) {
+          active_seg_->reclaim_frontier->observe_active_min(seg_min_lsn_);
+        }
       }
       break;
     case wal_plan_kind::trailer:

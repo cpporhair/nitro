@@ -109,6 +109,7 @@ namespace apps::inconel::runtime {
         int32_t coord_core = -1;
         int32_t wal_space_core = -1;
         wal::segment_geometry wal_geometry;
+        core::wal_reclaim_frontier* wal_reclaim_frontier = nullptr;
         const core::tree_geometry* tree_geometry = nullptr;
         std::size_t front_queue_depth = 1024;
         std::size_t coord_queue_depth = 1024;
@@ -246,6 +247,10 @@ namespace apps::inconel::runtime {
             "power of two and >= 2",
             opts.coord_queue_depth);
         wal::validate_segment_geometry(opts.wal_geometry);
+        if (opts.wal_reclaim_frontier == nullptr) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: wal_reclaim_frontier is null");
+        }
         validate_tree_geometry_for_front_topology(opts.tree_geometry);
         wal::validate_wal_append_config(opts.front_wal_config);
 
@@ -306,7 +311,9 @@ namespace apps::inconel::runtime {
 
         pump::core::this_core_id = wal_space_core;
         topology.wal_space = new wal::wal_space_sched(
-            opts.wal_geometry, front_count);
+            opts.wal_geometry,
+            opts.wal_reclaim_frontier,
+            front_count);
         core::registry::wal_space_sched_singleton_ptr = topology.wal_space;
 
         core::registry::front_scheds.list.assign(front_count, nullptr);
@@ -772,6 +779,9 @@ namespace apps::inconel::runtime {
         auto* rt = new inconel_runtime_t<TreeCache, ValueCache>();
         auto shared_heads = std::make_shared<core::data_area_heads>();
         core::registry::data_area_heads_ptr = shared_heads;
+        auto wal_reclaim_frontier =
+            std::make_shared<core::wal_reclaim_frontier>();
+        core::registry::wal_reclaim_frontier_ptr = wal_reclaim_frontier;
 
         // ── Step 2: resolve role → core map ─────────────────────────
         const uint32_t value_core = opts.value_core < 0
@@ -830,6 +840,7 @@ namespace apps::inconel::runtime {
             .coord_core = opts.coord_core,
             .wal_space_core = opts.wal_space_core,
             .wal_geometry = wal_geometry_from_profile(profile),
+            .wal_reclaim_frontier = wal_reclaim_frontier.get(),
             .tree_geometry = &kBootstrapTreeGeometry,
             .front_queue_depth = opts.front_queue_depth,
             .coord_queue_depth = opts.coord_queue_depth,
@@ -908,6 +919,7 @@ namespace apps::inconel::runtime {
                     &kBootstrapTreeGeometry,
                     profile.value_data_area_base,
                     shared_heads.get(),
+                    wal_reclaim_frontier.get(),
                     opts.tree_queue_depth,
                     make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,

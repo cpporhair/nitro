@@ -1,6 +1,7 @@
 #ifndef APPS_INCONEL_CORE_WAL_STREAM_HH
 #define APPS_INCONEL_CORE_WAL_STREAM_HH
 
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <limits>
@@ -9,6 +10,10 @@
 #include "../format/superblock.hh"
 #include "../format/types.hh"
 #include "../format/wal.hh"
+
+namespace apps::inconel::core {
+struct wal_reclaim_frontier;
+}
 
 namespace apps::inconel::wal {
 
@@ -31,13 +36,45 @@ enum class wal_segment_state : uint8_t {
   sealed = 3,
 };
 
+struct segment_lsn_cell {
+  std::atomic<uint64_t> value{0};
+
+  segment_lsn_cell() noexcept = default;
+  segment_lsn_cell(uint64_t v) noexcept : value(v) {}
+  segment_lsn_cell(const segment_lsn_cell &rhs) noexcept
+      : value(rhs.load(std::memory_order_relaxed)) {}
+
+  segment_lsn_cell &operator=(const segment_lsn_cell &rhs) noexcept {
+    store(rhs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+
+  segment_lsn_cell &operator=(uint64_t v) noexcept {
+    store(v, std::memory_order_relaxed);
+    return *this;
+  }
+
+  [[nodiscard]] uint64_t
+  load(std::memory_order order = std::memory_order_relaxed) const noexcept {
+    return value.load(order);
+  }
+
+  void store(uint64_t v,
+             std::memory_order order = std::memory_order_relaxed) noexcept {
+    value.store(v, order);
+  }
+
+  [[nodiscard]] operator uint64_t() const noexcept { return load(); }
+};
+
 struct segment_runtime {
   segment_id id{};
   uint32_t owner_stream = std::numeric_limits<uint32_t>::max();
   uint32_t segment_gen = 0;
   wal_segment_state st = wal_segment_state::free;
-  uint64_t min_lsn = 0;
+  segment_lsn_cell min_lsn{0};
   uint64_t max_lsn = 0;
+  core::wal_reclaim_frontier *reclaim_frontier = nullptr;
 };
 
 struct segment_alloc_entry {

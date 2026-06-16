@@ -27,6 +27,7 @@
 #include "pump/core/op_tuple_builder.hh"
 
 #include "../core/owner_callback.hh"
+#include "../core/wal_reclaim_frontier.hh"
 #include "../core/wal_stream.hh"
 
 namespace apps::inconel::wal {
@@ -93,14 +94,14 @@ struct sender {
 namespace _wal_reclaim {
 
 struct req {
-  uint64_t recovery_safe_lsn = 0;
+  uint64_t flush_durable_frontier = 0;
   std::move_only_function<void(core::owner_outcome<void>&&)> cb;
 };
 
 struct op {
   constexpr static bool wal_reclaim_check_op = true;
   wal_space_sched *sched = nullptr;
-  uint64_t recovery_safe_lsn = 0;
+  uint64_t flush_durable_frontier = 0;
 
   template <uint32_t pos, typename ctx_t, typename scope_t>
   void start(ctx_t &ctx, scope_t &scope);
@@ -108,12 +109,12 @@ struct op {
 
 struct sender {
   wal_space_sched *sched = nullptr;
-  uint64_t recovery_safe_lsn = 0;
+  uint64_t flush_durable_frontier = 0;
 
   auto make_op() {
     return op{
         .sched = sched,
-        .recovery_safe_lsn = recovery_safe_lsn,
+        .flush_durable_frontier = flush_durable_frontier,
     };
   }
 
@@ -125,15 +126,22 @@ struct sender {
 
 class wal_space_sched {
 public:
-  explicit wal_space_sched(segment_geometry geometry, uint32_t stream_count = 0,
+  explicit wal_space_sched(segment_geometry geometry,
+                           core::wal_reclaim_frontier *wal_frontier,
+                           uint32_t stream_count = 0,
                            std::size_t queue_depth = 1024,
                            std::size_t pending_alloc_capacity = 0)
       : alloc_q_(queue_depth), reclaim_q_(queue_depth), geometry_(geometry),
+        wal_frontier_(wal_frontier),
         stream_count_(stream_count),
         pending_alloc_capacity_(pending_alloc_capacity == 0
                                     ? geometry.wal_segment_count
                                     : pending_alloc_capacity) {
     validate_segment_geometry(geometry_);
+    if (wal_frontier_ == nullptr) {
+      throw std::invalid_argument(
+          "wal::wal_space_sched: wal reclaim frontier must not be null");
+    }
     if (pending_alloc_capacity_ == 0) {
       throw std::invalid_argument(
           "wal::wal_space_sched: pending capacity must be nonzero");
@@ -160,8 +168,10 @@ public:
           .st = wal_segment_state::free,
           .min_lsn = 0,
           .max_lsn = 0,
+          .reclaim_frontier = wal_frontier_,
       });
     }
+    publish_global_min_unreclaimed_lsn();
   }
 
   ~wal_space_sched();
@@ -177,10 +187,11 @@ public:
     return _wal_alloc::sender{this, stream_id, std::move(sealed)};
   }
 
-  [[nodiscard]] _wal_reclaim::sender reclaim_check(uint64_t recovery_safe_lsn) {
+  [[nodiscard]] _wal_reclaim::sender
+  reclaim_check(uint64_t flush_durable_frontier) {
     return _wal_reclaim::sender{
         .sched = this,
-        .recovery_safe_lsn = recovery_safe_lsn,
+        .flush_durable_frontier = flush_durable_frontier,
     };
   }
 
@@ -227,8 +238,8 @@ public:
     return try_allocate_now(stream_id);
   }
 
-  void reclaim_check_for_testing(uint64_t recovery_safe_lsn) {
-    reclaim_segments(recovery_safe_lsn);
+  void reclaim_check_for_testing(uint64_t flush_durable_frontier) {
+    reclaim_segments(flush_durable_frontier);
     drain_pending_allocs();
   }
 
@@ -263,6 +274,29 @@ private:
           "wal::wal_space_sched: segment index out of range");
     }
     return slots_[index];
+  }
+
+  void publish_global_min_unreclaimed_lsn() {
+    uint64_t min_lsn = core::wal_reclaim_frontier::no_unreclaimed_lsn;
+    for (const auto &slot : slots_) {
+      switch (slot.st) {
+      case wal_segment_state::sealed:
+        min_lsn = std::min(
+            min_lsn, slot.min_lsn.load(std::memory_order_acquire));
+        break;
+      case wal_segment_state::active: {
+        const uint64_t active_min =
+            slot.min_lsn.load(std::memory_order_acquire);
+        if (active_min != core::wal_reclaim_frontier::no_unreclaimed_lsn) {
+          min_lsn = std::min(min_lsn, active_min);
+        }
+        break;
+      }
+      case wal_segment_state::free:
+        break;
+      }
+    }
+    wal_frontier_->publish_exact_min(min_lsn);
   }
 
   void record_sealed_segment(uint32_t stream_id,
@@ -308,8 +342,9 @@ private:
 
     sealed_segments_.push_back(info);
     slot.st = wal_segment_state::sealed;
-    slot.min_lsn = info.min_lsn;
+    slot.min_lsn.store(info.min_lsn, std::memory_order_release);
     slot.max_lsn = info.max_lsn;
+    publish_global_min_unreclaimed_lsn();
   }
 
   [[nodiscard]] segment_runtime *try_allocate_now(uint32_t stream_id) {
@@ -360,17 +395,19 @@ private:
     slot.owner_stream = stream_id;
     slot.segment_gen = entry.next_gen;
     slot.st = wal_segment_state::active;
-    slot.min_lsn = std::numeric_limits<uint64_t>::max();
+    slot.min_lsn.store(std::numeric_limits<uint64_t>::max(),
+                       std::memory_order_release);
     slot.max_lsn = 0;
     used_segment_count_.fetch_add(1, std::memory_order_relaxed);
+    publish_global_min_unreclaimed_lsn();
     return &slot;
   }
 
-  void reclaim_segments(uint64_t recovery_safe_lsn) {
+  void reclaim_segments(uint64_t flush_durable_frontier) {
     std::size_t write = 0;
     for (std::size_t read = 0; read < sealed_segments_.size(); ++read) {
       const sealed_segment_info info = sealed_segments_[read];
-      if (info.max_lsn > recovery_safe_lsn) {
+      if (info.max_lsn > flush_durable_frontier) {
         if (write != read)
           sealed_segments_[write] = info;
         ++write;
@@ -397,11 +434,12 @@ private:
       });
       slot.owner_stream = std::numeric_limits<uint32_t>::max();
       slot.st = wal_segment_state::free;
-      slot.min_lsn = 0;
+      slot.min_lsn.store(0, std::memory_order_release);
       slot.max_lsn = 0;
       used_segment_count_.fetch_sub(1, std::memory_order_relaxed);
     }
     sealed_segments_.resize(write);
+    publish_global_min_unreclaimed_lsn();
   }
 
   void compact_pending_if_needed() {
@@ -469,6 +507,7 @@ private:
   pump::core::per_core::queue<_wal_reclaim::req *> reclaim_q_;
 
   segment_geometry geometry_;
+  core::wal_reclaim_frontier *wal_frontier_ = nullptr;
   uint32_t stream_count_ = 0;
   std::vector<segment_runtime> slots_;
   uint32_t alloc_head_ = 0;
@@ -538,7 +577,7 @@ inline void wal_space_sched::handle_alloc(_wal_alloc::req *r) {
 inline void wal_space_sched::handle_reclaim(_wal_reclaim::req *r) {
   std::unique_ptr<_wal_reclaim::req> req(r);
   try {
-    reclaim_segments(req->recovery_safe_lsn);
+    reclaim_segments(req->flush_durable_frontier);
   } catch (...) {
     auto cb = std::move(req->cb);
     req.reset();
@@ -594,7 +633,7 @@ void _wal_alloc::op::start(ctx_t &ctx, scope_t &scope) {
 template <uint32_t pos, typename ctx_t, typename scope_t>
 void _wal_reclaim::op::start(ctx_t &ctx, scope_t &scope) {
   sched->schedule_reclaim(new req{
-      .recovery_safe_lsn = recovery_safe_lsn,
+      .flush_durable_frontier = flush_durable_frontier,
       .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
   });
 }

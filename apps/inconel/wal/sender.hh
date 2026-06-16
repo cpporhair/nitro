@@ -16,8 +16,8 @@ alloc_segment(wal_space_sched &sched, uint32_t stream_id,
 }
 
 [[nodiscard]] inline auto reclaim_check(wal_space_sched &sched,
-                                        uint64_t recovery_safe_lsn) {
-  return sched.reclaim_check(recovery_safe_lsn);
+                                        uint64_t flush_durable_frontier) {
+  return sched.reclaim_check(flush_durable_frontier);
 }
 
 } // namespace apps::inconel::wal

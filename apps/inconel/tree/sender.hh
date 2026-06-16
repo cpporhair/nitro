@@ -34,6 +34,7 @@
 
 #include "pump/core/meta.hh"
 #include "pump/coro/coro.hh"
+#include "pump/sender/any_exception.hh"
 #include "pump/sender/concurrent.hh"
 #include "pump/sender/flat.hh"
 #include "pump/sender/generate.hh"
@@ -797,8 +798,8 @@ namespace apps::inconel::tree {
     // (`tree_sched`) is resolved internally via `rt::owner()`, so
     // callers only pass the request payload. See `runtime/facade.hh`.
     inline auto
-    tree_local_flush(tree_flush_request req) {
-            return rt::owner()->submit_flush_fold(std::move(req))
+    tree_local_flush_under_gate(tree_flush_request req) {
+        return rt::owner()->submit_flush_fold(std::move(req))
             >> flat_map([](flush_fold_result&& fr) {
                 auto round_id = fr.round_id;
                 return just()
@@ -841,6 +842,26 @@ namespace apps::inconel::tree {
                     })
                     >> flat_map([](tree_flush_result&& r) {
                         return reclaim_wal_after_flush(std::move(r));
+                    });
+            });
+    }
+
+    inline auto
+    tree_local_flush(tree_flush_request req) {
+        return rt::owner()->submit_acquire_tree_mutation()
+            >> flat_map([req = std::move(req)](tree_mutation_token token) mutable {
+                return tree_local_flush_under_gate(std::move(req))
+                    >> flat_map([token](tree_flush_result&& r) {
+                        return rt::owner()->submit_release_tree_mutation(token)
+                            >> then([r = std::move(r)]() mutable {
+                                return std::move(r);
+                            });
+                    })
+                    >> any_exception([token](std::exception_ptr ep) {
+                        return rt::owner()->submit_release_tree_mutation(token)
+                            >> then([ep = std::move(ep)]() -> tree_flush_result {
+                                std::rethrow_exception(ep);
+                            });
                     });
             });
     }

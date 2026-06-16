@@ -145,7 +145,88 @@ namespace apps::inconel::tree {
         format::range_ref range{};
     };
 
+    struct tree_mutation_token {
+        uint64_t ticket = 0;
+    };
+
+    namespace _mutation_gate_acquire {
+
+        struct req {
+            std::move_only_function<void(tree_mutation_token)> cb;
+        };
+
+        struct op {
+            constexpr static bool mutation_gate_acquire_op = true;
+
+            tree_sched* sched = nullptr;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+
+            auto
+            make_op() {
+                return op{ .sched = sched };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _mutation_gate_acquire
+
+    namespace _mutation_gate_release {
+
+        struct req {
+            tree_mutation_token token{};
+            std::move_only_function<void()> cb;
+        };
+
+        struct op {
+            constexpr static bool mutation_gate_release_op = true;
+
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .token = token };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _mutation_gate_release
+
+    struct tree_mutation_gate {
+        bool held = false;
+        uint64_t active_ticket = 0;
+        uint64_t next_ticket = 1;
+        std::deque<_mutation_gate_acquire::req*> waiters;
+    };
+
     struct active_reclaim_round {
+        tree_mutation_token token{};
         uint64_t round_id = 0;
         uint32_t pending_invalidations = 0;
         uint32_t pending_trims = 0;
@@ -300,7 +381,9 @@ namespace apps::inconel::tree {
         pump::core::mpmc::queue<reclaim_invalidate_completion*>
             reclaim_invalidate_done_q{256};
         pump::core::mpmc::queue<reclaim_trim_completion*> reclaim_trim_done_q{256};
+        tree_mutation_gate mutation_gate;
         std::optional<active_reclaim_round> active_reclaim;
+        bool reclaim_gate_requested = false;
         uint64_t next_reclaim_round_id = 1;
 
         absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
@@ -2288,6 +2371,7 @@ namespace apps::inconel::tree {
         static constexpr uint32_t kMaxReclaimTasksPerAdvance              = 16;
         static constexpr uint32_t kMaxReclaimTrimCompletePerAdvance       = 64;
         static constexpr uint32_t kMaxValueRefsPerReclaimBatch            = 256;
+        static constexpr uint32_t kMaxMutationGateOpsPerAdvance           = 16;
         static constexpr uint32_t kWriteBatchConcurrency                  = 32;
 
         const core::tree_geometry* geom = nullptr;
@@ -2303,6 +2387,8 @@ namespace apps::inconel::tree {
         pump::core::per_core::queue<_finish_update_superblock::req*> finish_update_superblock_q;
         pump::core::per_core::queue<_finalize_flush_round::req*>     finalize_q;
         pump::core::per_core::queue<_recompute_recovery_frontier::req*> recovery_frontier_q;
+        pump::core::per_core::queue<_mutation_gate_acquire::req*>     mutation_gate_acquire_q;
+        pump::core::per_core::queue<_mutation_gate_release::req*>     mutation_gate_release_q;
         // Serializes the superblock begin→finish pair: begin latches
         // the flag, finish clears it. The outer pipeline is expected
         // to issue read/mutate/FUA-write between the two seams.
@@ -2334,6 +2420,8 @@ namespace apps::inconel::tree {
             , finish_update_superblock_q(depth)
             , finalize_q(depth)
             , recovery_frontier_q(depth)
+            , mutation_gate_acquire_q(depth)
+            , mutation_gate_release_q(depth)
         {
             if (wal_frontier == nullptr) {
                 throw std::invalid_argument(
@@ -2364,6 +2452,15 @@ namespace apps::inconel::tree {
             }
             while (auto item = state.reclaim_trim_done_q.try_dequeue()) {
                 delete *item;
+            }
+            while (auto item = mutation_gate_acquire_q.try_dequeue()) {
+                delete *item;
+            }
+            while (auto item = mutation_gate_release_q.try_dequeue()) {
+                delete *item;
+            }
+            for (auto* waiter : state.mutation_gate.waiters) {
+                delete waiter;
             }
         }
 
@@ -2692,18 +2789,22 @@ namespace apps::inconel::tree {
                     flush_durable_frontier());
             }
 
+            const tree_mutation_token token = round.token;
             state.active_reclaim.reset();
+            schedule_mutation_gate_release(
+                new _mutation_gate_release::req{ token, []() {} });
             return true;
         }
 
         void
-        begin_reclaim_round() {
+        begin_reclaim_round(tree_mutation_token token) {
             if (state.active_reclaim.has_value()) {
                 core::panic_inconsistency(
                     "tree::tree_sched::begin_reclaim_round",
                     "reclaim round already active");
             }
             auto& round = state.active_reclaim.emplace();
+            round.token = token;
             round.round_id = state.next_reclaim_round_id++;
             round.reclaim_now.reserve(kMaxValueRefsPerReclaimBatch);
 
@@ -2723,10 +2824,17 @@ namespace apps::inconel::tree {
         bool
         process_pending_reclaim() {
             if (state.pending_reclaim.empty() ||
-                state.active_reclaim.has_value()) {
+                state.active_reclaim.has_value() ||
+                state.reclaim_gate_requested) {
                 return false;
             }
-            begin_reclaim_round();
+            state.reclaim_gate_requested = true;
+            schedule_mutation_gate_acquire(
+                new _mutation_gate_acquire::req{
+                    [this](tree_mutation_token token) {
+                        state.reclaim_gate_requested = false;
+                        begin_reclaim_round(token);
+                    } });
             return true;
         }
 
@@ -2774,6 +2882,26 @@ namespace apps::inconel::tree {
             }
         }
 
+        void
+        schedule_mutation_gate_acquire(_mutation_gate_acquire::req* r) {
+            if (!mutation_gate_acquire_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_mutation_gate_acquire",
+                    "mutation gate acquire queue full");
+            }
+        }
+
+        void
+        schedule_mutation_gate_release(_mutation_gate_release::req* r) {
+            if (!mutation_gate_release_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_mutation_gate_release",
+                    "mutation gate release queue full");
+            }
+        }
+
         auto
         submit_flush_fold(tree_flush_request args) {
             return _flush_fold::sender{ this, std::move(args) };
@@ -2812,6 +2940,16 @@ namespace apps::inconel::tree {
         auto
         submit_recompute_recovery_frontier() {
             return _recompute_recovery_frontier::sender{ this };
+        }
+
+        _mutation_gate_acquire::sender
+        submit_acquire_tree_mutation() {
+            return _mutation_gate_acquire::sender{ this };
+        }
+
+        _mutation_gate_release::sender
+        submit_release_tree_mutation(tree_mutation_token token) {
+            return _mutation_gate_release::sender{ this, token };
         }
 
         uint64_t
@@ -2864,6 +3002,58 @@ namespace apps::inconel::tree {
             return memory::pooled_frame_ptr<memory::segmented_tree_frame>(
                 &frame_pool,
                 new memory::segmented_tree_frame(std::move(*frame)));
+        }
+
+        tree_mutation_token
+        issue_mutation_token() {
+            auto& gate = state.mutation_gate;
+            auto token = tree_mutation_token{ .ticket = gate.next_ticket++ };
+            gate.held = true;
+            gate.active_ticket = token.ticket;
+            return token;
+        }
+
+        void
+        wake_mutation_gate_waiter(_mutation_gate_acquire::req* r) {
+            auto token = issue_mutation_token();
+            r->cb(token);
+            delete r;
+        }
+
+        void
+        handle_mutation_gate_acquire_req(_mutation_gate_acquire::req* r) {
+            auto& gate = state.mutation_gate;
+            if (!gate.held && gate.waiters.empty()) {
+                wake_mutation_gate_waiter(r);
+                return;
+            }
+            gate.waiters.push_back(r);
+        }
+
+        void
+        handle_mutation_gate_release_req(_mutation_gate_release::req* r) {
+            auto& gate = state.mutation_gate;
+            if (!gate.held || gate.active_ticket != r->token.ticket ||
+                r->token.ticket == 0) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::handle_mutation_gate_release_req",
+                    "invalid mutation gate token");
+            }
+
+            _mutation_gate_acquire::req* next = nullptr;
+            if (!gate.waiters.empty()) {
+                next = gate.waiters.front();
+                gate.waiters.pop_front();
+            } else {
+                gate.held = false;
+                gate.active_ticket = 0;
+            }
+
+            r->cb();
+            delete r;
+            if (next != nullptr) {
+                wake_mutation_gate_waiter(next);
+            }
         }
 
         // Builds the merge_step_decision for the just-yielded state.
@@ -3537,6 +3727,18 @@ namespace apps::inconel::tree {
             bool progress = false;
 
             progress |= drain_queue(
+                mutation_gate_release_q, kMaxMutationGateOpsPerAdvance,
+                [this](_mutation_gate_release::req* r) {
+                    handle_mutation_gate_release_req(r);
+                });
+
+            progress |= drain_queue(
+                mutation_gate_acquire_q, kMaxMutationGateOpsPerAdvance,
+                [this](_mutation_gate_acquire::req* r) {
+                    handle_mutation_gate_acquire_req(r);
+                });
+
+            progress |= drain_queue(
                 fold_q, kMaxFoldOpsPerAdvance,
                 [this](_flush_fold::req* r) { handle_fold_req(r); });
 
@@ -3695,6 +3897,31 @@ namespace apps::inconel::tree {
                     recovery_frontier_snapshot&& snapshot) mutable {
                     pump::core::op_pusher<pos + 1, scope_t>::push_value(
                         ctx, scope, std::move(snapshot));
+                },
+            });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _mutation_gate_acquire::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_mutation_gate_acquire(
+            new _mutation_gate_acquire::req{
+                [ctx = ctx, scope = scope](tree_mutation_token token) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope, token);
+                },
+            });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _mutation_gate_release::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_mutation_gate_release(
+            new _mutation_gate_release::req{
+                token,
+                [ctx = ctx, scope = scope]() mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope);
                 },
             });
     }
@@ -3907,6 +4134,61 @@ namespace pump::core {
         get_value_type_identity() {
             return std::type_identity<
                 apps::inconel::tree::recovery_frontier_snapshot>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::mutation_gate_acquire_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_mutation_gate_acquire::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::tree_mutation_token>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::mutation_gate_release_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_mutation_gate_release::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 0;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<void>{};
         }
     };
 

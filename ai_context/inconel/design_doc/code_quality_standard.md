@@ -212,6 +212,24 @@
 2. 终端 I/O owner 的 `handle_*()`
 3. 明确标为 local seam 的测试 / 算法 helper，且不能作为 runtime 正确性证据
 
+### 3.10 禁止 `virtual` / 类多态分发（step 3 / 057 立）
+
+inconel 是编译期 flat OpTuple + position-based dispatch + 无锁 + 热路径预算设计。vtable 间接跳转违背 ethos、破坏内联、压热路径。**production 禁止新增 `virtual` / `override` / 虚析构 / 纯虚接口。**
+
+替代范式（都在库里有现成范本）：
+
+| 需求 | 范式 | 范本 |
+|---|---|---|
+| Cache / 模板参数类型擦除 | **非多态 base**（持队列/数据/factory + 非虚方法）+ runtime **concrete tuple** 驱动 `T::advance()` | `value::value_alloc_sched_base`；`tree_read_domain_base`（057 去虚后） |
+| 运行时闭集分支 | `std::variant` + `visit()`（编译期） | tree lookup variant、frontier_switch no-op |
+| 跨层 / 跨域回调 | `{void* self; fn* thunks}` 函数指针 handle，或已有 concrete registry 指针 | `core::reclaim_sink`（057 去虚后）、`run.hh` thunk |
+
+`std::move_only_function` **仅**允许作 PUMP scheduler req 的 `cb`/`fail` continuation；**禁止**放进 per-record / per-KV 内层循环（那是热路径间接调用，按 §3.1 预算单独论证）。
+
+**Review gate（必跑）**：`rg -n '\bvirtual\b|\boverride\b' apps/inconel --glob '!**/test*' --glob '!**/*test*'` 任何命中**默认 fail**。唯一例外须在命中处注释写明充分理由（性能 / ABI 论证，**"代码更简单"不算**）并登记 allowlist。
+
+> 背景：step 2 一度引入 `reclaim_sink` 纯虚接口；step 3（057）审计发现 production 仅 4 处虚函数（reclaim_sink + 3 个 step-030 `*_base`），全部去虚——因为它们都不是不可避的热路径多态、且都有上表的非虚范式。立此规则防复发。
+
 ## 4. 推荐证据
 
 不是每次改动都要 benchmark，但每次都应留下可审计证据。可接受的证据包括：

@@ -458,6 +458,8 @@ for each front_sched:
 
 **但**：只有 root-change flush 会因为 superblock 未更新而阻塞 WAL reclaim。root-stable flush 不更新 superblock 仍然是安全的，因为 recovery 从相同的 root range base 出发可以扫描到最新 root slot。对应的统一规则见 `runtime_state_machine.md` §4.9。
 
+> **实现现状 gap（055 §8.B5，2026-06-16）**：上面"install CAT2（立即，不等 superblock）"是**目标时序**，但当前 `tree/sender.hh::finalize_root_change` 把 superblock FUA 放在 `tree_flush_result` 返回**之前**（`begin_update_superblock → perform_superblock_io → finalize_flush_round`），而生产 `flush_round_once` 的 `frontier_switch`（装 CAT2）在 `tree_local_flush` 返回**之后**——即实际是 **superblock-FUA → CAT2**，与本节目标反序。**correctness-safe**（superblock 只是 recovery hint，crash 丢内存 CAT2 无妨；仅 root-change 罕见路径多一次 reader 可见延迟），但不是本节声称的时序。reorder（CAT2 先、superblock 异步在后）属 `tree_local_flush` 编排重构，随 step 2 / INC-024（update_superblock 正式化）一并做。
+
 ## 7. Old CAT / Old Guard 回收链
 
 ### 7.1 回收触发链

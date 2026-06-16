@@ -36,8 +36,11 @@ struct coord_state {
     std::shared_ptr<publish_catalog> current_cat;    // 当前活跃 catalog（atomic store/load）
     ready_bitmap ready_set;                          // 跟踪哪些 batch_lsn 已达到终态（publish 或 release）
 
-    // ── Seal 重入保护 ──
-    bool seal_in_progress = false;                   // seal_round 异步执行期间为 true
+    // ── Seal/Flush CAT 安装互斥（055 §6）──
+    // 统一串行标志：seal 与 flush 都在 coord 上安装 CAT（CAT1 / CAT2），必须互斥。
+    // capture_flush_frontier / close_gate 置位（已置位则 fail-fast）；
+    // end_flush_round / open_gate 清位。覆盖 flush-vs-flush + flush-vs-seal + seal-vs-seal。
+    bool catalog_update_in_progress = false;
 
     // ── 纪元 ──
     uint64_t cat_epoch;                              // catalog 版本号，单调递增
@@ -275,10 +278,11 @@ struct seal_trigger_config {
 ```text
 handle_assign_lsn(raw_batch):
     // ── seal 触发检查（内联，relaxed load atomic counters）──
-    if !seal_in_progress && seal_conditions_met():
-        seal_in_progress = true
+    // catalog_update_in_progress 统一挡 seal 与 flush（055 §6）：flush 在飞时不发起 seal
+    if !catalog_update_in_progress && seal_conditions_met():
+        catalog_update_in_progress = true        // close_gate 内置位
         initiate_seal_round()
-        // seal_round 异步完成后回调 coord_sched: seal_in_progress = false
+        // seal_round 的 open_gate 完成后清 catalog_update_in_progress = false
 
     // ── 反压检查（relaxed load 各 front 的 sealed_gen_count atomic）──
     if any front_sched 的 sealed gen count >= max_sealed_gens_per_front:
@@ -1663,6 +1667,7 @@ tree_sched ── maybe update superblock
 1. `batch_lsn` 分配是无间隙的。
 2. seal 发起和 write batch fan-out 有确定的先后关系。
 3. `publish_gate` 的开/关和 `durable_lsn` 推进不会并发。
+4. **CAT 安装互斥（055 §6，显式不变量）**：seal（装 CAT1）与 flush（frontier_switch 装 CAT2）是 coord 上仅有的两类 CAT 安装操作，由 `catalog_update_in_progress` 串行——任一在飞时另一方 fail-fast。**flush round 端到端串行**：`capture_flush_frontier` 置位、`end_flush_round`（在 `release_gens` 之后）清位，保证同一 sealed gen 不被两轮 fold、且 frontier_switch 不会插进 seal 的 close→install 窗口。pipelined flush 是 future opt（需 per-gen in-flight 追踪），v1 不做。
 
 ### 10.3 tree-domain schedulers 单线程
 

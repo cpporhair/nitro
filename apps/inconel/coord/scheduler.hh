@@ -33,7 +33,9 @@
 #include "pump/core/op_tuple_builder.hh"
 
 #include "../core/batch_carrier.hh"
+#include "../core/flush_round.hh"
 #include "../core/owner_callback.hh"
+#include "../core/panic.hh"
 #include "../core/read_catalog.hh"
 
 namespace apps::inconel::coord {
@@ -219,6 +221,9 @@ namespace apps::inconel::coord {
     namespace _coord_install_cat { struct req; struct sender; }
     namespace _coord_open_gate { struct req; struct sender; }
     namespace _coord_enter_memtable { struct req; struct sender; }
+    namespace _coord_capture_frontier { struct req; struct sender; }
+    namespace _coord_frontier_switch { struct req; struct sender; }
+    namespace _coord_end_flush_round { struct req; struct sender; }
 
     namespace _coord_event {
         using request = std::variant<
@@ -228,7 +233,10 @@ namespace apps::inconel::coord {
             _coord_close_gate::req*,
             _coord_install_cat::req*,
             _coord_open_gate::req*,
-            _coord_enter_memtable::req*>;
+            _coord_enter_memtable::req*,
+            _coord_capture_frontier::req*,
+            _coord_frontier_switch::req*,
+            _coord_end_flush_round::req*>;
     }
 
     struct coord_sched {
@@ -295,6 +303,19 @@ namespace apps::inconel::coord {
 
         [[nodiscard]] _coord_enter_memtable::sender
         enter_memtable_phase(uint64_t batch_lsn);
+
+        [[nodiscard]] _coord_capture_frontier::sender
+        capture_flush_frontier();
+
+        [[nodiscard]] _coord_frontier_switch::sender
+        frontier_switch(
+            std::shared_ptr<core::checkpoint_guard> old_guard,
+            std::shared_ptr<const core::tree_manifest> new_manifest,
+            core::retired_objects retired,
+            core::flush_release_plan release_plan);
+
+        [[nodiscard]] _coord_end_flush_round::sender
+        end_flush_round();
 
         [[nodiscard]] core::batch_ctx
         assign_batch_lsn_for_testing(core::client_batch_buffer&& input) {
@@ -384,6 +405,9 @@ namespace apps::inconel::coord {
         void schedule_install_cat(_coord_install_cat::req* r);
         void schedule_open_gate(_coord_open_gate::req* r);
         void schedule_enter_memtable(_coord_enter_memtable::req* r);
+        void schedule_capture_frontier(_coord_capture_frontier::req* r);
+        void schedule_frontier_switch(_coord_frontier_switch::req* r);
+        void schedule_end_flush_round(_coord_end_flush_round::req* r);
 
         bool advance();
 
@@ -511,7 +535,60 @@ namespace apps::inconel::coord {
         handle_enter_memtable(_coord_enter_memtable::req* r);
 
         void
+        handle_capture_frontier(_coord_capture_frontier::req* r);
+
+        void
+        handle_frontier_switch(_coord_frontier_switch::req* r);
+
+        void
+        handle_end_flush_round(_coord_end_flush_round::req* r);
+
+        void
         handle_event(_coord_event::request event);
+
+        [[nodiscard]] static std::shared_ptr<const std::vector<core::front_read_set>>
+        subtract_flushed_gens(
+            const std::shared_ptr<const std::vector<core::front_read_set>>& fronts,
+            const core::flush_release_plan& release_plan) {
+            if (!fronts) {
+                throw std::invalid_argument(
+                    "coord::coord_sched: subtract requires front snapshot");
+            }
+            for (std::size_t i = fronts->size();
+                 i < release_plan.gen_ids_by_front.size();
+                 ++i) {
+                if (!release_plan.gen_ids_by_front[i].empty()) {
+                    throw std::out_of_range(
+                        "coord::coord_sched: flush release plan front index "
+                        "outside topology");
+                }
+            }
+
+            std::vector<core::front_read_set> out;
+            out.reserve(fronts->size());
+            for (std::size_t i = 0; i < fronts->size(); ++i) {
+                const auto& src = (*fronts)[i];
+                const auto ids = release_plan.gen_ids_for(i);
+                core::front_read_set dst{
+                    .active = src.active,
+                    .imms = {},
+                };
+                dst.imms.reserve(src.imms.size());
+                for (const auto& gen : src.imms) {
+                    if (!gen) {
+                        throw std::invalid_argument(
+                            "coord::coord_sched: PRS imm gen is null");
+                    }
+                    if (std::find(ids.begin(), ids.end(), gen->gen_id) ==
+                        ids.end()) {
+                        dst.imms.push_back(gen);
+                    }
+                }
+                out.push_back(std::move(dst));
+            }
+            return std::make_shared<const std::vector<core::front_read_set>>(
+                std::move(out));
+        }
 
         void
         resolve_terminal_lsn(uint64_t lsn) {
@@ -577,6 +654,7 @@ namespace apps::inconel::coord {
         uint64_t            next_lsn_;
         uint32_t            front_count_;
         uint64_t            cat_epoch_;
+        bool                catalog_update_in_progress_ = false;
     };
 
     namespace _coord_assign {
@@ -850,6 +928,128 @@ namespace apps::inconel::coord {
         };
     }
 
+    namespace _coord_capture_frontier {
+
+        struct req {
+            std::move_only_function<void(
+                core::owner_outcome<core::flush_frontier>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_capture_frontier_op = true;
+            coord_sched* sched;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+
+            auto make_op() {
+                return op{.sched = sched};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
+    namespace _coord_frontier_switch {
+
+        struct req {
+            std::shared_ptr<core::checkpoint_guard> old_guard;
+            std::shared_ptr<const core::tree_manifest> new_manifest;
+            core::retired_objects retired;
+            core::flush_release_plan release_plan;
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_frontier_switch_op = true;
+            coord_sched* sched;
+            std::shared_ptr<core::checkpoint_guard> old_guard;
+            std::shared_ptr<const core::tree_manifest> new_manifest;
+            core::retired_objects retired;
+            core::flush_release_plan release_plan;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+            std::shared_ptr<core::checkpoint_guard> old_guard;
+            std::shared_ptr<const core::tree_manifest> new_manifest;
+            core::retired_objects retired;
+            core::flush_release_plan release_plan;
+
+            sender(coord_sched* s,
+                   std::shared_ptr<core::checkpoint_guard> old_guard_in,
+                   std::shared_ptr<const core::tree_manifest> new_manifest_in,
+                   core::retired_objects retired_in,
+                   core::flush_release_plan release_plan_in)
+                : sched(s)
+                , old_guard(std::move(old_guard_in))
+                , new_manifest(std::move(new_manifest_in))
+                , retired(std::move(retired_in))
+                , release_plan(std::move(release_plan_in)) {}
+
+            sender(sender&&) noexcept = default;
+            sender& operator=(sender&&) noexcept = default;
+            sender(const sender&) = delete;
+            sender& operator=(const sender&) = delete;
+
+            auto make_op() {
+                return op{
+                    .sched = sched,
+                    .old_guard = std::move(old_guard),
+                    .new_manifest = std::move(new_manifest),
+                    .retired = std::move(retired),
+                    .release_plan = std::move(release_plan),
+                };
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
+    namespace _coord_end_flush_round {
+
+        struct req {
+            std::move_only_function<void(core::owner_outcome<void>&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool coord_end_flush_round_op = true;
+            coord_sched* sched;
+
+            template<uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            coord_sched* sched;
+
+            auto make_op() {
+                return op{.sched = sched};
+            }
+
+            template<typename ctx_t>
+            auto connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+    }
+
     inline coord_sched::~coord_sched() {
         while (auto item = assign_q_.try_dequeue()) delete *item;
         while (auto item = event_q_.try_dequeue()) {
@@ -900,6 +1100,31 @@ namespace apps::inconel::coord {
             .sched = this,
             .batch_lsn = batch_lsn,
         };
+    }
+
+    inline _coord_capture_frontier::sender
+    coord_sched::capture_flush_frontier() {
+        return _coord_capture_frontier::sender{.sched = this};
+    }
+
+    inline _coord_frontier_switch::sender
+    coord_sched::frontier_switch(
+        std::shared_ptr<core::checkpoint_guard> old_guard,
+        std::shared_ptr<const core::tree_manifest> new_manifest,
+        core::retired_objects retired,
+        core::flush_release_plan release_plan) {
+        return _coord_frontier_switch::sender{
+            this,
+            std::move(old_guard),
+            std::move(new_manifest),
+            std::move(retired),
+            std::move(release_plan),
+        };
+    }
+
+    inline _coord_end_flush_round::sender
+    coord_sched::end_flush_round() {
+        return _coord_end_flush_round::sender{.sched = this};
     }
 
     inline void
@@ -986,6 +1211,33 @@ namespace apps::inconel::coord {
             delete r;
             throw std::runtime_error(
                 "coord::coord_sched: enter_memtable queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_capture_frontier(_coord_capture_frontier::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: capture_flush_frontier queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_frontier_switch(_coord_frontier_switch::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: frontier_switch queue full");
+        }
+    }
+
+    inline void
+    coord_sched::schedule_end_flush_round(_coord_end_flush_round::req* r) {
+        if (!event_q_.try_enqueue(_coord_event::request{r})) {
+            delete r;
+            throw std::runtime_error(
+                "coord::coord_sched: end_flush_round queue full");
         }
     }
 
@@ -1122,11 +1374,15 @@ namespace apps::inconel::coord {
         std::unique_ptr<_coord_close_gate::req> req(r);
         std::shared_ptr<const core::publish_catalog> cat;
         try {
+            if (catalog_update_in_progress_) {
+                throw std::logic_error("catalog_update_in_progress");
+            }
             if (!gate_.is_open()) {
                 throw std::logic_error(
                     "coord::coord_sched: close_gate on a closed gate");
             }
             gate_.close();
+            catalog_update_in_progress_ = true;
             cat = cats_.current_cat();
         } catch (...) {
             auto cb = std::move(req->cb);
@@ -1178,6 +1434,7 @@ namespace apps::inconel::coord {
             }
             apply_pending_gate_prefix(gate_.open_and_take_pending());
             drain_pending_assigns();
+            catalog_update_in_progress_ = false;
         } catch (...) {
             auto cb = std::move(req->cb);
             req.reset();
@@ -1210,6 +1467,140 @@ namespace apps::inconel::coord {
     }
 
     inline void
+    coord_sched::handle_capture_frontier(_coord_capture_frontier::req* r) {
+        std::unique_ptr<_coord_capture_frontier::req> req(r);
+        core::flush_frontier frontier;
+        try {
+            if (catalog_update_in_progress_) {
+                throw std::logic_error("catalog_update_in_progress");
+            }
+            catalog_update_in_progress_ = true;
+            const auto cat = cats_.current_cat();
+            frontier = core::flush_frontier{
+                .durable_lsn =
+                    cat->durable_lsn.load(std::memory_order_acquire),
+                .old_guard = cat->prs->tree_guard,
+            };
+            if (!frontier.old_guard) {
+                throw std::logic_error(
+                    "coord::coord_sched: current CAT has null tree guard");
+            }
+        } catch (...) {
+            auto cb = std::move(req->cb);
+            req.reset();
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
+            }
+            return;
+        }
+
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<core::flush_frontier>{std::move(frontier)});
+        }
+    }
+
+    inline void
+    coord_sched::handle_frontier_switch(_coord_frontier_switch::req* r) {
+        std::unique_ptr<_coord_frontier_switch::req> req(r);
+        std::shared_ptr<const core::publish_catalog> cat2;
+        uint64_t new_epoch = 0;
+
+        try {
+            if (!req->old_guard) {
+                throw std::invalid_argument(
+                    "coord::coord_sched: frontier_switch old_guard is null");
+            }
+            if (!req->new_manifest) {
+                throw std::invalid_argument(
+                    "coord::coord_sched: frontier_switch new_manifest is null");
+            }
+
+            const auto cat = cats_.current_cat();
+            if (cat->prs->tree_guard.get() != req->old_guard.get()) {
+                core::panic_inconsistency(
+                    "coord::frontier_switch",
+                    "stale base guard; seal/flush must be serialized");
+            }
+            if (cat->epoch == std::numeric_limits<uint64_t>::max()) {
+                throw std::overflow_error(
+                    "coord::coord_sched: CAT epoch overflow");
+            }
+
+            const uint64_t durable =
+                cat->durable_lsn.load(std::memory_order_acquire);
+            new_epoch = cat->epoch + 1;
+
+            auto new_guard = std::make_shared<core::checkpoint_guard>(
+                core::checkpoint_guard{
+                    .manifest = std::move(req->new_manifest),
+                    .retired = {},
+                });
+            auto new_fronts =
+                subtract_flushed_gens(cat->prs->fronts, req->release_plan);
+            auto prs = std::make_shared<const core::published_read_set>(
+                core::published_read_set{
+                    .tree_guard = std::move(new_guard),
+                    .fronts = std::move(new_fronts),
+                    .epoch = new_epoch,
+                });
+            cat2 = std::make_shared<const core::publish_catalog>(
+                std::move(prs), durable, new_epoch);
+
+            req->old_guard->retired.old_slots.reserve(
+                req->old_guard->retired.old_slots.size() +
+                req->retired.old_slots.size());
+            req->old_guard->retired.old_ranges.reserve(
+                req->old_guard->retired.old_ranges.size() +
+                req->retired.old_ranges.size());
+            req->old_guard->retired.old_tree_values.reserve(
+                req->old_guard->retired.old_tree_values.size() +
+                req->retired.old_tree_values.size());
+        } catch (...) {
+            auto cb = std::move(req->cb);
+            req.reset();
+            if (cb) {
+                cb(std::unexpected(std::current_exception()));
+            }
+            return;
+        }
+
+        auto& dst_retired = req->old_guard->retired;
+        dst_retired.old_slots.insert(
+            dst_retired.old_slots.end(),
+            req->retired.old_slots.begin(),
+            req->retired.old_slots.end());
+        dst_retired.old_ranges.insert(
+            dst_retired.old_ranges.end(),
+            req->retired.old_ranges.begin(),
+            req->retired.old_ranges.end());
+        dst_retired.old_tree_values.insert(
+            dst_retired.old_tree_values.end(),
+            req->retired.old_tree_values.begin(),
+            req->retired.old_tree_values.end());
+        cats_.install_cat(std::move(cat2));
+        cat_epoch_ = new_epoch;
+
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<void>{});
+        }
+    }
+
+    inline void
+    coord_sched::handle_end_flush_round(_coord_end_flush_round::req* r) {
+        std::unique_ptr<_coord_end_flush_round::req> req(r);
+        catalog_update_in_progress_ = false;
+        auto cb = std::move(req->cb);
+        req.reset();
+        if (cb) {
+            cb(core::owner_outcome<void>{});
+        }
+    }
+
+    inline void
     coord_sched::handle_event(_coord_event::request event) {
         std::visit(
             [this](auto* r) {
@@ -1231,10 +1622,19 @@ namespace apps::inconel::coord {
                 } else if constexpr (
                     std::is_same_v<req_t, _coord_open_gate::req>) {
                     handle_open_gate(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_enter_memtable::req>) {
+                    handle_enter_memtable(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_capture_frontier::req>) {
+                    handle_capture_frontier(r);
+                } else if constexpr (
+                    std::is_same_v<req_t, _coord_frontier_switch::req>) {
+                    handle_frontier_switch(r);
                 } else {
                     static_assert(
-                        std::is_same_v<req_t, _coord_enter_memtable::req>);
-                    handle_enter_memtable(r);
+                        std::is_same_v<req_t, _coord_end_flush_round::req>);
+                    handle_end_flush_round(r);
                 }
             },
             event);
@@ -1331,6 +1731,35 @@ namespace apps::inconel::coord {
     _coord_enter_memtable::op::start(ctx_t& ctx, scope_t& scope) {
         sched->schedule_enter_memtable(new req{
             .batch_lsn = batch_lsn,
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_capture_frontier::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_capture_frontier(new req{
+            .cb = core::make_owner_pusher<
+                pos, scope_t, core::flush_frontier>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_frontier_switch::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_frontier_switch(new req{
+            .old_guard = std::move(old_guard),
+            .new_manifest = std::move(new_manifest),
+            .retired = std::move(retired),
+            .release_plan = std::move(release_plan),
+            .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
+        });
+    }
+
+    template<uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _coord_end_flush_round::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_end_flush_round(new req{
             .cb = core::make_owner_pusher<pos, scope_t, void>(ctx, scope),
         });
     }
@@ -1495,6 +1924,66 @@ namespace pump::core {
     struct compute_sender_type<
         ctx_t,
         apps::inconel::coord::_coord_enter_memtable::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_capture_frontier_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_capture_frontier::sender> {
+        consteval static uint32_t count_value() { return 1; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<apps::inconel::core::flush_frontier>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_frontier_switch_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_frontier_switch::sender> {
+        consteval static uint32_t count_value() { return 0; }
+        consteval static auto get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::coord_end_flush_round_op)
+    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template<typename ctx_t>
+        static void push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template<typename ctx_t>
+    struct compute_sender_type<
+        ctx_t,
+        apps::inconel::coord::_coord_end_flush_round::sender> {
         consteval static uint32_t count_value() { return 0; }
         consteval static auto get_value_type_identity() {
             return std::type_identity<void>{};

@@ -50,6 +50,29 @@ namespace apps::inconel::coord {
         return sched.enter_memtable_phase(batch_lsn);
     }
 
+    [[nodiscard]] inline auto
+    capture_flush_frontier(coord_sched& sched) {
+        return sched.capture_flush_frontier();
+    }
+
+    [[nodiscard]] inline auto
+    frontier_switch(coord_sched& sched,
+                    std::shared_ptr<core::checkpoint_guard> old_guard,
+                    std::shared_ptr<const core::tree_manifest> new_manifest,
+                    core::retired_objects retired,
+                    core::flush_release_plan release_plan) {
+        return sched.frontier_switch(
+            std::move(old_guard),
+            std::move(new_manifest),
+            std::move(retired),
+            std::move(release_plan));
+    }
+
+    [[nodiscard]] inline auto
+    end_flush_round(coord_sched& sched) {
+        return sched.end_flush_round();
+    }
+
 }  // namespace apps::inconel::coord
 
 #endif  // APPS_INCONEL_COORD_SENDER_HH

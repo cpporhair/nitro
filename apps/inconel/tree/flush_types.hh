@@ -38,6 +38,7 @@
 #include <absl/container/inlined_vector.h>
 
 #include "../core/checkpoint_guard.hh"
+#include "../core/flush_round.hh"
 #include "../core/memtable.hh"
 #include "../core/retired_objects.hh"
 #include "../core/tree_manifest.hh"
@@ -271,10 +272,7 @@ namespace apps::inconel::tree {
         flush_stage_status                          st = flush_stage_status::ok;
         std::shared_ptr<const core::tree_manifest>  new_manifest;
         core::retired_objects                       retired;
-        absl::flat_hash_map<
-            uint32_t,
-            absl::InlinedVector<std::shared_ptr<core::memtable_gen>, 8>>
-                                                    flushed_gens_by_front;
+        flushed_gens_by_front_map                   flushed_gens_by_front;
         uint64_t                                    flushed_max_lsn = 0;
     };
 

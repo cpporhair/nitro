@@ -35,6 +35,7 @@
 //     keeps the manifest alive.
 
 #include <memory>
+#include <utility>
 
 #include "./retired_objects.hh"
 #include "./tree_manifest.hh"
@@ -48,6 +49,15 @@ namespace apps::inconel::core {
         // validates its own pointer before wrapping it in a guard.
         std::shared_ptr<const tree_manifest> manifest;
         retired_objects                      retired;
+
+        ~checkpoint_guard() {
+            if (retired.empty()) {
+                return;
+            }
+            if (auto* sink = active_reclaim_sink()) {
+                sink->post_retired(std::move(retired));
+            }
+        }
     };
 
 }  // namespace apps::inconel::core

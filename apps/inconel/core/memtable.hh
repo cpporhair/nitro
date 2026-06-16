@@ -21,6 +21,7 @@
 //   - cross_doc_contracts.md §2
 //   - read_api_and_pipeline.md §4.4
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -39,6 +40,8 @@
 namespace apps::inconel::core {
 
     using format::value_ref;
+
+    struct retired_objects;
 
     // ── gen_arena ────────────────────────────────────────────
     //
@@ -104,6 +107,26 @@ namespace apps::inconel::core {
         value_ref vr;
         uint64_t  data_ver;
     };
+
+    using retired_value_refs = absl::InlinedVector<retired_value_ref, 16>;
+
+    struct reclaim_sink {
+        virtual ~reclaim_sink() = default;
+        virtual void post_retired(retired_objects&& retired) = 0;
+        virtual void post_gen_losers(retired_value_refs&& losers) = 0;
+    };
+
+    inline std::atomic<reclaim_sink*> active_reclaim_sink_cell{nullptr};
+
+    inline void
+    set_reclaim_sink(reclaim_sink* sink) noexcept {
+        active_reclaim_sink_cell.store(sink, std::memory_order_release);
+    }
+
+    [[nodiscard]] inline reclaim_sink*
+    active_reclaim_sink() noexcept {
+        return active_reclaim_sink_cell.load(std::memory_order_acquire);
+    }
 
     // ── retire_list<T> ──────────────────────────────────────
     //
@@ -216,6 +239,20 @@ namespace apps::inconel::core {
             table;
 
         retire_list<retired_value_ref> loser_durable_refs;
+
+        ~memtable_gen() {
+            if (loser_durable_refs.size() == 0) {
+                return;
+            }
+
+            retired_value_refs losers;
+            loser_durable_refs.drain([&losers](retired_value_ref&& ref) {
+                losers.push_back(std::move(ref));
+            });
+            if (auto* sink = active_reclaim_sink()) {
+                sink->post_gen_losers(std::move(losers));
+            }
+        }
     };
 
     // ── front_read_set ──────────────────────────────────────

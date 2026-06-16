@@ -50,7 +50,6 @@
 
 namespace apps::inconel::tree {
 
-    struct reclaim_task;
     struct tree_sched;
 
     struct recovery_frontier_snapshot {
@@ -267,7 +266,7 @@ namespace apps::inconel::tree {
             memory::pooled_frame_ptr<memory::segmented_tree_frame>>
             non_leaf_page_cache;
 
-        pump::core::per_core::queue<reclaim_task*> reclaim_q{256};
+        pump::core::mpmc::queue<core::reclaim_task*> reclaim_q{256};
 
         absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
             active_rounds;
@@ -2227,7 +2226,7 @@ namespace apps::inconel::tree {
 
     }  // namespace _owner
 
-    struct tree_sched {
+    struct tree_sched : core::reclaim_sink {
         static constexpr uint32_t kMaxFoldOpsPerAdvance                   = 8;
         static constexpr uint32_t kMaxMergeStepOpsPerAdvance              = 16;
         static constexpr uint32_t kMaxMergeReadsDoneOpsPerAdvance         = 4;
@@ -2290,6 +2289,42 @@ namespace apps::inconel::tree {
                 state.alloc.range_lbas =
                     static_cast<uint32_t>(geom->range_lbas());
                 state.alloc.shadow_slots = geom->shadow_slots_per_range;
+            }
+        }
+
+        ~tree_sched() override {
+            while (auto item = state.reclaim_q.try_dequeue()) {
+                delete *item;
+            }
+        }
+
+        void
+        post_retired(core::retired_objects&& retired) override {
+            auto* task = new core::reclaim_task{
+                .k = core::reclaim_task::kind::retired,
+                .retired = std::move(retired),
+                .gen_losers = {},
+            };
+            if (!state.reclaim_q.try_enqueue(std::move(task))) {
+                delete task;
+                core::panic_inconsistency(
+                    "tree::tree_sched::post_retired",
+                    "reclaim queue full");
+            }
+        }
+
+        void
+        post_gen_losers(core::retired_value_refs&& losers) override {
+            auto* task = new core::reclaim_task{
+                .k = core::reclaim_task::kind::gen_losers,
+                .retired = {},
+                .gen_losers = std::move(losers),
+            };
+            if (!state.reclaim_q.try_enqueue(std::move(task))) {
+                delete task;
+                core::panic_inconsistency(
+                    "tree::tree_sched::post_gen_losers",
+                    "reclaim queue full");
             }
         }
 

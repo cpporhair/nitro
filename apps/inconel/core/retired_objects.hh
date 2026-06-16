@@ -55,6 +55,23 @@ namespace apps::inconel::core {
         // `data_ver` against `recovery_safe_lsn` before actually
         // freeing the backing value page.
         absl::InlinedVector<retired_value_ref, 64> old_tree_values;
+
+        [[nodiscard]] bool
+        empty() const noexcept {
+            return old_slots.empty() &&
+                   old_ranges.empty() &&
+                   old_tree_values.empty();
+        }
+    };
+
+    struct reclaim_task {
+        enum class kind : uint8_t {
+            retired,
+            gen_losers,
+        } k = kind::retired;
+
+        retired_objects retired;
+        retired_value_refs gen_losers;
     };
 
 }  // namespace apps::inconel::core

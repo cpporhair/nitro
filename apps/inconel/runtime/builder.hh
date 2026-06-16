@@ -925,6 +925,7 @@ namespace apps::inconel::runtime {
                     opts.nvme_dma_alignment,
                     opts.nvme_numa_id);
                 core::registry::tree_sched_singleton_ptr = tsched;
+                core::set_reclaim_sink(tsched);
                 tsched_singleton = tsched;
                 shared_heads->tree_head_lba.store(
                     tsched->state.alloc.head.lba, std::memory_order_relaxed);
@@ -1007,6 +1008,7 @@ namespace apps::inconel::runtime {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
+        core::set_reclaim_sink(nullptr);
         if (core::registry::coord_sched_singleton_ptr) {
             delete core::registry::coord_sched_singleton_ptr;
         }

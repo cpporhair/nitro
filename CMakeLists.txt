@@ -116,6 +116,12 @@ target_include_directories(inconel_test_steady_e2e PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_steady_e2e PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_concurrent_runtime_e2e
+        apps/inconel/test/test_concurrent_runtime_e2e.cc)
+target_include_directories(inconel_test_concurrent_runtime_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_concurrent_runtime_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # INC-050 direction B: CRC32C bit-identical-to-absl compatibility gate (053 §7).
 add_executable(inconel_test_crc32c apps/inconel/test/test_crc32c.cc)
 target_include_directories(inconel_test_crc32c PRIVATE ${CMAKE_SOURCE_DIR})

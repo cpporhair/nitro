@@ -141,11 +141,7 @@ namespace apps::inconel::runtime {
 
     [[nodiscard]] inline memory::dma_page_allocator
     make_runtime_dma_page_allocator() noexcept {
-#ifdef INCONEL_NVME_MOCK_BACKEND
-        return memory::make_heap_dma_page_allocator();
-#else
         return memory::make_spdk_dma_page_allocator();
-#endif
     }
 
     [[nodiscard]] inline uint32_t
@@ -327,7 +323,8 @@ namespace apps::inconel::runtime {
                 1,
                 opts.wal_geometry,
                 opts.front_wal_config,
-                opts.front_queue_depth);
+                opts.front_queue_depth,
+                make_runtime_dma_page_allocator());
             topology.fronts[owner] = fs;
             core::registry::front_scheds.list[owner] = fs;
             core::registry::front_scheds.by_core[home_core] = fs;

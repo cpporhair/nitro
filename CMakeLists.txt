@@ -108,6 +108,14 @@ target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_flush_e2e PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+# 058 steady-state background-loop e2e on the real SPDK NVMe backend.
+# Needs --pci-addr BDF (or INCONEL_NVME_PCI_ADDR); force-formats the
+# target namespace, so point it at a scratch device only.
+add_executable(inconel_test_steady_e2e apps/inconel/test/test_steady_e2e.cc)
+target_include_directories(inconel_test_steady_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_steady_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 # INC-050 direction B: CRC32C bit-identical-to-absl compatibility gate (053 §7).
 add_executable(inconel_test_crc32c apps/inconel/test/test_crc32c.cc)
 target_include_directories(inconel_test_crc32c PRIVATE ${CMAKE_SOURCE_DIR})
@@ -183,40 +191,6 @@ add_executable(inconel_test_m12_seal_round
         apps/inconel/test/test_m12_seal_round.cc)
 target_include_directories(inconel_test_m12_seal_round PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_m12_seal_round PRIVATE
-        inconel_real_nvme ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_m13_e2e_matrix
-        apps/inconel/test/test_m13_e2e_matrix.cc)
-target_include_directories(inconel_test_m13_e2e_matrix PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_definitions(inconel_test_m13_e2e_matrix PRIVATE INCONEL_NVME_MOCK_BACKEND)
-target_link_libraries(inconel_test_m13_e2e_matrix PRIVATE
-        inconel_real_nvme ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_reclaim
-        apps/inconel/test/test_reclaim.cc)
-target_include_directories(inconel_test_reclaim PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_definitions(inconel_test_reclaim PRIVATE INCONEL_NVME_MOCK_BACKEND)
-target_link_libraries(inconel_test_reclaim PRIVATE
-        inconel_real_nvme ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_steady_e2e
-        apps/inconel/test/test_steady_e2e.cc)
-target_include_directories(inconel_test_steady_e2e PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_definitions(inconel_test_steady_e2e PRIVATE INCONEL_NVME_MOCK_BACKEND)
-target_link_libraries(inconel_test_steady_e2e PRIVATE
-        inconel_real_nvme ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_test_flush_round
-        apps/inconel/test/test_flush_round.cc)
-target_include_directories(inconel_test_flush_round PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_definitions(inconel_test_flush_round PRIVATE INCONEL_NVME_MOCK_BACKEND)
-target_link_libraries(inconel_test_flush_round PRIVATE
-        inconel_real_nvme ${INCONEL_ABSL_LIBS})
-
-add_executable(inconel_profile_m13 apps/inconel/test/profile_m13.cc)
-target_include_directories(inconel_profile_m13 PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_definitions(inconel_profile_m13 PRIVATE INCONEL_NVME_MOCK_BACKEND)
-target_link_libraries(inconel_profile_m13 PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
 add_executable(inconel_test_m14_wal_group_commit

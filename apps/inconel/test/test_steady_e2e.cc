@@ -1,17 +1,32 @@
-// 058 steady-state e2e harness.
+// 058 steady-state e2e harness — real SPDK NVMe backend.
+//
+// Drives the coord-orchestrated steady-state background loop
+//   write_batch → seal_once → flush_once (frontier switch / CAT2) →
+//   physical reclaim (TRIM + value reclaim) → recovery_safe_lsn advance
+// over many rounds against a freshly formatted real NVMe namespace, and
+// asserts correctness (point_get readback vs an in-test oracle),
+// stability (no panic; bounded live gens / tree+value heads), and the
+// flush-shape coverage matrix F1-F8 (§3 of the plan).
 //
 // Test-only runtime builder note:
 // build_runtime() is intentionally pinned to the bootstrap disk profile, whose
 // current shadow_slots_per_range is 1. F2/F3 require exercising next-slot and
 // slot exhaustion, so this test constructs the same production schedulers over
-// a mock NVMe device with a test-local tree_geometry carrying 4 shadow slots.
-// No production hook or production code path is changed.
+// a real NVMe device with a test-local tree_geometry carrying 4 shadow slots.
+// shadow_slots=4 is a valid production geometry, not a code fork — no
+// production hook or production code path is changed.
+//
+// Requires an SPDK-bound NVMe controller: pass --pci-addr BDF (or set
+// INCONEL_NVME_PCI_ADDR). The target namespace is force-formatted on
+// every run, so point it at a scratch device only.
 
 #include "apps/inconel/runtime/operations.hh"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -37,6 +52,7 @@
 #include "apps/inconel/format/superblock_builder.hh"
 #include "apps/inconel/format/tree_page.hh"
 #include "apps/inconel/format/value_object.hh"
+#include "apps/inconel/nvme/runtime_scheduler.hh"
 #include "apps/inconel/runtime/builder.hh"
 #include "apps/inconel/runtime/facade.hh"
 #include "apps/inconel/test/check.hh"
@@ -149,29 +165,69 @@ steady_layout_plan() {
     return plan;
 }
 
+// Drive a transient NVMe scheduler to completion. Used only for the
+// bootstrap superblock format, which runs before the runtime (and its
+// per-core advance loop) exists, so it owns its own advance loop —
+// mirrors test_flush_e2e's real-NVMe bootstrap.
+template <typename SenderBuilder>
+bool
+submit_nvme_and_wait(nvme::runtime_scheduler& sched,
+                     SenderBuilder&&          build_sender) {
+    auto ctx     = pump::core::make_root_context();
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto fut     = promise->get_future();
+
+    std::forward<SenderBuilder>(build_sender)()
+        >> pump::sender::then([promise](bool ok) { promise->set_value(ok); })
+        >> pump::sender::submit(ctx);
+
+    while (fut.wait_for(std::chrono::milliseconds(0)) !=
+           std::future_status::ready) {
+        sched.advance();
+        std::this_thread::yield();
+    }
+    return fut.get();
+}
+
 void
-format_mock_superblocks(nvme::runtime_device& device) {
+write_superblock_page(nvme::runtime_scheduler&  sched,
+                      uint64_t                  lba,
+                      const format::superblock& sb) {
+    std::vector<char> page(kLbaSize, 0);
+    std::memcpy(page.data(), &sb, sizeof(sb));
+    const bool ok = submit_nvme_and_wait(sched, [&]() {
+        return sched.write(lba, page.data(), 1, nvme::IO_FLAGS_FUA);
+    });
+    CHECK(ok && "real NVMe superblock write failed");
+}
+
+// Format superblock A/B onto the real namespace through a transient
+// scheduler bound to fmt_core's qpair. The scheduler borrows the qpair
+// (real_device owns it) and releases it on destruction, so the runtime
+// can claim the same qpair afterwards.
+void
+format_real_superblocks(nvme::runtime_device& device, uint32_t fmt_core) {
     const auto sb_a = format::build_superblock(steady_layout_plan(), 1);
     const auto sb_b = format::build_superblock(steady_layout_plan(), 0);
 
-    std::vector<char> page(kLbaSize, 0);
-    std::memcpy(page.data(), &sb_a, sizeof(sb_a));
-    CHECK(device.write_bytes(0, std::span<const char>(page.data(),
-                                                      page.size())));
-    std::fill(page.begin(), page.end(), 0);
-    std::memcpy(page.data(), &sb_b, sizeof(sb_b));
-    CHECK(device.write_bytes(1, std::span<const char>(page.data(),
-                                                      page.size())));
-}
+    pump::core::this_core_id = fmt_core;
+    nvme::runtime_scheduler fmt_sched(
+        device.qpair_for_core(fmt_core),
+        kLbaSize,
+        /*pool_pages=*/  64,
+        /*queue_depth=*/ 128,
+        /*local_depth=*/ 32,
+        /*alignment=*/   4096,
+        SPDK_ENV_NUMA_ID_ANY,
+        device.device_id());
 
-format::superblock
-read_mock_superblock(nvme::runtime_device& device, uint64_t lba) {
-    std::vector<char> page(kLbaSize);
-    CHECK(device.read_bytes(lba, std::span<char>(page.data(), page.size())));
-    format::superblock sb{};
-    std::memcpy(&sb, page.data(), sizeof(sb));
-    CHECK(format::inspect_superblock(sb) == format::superblock_status::ok);
-    return sb;
+    write_superblock_page(fmt_sched, 0, sb_a);
+    write_superblock_page(fmt_sched, 1, sb_b);
+
+    const bool flushed = submit_nvme_and_wait(fmt_sched, [&]() {
+        return fmt_sched.flush();
+    });
+    CHECK(flushed && "real NVMe flush after steady bootstrap format failed");
 }
 
 runtime_t*
@@ -395,18 +451,35 @@ struct tree_record_result {
 };
 
 struct steady_fixture {
+    std::string pci_addr;
     std::vector<uint32_t> cores;
-    nvme::runtime_device device{kLbaSize, kNamespaceLbas, 0};
+    nvme::runtime_device device;
     runtime_t* rt = nullptr;
 
-    explicit steady_fixture(std::vector<uint32_t> cores_in = {0, 1})
-        : cores(std::move(cores_in)) {
-        pump::core::this_core_id = 0;
+    steady_fixture(std::string pci_addr_in,
+                   std::vector<uint32_t> cores_in = {0, 1})
+        : pci_addr(std::move(pci_addr_in))
+        , cores(std::move(cores_in))
+        , device(nvme::real_device_options{
+              .pci_addr       = pci_addr.c_str(),
+              .cores          = cores,
+              .spdk_core_mask = nullptr,
+              .spdk_name      = "inconel_steady_e2e",
+              .init_spdk_env  = true,
+              .qpair_depth    = 256,
+              .device_id      = 0,
+          }) {
+        CHECK(device.size_bytes() >=
+              kNamespaceLbas * static_cast<uint64_t>(kLbaSize));
+        // Format must precede build: the transient fmt scheduler borrows
+        // cores.front()'s qpair and releases it before build_steady_runtime
+        // claims the same qpair for the runtime's core-0 nvme scheduler.
+        pump::core::this_core_id = cores.front();
+        format_real_superblocks(device, cores.front());
         rt = build_steady_runtime(
             std::span<const uint32_t>(cores.data(), cores.size()),
             &device);
-        pump::core::this_core_id = 0;
-        format_mock_superblocks(device);
+        pump::core::this_core_id = cores.front();
     }
 
     ~steady_fixture() {
@@ -560,10 +633,40 @@ struct steady_fixture {
         return acquire_handle().cat->prs->tree_guard->manifest;
     }
 
+    // Raw LBA read through the runtime's core-front NVMe scheduler.
+    // Replaces the mock device's synchronous read_bytes: on the real
+    // backend every byte-level inspection (tree pages, value objects,
+    // superblocks) must go through a scheduler sender driven to
+    // completion by advance_all.
+    [[nodiscard]] std::vector<char> read_lbas(uint64_t lba,
+                                              uint32_t num_lbas) {
+        auto* sched = core::registry::nvme_scheds.by_core[cores.front()];
+        CHECK(sched != nullptr);
+        std::vector<char> buf(
+            static_cast<std::size_t>(num_lbas) * kLbaSize);
+        pump::core::this_core_id = cores.front();
+        auto sub = submit_result<bool>([sched, lba, num_lbas, &buf]() {
+            return sched->read(lba, buf.data(), num_lbas);
+        });
+        drive_until_ready(sub);
+        CHECK(expect_ok<bool>(sub.fut.get()) &&
+              "real NVMe inspection read failed");
+        return buf;
+    }
+
+    [[nodiscard]] format::superblock read_superblock(uint64_t lba) {
+        auto page = read_lbas(lba, 1);
+        format::superblock sb{};
+        std::memcpy(&sb, page.data(), sizeof(sb));
+        CHECK(format::inspect_superblock(sb) ==
+              format::superblock_status::ok);
+        return sb;
+    }
+
     [[nodiscard]] std::vector<char> read_tree_page(format::paddr slot) {
-        std::vector<char> page(kSteadyTreeGeometry.tree_page_size);
-        CHECK(device.read_bytes(slot.lba,
-                                std::span<char>(page.data(), page.size())));
+        const uint32_t num_lbas =
+            kSteadyTreeGeometry.tree_page_size / kLbaSize;
+        auto page = read_lbas(slot.lba, num_lbas);
         CHECK(format::tree_page_validate(page.data(), page.size()));
         return page;
     }
@@ -620,10 +723,7 @@ struct steady_fixture {
             vr.len;
         const uint32_t span_lbas =
             (vr.byte_offset + total + kLbaSize - 1) / kLbaSize;
-        std::vector<char> page(
-            static_cast<std::size_t>(span_lbas) * kLbaSize);
-        CHECK(device.read_bytes(vr.base.lba,
-                                std::span<char>(page.data(), page.size())));
+        auto page = read_lbas(vr.base.lba, span_lbas);
         auto decoded = format::decode_value_object(
             std::span<const char>(page.data() + vr.byte_offset,
                                   page.size() - vr.byte_offset),
@@ -670,6 +770,10 @@ struct steady_fixture {
 
     [[nodiscard]] uint64_t tree_head_lba() const {
         return rt::owner()->state.alloc.head.lba;
+    }
+
+    [[nodiscard]] std::size_t tree_free_range_count() const {
+        return rt::owner()->state.alloc.free_ranges.size();
     }
 
     [[nodiscard]] uint64_t value_head_lba() const {
@@ -928,7 +1032,7 @@ coverage_f3_slot_exhaustion_consolidates(steady_fixture& fx,
                                          const shadow_target& target) {
     const auto before = fx.current_manifest();
     CHECK(fx.slot_index(*before, target.leaf_range) == kShadowSlots - 1);
-    const auto trims_before = fx.device.trims();
+    const auto free_before = fx.tree_free_range_count();
     fx.write_put(target.key, "f3-new-range", o);
     fx.seal_flush_mark_wal_safe_and_drain();
 
@@ -936,19 +1040,22 @@ coverage_f3_slot_exhaustion_consolidates(steady_fixture& fx,
     const auto new_range = fx.leaf_range_for_key(*after, target.key);
     CHECK(new_range != target.leaf_range);
     CHECK(fx.slot_index(*after, new_range) == 0);
-    CHECK(fx.device.trims() > trims_before);
+    // Old range retired → reclaimed (TRIM + returned to the tree
+    // allocator free list). On the real backend the device TRIM count is
+    // not observable, so the engine-side signal is the freed range
+    // landing in free_ranges; F4 then proves it is reused.
+    CHECK(fx.tree_free_range_count() > free_before);
     CHECK(fx.reclaim_idle());
     expect_found(expect_ok<pipeline::point_get_result>(
                      fx.run_point_get(target.key)),
                  "f3-new-range");
     std::fprintf(stderr,
                  "[F3] exhausted range lba=%lu consolidated to new range "
-                 "lba=%lu; trims %lu->%lu free_ranges=%zu\n",
+                 "lba=%lu; free_ranges %zu->%zu\n",
                  static_cast<unsigned long>(target.leaf_range.lba),
                  static_cast<unsigned long>(new_range.lba),
-                 static_cast<unsigned long>(trims_before),
-                 static_cast<unsigned long>(fx.device.trims()),
-                 rt::owner()->state.alloc.free_ranges.size());
+                 free_before,
+                 fx.tree_free_range_count());
     return target.leaf_range;
 }
 
@@ -1021,8 +1128,8 @@ coverage_f5_root_change(steady_fixture& fx,
 
     CHECK(after->root_range_base != root_before);
     CHECK(root_has_internal_child(fx, *after));
-    auto sb_a = read_mock_superblock(fx.device, 0);
-    auto sb_b = read_mock_superblock(fx.device, 1);
+    auto sb_a = fx.read_superblock(0);
+    auto sb_b = fx.read_superblock(1);
     const auto chosen = format::choose_newer_superblock(sb_a, sb_b);
     CHECK(chosen.chosen != nullptr);
     CHECK(chosen.chosen->root_base_paddr == after->root_range_base);
@@ -1125,7 +1232,6 @@ steady_long_run(steady_fixture& fx,
                 oracle& o,
                 std::vector<std::string>& samples) {
     const auto stats_before = rt::value_reclaim_stats();
-    const auto trims_before = fx.device.trims();
     const auto tree_head_before = fx.tree_head_lba();
     const auto value_head_before = fx.value_head_lba();
     uint64_t last_recovery_safe = rt::owner()->state.recovery_safe_lsn;
@@ -1213,7 +1319,6 @@ steady_long_run(steady_fixture& fx,
     const auto stats_after = rt::value_reclaim_stats();
     CHECK(stats_after.reclaim_total_refs > stats_before.reclaim_total_refs);
     CHECK(stats_after.partial_into_untracked == 0);
-    CHECK(fx.device.trims() > trims_before);
     CHECK(fx.tree_head_lba() <= tree_head_before + 160);
     CHECK(value_head_before >= fx.value_head_lba());
     CHECK(value_head_before - fx.value_head_lba() <= 96);
@@ -1221,19 +1326,18 @@ steady_long_run(steady_fixture& fx,
     CHECK(fx.reclaim_idle());
     std::fprintf(stderr,
                  "[steady] rounds=%u samples=%zu tree_head_delta=%ld "
-                 "value_head_delta=%ld trims=%lu->%lu value_reclaims=%lu\n",
+                 "value_head_delta=%ld value_reclaims=%lu free_ranges=%zu\n",
                  kSteadyRounds,
                  samples.size(),
                  static_cast<long>(fx.tree_head_lba() - tree_head_before),
                  static_cast<long>(value_head_before - fx.value_head_lba()),
-                 static_cast<unsigned long>(trims_before),
-                 static_cast<unsigned long>(fx.device.trims()),
-                 static_cast<unsigned long>(stats_after.reclaim_total_refs));
+                 static_cast<unsigned long>(stats_after.reclaim_total_refs),
+                 fx.tree_free_range_count());
 }
 
 void
-run_steady_e2e() {
-    steady_fixture fx({0, 1});
+run_steady_e2e(const std::string& pci_addr) {
+    steady_fixture fx(pci_addr, {0, 1});
     oracle o;
     std::vector<std::string> samples;
 
@@ -1258,7 +1362,45 @@ run_steady_e2e() {
 
 }  // namespace
 
-int main() {
-    run_steady_e2e();
+int main(int argc, char** argv) {
+    // Line-buffer stdout so phase progress reaches the log before a
+    // mid-phase std::abort() (CHECK) — block buffering swallows it.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    std::string pci_addr;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a{argv[i]};
+        if (a == "--pci-addr" && i + 1 < argc) {
+            pci_addr = argv[++i];
+        } else if (a == "--help" || a == "-h") {
+            std::printf(
+                "usage: %s --pci-addr BDF   (or set INCONEL_NVME_PCI_ADDR)\n"
+                "  WARNING: the target NVMe namespace is force-formatted on "
+                "every run; point it at a scratch device only.\n",
+                argv[0]);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown arg: %.*s\n",
+                         static_cast<int>(a.size()), a.data());
+            return 2;
+        }
+    }
+    if (pci_addr.empty()) {
+        if (const char* env = std::getenv("INCONEL_NVME_PCI_ADDR")) {
+            pci_addr = env;
+        }
+    }
+    if (pci_addr.empty()) {
+        std::fprintf(stderr,
+            "--pci-addr BDF or INCONEL_NVME_PCI_ADDR is required "
+            "(the device is force-formatted; use a scratch namespace)\n");
+        return 2;
+    }
+
+    std::printf("test_steady_e2e: pci=%s rounds=%u shadow_slots=%u "
+                "cores=[0,1]\n",
+                pci_addr.c_str(), kSteadyRounds, kShadowSlots);
+    run_steady_e2e(pci_addr);
+    std::printf("all passed\n");
     return 0;
 }

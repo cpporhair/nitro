@@ -176,9 +176,12 @@ namespace apps::inconel::front {
                     uint32_t front_count,
                     wal::segment_geometry wal_geometry,
                     wal::wal_append_config wal_config = {},
-                    std::size_t queue_depth = 1024)
+                    std::size_t queue_depth = 1024,
+                    memory::dma_page_allocator wal_dma_alloc =
+                        memory::make_heap_dma_page_allocator())
             : front_sched(owner_id, front_count, queue_depth) {
-            configure_wal(std::move(wal_geometry), wal_config);
+            configure_wal(std::move(wal_geometry), wal_config,
+                          std::move(wal_dma_alloc));
         }
 
         front_sched(uint32_t owner_id,
@@ -212,13 +215,16 @@ namespace apps::inconel::front {
                     uint64_t next_local_gen_epoch,
                     wal::segment_geometry wal_geometry,
                     wal::wal_append_config wal_config = {},
-                    std::size_t queue_depth = 1024)
+                    std::size_t queue_depth = 1024,
+                    memory::dma_page_allocator wal_dma_alloc =
+                        memory::make_heap_dma_page_allocator())
             : front_sched(owner_id,
                           front_count,
                           std::move(initial_active),
                           next_local_gen_epoch,
                           queue_depth) {
-            configure_wal(std::move(wal_geometry), wal_config);
+            configure_wal(std::move(wal_geometry), wal_config,
+                          std::move(wal_dma_alloc));
         }
 
         ~front_sched();
@@ -561,7 +567,9 @@ namespace apps::inconel::front {
         }
 
         void configure_wal(wal::segment_geometry geometry,
-                           wal::wal_append_config config);
+                           wal::wal_append_config config,
+                           memory::dma_page_allocator wal_dma_alloc =
+                               memory::make_heap_dma_page_allocator());
 
         [[nodiscard]] wal::wal_stream_state& require_wal();
         [[nodiscard]] const wal::wal_stream_state& require_wal() const;
@@ -1579,18 +1587,25 @@ namespace apps::inconel::front {
 
     inline void
     front_sched::configure_wal(wal::segment_geometry geometry,
-                               wal::wal_append_config config) {
+                               wal::wal_append_config config,
+                               memory::dma_page_allocator wal_dma_alloc) {
         wal::validate_segment_geometry(geometry);
         wal::validate_wal_append_config(config);
         wal_.emplace(owner_id_, geometry);
         wal_config_ = config;
         wal_pending_prepare_capacity_ =
             resolve_wal_pending_prepare_capacity(config, queue_depth_);
+        // WAL frames are FUA-written straight to NVMe, so the pool must use
+        // the runtime DMA allocator (SPDK hugepage memory on the real
+        // backend); a heap allocator fails vtophys on real hardware. The
+        // allocator is supplied by the caller (build_front_topology passes
+        // make_runtime_dma_page_allocator); the heap default only serves
+        // unit tests that never touch a real device.
         wal_frame_pool_ = std::make_unique<memory::lba_dma_page_pool>(
             geometry.lba_size,
             geometry.lba_size,
             0,
-            memory::make_heap_dma_page_allocator());
+            std::move(wal_dma_alloc));
         next_wal_plan_id_ = 1;
     }
 

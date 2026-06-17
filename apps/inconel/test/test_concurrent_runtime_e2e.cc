@@ -32,6 +32,7 @@
 #include <variant>
 #include <vector>
 
+#include "apps/inconel/coord/sender.hh"
 #include "apps/inconel/core/batch_carrier.hh"
 #include "apps/inconel/core/data_area_heads.hh"
 #include "apps/inconel/core/registry.hh"
@@ -73,12 +74,15 @@ constexpr uint32_t kWriterCoreBase = 10;
 constexpr uint32_t kReaderCoreBase = 20;
 constexpr uint32_t kMaintenanceCore = 30;
 constexpr uint32_t kVerifyCore = 40;
+constexpr uint32_t kBurstSubmitCore = 50;
+constexpr uint32_t kDurableSamplerCore = 51;
 
 constexpr uint32_t kWriterCount = 3;
 constexpr uint32_t kReaderCount = 2;
 constexpr uint32_t kKeysPerWriter = 768;
 constexpr uint32_t kOpsPerBatch = 8;
 constexpr uint32_t kBatchesPerWriter = 160;
+constexpr uint32_t kBurstBatchesPerWriter = 64;
 constexpr uint32_t kMaintenanceRounds = 14;
 constexpr uint32_t kVerifyWindow = 64;
 constexpr uint32_t kLbaSize = 4096;
@@ -298,6 +302,7 @@ struct writer_result {
     uint64_t batches = 0;
     uint64_t puts = 0;
     uint64_t tombstones = 0;
+    uint64_t highest_batch_lsn = 0;
 };
 
 struct reader_counters {
@@ -310,6 +315,58 @@ struct maintenance_counters {
     uint64_t seal_rounds = 0;
     uint64_t flush_rounds = 0;
     uint64_t non_noop_flushes = 0;
+};
+
+struct write_burst_counters {
+    std::atomic<uint64_t> submitted{0};
+    std::atomic<uint64_t> acked{0};
+    std::atomic<uint64_t> max_inflight{0};
+
+    void update_max(uint64_t depth) {
+        uint64_t observed = max_inflight.load(std::memory_order_relaxed);
+        while (observed < depth &&
+               !max_inflight.compare_exchange_weak(
+                   observed,
+                   depth,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
+    }
+
+    void note_submitted() {
+        const uint64_t now_submitted =
+            submitted.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const uint64_t now_acked = acked.load(std::memory_order_acquire);
+        update_max(now_submitted - now_acked);
+    }
+
+    void note_acked() {
+        const uint64_t now_acked =
+            acked.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const uint64_t now_submitted =
+            submitted.load(std::memory_order_acquire);
+        update_max(now_submitted >= now_acked ? now_submitted - now_acked : 0);
+    }
+};
+
+struct durable_sample_stats {
+    uint64_t samples = 0;
+    uint64_t first_lsn = 0;
+    uint64_t last_lsn = 0;
+};
+
+struct durable_sampler_control {
+    std::atomic<bool> ready{false};
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> samples{0};
+};
+
+struct burst_result {
+    uint64_t batches = 0;
+    uint64_t puts = 0;
+    uint64_t tombstones = 0;
+    uint64_t highest_batch_lsn = 0;
+    uint64_t max_inflight = 0;
+    durable_sample_stats durable_samples;
 };
 
 std::vector<planned_op>
@@ -335,6 +392,22 @@ build_writer_batch(uint32_t writer_id, uint64_t first_seq) {
     return ops;
 }
 
+core::client_batch_buffer
+encode_planned_batch(const std::vector<planned_op>& planned) {
+    std::vector<core::raw_batch_op> raw;
+    raw.reserve(planned.size());
+    for (const auto& op : planned) {
+        raw.push_back(core::raw_batch_op{
+            .op = op.raw.op,
+            .key = op.raw.key,
+            .value = op.raw.value,
+        });
+    }
+
+    return core::encode_client_batch(
+        std::span<const core::raw_batch_op>(raw.data(), raw.size()));
+}
+
 void
 apply_to_expected(const planned_op& op, expected_cell& cell) {
     if (op.raw.op == core::write_op_type::put) {
@@ -344,6 +417,187 @@ apply_to_expected(const planned_op& op, expected_cell& cell) {
         cell.tag = expected_cell::kind::tombstone;
         cell.value.clear();
     }
+}
+
+submission<write_path::write_batch_result>
+submit_counted_write(core::client_batch_buffer input,
+                     write_burst_counters* counters) {
+    auto ctx = pump::core::make_root_context();
+    auto promise =
+        std::make_shared<std::promise<op_result<write_path::write_batch_result>>>();
+    auto fut = promise->get_future();
+    auto caught = std::make_shared<std::exception_ptr>();
+
+    counters->note_submitted();
+    try {
+        rt::write_batch(std::move(input))
+            >> pump::sender::any_exception([caught](std::exception_ptr ep) {
+                *caught = std::move(ep);
+                return pump::sender::just(write_path::write_batch_result{});
+            })
+            >> pump::sender::then([promise, caught, counters](auto&& value) {
+                counters->note_acked();
+                if (*caught) {
+                    promise->set_value(*caught);
+                } else {
+                    promise->set_value(write_path::write_batch_result(
+                        std::forward<decltype(value)>(value)));
+                }
+            })
+            >> pump::sender::submit(ctx);
+    } catch (...) {
+        counters->note_acked();
+        promise->set_value(std::current_exception());
+    }
+
+    return submission<write_path::write_batch_result>{
+        .ctx = std::move(ctx),
+        .fut = std::move(fut),
+    };
+}
+
+uint64_t
+sample_durable_lsn(uint32_t caller_core, const char* label) {
+    pump::core::this_core_id = caller_core;
+    auto sub = submit_result<core::read_handle>([]() {
+        return coord::acquire_read_handle(*core::registry::coord_sched_singleton());
+    });
+    auto handle = expect_ok<core::read_handle>(sub.fut.get(), label);
+    return handle.read_lsn;
+}
+
+void
+durable_sampler_main(durable_sampler_control* control,
+                     durable_sample_stats* stats) {
+    uint64_t last = sample_durable_lsn(
+        kDurableSamplerCore, "durable_lsn sample");
+    stats->first_lsn = last;
+    stats->last_lsn = last;
+    stats->samples = 1;
+    control->samples.store(1, std::memory_order_release);
+    control->ready.store(true, std::memory_order_release);
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        const uint64_t current = sample_durable_lsn(
+            kDurableSamplerCore, "durable_lsn sample");
+        if (current < last) {
+            std::fprintf(stderr,
+                         "durable_lsn regressed: before=%lu after=%lu\n",
+                         static_cast<unsigned long>(last),
+                         static_cast<unsigned long>(current));
+            CHECK(false);
+        }
+        last = current;
+        stats->last_lsn = current;
+        stats->samples++;
+        control->samples.fetch_add(1, std::memory_order_release);
+        if (control->stop.load(std::memory_order_acquire)) {
+            break;
+        }
+    }
+}
+
+std::vector<std::size_t>
+build_drain_permutation(std::size_t count) {
+    std::vector<std::size_t> order;
+    order.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        order.push_back((i * 37) % count);
+    }
+    return order;
+}
+
+burst_result
+run_multi_batch_burst(std::vector<writer_result>& writers) {
+    pump::core::this_core_id = kBurstSubmitCore;
+
+    constexpr std::size_t kBurstBatchCount =
+        kWriterCount * kBurstBatchesPerWriter;
+    write_burst_counters counters;
+    durable_sampler_control sampler_control;
+    durable_sample_stats sample_stats;
+    std::jthread sampler([&]() {
+        durable_sampler_main(&sampler_control, &sample_stats);
+    });
+    while (!sampler_control.ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::vector<uint32_t> submission_writer;
+    std::vector<std::vector<planned_op>> planned_batches;
+    std::vector<submission<write_path::write_batch_result>> submissions;
+    submission_writer.reserve(kBurstBatchCount);
+    planned_batches.reserve(kBurstBatchCount);
+    submissions.reserve(kBurstBatchCount);
+
+    for (uint32_t batch = 0; batch < kBurstBatchesPerWriter; ++batch) {
+        for (uint32_t writer = 0; writer < kWriterCount; ++writer) {
+            const uint64_t first_seq =
+                (static_cast<uint64_t>(kBatchesPerWriter) + batch) *
+                kOpsPerBatch;
+            auto planned = build_writer_batch(writer, first_seq);
+            auto input = encode_planned_batch(planned);
+            submission_writer.push_back(writer);
+            planned_batches.push_back(std::move(planned));
+            submissions.push_back(
+                submit_counted_write(std::move(input), &counters));
+        }
+    }
+
+    auto drain_order = build_drain_permutation(submissions.size());
+    std::vector<write_path::write_batch_result> acks(submissions.size());
+    for (std::size_t idx : drain_order) {
+        auto ack = expect_ok<write_path::write_batch_result>(
+            submissions[idx].fut.get(), "burst write_batch");
+        CHECK(ack.entry_count == planned_batches[idx].size());
+        CHECK(ack.batch_lsn > 0);
+        acks[idx] = ack;
+    }
+
+    sampler_control.stop.store(true, std::memory_order_release);
+    sampler.join();
+
+    burst_result result;
+    result.batches = submissions.size();
+    result.max_inflight =
+        counters.max_inflight.load(std::memory_order_acquire);
+    result.durable_samples = sample_stats;
+
+    CHECK(counters.submitted.load(std::memory_order_acquire) == result.batches);
+    CHECK(counters.acked.load(std::memory_order_acquire) == result.batches);
+    CHECK(result.max_inflight > 1);
+    CHECK(result.durable_samples.samples >= 2);
+
+    std::vector<std::size_t> apply_order;
+    apply_order.reserve(planned_batches.size());
+    for (std::size_t i = 0; i < planned_batches.size(); ++i) {
+        apply_order.push_back(i);
+    }
+    std::sort(apply_order.begin(), apply_order.end(), [&](auto lhs, auto rhs) {
+        return acks[lhs].batch_lsn < acks[rhs].batch_lsn;
+    });
+
+    for (std::size_t i : apply_order) {
+        const uint32_t writer = submission_writer[i];
+        result.highest_batch_lsn =
+            std::max(result.highest_batch_lsn, acks[i].batch_lsn);
+        writers[writer].highest_batch_lsn =
+            std::max(writers[writer].highest_batch_lsn, acks[i].batch_lsn);
+        ++writers[writer].batches;
+        for (const auto& op : planned_batches[i]) {
+            apply_to_expected(op, writers[writer].expected[op.key_idx]);
+            if (op.raw.op == core::write_op_type::put) {
+                ++writers[writer].puts;
+                ++result.puts;
+            } else {
+                ++writers[writer].tombstones;
+                ++result.tombstones;
+            }
+        }
+    }
+
+    return result;
 }
 
 struct alloc_snapshot {
@@ -493,18 +747,7 @@ writer_main(uint32_t writer_id,
         auto planned = build_writer_batch(writer_id, next_seq);
         next_seq += planned.size();
 
-        std::vector<core::raw_batch_op> raw;
-        raw.reserve(planned.size());
-        for (const auto& op : planned) {
-            raw.push_back(core::raw_batch_op{
-                .op = op.raw.op,
-                .key = op.raw.key,
-                .value = op.raw.value,
-            });
-        }
-
-        auto input = core::encode_client_batch(
-            std::span<const core::raw_batch_op>(raw.data(), raw.size()));
+        auto input = encode_planned_batch(planned);
         auto sub = submit_result<write_path::write_batch_result>(
             [input = std::move(input)]() mutable {
                 return rt::write_batch(std::move(input));
@@ -512,6 +755,8 @@ writer_main(uint32_t writer_id,
         auto ack = expect_ok<write_path::write_batch_result>(
             sub.fut.get(), "write_batch");
         CHECK(ack.entry_count == planned.size());
+        result.highest_batch_lsn =
+            std::max(result.highest_batch_lsn, ack.batch_lsn);
 
         for (const auto& op : planned) {
             apply_to_expected(op, result.expected[op.key_idx]);
@@ -863,8 +1108,12 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
     reader_stop.store(true, std::memory_order_release);
     readers.clear();
 
+    auto burst_stats = run_multi_batch_burst(writer_results);
+
     final_maintenance_round();
     wait_for_quiesced_reclaim();
+    const uint64_t final_durable_lsn =
+        sample_durable_lsn(kVerifyCore, "final durable_lsn");
     verify_all_keys(writer_results);
 
     // Join advance loops before one-shot owner/front snapshots below.
@@ -874,6 +1123,11 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
     const auto reclaim_after = rt::value_reclaim_stats();
     const std::size_t final_imm_count = current_imm_count();
     const bool final_reclaim_idle = reclaim_idle();
+    const uint64_t total_batches = [&]() {
+        uint64_t total = 0;
+        for (const auto& w : writer_results) total += w.batches;
+        return total;
+    }();
     const uint64_t total_puts = [&]() {
         uint64_t total = 0;
         for (const auto& w : writer_results) total += w.puts;
@@ -883,6 +1137,13 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
         uint64_t total = 0;
         for (const auto& w : writer_results) total += w.tombstones;
         return total;
+    }();
+    const uint64_t highest_batch_lsn = [&]() {
+        uint64_t highest = 0;
+        for (const auto& w : writer_results) {
+            highest = std::max(highest, w.highest_batch_lsn);
+        }
+        return highest;
     }();
     const uint64_t tree_delta =
         alloc_after.tree_head_lba >= alloc_before.tree_head_lba
@@ -903,6 +1164,8 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
     CHECK(final_reclaim_idle);
     CHECK(alloc_after.tree_head_lba >= alloc_before.tree_head_lba);
     CHECK(alloc_before.value_head_lba >= alloc_after.value_head_lba);
+    CHECK(final_durable_lsn == highest_batch_lsn);
+    CHECK(burst_stats.highest_batch_lsn == highest_batch_lsn);
     CHECK(tree_delta <= 4096);
     CHECK(value_delta <= total_puts + 1024);
     CHECK(reclaim_after.reclaim_total_refs >= reclaim_before.reclaim_total_refs);
@@ -918,10 +1181,20 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
     CHECK(total_reads > 0);
 
     std::printf("  writers: batches=%lu puts=%lu tombstones=%lu\n",
-                static_cast<unsigned long>(
-                    write_batches_done.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(total_batches),
                 static_cast<unsigned long>(total_puts),
                 static_cast<unsigned long>(total_tombstones));
+    std::printf("  burst: batches=%lu max_inflight=%lu samples=%lu "
+                "durable_lsn=%lu->%lu highest_lsn=%lu\n",
+                static_cast<unsigned long>(burst_stats.batches),
+                static_cast<unsigned long>(burst_stats.max_inflight),
+                static_cast<unsigned long>(
+                    burst_stats.durable_samples.samples),
+                static_cast<unsigned long>(
+                    burst_stats.durable_samples.first_lsn),
+                static_cast<unsigned long>(
+                    burst_stats.durable_samples.last_lsn),
+                static_cast<unsigned long>(burst_stats.highest_batch_lsn));
     std::printf("  readers: reads=%lu found=%lu not_found=%lu\n",
                 static_cast<unsigned long>(total_reads),
                 static_cast<unsigned long>(total_found),

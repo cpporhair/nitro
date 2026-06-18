@@ -1512,10 +1512,6 @@ namespace apps::inconel::coord {
                 throw std::invalid_argument(
                     "coord::coord_sched: frontier_switch old_guard is null");
             }
-            if (!req->new_manifest) {
-                throw std::invalid_argument(
-                    "coord::coord_sched: frontier_switch new_manifest is null");
-            }
 
             const auto cat = cats_.current_cat();
             if (cat->prs->tree_guard.get() != req->old_guard.get()) {
@@ -1532,9 +1528,14 @@ namespace apps::inconel::coord {
                 cat->durable_lsn.load(std::memory_order_acquire);
             new_epoch = cat->epoch + 1;
 
+            // flush_and_frontier_switch.md §4.2: an empty tree delta keeps the
+            // current manifest while still switching and releasing gens.
+            auto new_manifest = req->new_manifest
+                                    ? std::move(req->new_manifest)
+                                    : cat->prs->tree_guard->manifest;
             auto new_guard = std::make_shared<core::checkpoint_guard>(
                 core::checkpoint_guard{
-                    .manifest = std::move(req->new_manifest),
+                    .manifest = std::move(new_manifest),
                     .retired = {},
                 });
             auto new_fronts =

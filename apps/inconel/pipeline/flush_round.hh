@@ -132,11 +132,8 @@ namespace apps::inconel::pipeline {
             if (result.st != tree::flush_stage_status::ok) {
                 throw flush_round_error(result.st);
             }
-            if (result.new_manifest == nullptr) {
-                throw std::runtime_error(
-                    "pipeline::flush_round_once: tree flush returned null "
-                    "manifest");
-            }
+            // flush_and_frontier_switch.md §3.3.3: an empty round reports ok
+            // with an empty manifest delta; frontier_switch keeps the layout.
             return std::move(result);
         }
 

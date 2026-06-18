@@ -128,6 +128,12 @@ target_include_directories(inconel_test_value_placement_e2e PRIVATE ${CMAKE_SOUR
 target_link_libraries(inconel_test_value_placement_e2e PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_multishard_split_e2e
+        apps/inconel/test/test_multishard_split_e2e.cc)
+target_include_directories(inconel_test_multishard_split_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_multishard_split_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_seal_inflight_race_e2e
         apps/inconel/test/test_seal_inflight_race_e2e.cc)
 target_include_directories(inconel_test_seal_inflight_race_e2e PRIVATE ${CMAKE_SOURCE_DIR})

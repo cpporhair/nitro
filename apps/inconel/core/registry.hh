@@ -84,6 +84,7 @@ namespace apps::inconel::core::registry {
     inline value::value_alloc_sched_base* value_alloc_sched = nullptr;
     inline std::shared_ptr<data_area_heads> data_area_heads_ptr;
     inline std::shared_ptr<wal_reclaim_frontier> wal_reclaim_frontier_ptr;
+    inline std::shared_ptr<const tree_geometry> tree_geometry_ptr;
 
     // tree::tree_sched is a global singleton introduced in step 023
     // (Phase 3 G5, D17/D18/D24). It owns the tree-local flush round
@@ -151,6 +152,7 @@ namespace apps::inconel::core::registry {
         value_alloc_sched = nullptr;
         data_area_heads_ptr.reset();
         wal_reclaim_frontier_ptr.reset();
+        tree_geometry_ptr.reset();
         tree_sched_singleton_ptr = nullptr;
         coord_sched_singleton_ptr = nullptr;
         current_shard_partitions_ptr.reset();

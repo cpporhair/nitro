@@ -231,10 +231,6 @@ namespace apps::inconel::ycsb {
             throw std::invalid_argument(
                 "refusing known system-disk BDF 0000:03:00.0");
         }
-        if (!cfg.force_format) {
-            throw std::invalid_argument(
-                "--force-format is required until recovery boot lands");
-        }
         if (cfg.records == 0) {
             throw std::invalid_argument("--records must be > 0");
         }

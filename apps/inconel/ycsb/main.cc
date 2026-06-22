@@ -2,6 +2,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@
 
 #include "../core/page_cache.hh"
 #include "../nvme/real_device.hh"
+#include "../recovery/boot.hh"
 #include "../runtime/builder.hh"
 #include "../runtime/run.hh"
 #include "./config.hh"
@@ -26,7 +28,7 @@ namespace apps::inconel::ycsb {
     inline void
     print_usage(std::ostream& out) {
         out
-            << "usage: inconel_ycsb --pci-addr BDF --force-format [options]\n"
+            << "usage: inconel_ycsb --pci-addr BDF [--force-format] [options]\n"
             << "\n"
             << "workload:\n"
             << "  --workload load|a|b|c|load-a|load-b|load-c\n"
@@ -143,6 +145,11 @@ namespace apps::inconel::ycsb {
         if (cfg.force_format) {
             force_format_device(device, cfg.main_core);
         }
+        std::optional<recovery::recovered_boot_state> recovered_boot;
+        if (!cfg.force_format) {
+            recovered_boot.emplace(
+                recovery::recover_empty_clean_boot(device, cfg.main_core));
+        }
 
         auto state = std::make_shared<run_state>();
         state->cfg = std::make_shared<config>(std::move(cfg));
@@ -167,6 +174,8 @@ namespace apps::inconel::ycsb {
             .cores = std::span<const uint32_t>(
                 state->cfg->cores.data(), state->cfg->cores.size()),
             .device = &device,
+            .disk_profile =
+                recovered_boot.has_value() ? &recovered_boot->profile : nullptr,
             .read_domain_cores = {},
             .value_core = state->cfg->value_core,
             .owner_core = state->cfg->owner_core,

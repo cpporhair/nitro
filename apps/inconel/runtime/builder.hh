@@ -95,6 +95,15 @@ namespace apps::inconel::runtime {
         .shadow_slots_per_range = format::kBootstrapFormatProfile.shadow_slots_per_range,
     };
 
+    [[nodiscard]] inline core::tree_geometry
+    tree_geometry_from_profile(const format::format_profile& profile) noexcept {
+        return core::tree_geometry{
+            .lba_size = profile.lba_size,
+            .tree_page_size = profile.tree_page_size,
+            .shadow_slots_per_range = profile.shadow_slots_per_range,
+        };
+    }
+
     [[nodiscard]] inline wal::segment_geometry
     wal_geometry_from_profile(const format::format_profile& profile) {
         return wal::segment_geometry{
@@ -373,6 +382,7 @@ namespace apps::inconel::runtime {
     struct build_options {
         std::span<const uint32_t> cores;             // which cores to populate
         nvme::runtime_device*     device;            // nvme backing device
+        const format::format_profile* disk_profile = nullptr;
 
         // Optional per-role topology. Leave default for the symmetric
         // layout (read_domain on every core, value + owner on cores[0]).
@@ -791,12 +801,20 @@ namespace apps::inconel::runtime {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline inconel_runtime_t<TreeCache, ValueCache>*
     build_runtime(const build_options& opts) {
-        const auto& profile = format::kBootstrapFormatProfile;
+        const auto& profile =
+            opts.disk_profile == nullptr
+                ? format::kBootstrapFormatProfile
+                : *opts.disk_profile;
         validate_build_inputs(opts, profile);
 
         const uint32_t max_cores = std::thread::hardware_concurrency();
         core::registry::clear();
         core::registry::init_capacity(max_cores);
+        core::registry::tree_geometry_ptr =
+            std::make_shared<core::tree_geometry>(
+                tree_geometry_from_profile(profile));
+        const core::tree_geometry* tree_geometry =
+            core::registry::tree_geometry_ptr.get();
 
         auto* rt = new inconel_runtime_t<TreeCache, ValueCache>();
         auto shared_heads = std::make_shared<core::data_area_heads>();
@@ -866,7 +884,7 @@ namespace apps::inconel::runtime {
             .wal_space_core = opts.wal_space_core,
             .wal_geometry = wal_geometry_from_profile(profile),
             .wal_reclaim_frontier = wal_reclaim_frontier.get(),
-            .tree_geometry = &kBootstrapTreeGeometry,
+            .tree_geometry = tree_geometry,
             .front_queue_depth = opts.front_queue_depth,
             .coord_queue_depth = opts.coord_queue_depth,
             .coord_ready_window = opts.coord_ready_window,
@@ -908,7 +926,7 @@ namespace apps::inconel::runtime {
                     static_cast<uint32_t>(rd_index),
                     core::registry::current_shard_partitions(),
                     TreeCache(opts.tree_cache_capacity),
-                    &kBootstrapTreeGeometry,
+                    tree_geometry,
                     opts.tree_queue_depth,
                     make_runtime_dma_page_allocator(),
                     opts.nvme_dma_alignment,
@@ -942,7 +960,7 @@ namespace apps::inconel::runtime {
             tree::tree_sched* tsched = nullptr;
             if (core == owner_core) {
                 tsched = new tree::tree_sched(
-                    &kBootstrapTreeGeometry,
+                    tree_geometry,
                     profile.value_data_area_base,
                     shared_heads.get(),
                     wal_reclaim_frontier.get(),

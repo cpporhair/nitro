@@ -53,6 +53,7 @@ Rebuild real-NVMe targets from `build_real/`, not `build/`:
 
 ```bash
 cmake --build build_real --target \
+  inconel_ycsb \
   inconel_test_steady_e2e \
   inconel_test_concurrent_runtime_e2e \
   inconel_test_flush_e2e \
@@ -158,6 +159,40 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
   timeout 300s build_real/<binary> \
   --pci-addr 0000:04:00.0
+```
+
+YCSB execution entry smoke:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_ycsb \
+  --pci-addr 0000:04:00.0 \
+  --force-format \
+  --workload load-c \
+  --records 1000 \
+  --operations 1000 \
+  --value-size 256 \
+  --verify-samples 32 \
+  --cores 0,1,2,3 \
+  --main-core 0
+```
+
+Mixed read/update smoke:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_ycsb \
+  --pci-addr 0000:04:00.0 \
+  --force-format \
+  --workload load-a \
+  --records 1000 \
+  --operations 1000 \
+  --value-size 256 \
+  --verify-samples 32 \
+  --cores 0,1,2,3 \
+  --main-core 0
 ```
 
 ## Maintenance Cadence Tests

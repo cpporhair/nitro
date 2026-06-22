@@ -103,6 +103,11 @@ target_include_directories(inconel_real_nvme_compile_check PRIVATE ${CMAKE_SOURC
 target_link_libraries(inconel_real_nvme_compile_check PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_ycsb apps/inconel/ycsb/main.cc)
+target_include_directories(inconel_ycsb PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_ycsb PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_flush_e2e apps/inconel/test/test_flush_e2e.cc)
 target_include_directories(inconel_test_flush_e2e PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(inconel_test_flush_e2e PRIVATE

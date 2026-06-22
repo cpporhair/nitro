@@ -33,6 +33,7 @@
 #include "../value/scheduler.hh"
 #include "../wal/scheduler.hh"
 #include "./facade.hh"
+#include "./maintenance_scheduler.hh"
 
 namespace apps::inconel::runtime {
 
@@ -70,7 +71,8 @@ namespace apps::inconel::runtime {
         tree::tree_sched,
         coord::coord_sched,
         front::front_sched,
-        wal::wal_space_sched
+        wal::wal_space_sched,
+        maintenance_sched
     >;
 
     // ── Bootstrap tree geometry ──
@@ -407,6 +409,7 @@ namespace apps::inconel::runtime {
         size_t                    tree_queue_depth = 2048;
         size_t                    value_queue_depth = 2048;
         value::value_io_policy    value_io_policy = {};
+        maintenance_options       maintenance = {};
 
         // Real NVMe scheduler queue knobs. The device/qpair lifecycle is owned
         // by nvme::real_device; these tune the per-core PUMP scheduler and
@@ -699,6 +702,27 @@ namespace apps::inconel::runtime {
                 "runtime::build_runtime: opts.wal_space_core is not a member "
                 "of opts.cores");
         }
+        if (opts.maintenance.core < -1) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.maintenance.core is below -1");
+        }
+        if (opts.maintenance.core >= 0 &&
+            !core_in_set(static_cast<uint32_t>(opts.maintenance.core))) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: opts.maintenance.core is not a "
+                "member of opts.cores");
+        }
+        if (opts.maintenance.idle_initial_backoff_ticks == 0 ||
+            opts.maintenance.idle_max_backoff_ticks == 0 ||
+            opts.maintenance.idle_initial_backoff_ticks >
+                opts.maintenance.idle_max_backoff_ticks) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: invalid maintenance backoff");
+        }
+        validate_runtime_queue_depth(
+            "runtime::build_runtime: maintenance completion_queue_depth "
+            "must be a power of two and >= 2",
+            opts.maintenance.completion_queue_depth);
         for (size_t i = 0; i < opts.read_domain_cores.size(); ++i) {
             uint32_t c = opts.read_domain_cores[i];
             if (!core_in_set(c)) {
@@ -787,6 +811,9 @@ namespace apps::inconel::runtime {
         const uint32_t owner_core = opts.owner_core < 0
             ? opts.cores.front()
             : static_cast<uint32_t>(opts.owner_core);
+        const uint32_t maintenance_core = opts.maintenance.core < 0
+            ? owner_core
+            : static_cast<uint32_t>(opts.maintenance.core);
         std::vector<uint32_t> read_domain_cores_buf;
         std::span<const uint32_t> read_domain_cores = opts.read_domain_cores;
         if (read_domain_cores.empty()) {
@@ -829,7 +856,7 @@ namespace apps::inconel::runtime {
         //
         // PUMP add_core_schedulers() is a one-shot tuple install per core,
         // so the front stack must be fully constructed before the per-core
-        // loop below. The loop then passes all seven scheduler classes in a
+        // loop below. The loop then passes all eight scheduler classes in a
         // single call for each core.
         auto front_topo = build_front_topology(front_topology_options{
             .cores = opts.cores,
@@ -849,6 +876,7 @@ namespace apps::inconel::runtime {
         using value_sched_t = value::value_alloc_sched<ValueCache>;
         value_sched_t* value_sched_singleton = nullptr;
         tree::tree_sched* tsched_singleton = nullptr;
+        maintenance_sched* maintenance_singleton = nullptr;
 
         for (uint32_t core : opts.cores) {
             // PUMP per_core::queue routes by this_core_id, so it must be set
@@ -939,10 +967,15 @@ namespace apps::inconel::runtime {
                 core == front_topo.wal_space_core
                     ? front_topo.wal_space
                     : nullptr;
+            maintenance_sched* maintenance = nullptr;
+            if (opts.maintenance.enabled && core == maintenance_core) {
+                maintenance = new maintenance_sched(opts.maintenance);
+                maintenance_singleton = maintenance;
+            }
 
             // PUMP runtime (typed). Tuple order matches `inconel_runtime_t`:
             // nvme, tree_read_domain, value_alloc, tree_sched, coord,
-            // front, wal_space.
+            // front, wal_space, maintenance driver.
             rt->add_core_schedulers(
                 core,
                 nvme_sched,
@@ -951,7 +984,8 @@ namespace apps::inconel::runtime {
                 tsched,
                 coord_sched,
                 front_sched,
-                wal_space_sched);
+                wal_space_sched,
+                maintenance);
 
             // Application registry (non-templated)
             core::registry::nvme_scheds.list.push_back(nvme_sched);
@@ -980,6 +1014,7 @@ namespace apps::inconel::runtime {
         // readability and future assertions.
         (void)value_sched_singleton;
         (void)tsched_singleton;
+        (void)maintenance_singleton;
 
         // Go through `publish_shard_partitions` even during bootstrap
         // so every install path (bootstrap + future tree_sched
@@ -1006,6 +1041,16 @@ namespace apps::inconel::runtime {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     inline void
     destroy_runtime(inconel_runtime_t<TreeCache, ValueCache>* rt) {
+        for (auto* ms : rt->template get_schedulers<maintenance_sched>()) {
+            if (ms != nullptr && !ms->quiesced()) {
+                core::panic_inconsistency(
+                    "runtime::destroy_runtime",
+                    "maintenance scheduler still has an inflight round");
+            }
+        }
+        for (auto* ms : rt->template get_schedulers<maintenance_sched>()) {
+            delete ms;
+        }
         core::set_reclaim_sink(nullptr);
         if (core::registry::coord_sched_singleton_ptr) {
             delete core::registry::coord_sched_singleton_ptr;

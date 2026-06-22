@@ -62,13 +62,22 @@ namespace apps::inconel::value {
 
     template <typename NvmeProvider = local_nvme_provider>
     inline auto
-    drain_trim_pending(NvmeProvider nvme = {}) {
+    drain_trim_once(NvmeProvider nvme = {}) {
         return rt::value()->prepare_trim_batch()
             >> visit()
             >> flat_map([nvme]<typename T>(T&& alt) mutable {
                 using alt_t = std::decay_t<T>;
                 if constexpr (std::is_same_v<alt_t, trim_batch>) {
                     uint64_t batch_id = alt.batch_id;
+                    value_trim_round_result result{
+                        .noop           = false,
+                        .trimmed_ranges =
+                            static_cast<uint32_t>(alt.trims.size()),
+                        .trimmed_lbas = 0,
+                    };
+                    for (const auto& tr : alt.trims) {
+                        result.trimmed_lbas += tr.num_lbas;
+                    }
                     return just()
                         >> as_stream(std::span<format::trim_desc>{alt.trims})
                         >> concurrent(alt.max_trim_inflight)
@@ -78,11 +87,20 @@ namespace apps::inconel::value {
                         >> all()
                         >> flat_map([batch_id](bool trim_ok) {
                             return rt::value()->complete_trim_batch(batch_id, trim_ok);
+                        })
+                        >> then([result]() {
+                            return result;
                         });
                 } else {
-                    return just();
+                    return just(value_trim_round_result{.noop = true});
                 }
             });
+    }
+
+    template <typename NvmeProvider = local_nvme_provider>
+    inline auto
+    drain_trim_pending(NvmeProvider nvme = {}) {
+        return drain_trim_once(nvme) >> ignore_results();
     }
 
     template <typename NvmeProvider>

@@ -1519,6 +1519,7 @@ main(int argc, char** argv) {
         .read_domain_cores = kReadDomainCores,
         .value_core        = kValueCore,
         .owner_core        = kOwnerCore,
+        .maintenance       = {.enabled = false},
     };
     auto* rt = runtime::build_runtime<TreeCache, ValueCache>(bopts);
     std::printf("  runtime built: bootstrap shard_count=%u "

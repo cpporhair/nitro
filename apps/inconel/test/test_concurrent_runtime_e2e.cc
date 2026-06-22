@@ -315,7 +315,7 @@ struct maintenance_counters {
     uint64_t seal_rounds = 0;
     uint64_t flush_rounds = 0;
     uint64_t non_noop_flushes = 0;
-    uint64_t non_noop_reclaims = 0;
+    uint64_t auto_work_rounds = 0;
 };
 
 struct write_burst_counters {
@@ -634,12 +634,19 @@ reclaim_idle() {
            !owner->state.active_reclaim.has_value();
 }
 
-tree::reclaim_round_result
-run_reclaim(const char* label) {
-    pump::core::this_core_id = kMaintenanceCore;
-    auto reclaim = submit_result<tree::reclaim_round_result>(
-        []() { return rt::reclaim_once(); });
-    return expect_ok<tree::reclaim_round_result>(reclaim.fut.get(), label);
+runtime::maintenance_stats_snapshot
+maintenance_snapshot(runtime_t* runtime) {
+    runtime::maintenance_stats_snapshot out{};
+    bool found = false;
+    for (auto* sched :
+         runtime->get_schedulers<runtime::maintenance_sched>()) {
+        if (sched == nullptr) continue;
+        CHECK(!found);
+        out = sched->snapshot();
+        found = true;
+    }
+    CHECK(found);
+    return out;
 }
 
 class concurrent_runtime_fixture {
@@ -855,11 +862,6 @@ maintenance_main(std::atomic<uint64_t>* write_batches_done,
 
         core::registry::wal_reclaim_frontier_singleton()->publish_exact_min(
             core::wal_reclaim_frontier::no_unreclaimed_lsn);
-        auto reclaim_result = run_reclaim("reclaim_once");
-        if (!reclaim_result.noop) {
-            ++local.non_noop_reclaims;
-        }
-        CHECK(rt::value_reclaim_stats().partial_into_untracked == 0);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -883,23 +885,26 @@ final_maintenance_round() {
 
     core::registry::wal_reclaim_frontier_singleton()->publish_exact_min(
         core::wal_reclaim_frontier::no_unreclaimed_lsn);
-    (void)run_reclaim("final reclaim_once");
 }
 
 void
-wait_for_quiesced_reclaim() {
+wait_for_quiesced_reclaim(runtime_t* runtime,
+                          uint64_t min_completed_maintenance_rounds) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < deadline) {
-        const auto reclaim = run_reclaim("wait reclaim_once");
-        if (reclaim.noop && reclaim_idle() &&
+        const auto maint = maintenance_snapshot(runtime);
+        if (maint.completed_rounds >= min_completed_maintenance_rounds &&
+            !maint.inflight &&
+            reclaim_idle() &&
             rt::value_reclaim_stats().partial_into_untracked == 0) {
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    const auto reclaim = run_reclaim("deadline reclaim_once");
-    CHECK(reclaim.noop);
+    const auto maint = maintenance_snapshot(runtime);
+    CHECK(maint.completed_rounds >= min_completed_maintenance_rounds);
+    CHECK(!maint.inflight);
     CHECK(reclaim_idle());
     CHECK(rt::value_reclaim_stats().partial_into_untracked == 0);
 }
@@ -1078,6 +1083,7 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
 
     const auto alloc_before = capture_alloc_snapshot();
     const auto reclaim_before = rt::value_reclaim_stats();
+    const auto maintenance_before = maintenance_snapshot(fx.runtime());
 
     std::atomic<uint64_t> write_batches_done{0};
     std::atomic<bool> reader_stop{false};
@@ -1124,8 +1130,13 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
 
     auto burst_stats = run_multi_batch_burst(writer_results);
 
+    const auto maintenance_before_final = maintenance_snapshot(fx.runtime());
     final_maintenance_round();
-    wait_for_quiesced_reclaim();
+    wait_for_quiesced_reclaim(
+        fx.runtime(), maintenance_before_final.completed_rounds + 1);
+    const auto maintenance_after = maintenance_snapshot(fx.runtime());
+    maintenance_stats.auto_work_rounds =
+        maintenance_after.work_rounds - maintenance_before.work_rounds;
     const uint64_t final_durable_lsn =
         sample_durable_lsn(kVerifyCore, "final durable_lsn");
     verify_all_keys(writer_results);
@@ -1171,6 +1182,9 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
     CHECK(maintenance_stats.seal_rounds == kMaintenanceRounds);
     CHECK(maintenance_stats.flush_rounds == kMaintenanceRounds);
     CHECK(maintenance_stats.non_noop_flushes > 0);
+    CHECK(maintenance_after.completed_rounds >
+          maintenance_before.completed_rounds);
+    CHECK(maintenance_stats.auto_work_rounds > 0);
     CHECK(write_batches_done.load(std::memory_order_acquire) ==
           kWriterCount * kBatchesPerWriter);
     CHECK(final_imm_count <= core::registry::front_count());
@@ -1214,13 +1228,13 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
                 static_cast<unsigned long>(total_found),
                 static_cast<unsigned long>(total_not_found));
     std::printf("  maintenance: seals=%lu flushes=%lu non_noop=%lu "
-                "reclaims=%lu imms=%zu\n",
+                "auto_work=%lu imms=%zu\n",
                 static_cast<unsigned long>(maintenance_stats.seal_rounds),
                 static_cast<unsigned long>(maintenance_stats.flush_rounds),
                 static_cast<unsigned long>(
                     maintenance_stats.non_noop_flushes),
                 static_cast<unsigned long>(
-                    maintenance_stats.non_noop_reclaims),
+                    maintenance_stats.auto_work_rounds),
                 final_imm_count);
     std::printf("  bounded: tree_head_delta=%lu value_head_delta=%lu "
                 "value_reclaims=%lu partial_into_untracked=%lu\n",

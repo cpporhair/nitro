@@ -548,6 +548,7 @@ class seal_inflight_race_fixture {
             .value_io_policy = {.max_write_inflight = 64,
                                 .max_read_inflight = 64,
                                 .max_trim_inflight = 32},
+            .maintenance = {.enabled = false},
             .nvme_queue_depth = 2048,
             .nvme_local_depth = 128,
             .nvme_dma_pool_pages_per_core = 4096,

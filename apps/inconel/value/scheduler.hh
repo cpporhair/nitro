@@ -113,6 +113,12 @@ namespace apps::inconel::value {
 
     using prepare_trim_result = std::variant<trim_idle, trim_batch>;
 
+    struct value_trim_round_result {
+        bool     noop           = true;
+        uint32_t trimmed_ranges = 0;
+        uint64_t trimmed_lbas   = 0;
+    };
+
     // Followers piggy-back on the leader's NVMe write. handle_finalize
     // copies the leader's nvme_ok into every follower's `ok` field so the
     // caller can react to a failed round even when it didn't drive the
@@ -980,16 +986,18 @@ namespace apps::inconel::value {
         // value_too_large → fail items + abort space round.
         //
         // Fatal failure: out of space, encode disagrees with class table,
-        // stale cached candidate, NVMe path corruption — panic. These mean
-        // an upstream invariant has broken and silent-fail would propagate
-        // corruption.
+        // NVMe path corruption — panic. These mean an upstream invariant has
+        // broken and silent-fail would propagate corruption. Stale cached
+        // candidates are recoverable: the manager index is an advisory cache
+        // and 037 requires abort + erase + retry when the scheduler cannot
+        // pin the matching resident frame.
 
         enum class persist_entry_status : uint8_t {
             ok = 0,
             value_too_large,   // recoverable
             out_of_space,      // fatal
             encode_failure,    // fatal
-            stale_cached,      // fatal — cached_partial_index drift
+            stale_cached,      // recoverable — cached_partial_index drift
         };
 
         static constexpr uint32_t kMaxFollowersPerRound = 64;
@@ -1036,47 +1044,60 @@ namespace apps::inconel::value {
                 }
             }
 
-            auto rnd = std::make_unique<round>();
-            rnd->id = next_round_id_++;
-            // Followers are items[1..]; the leader (items[0]) is settled by
-            // publish_{prefill,round} and never stored in the round, so a
-            // post-publish access cannot race a delete on the leader.
-            rnd->followers.reserve(items.size() > 1 ? items.size() - 1 : 0);
-            for (size_t i = 1; i < items.size(); ++i) {
-                rnd->followers.push_back(items[i]);
-            }
-            rnd->entries_flat = entries_flat;  // snapshot survives leader delete
-            rnd->space_round = space_->begin_round();
-            rnd->lowest_fresh_lba = data_area_end_lba_;
+            std::unique_ptr<round> rnd;
+            persist_entry_status status = persist_entry_status::ok;
+            uint32_t stale_cached_retries = 0;
+            const uint32_t stale_cached_retry_limit =
+                std::max<uint32_t>(
+                    64, static_cast<uint32_t>(reqs.size()));
 
-            auto claims = space_->allocate_batch(rnd->space_round, reqs);
-            if (claims.empty()) {
-                // Manager rejected the batch (space exhausted or hard gate).
-                // Per project rule "禁止 silent fallback" + "10亿 KV 起步",
-                // out-of-space is a fatal invariant break, not a recoverable
-                // condition — at v1 we have no compaction loop to retry
-                // against. Manager has already rolled back its round.
-                space_->abort(std::move(rnd->space_round));
-                core::panic_inconsistency(
-                    "value::value_alloc_sched::handle_persist",
-                    "value_space_manager::allocate_batch returned empty for round %lu (entries=%u)",
-                    static_cast<unsigned long>(rnd->id),
-                    static_cast<unsigned>(reqs.size()));
-            }
-            rnd->claims = std::move(claims);
+            while (true) {
+                rnd = std::make_unique<round>();
+                rnd->id = next_round_id_++;
+                // Followers are items[1..]; the leader (items[0]) is settled by
+                // publish_{prefill,round} and never stored in the round, so a
+                // post-publish access cannot race a delete on the leader.
+                rnd->followers.reserve(
+                    items.size() > 1 ? items.size() - 1 : 0);
+                for (size_t i = 1; i < items.size(); ++i) {
+                    rnd->followers.push_back(items[i]);
+                }
+                // Snapshot survives leader delete.
+                rnd->entries_flat = entries_flat;
+                rnd->space_round = space_->begin_round();
+                rnd->lowest_fresh_lba = data_area_end_lba_;
 
-            auto status = translate_claims_into_round(*rnd, entries_flat);
-            if (status == persist_entry_status::stale_cached) {
-                // Stale cached candidate: manager's index pointed to a page
-                // we no longer hold. Fatal because the manager's own
-                // bookkeeping just contradicted the scheduler's mirror.
-                // erase calls already fired in-line so the index is back
-                // in sync; the round is undone wholesale.
+                auto claims = space_->allocate_batch(rnd->space_round, reqs);
+                if (claims.empty()) {
+                    // Manager rejected the batch (space exhausted or hard gate).
+                    // Per project rule "禁止 silent fallback" + "10亿 KV 起步",
+                    // out-of-space is a fatal invariant break, not a recoverable
+                    // condition — at v1 we have no compaction loop to retry
+                    // against. Manager has already rolled back its round.
+                    space_->abort(std::move(rnd->space_round));
+                    core::panic_inconsistency(
+                        "value::value_alloc_sched::handle_persist",
+                        "value_space_manager::allocate_batch returned empty for round %lu (entries=%u)",
+                        static_cast<unsigned long>(rnd->id),
+                        static_cast<unsigned>(reqs.size()));
+                }
+                rnd->claims = std::move(claims);
+
+                status = translate_claims_into_round(*rnd, entries_flat);
+                if (status != persist_entry_status::stale_cached) {
+                    break;
+                }
+
                 rollback_partial_round(*rnd);
-                core::panic_inconsistency(
-                    "value::value_alloc_sched::handle_persist",
-                    "stale cached_partial claim for round %lu",
-                    static_cast<unsigned long>(rnd->id));
+                if (++stale_cached_retries > stale_cached_retry_limit) {
+                    core::panic_inconsistency(
+                        "value::value_alloc_sched::handle_persist",
+                        "stale cached_partial retry limit exceeded "
+                        "(round=%lu retries=%u entries=%u)",
+                        static_cast<unsigned long>(rnd->id),
+                        static_cast<unsigned>(stale_cached_retries),
+                        static_cast<unsigned>(reqs.size()));
+                }
             }
             if (status == persist_entry_status::encode_failure) {
                 rollback_partial_round(*rnd);

@@ -11,6 +11,7 @@
 #include "../core/page_cache.hh"
 #include "../core/panic.hh"
 #include "./builder.hh"
+#include "./run.hh"
 
 namespace apps::inconel::runtime {
 
@@ -18,8 +19,8 @@ namespace apps::inconel::runtime {
     //
     // Parses tree+value cache policies from strings, instantiates the
     // corresponding inconel_runtime_t<TreeCache, ValueCache> specialization
-    // once, then hands off to PUMP's share_nothing::start() which blocks the
-    // main core.
+    // once, then hands off to Inconel's pre-captured per-core run loop which
+    // blocks the main core.
     //
     // The cache template parameters only cross this single dispatch point —
     // production runtime policies instantiate the segmented cache aliases
@@ -29,11 +30,12 @@ namespace apps::inconel::runtime {
     // (clock×clock, clock×slru, slru×clock, slru×slru), which is more
     // readable than a flat 4-way if/else chain.
     //
-    // The runtime can be stopped by setting
-    //   rt->is_running_by_core[core].store(false)
-    // for each core; PUMP's start() will unwind once all cores exit their
-    // advance loops. Stop coordination is left to the application (signal
-    // handler / RPC / external trigger).
+    // Shutdown uses the same run-flag signal as PUMP, but Inconel's run loop
+    // treats a cleared flag as "stop accepting new maintenance and keep
+    // draining until the maintenance root pipeline quiesces". Callers using
+    // the lower-level `build_runtime()` API may call
+    // `disable_maintenance_and_wait(rt)` before clearing run flags when they
+    // want an explicit two-phase stop.
 
     // Step 017 / INC-034: the disk-format fields that used to live here
     // (value_class_sizes / lba_size / value_data_area_{base,end}) are now
@@ -55,6 +57,7 @@ namespace apps::inconel::runtime {
         std::span<const uint32_t> cores;
         uint32_t                  main_core = 0;
         nvme::runtime_device*     device;
+        maintenance_options       maintenance = {};
     };
 
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
@@ -73,15 +76,17 @@ namespace apps::inconel::runtime {
                 .device               = opts.device,
                 .tree_cache_capacity  = opts.tree_cache_capacity,
                 .value_cache_capacity = opts.value_cache_capacity,
+                .maintenance          = opts.maintenance,
             };
             auto* rt = build_runtime<TreeCache, ValueCache>(bopts);
-            pump::env::runtime::start(rt, opts.cores, opts.main_core,
+            ::apps::inconel::rt::start(rt, opts.cores, opts.main_core,
                 [](auto*, uint32_t /*core*/) {
-                    // Per-core init hook. PUMP has already set this_core_id
-                    // by the time this runs. Future per-core init (e.g.
-                    // NUMA-local allocator warm-up) goes here.
+                    // Per-core init hook. Inconel's run loop has already set
+                    // this_core_id by the time this runs. Future per-core
+                    // init (e.g. NUMA-local allocator warm-up) goes here.
                 });
-            // start() returns once every is_running_by_core[core] flag is false.
+            // start() returns after the main-core loop observes stop, asks
+            // every worker loop to stop, and joins the worker threads.
             destroy_runtime<TreeCache, ValueCache>(rt);
         } catch (const std::exception& e) {
             core::panic_inconsistency("runtime::run_with",

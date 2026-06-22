@@ -38,7 +38,7 @@
 | `read_value` | `(value_ref)` → `owning value bytes` | RSM §6.5, RAP §4.2/4.5/9.3 |
 | `read_page_values` | `(value_read_group { page_fid, refs[] })` → `owning value bytes[]` | RSM §6.5, RAP §5.2/6.2/9.3 |
 | `reclaim_values` | `(dead_value_refs[])` → `void` | RSM §6.7, FF §7.2；056 reclaim consumer 的下游调用方 |
-| `drain_trim_pending` | `()` → `void` | RSM §6.8/§6.9 |
+| `drain_trim_once` / `drain_trim_pending` | `drain_trim_once()` → `value_trim_round_result`; `drain_trim_pending()` → `void` compatibility wrapper | RSM §6.8/§6.9; 061 §4.1 |
 | `reclaim_sink::post_retired / post_gen_losers` | `(retired_objects&& / losers&&)` → `void` | 056 §5.1。guard/gen 析构在任意线程 post `reclaim_task` 到 tree_sched（**mpmc** ingress，非 per_core）；core 抽象接口 + atomic 进程级 sink，teardown 先 null。impl `tree/owner_scheduler.hh` |
 | `tree_read_domain::invalidate_range` | `(range_ref, geom)` → `void`（**派到 read_domain owner core 执行**） | 056 §5.5。reclaim old_range 进 allocator 前的跨 shards barrier；tree_sched `loop>>concurrent>>flat_map(submit_invalidate_range)>>all()` fan-out + wait-all-acks；`node_cache.take()` 只在 read_domain 自己 core 跑（pin>0 panic）。impl `core/tree_read_domain.hh` |
 | `alloc_segment` | `(stream_id, sealed_info?)` → `segment_runtime*` | RSM §5.3, WP §7.2 |

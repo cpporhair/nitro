@@ -2,6 +2,10 @@
 
 > 已确认存在 + 已确认延后的问题登记。一行一条，方向一句话。
 > 真正动手修时回 audit / spec / 代码再研究；本文不是实施手册。
+> 实盘 e2e 前必须先读：
+> [real_nvme_test_guide.md](real_nvme_test_guide.md)。不要用 `build/`
+> 直接跑真盘；当前成功路径是 `build_real` + vendored SPDK/DPDK +
+> `sudo env LD_LIBRARY_PATH=...` + scratch BDF `0000:04:00.0`。
 
 ## Priority
 

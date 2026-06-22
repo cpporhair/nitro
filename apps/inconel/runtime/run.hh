@@ -35,15 +35,22 @@
 // void*)` and storing the runtime alongside the step.
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <pthread.h>
+#include <sched.h>
+#include <span>
 #include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "env/runtime/share_nothing.hh"
 #include "pump/core/lock_free_queue.hh"
+
+#include "./maintenance_scheduler.hh"
 
 namespace apps::inconel::rt {
 
@@ -82,7 +89,21 @@ namespace apps::inconel::rt {
             runtime->schedulers_by_core[core]);
 
         // ── Hot loop ──
-        while (runtime->is_running_by_core[core].load()) [[likely]] {
+        //
+        // Once stop is requested, keep every core draining until the runtime
+        // maintenance driver reports no inflight root pipeline. This preserves
+        // the old "clear run flags" stop signal while honoring 061's
+        // maintenance shutdown contract.
+        while (true) {
+            if (!runtime->is_running_by_core[core].load(
+                    std::memory_order_acquire)) [[unlikely]] {
+                ::apps::inconel::runtime::request_maintenance_disable(runtime);
+                if (::apps::inconel::runtime::all_maintenance_quiesced(
+                        runtime)) {
+                    break;
+                }
+            }
+
             bool any = false;
             for (std::size_t i = 0; i < n; ++i) {
                 any |= steps[i].fn(steps[i].obj);
@@ -100,6 +121,53 @@ namespace apps::inconel::rt {
         // otherwise make this call ambiguous.
         ::apps::inconel::rt::run(runtime, core,
                                  [](auto*, uint32_t) {});
+    }
+
+    template <typename... S, typename OnInit>
+    inline void
+    start(pump::env::runtime::global_runtime_t<S...>* runtime,
+          std::span<const uint32_t> cores,
+          uint32_t main_core,
+          OnInit&& on_init) {
+        std::vector<std::jthread> workers;
+        workers.reserve(cores.size());
+        for (auto core : cores) {
+            if (core == main_core) {
+                continue;
+            }
+            workers.emplace_back([runtime, core, on_init]() mutable {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(core, &cpuset);
+                pthread_setaffinity_np(
+                    pthread_self(), sizeof(cpuset), &cpuset);
+                ::apps::inconel::rt::run(runtime, core, on_init);
+            });
+        }
+        auto stop_all = [&] {
+            for (auto core : cores) {
+                runtime->is_running_by_core[core].store(
+                    false, std::memory_order_release);
+            }
+        };
+
+        try {
+            ::apps::inconel::rt::run(
+                runtime, main_core, std::forward<OnInit>(on_init));
+        } catch (...) {
+            stop_all();
+            throw;
+        }
+        stop_all();
+    }
+
+    template <typename... S>
+    inline void
+    start(pump::env::runtime::global_runtime_t<S...>* runtime,
+          std::span<const uint32_t> cores,
+          uint32_t main_core) {
+        ::apps::inconel::rt::start(
+            runtime, cores, main_core, [](auto*, uint32_t) {});
     }
 
 }  // namespace apps::inconel::rt

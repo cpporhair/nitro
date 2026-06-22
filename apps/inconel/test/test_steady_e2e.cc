@@ -362,7 +362,8 @@ build_steady_runtime(std::span<const uint32_t> cores,
                                 tree_sched,
                                 coord_sched,
                                 front_sched,
-                                wal_space);
+                                wal_space,
+                                nullptr);
 
         core::registry::nvme_scheds.list.push_back(nvme_sched);
         core::registry::nvme_scheds.by_core[core] = nvme_sched;

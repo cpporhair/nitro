@@ -7,6 +7,7 @@
 #include "../core/batch_carrier.hh"
 #include "../core/registry.hh"
 #include "../pipeline/flush_round.hh"
+#include "../pipeline/maintenance_round.hh"
 #include "../pipeline/point_get.hh"
 #include "../pipeline/seal_round.hh"
 #include "../tree/sender.hh"
@@ -57,6 +58,14 @@ namespace apps::inconel::rt {
     [[nodiscard]] inline auto
     reclaim_once() {
         return tree::reclaim_once(*core::registry::tree_sched_singleton());
+    }
+
+    template <typename NvmeProvider = value::local_nvme_provider>
+    [[nodiscard]] inline auto
+    maintenance_once(NvmeProvider value_nvme = {}) {
+        return pipeline::maintenance_round_once(
+            *core::registry::tree_sched_singleton(),
+            value_nvme);
     }
 
 }  // namespace apps::inconel::rt

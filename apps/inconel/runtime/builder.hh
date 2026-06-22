@@ -723,6 +723,7 @@ namespace apps::inconel::runtime {
             "runtime::build_runtime: maintenance completion_queue_depth "
             "must be a power of two and >= 2",
             opts.maintenance.completion_queue_depth);
+        validate_maintenance_policy(opts.maintenance.policy);
         for (size_t i = 0; i < opts.read_domain_cores.size(); ++i) {
             uint32_t c = opts.read_domain_cores[i];
             if (!core_in_set(c)) {

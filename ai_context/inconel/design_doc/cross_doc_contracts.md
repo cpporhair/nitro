@@ -14,9 +14,9 @@
 | `publish_batch` | `(batch_lsn)` → `void` | RSM §2.3, WP §2.1 |
 | `release_batch` | `(batch_lsn)` → `void` | RSM §2.3, WP §10.7, OV §7.4 |
 | `acquire_read_handle` | `()` → `read_handle { cat, read_lsn }` | RSM §2.3, RAP §2.1, RAP §4.2 |
-| `capture_flush_frontier` | `()` → `flush_frontier { durable_lsn, old_guard }` | RSM §2.3, FF §2.2/8.1；055 §5.2。pin 当前 guard + 读 durable_lsn；置位 `catalog_update_in_progress_`（已置位则返回 `catalog_update_in_progress` 错误）。impl `coord/scheduler.hh` |
+| `capture_flush_frontier` | `()` → `flush_frontier { durable_lsn, old_guard }` | RSM §2.3, FF §2.2/8.1；055 §5.2。pin 当前 guard + 读 durable_lsn；置位 `catalog_update_in_progress_`（已置位则进入 owner-local `pending_catalog_updates` 等 `end_flush_round` / `open_gate` 后继续）。impl `coord/scheduler.hh` |
 | `frontier_switch` | `(old_guard, new_manifest, retired, release_plan)` → `void` | RSM §2.3, FF §4.2/8.1；055 §5.3。第 4 参为 `core::flush_release_plan`（by value，从 `tree_flush_result.flushed_gens_by_front` 经 `extract_release_plan` 提取，055 §5.1/B1）。handler 两段式：阶段 A 构造 G1/PRS2/CAT2 + reserve G0.retired（可抛、不改已发布态）；阶段 B append retired 到 G0 + `install_cat`（noexcept，B2）。D1=安装瞬间 `cat->durable_lsn`。impl `coord/scheduler.hh::handle_frontier_switch` |
-| `end_flush_round` | `()` → `void` | 055 §5.4/§6（spec 新增的串行化兜底 seam）。清 `catalog_update_in_progress_`，必须在 `release_gens` 之后。impl `coord/scheduler.hh` |
+| `end_flush_round` | `()` → `void` | 055 §5.4/§6（spec 新增的串行化兜底 seam）。清 `catalog_update_in_progress_` 并 drain 一个 pending catalog-update waiter，必须在 `release_gens` 之后。impl `coord/scheduler.hh` |
 | `install_cat` | `(new_publish_catalog)` → `void` | RSM §2.3, FF §4.2 |
 | `write_wal_entries` | `(batch_lsn, entry_count, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7;M06 起由 front `prepare_wal_fragment / install_wal_segment / commit_wal_plan / abort_wal_plan` + L3 `write_path::write_wal_fragment` 实现(044/045);本行保留为概念签名。INC-057/054 起 `prepare_wal_fragment` 结果为 `variant<wal_prepare_issue_plan, wal_prepare_committed, wal_prepare_needs_segment>`:`issue_plan`=leader 发 FUA 并 commit/abort;`committed`=follower(group 内已被 leader FUA 落盘,只 adopt cursor,不碰 NVMe、不 commit);`needs_segment`=单 participant 触发 segment install。物理在飞 plan 恒为 1,group commit 只合并 logical participant。 |
 | `insert_memtable_entries` | `(batch_lsn, entries[])` → `void` | RSM §3.4-3.5, WP §2.3/§10.7 |
@@ -53,10 +53,10 @@ struct 在概要定义、详细设计细化。字段变更时需同步。
 
 | Struct | 关键字段 | 定义点 | 引用点 |
 |--------|---------|--------|--------|
-| `coord_state` | `next_lsn, gate, current_cat (catalog_store), ready_set, cat_epoch, catalog_update_in_progress`（055 §6：`catalog_update_in_progress` 统一串行 seal 与 flush 的 CAT 安装——capture_flush_frontier/close_gate 取、end_flush_round/open_gate 放；取代 spec 早期的 `seal_in_progress`） | RSM §2.1 | — |
+| `coord_state` | `next_lsn, gate, current_cat (catalog_store), ready_set, cat_epoch, catalog_update_in_progress, pending_catalog_updates`（055/063：`catalog_update_in_progress` 统一串行 seal 与 flush 的 CAT 安装——capture_flush_frontier/close_gate 取，busy 时 pending；end_flush_round/open_gate 放并 drain 一个 waiter；取代 spec 早期的 `seal_in_progress`） | RSM §2.1 | — |
 | `front_state` | `owner_id, active, imms, wal` | RSM §3.1 | — |
-| `memtable_gen` | `gen_id, st, front_owner_index, min_lsn, max_lsn, kv_arena, table, loser_durable_refs`（无内嵌 refcount；生命周期由 `std::shared_ptr<memtable_gen>` 管理；flush 可写 `loser_durable_refs`） | OV §5.1, RSM §3.2 | FF §3.3, RW §6 |
-| `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end`；`allocate(src, len) -> string_view`；只保存 key bytes，不保存 value body | RSM §3.2 | RMC §9.3 |
+| `memtable_gen` | `gen_id, st, front_owner_index, min_lsn, max_lsn, kv_arena, table, version_count, loser_durable_refs`（无内嵌 refcount；生命周期由 `std::shared_ptr<memtable_gen>` 管理；`version_count` 仅为 pressure/empty-gen signal；flush 可写 `loser_durable_refs`） | OV §5.1, RSM §3.2 | FF §3.3, RW §6 |
+| `gen_arena` | `chunks: vector<unique_ptr<char[]>>, bump_next, bump_end, allocated_bytes, reserved_bytes`；`allocate(src, len) -> string_view`；只保存 key bytes，不保存 value body；byte counters 仅服务 pressure policy | RSM §3.2 | RMC §9.3 |
 | `memtable_entry` | `data_ver, kind, vh`（trivially copyable POD） | RSM §3.3 | RAP §4.3 |
 | `value_handle` | `durable: value_ref`（POD）；memtable 不保存 value body | OV §5.1, RSM §3.3 | RAP §4.4 |
 | `publish_catalog` | `prs, durable_lsn (atomic), epoch` | OV §5.4 | RSM §2.1/2.3 |

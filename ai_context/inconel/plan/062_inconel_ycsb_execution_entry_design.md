@@ -134,7 +134,7 @@ runtime：
 
 cadence：
 
-1. `--flush-after-load` / `--no-flush-after-load`
+1. `--flush-after-load` / `--no-flush-after-load`（063 后默认 no-flush，使用 production auto maintenance；显式 `--flush-after-load` 进入 deterministic/manual barrier 模式）
 2. `--verify-samples <N>`：load flush 后抽样 point-get 校验 deterministic value。
 3. Deferred: `--seal-flush-interval-ops <N>`。这需要把 run phase 拆成 window driver，不能在 helper 里补一个隐藏 root。
 

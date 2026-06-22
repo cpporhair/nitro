@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -31,11 +32,16 @@ namespace apps::inconel::ycsb {
             << "  --workload load|a|b|c|load-a|load-b|load-c\n"
             << "  --records N --operations N --value-size BYTES\n"
             << "  --batch-size N --inflight N --seed N --verify-samples N\n"
+            << "  --flush-after-load --no-flush-after-load\n"
             << "\n"
             << "runtime:\n"
             << "  --cores 0,1,2,3 --main-core 0 --front-cores 0,1\n"
             << "  --value-core N --owner-core N --coord-core N\n"
             << "  --wal-space-core N --maintenance-core N\n"
+            << "  --maintenance-seal-active-bytes N\n"
+            << "  --maintenance-total-memtable-bytes N\n"
+            << "  --maintenance-wal-seal-percent N\n"
+            << "  --maintenance-max-sealed-gens-per-front N\n"
             << "  --tree-cache clock|slru --value-cache clock|slru\n"
             << "  --tree-cache-capacity N --value-cache-capacity N\n";
     }
@@ -49,6 +55,52 @@ namespace apps::inconel::ycsb {
             }
         }
         return false;
+    }
+
+    template <typename Runtime>
+    [[nodiscard]] inline runtime::maintenance_stats_snapshot
+    collect_maintenance_stats(Runtime* rt) {
+        runtime::maintenance_stats_snapshot out{};
+        for (auto* sched :
+             rt->template get_schedulers<runtime::maintenance_sched>()) {
+            if (sched == nullptr) {
+                continue;
+            }
+            const auto snap = sched->snapshot();
+            out.enabled = out.enabled || snap.enabled;
+            out.stopping = out.stopping || snap.stopping;
+            out.inflight = out.inflight || snap.inflight;
+            out.cooldown_ticks =
+                std::max(out.cooldown_ticks, snap.cooldown_ticks);
+            out.idle_backoff_ticks =
+                std::max(out.idle_backoff_ticks, snap.idle_backoff_ticks);
+            out.launched_rounds += snap.launched_rounds;
+            out.completed_rounds += snap.completed_rounds;
+            out.failed_rounds += snap.failed_rounds;
+            out.work_rounds += snap.work_rounds;
+            out.noop_rounds += snap.noop_rounds;
+            out.seal_rounds += snap.seal_rounds;
+            out.flush_rounds += snap.flush_rounds;
+            out.non_noop_flush_rounds += snap.non_noop_flush_rounds;
+        }
+        return out;
+    }
+
+    inline void
+    print_maintenance_stats(
+        std::ostream& out,
+        const runtime::maintenance_stats_snapshot& stats) {
+        out << "maintenance"
+            << " enabled=" << (stats.enabled ? 1 : 0)
+            << " launched=" << stats.launched_rounds
+            << " completed=" << stats.completed_rounds
+            << " failed=" << stats.failed_rounds
+            << " work=" << stats.work_rounds
+            << " noop=" << stats.noop_rounds
+            << " seal=" << stats.seal_rounds
+            << " flush=" << stats.flush_rounds
+            << " non_noop_flush=" << stats.non_noop_flush_rounds
+            << "\n";
     }
 
     template <typename Runtime>
@@ -100,6 +152,16 @@ namespace apps::inconel::ycsb {
 
         runtime::maintenance_options maintenance{};
         maintenance.core = state->cfg->maintenance_core;
+        maintenance.policy.auto_seal_flush = !state->cfg->flush_after_load;
+        maintenance.policy.seal_active_memtable_bytes =
+            state->cfg->maintenance_seal_active_bytes;
+        maintenance.policy.total_memtable_limit_bytes =
+            state->cfg->maintenance_total_memtable_bytes;
+        maintenance.policy.wal_seal_used_ratio =
+            static_cast<float>(state->cfg->maintenance_wal_seal_percent) /
+            100.0f;
+        maintenance.policy.max_sealed_gens_per_front =
+            state->cfg->maintenance_max_sealed_gens_per_front;
 
         runtime::build_options bopts{
             .cores = std::span<const uint32_t>(
@@ -119,6 +181,7 @@ namespace apps::inconel::ycsb {
         };
 
         runtime::inconel_runtime_t<TreeCache, ValueCache>* rt = nullptr;
+        runtime::maintenance_stats_snapshot maintenance_stats{};
         try {
             rt = runtime::build_runtime<TreeCache, ValueCache>(bopts);
             rt::start(
@@ -131,6 +194,7 @@ namespace apps::inconel::ycsb {
                         submit_app_root(runtime, state, cores);
                     }
                 });
+            maintenance_stats = collect_maintenance_stats(rt);
             runtime::destroy_runtime<TreeCache, ValueCache>(rt);
             rt = nullptr;
         } catch (...) {
@@ -144,6 +208,7 @@ namespace apps::inconel::ycsb {
             std::rethrow_exception(state->error);
         }
         print_all_stats(std::cout, *state->stats);
+        print_maintenance_stats(std::cout, maintenance_stats);
         return 0;
     }
 

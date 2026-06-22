@@ -769,6 +769,7 @@ struct memtable_gen {
     // kv_arena holds key bytes only for this gen; table's key
     // is std::string_view into kv_arena. Value bytes live in
     // Value Area and are addressed by value_ref.
+    std::size_t version_count;   // approximate pressure / empty-gen signal
 };
 ```
 
@@ -781,6 +782,7 @@ struct memtable_gen {
 5. memtable 中的 PUT entry 保存的是 `value_ref`（或只含 durable `value_ref` 的 `value_handle`）；DELETE 保存 tombstone。
 6. memtable hit 的 value 来源不是 `kv_arena`，而是 memtable entry 携带的 `value_ref`。读路径必须交给 `value_alloc_sched.read_value(value_ref)` / `read_page_values(...)`，由 value cache / resident frame 尽量命中内存，miss 才读 NVMe。
 7. `kv_arena` 只保活 key bytes；value bytes 的驻留由 value 模块负责。为避免 memtable hit 频繁读盘，value 层必须优先保留 recently-written / memtable-visible value pages（见 `INC-055`）。
+8. `version_count` 与 arena byte counters 只作为 seal/flush pressure signal；读可见性仍只看 `data_ver <= read_lsn`。
 
 ### 5.2 `checkpoint_guard`
 

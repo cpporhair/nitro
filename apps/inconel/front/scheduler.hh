@@ -8,6 +8,7 @@
 // runtime API, seal-round orchestration, frontier switch, or recovery.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -207,6 +208,7 @@ namespace apps::inconel::front {
             , queue_depth_(queue_depth)
             , wal_pending_prepare_capacity_(queue_depth) {
             validate_constructor_state(queue_depth);
+            publish_memtable_pressure();
         }
 
         front_sched(uint32_t owner_id,
@@ -237,6 +239,32 @@ namespace apps::inconel::front {
         [[nodiscard]] uint32_t
         owner_id() const noexcept {
             return owner_id_;
+        }
+
+        [[nodiscard]] uint64_t
+        active_memtable_bytes() const noexcept {
+            return active_memtable_bytes_.load(std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] uint64_t
+        sealed_memtable_bytes() const noexcept {
+            return sealed_memtable_bytes_.load(std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] uint64_t
+        total_memtable_bytes() const noexcept {
+            return active_memtable_bytes() + sealed_memtable_bytes();
+        }
+
+        [[nodiscard]] uint32_t
+        sealed_gen_count() const noexcept {
+            return sealed_gen_count_.load(std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] bool
+        active_memtable_has_entries() const noexcept {
+            return active_memtable_has_entries_.load(
+                std::memory_order_relaxed);
         }
 
         [[nodiscard]] uint32_t
@@ -714,6 +742,7 @@ namespace apps::inconel::front {
                         "front::front_sched: impossible canonical op");
                 }
             }
+            publish_active_pressure();
         }
 
         [[nodiscard]] core::memtable_lookup_result
@@ -769,6 +798,7 @@ namespace apps::inconel::front {
             old->st = core::memtable_gen::state::sealed;
             active_ = std::move(next);
             ++next_local_gen_epoch_;
+            publish_memtable_pressure();
 
             return core::front_read_set{
                 .active = active_,
@@ -800,6 +830,7 @@ namespace apps::inconel::front {
                                          gen->gen_id) != gen_ids.end();
                     }),
                 imms_.end());
+            publish_sealed_pressure();
         }
 
         void handle_insert(_front_insert::req* r);
@@ -823,6 +854,36 @@ namespace apps::inconel::front {
                    wal_awaiting_segment_;
         }
 
+        void publish_active_pressure() noexcept {
+            const bool has_entries =
+                active_ && core::memtable_gen_has_entries(*active_);
+            active_memtable_has_entries_.store(
+                has_entries, std::memory_order_relaxed);
+            active_memtable_bytes_.store(
+                active_
+                    ? core::approximate_memtable_gen_bytes(*active_)
+                    : 0,
+                std::memory_order_relaxed);
+        }
+
+        void publish_sealed_pressure() noexcept {
+            uint64_t bytes = 0;
+            for (const auto& gen : imms_) {
+                if (gen) {
+                    bytes += core::approximate_memtable_gen_bytes(*gen);
+                }
+            }
+            sealed_memtable_bytes_.store(bytes, std::memory_order_relaxed);
+            sealed_gen_count_.store(
+                static_cast<uint32_t>(imms_.size()),
+                std::memory_order_relaxed);
+        }
+
+        void publish_memtable_pressure() noexcept {
+            publish_active_pressure();
+            publish_sealed_pressure();
+        }
+
         pump::core::per_core::queue<_front_insert::req*> insert_q_;
         pump::core::per_core::queue<_front_lookup::req*> lookup_q_;
         pump::core::per_core::queue<_front_batch_lookup::req*> batch_lookup_q_;
@@ -839,6 +900,10 @@ namespace apps::inconel::front {
         uint32_t front_count_;
         uint64_t next_local_gen_epoch_;
         std::shared_ptr<core::memtable_gen> active_;
+        std::atomic<uint64_t> active_memtable_bytes_{0};
+        std::atomic<uint64_t> sealed_memtable_bytes_{0};
+        std::atomic<uint32_t> sealed_gen_count_{0};
+        std::atomic<bool> active_memtable_has_entries_{false};
         std::size_t queue_depth_ = 0;
         std::vector<std::shared_ptr<core::memtable_gen>> imms_;
         std::optional<wal::wal_stream_state> wal_;

@@ -35,6 +35,7 @@ namespace apps::inconel::runtime {
         uint32_t idle_initial_backoff_ticks = 256;
         uint32_t idle_max_backoff_ticks = 1u << 20;
         uint32_t completion_queue_depth = 4;
+        maintenance_policy policy = {};
     };
 
     struct maintenance_stats_snapshot {
@@ -48,6 +49,9 @@ namespace apps::inconel::runtime {
         uint64_t failed_rounds = 0;
         uint64_t work_rounds = 0;
         uint64_t noop_rounds = 0;
+        uint64_t seal_rounds = 0;
+        uint64_t flush_rounds = 0;
+        uint64_t non_noop_flush_rounds = 0;
     };
 
     namespace _maintenance_finish { struct req; }
@@ -77,6 +81,7 @@ namespace apps::inconel::runtime {
         uint32_t active_gap_ticks = 1;
         uint32_t idle_initial_backoff_ticks = 256;
         uint32_t idle_max_backoff_ticks = 1u << 20;
+        maintenance_policy policy = {};
         std::atomic<uint32_t> cooldown_ticks{0};
         std::atomic<uint32_t> idle_backoff_ticks{256};
 
@@ -85,6 +90,9 @@ namespace apps::inconel::runtime {
         std::atomic<uint64_t> failed_rounds{0};
         std::atomic<uint64_t> work_rounds{0};
         std::atomic<uint64_t> noop_rounds{0};
+        std::atomic<uint64_t> seal_rounds{0};
+        std::atomic<uint64_t> flush_rounds{0};
+        std::atomic<uint64_t> non_noop_flush_rounds{0};
 
         pump::core::per_core::queue<_maintenance_finish::req*, false> finish_q;
         pump::core::per_core::queue<_maintenance_fail::req*, false> fail_q;
@@ -122,6 +130,10 @@ namespace apps::inconel::runtime {
                     failed_rounds.load(std::memory_order_acquire),
                 .work_rounds = work_rounds.load(std::memory_order_acquire),
                 .noop_rounds = noop_rounds.load(std::memory_order_acquire),
+                .seal_rounds = seal_rounds.load(std::memory_order_acquire),
+                .flush_rounds = flush_rounds.load(std::memory_order_acquire),
+                .non_noop_flush_rounds =
+                    non_noop_flush_rounds.load(std::memory_order_acquire),
             };
         }
 
@@ -220,6 +232,7 @@ namespace apps::inconel::runtime {
         , active_gap_ticks(opts.active_gap_ticks)
         , idle_initial_backoff_ticks(opts.idle_initial_backoff_ticks)
         , idle_max_backoff_ticks(opts.idle_max_backoff_ticks)
+        , policy(opts.policy)
         , cooldown_ticks(0)
         , idle_backoff_ticks(opts.idle_initial_backoff_ticks)
         , finish_q(checked_maintenance_completion_queue_depth(
@@ -232,6 +245,14 @@ namespace apps::inconel::runtime {
             core::panic_inconsistency(
                 "runtime::maintenance_sched::ctor",
                 "invalid maintenance options");
+        }
+        try {
+            validate_maintenance_policy(policy);
+        } catch (const std::exception& e) {
+            core::panic_inconsistency(
+                "runtime::maintenance_sched::ctor",
+                "invalid maintenance policy: %s",
+                e.what());
         }
     }
 
@@ -268,7 +289,7 @@ namespace apps::inconel::runtime {
 
         try {
             auto ctx = pump::core::make_root_context();
-            rt::maintenance_once()
+            rt::maintenance_once(policy)
                 >> pump::sender::flat_map(
                     [this](maintenance_round_result result) mutable {
                         return submit_finish_round(std::move(result));
@@ -304,6 +325,15 @@ namespace apps::inconel::runtime {
                     : backoff * 2);
             idle_backoff_ticks.store(
                 next_backoff, std::memory_order_release);
+        }
+        if (result.seal_flush.seal_ran) {
+            seal_rounds.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (result.seal_flush.flush_ran) {
+            flush_rounds.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (!result.seal_flush.flush.noop) {
+            non_noop_flush_rounds.fetch_add(1, std::memory_order_acq_rel);
         }
         inflight.store(false, std::memory_order_release);
     }

@@ -60,12 +60,37 @@ namespace apps::inconel::rt {
         return tree::reclaim_once(*core::registry::tree_sched_singleton());
     }
 
-    template <typename NvmeProvider = value::local_nvme_provider>
+    template <typename NvmeProvider>
     [[nodiscard]] inline auto
-    maintenance_once(NvmeProvider value_nvme = {}) {
+    maintenance_once_with_policy(runtime::maintenance_policy policy,
+                                 NvmeProvider value_nvme) {
         return pipeline::maintenance_round_once(
+            *core::registry::coord_sched_singleton(),
+            core::registry::fronts_span(),
+            *core::registry::wal_space_singleton(),
             *core::registry::tree_sched_singleton(),
+            policy,
             value_nvme);
+    }
+
+    [[nodiscard]] inline auto
+    maintenance_once(runtime::maintenance_policy policy = {}) {
+        return maintenance_once_with_policy(
+            policy, value::local_nvme_provider{});
+    }
+
+    template <typename NvmeProvider>
+    [[nodiscard]] inline auto
+    maintenance_once(runtime::maintenance_policy policy,
+                     NvmeProvider value_nvme) {
+        return maintenance_once_with_policy(policy, std::move(value_nvme));
+    }
+
+    template <typename NvmeProvider>
+    [[nodiscard]] inline auto
+    maintenance_once(NvmeProvider value_nvme) {
+        return maintenance_once_with_policy(
+            runtime::maintenance_policy{}, std::move(value_nvme));
     }
 
 }  // namespace apps::inconel::rt

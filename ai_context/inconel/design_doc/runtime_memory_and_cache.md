@@ -52,7 +52,9 @@ read_handle
         -> front_read_set[]
            -> shared_ptr<memtable_gen>       ← 唯一跨线程 atomic gate
               -> kv_arena                      (chunks of key bytes)
+                 -> allocated/reserved byte counters (pressure signal)
               -> table                         (btree_map<string_view → InlinedVec>)
+              -> version_count                 (pressure / empty-gen signal)
                  -> memtable_entry             (trivially copyable POD)
                     -> value_handle
                        -> value_ref
@@ -889,6 +891,7 @@ value 模块的 cache / residency 负责两类读：
 2. `memtable_gen.kv_arena`
    - 承载该 gen 所有 key bytes，随 gen 析构一次 sweep 释放所有 chunk。
    - gen 的生命周期跟着 `std::shared_ptr<memtable_gen>` 的 pin 链走，与 page eviction 无关。
+   - arena byte counters 与 `version_count` 只服务 seal/flush pressure policy，不是读路径 correctness source。
 
 3. clean frame
    - `pin_count == 0` 时可驱逐。

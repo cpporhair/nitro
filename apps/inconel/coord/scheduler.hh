@@ -643,6 +643,40 @@ namespace apps::inconel::coord {
             }
         }
 
+        using catalog_update_request = std::variant<
+            _coord_close_gate::req*,
+            _coord_capture_frontier::req*>;
+
+        void
+        enqueue_catalog_update_waiter(catalog_update_request req) {
+            pending_catalog_updates_.push_back(std::move(req));
+        }
+
+        void
+        drain_catalog_update_waiters() {
+            if (catalog_update_in_progress_ ||
+                pending_catalog_updates_.empty()) {
+                return;
+            }
+            auto req = pending_catalog_updates_.front();
+            pending_catalog_updates_.pop_front();
+            std::visit(
+                [this](auto* r) {
+                    using req_t = std::remove_pointer_t<decltype(r)>;
+                    if constexpr (
+                        std::is_same_v<req_t, _coord_close_gate::req>) {
+                        handle_close_gate(r);
+                    } else {
+                        static_assert(
+                            std::is_same_v<
+                                req_t,
+                                _coord_capture_frontier::req>);
+                        handle_capture_frontier(r);
+                    }
+                },
+                req);
+        }
+
         pump::core::per_core::queue<_coord_assign::req*> assign_q_;
         pump::core::per_core::queue<_coord_event::request> event_q_;
 
@@ -650,6 +684,7 @@ namespace apps::inconel::coord {
         ready_window        ready_;
         publish_gate        gate_;
         std::deque<_coord_assign::req*> pending_assigns_;
+        std::deque<catalog_update_request> pending_catalog_updates_;
         std::size_t         pending_assign_capacity_;
         uint64_t            next_lsn_;
         uint32_t            front_count_;
@@ -1056,6 +1091,9 @@ namespace apps::inconel::coord {
             std::visit([](auto* r) { delete r; }, *item);
         }
         for (auto* r : pending_assigns_) delete r;
+        for (auto req : pending_catalog_updates_) {
+            std::visit([](auto* r) { delete r; }, req);
+        }
     }
 
     inline _coord_assign::sender
@@ -1375,7 +1413,8 @@ namespace apps::inconel::coord {
         std::shared_ptr<const core::publish_catalog> cat;
         try {
             if (catalog_update_in_progress_) {
-                throw std::logic_error("catalog_update_in_progress");
+                enqueue_catalog_update_waiter(req.release());
+                return;
             }
             if (!gate_.is_open()) {
                 throw std::logic_error(
@@ -1449,6 +1488,7 @@ namespace apps::inconel::coord {
         if (cb) {
             cb(core::owner_outcome<void>{});
         }
+        drain_catalog_update_waiters();
     }
 
     inline void
@@ -1472,7 +1512,8 @@ namespace apps::inconel::coord {
         core::flush_frontier frontier;
         try {
             if (catalog_update_in_progress_) {
-                throw std::logic_error("catalog_update_in_progress");
+                enqueue_catalog_update_waiter(req.release());
+                return;
             }
             catalog_update_in_progress_ = true;
             const auto cat = cats_.current_cat();
@@ -1599,6 +1640,7 @@ namespace apps::inconel::coord {
         if (cb) {
             cb(core::owner_outcome<void>{});
         }
+        drain_catalog_update_waiters();
     }
 
     inline void

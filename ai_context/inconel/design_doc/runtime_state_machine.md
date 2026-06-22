@@ -38,9 +38,11 @@ struct coord_state {
 
     // ── Seal/Flush CAT 安装互斥（055 §6）──
     // 统一串行标志：seal 与 flush 都在 coord 上安装 CAT（CAT1 / CAT2），必须互斥。
-    // capture_flush_frontier / close_gate 置位（已置位则 fail-fast）；
-    // end_flush_round / open_gate 清位。覆盖 flush-vs-flush + flush-vs-seal + seal-vs-seal。
+    // capture_flush_frontier / close_gate 置位（已置位则进入 pending_catalog_updates）；
+    // end_flush_round / open_gate 清位并 drain 一个 pending waiter。
+    // 覆盖 flush-vs-flush + flush-vs-seal + seal-vs-seal。
     bool catalog_update_in_progress = false;
+    deque<catalog_update_request> pending_catalog_updates;
 
     // ── 纪元 ──
     uint64_t cat_epoch;                              // catalog 版本号，单调递增
@@ -259,17 +261,18 @@ struct seal_trigger_config {
 };
 ```
 
-触发条件（任一满足即由 coord_sched 发起 seal_round）：
+触发条件（任一满足即由 runtime maintenance cadence 发起 seal_round）：
 
 ```text
 1. sum(front[i].active.memory_usage) > seal_memory_threshold
 2. wal_segment_pool.used_ratio > wal_seal_threshold
 3. sum(所有 front 的 active + sealed gen memory) > total_memtable_limit
+4. max(front[i].sealed_gen_count) >= max_sealed_gens_per_front
 ```
 
 参��� RocksDB：不使用时间驱��（seal 半满 memtable 浪费 tree page 空间，增加写放大）。
 
-**监控机制**：`coord_sched` 在 `handle_assign_lsn` 内联检查，不使用独立监控线程或跨 sched 消息。每个 `front_sched` 维护 `std::atomic<uint64_t> active_memory_usage`（memtable insert 时 relaxed store），`wal_space_sched` 维护 `std::atomic<uint32_t> used_segment_count`（分配/回收时 relaxed store）。`coord_sched` 在 `assign_lsn` 时 relaxed load 这些 atomic 本地求和判断。数据略旧不影响正确性（seal 触发是运行时调优，不是正确性约束）。
+**监控机制（063 production 实现）**：不使用独立监控线程，也不在 owner handler 内部 hidden-submit 子 pipeline。每个 `front_sched` 维护 relaxed atomic pressure counters（active bytes、sealed bytes、sealed gen count、active has entries），`wal_space_sched` 维护 `used_segment_count`。`maintenance_sched` 启动唯一 runtime-owned `rt::maintenance_once(policy)` root pipeline；pipeline 开头 relaxed load 这些 counters 本地求和，按 policy 决定是否 `seal_round -> flush_round`。数据略旧不影响正确性（seal 触发是运行时调优，不是正确性约束）。
 
 ### 2.7 写入反压
 
@@ -277,12 +280,11 @@ struct seal_trigger_config {
 
 ```text
 handle_assign_lsn(raw_batch):
-    // ── seal 触发检查（内联，relaxed load atomic counters）──
-    // catalog_update_in_progress 统一挡 seal 与 flush（055 §6）：flush 在飞时不发起 seal
-    if !catalog_update_in_progress && seal_conditions_met():
-        catalog_update_in_progress = true        // close_gate 内置位
-        initiate_seal_round()
-        // seal_round 的 open_gate 完成后清 catalog_update_in_progress = false
+    // ── seal 触发检查（063：runtime maintenance cadence）──
+    // maintenance pipeline relaxed-load pressure counters；
+    // close_gate/capture_flush_frontier 通过 pending_catalog_updates 串行等待。
+    if seal_conditions_met():
+        schedule/execute seal_round through maintenance pipeline
 
     // ── 反压检查（relaxed load 各 front 的 sealed_gen_count atomic）──
     if any front_sched 的 sealed gen count >= max_sealed_gens_per_front:
@@ -307,6 +309,10 @@ struct front_state {
     // ── Memtable ──
     std::shared_ptr<memtable_gen> active;             // 当前写入目标
     small_vector<std::shared_ptr<memtable_gen>, 8> imms;  // sealed gens（newest → oldest）
+    atomic<uint64_t> active_memtable_bytes;           // relaxed pressure signal
+    atomic<uint64_t> sealed_memtable_bytes;           // relaxed pressure signal
+    atomic<uint32_t> sealed_gen_count;                // relaxed pressure signal
+    atomic<bool> active_memtable_has_entries;         // 防空 idle seal
 
     // ── WAL Stream ──
     wal_stream_state wal;                            // WAL 追加状态
@@ -339,6 +345,7 @@ struct memtable_gen {
     //   - 声明顺序在 kv_arena 之后，保证反向析构时 table 先于 arena 析构
     absl::btree_map<std::string_view,
                     absl::InlinedVector<memtable_entry, 1>> table;
+    std::size_t version_count;                         // pressure / empty-gen signal
 
     // ── 回收 ──
     // flush fold 期间直接挂接 memtable-only losers。成功 round 继续保留；
@@ -352,6 +359,8 @@ struct gen_arena {
     std::vector<std::unique_ptr<char[]>> chunks;
     char* bump_next = nullptr;
     char* bump_end  = nullptr;
+    std::size_t allocated_bytes = 0;
+    std::size_t reserved_bytes  = 0;
 
     // Copy len bytes from src into arena, return view over slice.
     // View validity = this arena's validity (= owning gen's validity).
@@ -1677,7 +1686,7 @@ tree_sched ── maybe update superblock
 1. `batch_lsn` 分配是无间隙的。
 2. seal 发起和 write batch fan-out 有确定的先后关系。
 3. `publish_gate` 的开/关和 `durable_lsn` 推进不会并发。
-4. **CAT 安装互斥（055 §6，显式不变量）**：seal（装 CAT1）与 flush（frontier_switch 装 CAT2）是 coord 上仅有的两类 CAT 安装操作，由 `catalog_update_in_progress` 串行——任一在飞时另一方 fail-fast。**flush round 端到端串行**：`capture_flush_frontier` 置位、`end_flush_round`（在 `release_gens` 之后）清位，保证同一 sealed gen 不被两轮 fold、且 frontier_switch 不会插进 seal 的 close→install 窗口。pipelined flush 是 future opt（需 per-gen in-flight 追踪），v1 不做。
+4. **CAT 安装互斥（055 §6，显式不变量）**：seal（装 CAT1）与 flush（frontier_switch 装 CAT2）是 coord 上仅有的两类 CAT 安装操作，由 `catalog_update_in_progress` 串行——任一在飞时另一方进入 owner-local `pending_catalog_updates`，由 `open_gate` / `end_flush_round` 清位后 drain 一个 waiter。**flush round 端到端串行**：`capture_flush_frontier` 置位、`end_flush_round`（在 `release_gens` 之后）清位，保证同一 sealed gen 不被两轮 fold、且 frontier_switch 不会插进 seal 的 close→install 窗口。pipelined flush 是 future opt（需 per-gen in-flight 追踪），v1 不做。
 
 ### 10.3 tree-domain schedulers 单线程
 

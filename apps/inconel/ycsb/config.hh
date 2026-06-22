@@ -37,7 +37,7 @@ namespace apps::inconel::ycsb {
         uint32_t inflight = 64;
         uint64_t seed = 1;
         std::string key_prefix = "user";
-        bool flush_after_load = true;
+        bool flush_after_load = false;
         uint64_t verify_samples = 0;
 
         std::vector<uint32_t> cores = {0, 1, 2, 3};
@@ -48,6 +48,10 @@ namespace apps::inconel::ycsb {
         int32_t coord_core = -1;
         int32_t wal_space_core = -1;
         int32_t maintenance_core = -1;
+        uint64_t maintenance_seal_active_bytes = 256ull * 1024ull * 1024ull;
+        uint64_t maintenance_total_memtable_bytes = 1024ull * 1024ull * 1024ull;
+        uint32_t maintenance_wal_seal_percent = 70;
+        uint32_t maintenance_max_sealed_gens_per_front = 4;
         std::string spdk_core_mask;
         uint32_t qpair_depth = 128;
 
@@ -277,6 +281,14 @@ namespace apps::inconel::ycsb {
             cfg.wal_space_core, "--wal-space-core must be in --cores");
         validate_optional_core(
             cfg.maintenance_core, "--maintenance-core must be in --cores");
+        if (cfg.maintenance_wal_seal_percent > 100) {
+            throw std::invalid_argument(
+                "--maintenance-wal-seal-percent must be <= 100");
+        }
+        if (cfg.maintenance_max_sealed_gens_per_front == 0) {
+            throw std::invalid_argument(
+                "--maintenance-max-sealed-gens-per-front must be > 0");
+        }
         for (uint32_t core : cfg.front_cores) {
             if (!contains_core(cfg.cores, core)) {
                 throw std::invalid_argument("--front-cores must be in --cores");
@@ -309,6 +321,9 @@ namespace apps::inconel::ycsb {
             if (arg == "--force-format") {
                 args.take();
                 cfg.force_format = true;
+            } else if (arg == "--flush-after-load") {
+                args.take();
+                cfg.flush_after_load = true;
             } else if (arg == "--no-flush-after-load") {
                 args.take();
                 cfg.flush_after_load = false;
@@ -366,6 +381,28 @@ namespace apps::inconel::ycsb {
                 cfg.maintenance_core = parse_integer<int32_t>(
                     args.take_value("--maintenance-core"),
                     "invalid --maintenance-core");
+            } else if (option_matches(arg,
+                                      "--maintenance-seal-active-bytes")) {
+                cfg.maintenance_seal_active_bytes = parse_integer<uint64_t>(
+                    args.take_value("--maintenance-seal-active-bytes"),
+                    "invalid --maintenance-seal-active-bytes");
+            } else if (option_matches(
+                           arg, "--maintenance-total-memtable-bytes")) {
+                cfg.maintenance_total_memtable_bytes = parse_integer<uint64_t>(
+                    args.take_value("--maintenance-total-memtable-bytes"),
+                    "invalid --maintenance-total-memtable-bytes");
+            } else if (option_matches(arg,
+                                      "--maintenance-wal-seal-percent")) {
+                cfg.maintenance_wal_seal_percent = parse_integer<uint32_t>(
+                    args.take_value("--maintenance-wal-seal-percent"),
+                    "invalid --maintenance-wal-seal-percent");
+            } else if (option_matches(
+                           arg, "--maintenance-max-sealed-gens-per-front")) {
+                cfg.maintenance_max_sealed_gens_per_front =
+                    parse_integer<uint32_t>(
+                        args.take_value(
+                            "--maintenance-max-sealed-gens-per-front"),
+                        "invalid --maintenance-max-sealed-gens-per-front");
             } else if (option_matches(arg, "--spdk-core-mask")) {
                 cfg.spdk_core_mask =
                     std::string(args.take_value("--spdk-core-mask"));

@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <type_traits>
@@ -65,6 +66,8 @@ namespace apps::inconel::core {
         std::vector<std::unique_ptr<char[]>> chunks;
         char*                                bump_next = nullptr;
         char*                                bump_end  = nullptr;
+        std::size_t                          allocated_bytes = 0;
+        std::size_t                          reserved_bytes  = 0;
 
         // Copy `len` bytes of `src` into the arena and return
         // a string_view over the allocated slice. The returned
@@ -80,11 +83,23 @@ namespace apps::inconel::core {
                 bump_next = chunk.get();
                 bump_end  = chunk.get() + cap;
                 chunks.push_back(std::move(chunk));
+                reserved_bytes += cap;
             }
             char* start = bump_next;
             std::memcpy(start, src, len);
             bump_next += len;
+            allocated_bytes += len;
             return std::string_view{start, len};
+        }
+
+        [[nodiscard]] std::size_t
+        allocated() const noexcept {
+            return allocated_bytes;
+        }
+
+        [[nodiscard]] std::size_t
+        reserved() const noexcept {
+            return reserved_bytes;
         }
     };
 
@@ -238,6 +253,8 @@ namespace apps::inconel::core {
                         absl::InlinedVector<memtable_entry, 1>>
             table;
 
+        std::size_t version_count = 0;
+
         retire_list<retired_value_ref> loser_durable_refs;
 
         ~memtable_gen() {
@@ -276,6 +293,26 @@ namespace apps::inconel::core {
         if (data_ver > gen.max_lsn) gen.max_lsn = data_ver;
     }
 
+    [[nodiscard]] inline uint64_t
+    approximate_memtable_gen_bytes(const memtable_gen& gen) noexcept {
+        constexpr std::size_t kApproxTableKeyOverhead =
+            sizeof(std::string_view) + sizeof(void*) * 4;
+        const std::size_t bytes =
+            gen.kv_arena.reserved() +
+            gen.version_count * sizeof(memtable_entry) +
+            gen.table.size() * kApproxTableKeyOverhead;
+        if (bytes > static_cast<std::size_t>(
+                        std::numeric_limits<uint64_t>::max())) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return static_cast<uint64_t>(bytes);
+    }
+
+    [[nodiscard]] inline bool
+    memtable_gen_has_entries(const memtable_gen& gen) noexcept {
+        return gen.version_count != 0;
+    }
+
     inline absl::InlinedVector<memtable_entry, 1>&
     ensure_versions_for_key(memtable_gen& gen, std::string_view key) {
         auto it = gen.table.lower_bound(key);
@@ -299,6 +336,7 @@ namespace apps::inconel::core {
             .k        = memtable_entry::kind::value,
             .vh       = value_handle{.durable = durable},
         });
+        ++gen.version_count;
         update_lsn_bounds(gen, data_ver);
     }
 
@@ -312,6 +350,7 @@ namespace apps::inconel::core {
             .k        = memtable_entry::kind::tombstone,
             .vh       = {},
         });
+        ++gen.version_count;
         update_lsn_bounds(gen, data_ver);
     }
 

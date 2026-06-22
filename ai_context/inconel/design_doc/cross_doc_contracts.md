@@ -157,17 +157,18 @@ coord_sched(capture_flush_frontier)             # 置 catalog_update_in_progress
 被动触发：reader 释放 read_handle / seal / flush 装 CAT2
   → 旧 CAT refs→0 → PRS → fronts/gen + tree_guard(G0) refs→0
   → ~checkpoint_guard()/~memtable_gen() post reclaim_task → tree_sched.reclaim_q (mpmc)
-主动消费：tree_sched.advance() drain reclaim_q（持 tree_mutation_gate token）
-  → old_ranges: fan-out 各 read_domain invalidate_range → all() (wait-acks) → owner 清 non_leaf_cache
+主动消费：rt::reclaim_once() / tree::reclaim_once()（持 tree_mutation_gate token）
+  → tree_sched.prepare_reclaim_round 产出 bounded plan
+  → old_slots/old_ranges: fan-out 各 read_domain invalidate_range → all() (wait-acks) → owner 清 non_leaf_cache
   → nvme TRIM (old_slots 逐 slot / old_ranges 整段) bounded
   → tree_allocator.recycle(old_ranges)
   → value: data_ver ≤ recovery_safe_lsn → reclaim_values(dead) bounded；否则 deferred_value_reclaim
   → wal::reclaim_check(flush_durable_frontier) → wal 更新 global_min_unreclaimed_lsn cell
-  → recompute_recovery_safe_lsn(=min(flush_durable_frontier, wal_frontier)) → 扫 deferred
+  → 后续 reclaim prepare 基于 recovery_safe_lsn 扫 deferred
   → release token
 ```
 出现点：FF §5/§7, RSM §4.2/§4.4/§4.9/§8；实现 056（owner_scheduler.hh / tree_read_domain.hh / wal）。
-注：reclaim_round 与 flush 的 tree 阶段经 owner-local FIFO `tree_mutation_gate` 互斥（056 §5.8.3，与 coord `catalog_update_in_progress_` 正交）。
+注：reclaim_round 与 flush 的 tree 阶段经 owner-local FIFO `tree_mutation_gate` 互斥（056 §5.8.3，与 coord `catalog_update_in_progress_` 正交）；tree owner handler 只做 plan/finish/abort，不启动 hidden root sender。
 
 ### Recovery
 ```

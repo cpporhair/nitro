@@ -697,7 +697,7 @@ recovery_safe_lsn = min(
 
 ### 12.3 WAL Segment 回收条件
 
-概要 §9.5 规则 4：WAL segment 回收看的是 **recovery safety**。
+概要 §9.5 规则 4：WAL segment 回收看的是 **flush durable frontier**，不是含 WAL frontier 的 `recovery_safe_lsn`。
 
 一个 sealed WAL segment 可以被回收，当且仅当：
 
@@ -713,7 +713,7 @@ recovery_safe_lsn = min(
 简化表达：
 
 ```text
-segment 可回收 ⟺ seg.max_lsn <= recovery_safe_lsn
+segment 可回收 ⟺ seg.max_lsn <= flush_durable_frontier
 ```
 
 ### 12.4 WAL Reclaim Pipeline
@@ -722,9 +722,9 @@ Sealed segment 元数据由 `front_sched` 换段时搭在 `alloc_segment` 请求
 
 ```text
 wal_reclaim_round()
-  = on(tree_sched, compute_recovery_safe_lsn())
-  >> on(wal_space_sched, reclaim_check(recovery_safe_lsn))
-    // wal_space_sched 本地筛选 sealed_segments 中 max_lsn <= recovery_safe_lsn 的
+  = tree::reclaim_once()
+  >> wal_space_sched.reclaim_check(flush_durable_frontier)
+    // wal_space_sched 本地筛选 sealed_segments 中 max_lsn <= flush_durable_frontier 的
     // 放回 free_pool（见 runtime_state_machine.md §5.4）
 ```
 
@@ -738,8 +738,8 @@ wal_reclaim_round()
 3. segment 中的 batch 全部 publish [SEALED, published]
 4. 包含 segment 中 batch 的 gens 全部 flush [SEALED, flushed]
 5. 对应 flush 的 superblock 更新完成 [SEALED, sb_updated]
-6. tree_sched 推进 recovery_safe_lsn → 投递 reclaim_check 给 wal_space_sched
-7. wal_space_sched 本地筛选 max_lsn <= recovery_safe_lsn → 回收 [FREE]
+6. `rt::reclaim_once()` 完成 tree/value reclaim → 以 flush durable frontier 投递 reclaim_check 给 wal_space_sched
+7. wal_space_sched 本地筛选 max_lsn <= flush_durable_frontier → 回收 [FREE]
 8. 下次某个 front_sched 需要新 segment → 重新分配 [ACTIVE, gen++]
 ```
 

@@ -673,8 +673,10 @@ struct tree_state {
     uint64_t recovery_safe_lsn;                      // 对 WAL/value 回收安全的下界
 
     // ── Retire 队列 ──
-    // 由旧 checkpoint_guard 的 destructor 投递过来的回收任务
-    per_core::queue<reclaim_task*> reclaim_q;
+    // 由旧 checkpoint_guard / memtable_gen destructor 投递；rt::reclaim_once()
+    // 显式消费并驱动 read_domain invalidate / NVMe TRIM / value / WAL sender 链
+    mpmc::queue<reclaim_task*> reclaim_q;
+    deque<reclaim_task*> pending_reclaim;
 };
 ```
 
@@ -707,7 +709,7 @@ struct tree_flush_result {
 | Scheduler | 请求 | 输入 | 输出 | 说明 |
 |-----------|------|------|------|------|
 | `tree_sched` | `tree_flush` | `tree_flush_request` | `tree_flush_result` | 只覆盖 tree-local flush pipeline；frontier switch / gen release 在外层流程消费 result |
-| `tree_sched` | `reclaim` | `reclaim_task` | void | TRIM old slots/ranges, recycle value extents |
+| `tree_sched` | `prepare_reclaim_round` / `finish_reclaim_invalidates` / `finish_reclaim_trims` / `finish_reclaim_round` / `abort_reclaim_round` | token / bounded plan carriers | plan / finish carriers / void | first-class `tree::reclaim_once()` 的 owner seam；不在 handler 内隐藏 submit |
 | `tree_sched` | `update_superblock` | `(root_base_paddr, covered_lsn)` | void | root-change flush 后异步更新；完成后推进 `superblock_safe_lsn` |
 | `tree_lookup_sched` | `tree_lookup` | `(key, manifest)` | `variant<leaf_value, leaf_tombstone, absent>` | 普通读路径的 tree traversal |
 | `tree_lookup_sched` | `keys_to_leaf_groups` | `flush_lookup_req` | `flush_leaf_group_result[]` | 基于 `manifest->leaf_order` 做 key-group 到 affected leaf 的映射 |
@@ -1029,7 +1031,7 @@ struct wal_space_state {
 | 请求 | 输入 | 输出 |
 |------|------|------|
 | `alloc_segment` | `stream_id`, `sealed_info?`（可选，换段时携带刚 seal 的 segment 元数据） | `segment_runtime*` 或 backpressure |
-| `reclaim_check` | `recovery_safe_lsn` | void（内部筛选并回收） |
+| `reclaim_check` | `flush_durable_frontier` | void（内部筛选并回收） |
 
 ### 5.3 `handle_alloc_segment`
 
@@ -1069,13 +1071,13 @@ handle_alloc_segment(stream_id, sealed_info?):
 ### 5.4 `handle_reclaim_check`
 
 ```text
-handle_reclaim_check(recovery_safe_lsn):
-    // tree_sched 推进 recovery_safe_lsn 后投递此请求
+handle_reclaim_check(flush_durable_frontier):
+    // rt::reclaim_once() 在完成 tree/value reclaim 后，以 flush durable frontier 投递此请求
     // wal_space_sched 本地筛选可回收的 sealed segments
     reclaimable = []
     remaining = []
     for info in sealed_segments:
-        if info.max_lsn <= recovery_safe_lsn:
+        if info.max_lsn <= flush_durable_frontier:
             reclaimable.push(info)
         else:
             remaining.push(info)

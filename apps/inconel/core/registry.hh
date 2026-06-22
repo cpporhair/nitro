@@ -231,38 +231,6 @@ namespace apps::inconel::core::registry {
         return wal_space_sched_singleton_ptr;
     }
 
-    inline void
-    post_value_reclaim_values(std::vector<format::value_ref>&& dead_values) {
-        if (dead_values.empty()) {
-            return;
-        }
-        auto* sched = value_sched();
-        sched->schedule_reclaim(new value::_value_reclaim::req{
-            .dead_values = std::move(dead_values),
-            .cb = []() {},
-            .fail = [](std::exception_ptr) {
-                panic_inconsistency(
-                    "core::registry::post_value_reclaim_values",
-                    "value reclaim failed");
-            },
-        });
-    }
-
-    inline void
-    post_wal_reclaim_check(uint64_t flush_durable_frontier) {
-        auto* sched = wal_space_singleton();
-        sched->schedule_reclaim(new wal::_wal_reclaim::req{
-            .flush_durable_frontier = flush_durable_frontier,
-            .cb = [](owner_outcome<void>&& outcome) {
-                if (!outcome.has_value()) {
-                    panic_inconsistency(
-                        "core::registry::post_wal_reclaim_check",
-                        "wal reclaim failed");
-                }
-            },
-        });
-    }
-
     inline std::span<nvme::runtime_scheduler* const>
     nvme_by_front_owner_span() {
         if (nvme_by_front_owner.empty()) {

@@ -489,11 +489,12 @@ new CAT2 installed
   │               │
   │               └── tree_guard (G0) shared_ptr ref → 0 → 析构
   │                   │
-  │                   └── G0.retired 投递到 tree_sched
+  │                   └── G0.retired 投递到 tree_sched.reclaim_q
   │                       │
-  │                       ├── old_slots → TRIM
-  │                       ├── old_ranges → TRIM → tree_node invalidate barrier → tree_allocator.recycle
-  │                       └── old_tree_values → value reclaim 判定
+  │                       └── 后续由 rt::reclaim_once() 显式消费
+  │                           ├── old_slots → read_domain invalidate barrier → TRIM
+  │                           ├── old_ranges → read_domain invalidate barrier → TRIM → tree_allocator.recycle
+  │                           └── old_tree_values → value reclaim 判定
 ```
 
 ### 7.2 Value Reclaim 判定
@@ -511,14 +512,14 @@ else:
 
 recycle_value_slot 对不同 class 的处理（在 tree_sched 上）：
 - tree_sched 先按 dead `value_ref` 收集一批 `dead_value_refs`
-- 然后统一投递 `reclaim_values(dead_value_refs[])` 到 value_alloc_sched
+- 然后由 `tree::reclaim_once()` sender 尾部显式调用 `value::reclaim_values(dead_value_refs[])`
 - sub-LBA / whole-page 的 page-level 聚合，以及 whole-free page 的 TRIM 完成态，都在 value_alloc_sched owner 内部处理
 
 完整的 value_alloc_sched handle 逻辑见 `runtime_state_machine.md` §6.4-§6.8。
 
 ### 7.3 延迟回收扫描
 
-`tree_sched` 周期性检查 deferred_value_reclaim 队列：
+`tree_sched` 在 `rt::reclaim_once()` 的 prepare/finish seam 中检查 deferred_value_reclaim 队列：
 
 ```text
 while deferred_value_reclaim.front().data_ver <= recovery_safe_lsn:

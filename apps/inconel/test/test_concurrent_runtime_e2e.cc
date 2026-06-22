@@ -315,6 +315,7 @@ struct maintenance_counters {
     uint64_t seal_rounds = 0;
     uint64_t flush_rounds = 0;
     uint64_t non_noop_flushes = 0;
+    uint64_t non_noop_reclaims = 0;
 };
 
 struct write_burst_counters {
@@ -630,10 +631,15 @@ reclaim_idle() {
     const auto* owner = rt::owner();
     return owner->state.reclaim_q.empty() &&
            owner->state.pending_reclaim.empty() &&
-           !owner->state.active_reclaim.has_value() &&
-           owner->state.reclaim_invalidate_done_q.empty() &&
-           owner->state.reclaim_trim_done_q.empty() &&
-           !owner->state.reclaim_gate_requested;
+           !owner->state.active_reclaim.has_value();
+}
+
+tree::reclaim_round_result
+run_reclaim(const char* label) {
+    pump::core::this_core_id = kMaintenanceCore;
+    auto reclaim = submit_result<tree::reclaim_round_result>(
+        []() { return rt::reclaim_once(); });
+    return expect_ok<tree::reclaim_round_result>(reclaim.fut.get(), label);
 }
 
 class concurrent_runtime_fixture {
@@ -849,6 +855,10 @@ maintenance_main(std::atomic<uint64_t>* write_batches_done,
 
         core::registry::wal_reclaim_frontier_singleton()->publish_exact_min(
             core::wal_reclaim_frontier::no_unreclaimed_lsn);
+        auto reclaim_result = run_reclaim("reclaim_once");
+        if (!reclaim_result.noop) {
+            ++local.non_noop_reclaims;
+        }
         CHECK(rt::value_reclaim_stats().partial_into_untracked == 0);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -873,6 +883,7 @@ final_maintenance_round() {
 
     core::registry::wal_reclaim_frontier_singleton()->publish_exact_min(
         core::wal_reclaim_frontier::no_unreclaimed_lsn);
+    (void)run_reclaim("final reclaim_once");
 }
 
 void
@@ -880,12 +891,15 @@ wait_for_quiesced_reclaim() {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < deadline) {
-        if (reclaim_idle() &&
+        const auto reclaim = run_reclaim("wait reclaim_once");
+        if (reclaim.noop && reclaim_idle() &&
             rt::value_reclaim_stats().partial_into_untracked == 0) {
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    const auto reclaim = run_reclaim("deadline reclaim_once");
+    CHECK(reclaim.noop);
     CHECK(reclaim_idle());
     CHECK(rt::value_reclaim_stats().partial_into_untracked == 0);
 }
@@ -1200,11 +1214,13 @@ run_concurrent_runtime_e2e(const harness_options& opts) {
                 static_cast<unsigned long>(total_found),
                 static_cast<unsigned long>(total_not_found));
     std::printf("  maintenance: seals=%lu flushes=%lu non_noop=%lu "
-                "imms=%zu\n",
+                "reclaims=%lu imms=%zu\n",
                 static_cast<unsigned long>(maintenance_stats.seal_rounds),
                 static_cast<unsigned long>(maintenance_stats.flush_rounds),
                 static_cast<unsigned long>(
                     maintenance_stats.non_noop_flushes),
+                static_cast<unsigned long>(
+                    maintenance_stats.non_noop_reclaims),
                 final_imm_count);
     std::printf("  bounded: tree_head_delta=%lu value_head_delta=%lu "
                 "value_reclaims=%lu partial_into_untracked=%lu\n",

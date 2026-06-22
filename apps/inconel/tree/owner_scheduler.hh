@@ -24,13 +24,6 @@
 #include "pump/core/meta.hh"
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"
-#include "pump/sender/concurrent.hh"
-#include "pump/sender/flat.hh"
-#include "pump/sender/generate.hh"
-#include "pump/sender/just.hh"
-#include "pump/sender/reduce.hh"
-#include "pump/sender/submit.hh"
-#include "pump/sender/then.hh"
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -62,9 +55,6 @@ namespace apps::inconel::tree {
 
 namespace apps::inconel::core::registry {
     inline nvme::runtime_scheduler* local_nvme();
-    inline void post_value_reclaim_values(
-        std::vector<format::value_ref>&& dead_values);
-    inline void post_wal_reclaim_check(uint64_t flush_durable_frontier);
 }
 
 namespace apps::inconel::tree {
@@ -133,20 +123,53 @@ namespace apps::inconel::tree {
         }
     };
 
-    struct reclaim_trim_completion {
-        uint64_t round_id = 0;
-        bool recycle_range = false;
-        format::range_ref range{};
-    };
-
-    struct reclaim_invalidate_completion {
-        uint64_t round_id = 0;
-        bool recycle_range = false;
-        format::range_ref range{};
-    };
-
     struct tree_mutation_token {
         uint64_t ticket = 0;
+    };
+
+    struct reclaim_invalidate_item {
+        format::range_ref range{};
+        bool recycle_range = false;
+    };
+
+    struct reclaim_trim_item {
+        format::range_ref range{};
+        bool recycle_range = false;
+    };
+
+    struct reclaim_round_plan {
+        bool noop = false;
+        uint64_t round_id = 0;
+        tree_mutation_token token{};
+        std::vector<reclaim_invalidate_item> invalidates;
+        std::vector<format::value_ref> reclaim_now;
+        uint64_t flush_durable_frontier = 0;
+        uint32_t processed_tasks = 0;
+    };
+
+    struct reclaim_after_invalidate {
+        uint64_t round_id = 0;
+        tree_mutation_token token{};
+        std::vector<reclaim_trim_item> trims;
+        std::vector<format::value_ref> reclaim_now;
+        uint64_t flush_durable_frontier = 0;
+        uint32_t processed_tasks = 0;
+    };
+
+    struct reclaim_after_trim {
+        uint64_t round_id = 0;
+        tree_mutation_token token{};
+        std::vector<format::value_ref> reclaim_now;
+        uint64_t flush_durable_frontier = 0;
+        uint32_t processed_tasks = 0;
+    };
+
+    struct reclaim_round_result {
+        bool noop = false;
+        uint32_t processed_tasks = 0;
+        uint32_t invalidated_ranges = 0;
+        uint32_t trimmed_ranges = 0;
+        uint32_t reclaimed_values = 0;
     };
 
     namespace _mutation_gate_acquire {
@@ -228,10 +251,8 @@ namespace apps::inconel::tree {
     struct active_reclaim_round {
         tree_mutation_token token{};
         uint64_t round_id = 0;
-        uint32_t pending_invalidations = 0;
-        uint32_t pending_trims = 0;
         uint32_t processed_tasks = 0;
-        std::vector<format::value_ref> reclaim_now;
+        bool finishing = false;
     };
 
     // ── merge coroutine status codes ─────────────────────────────
@@ -378,12 +399,8 @@ namespace apps::inconel::tree {
         pump::core::mpmc::queue<core::reclaim_task*> reclaim_q{256};
         std::deque<core::reclaim_task*> pending_reclaim;
         std::vector<core::retired_value_ref> deferred_value_reclaim;
-        pump::core::mpmc::queue<reclaim_invalidate_completion*>
-            reclaim_invalidate_done_q{256};
-        pump::core::mpmc::queue<reclaim_trim_completion*> reclaim_trim_done_q{256};
         tree_mutation_gate mutation_gate;
         std::optional<active_reclaim_round> active_reclaim;
-        bool reclaim_gate_requested = false;
         uint64_t next_reclaim_round_id = 1;
 
         absl::flat_hash_map<uint64_t, std::unique_ptr<flush_round_state>>
@@ -697,18 +714,231 @@ namespace apps::inconel::tree {
 
     }  // namespace _recompute_recovery_frontier
 
-    namespace _reclaim_trim_complete {
+    namespace _prepare_reclaim_round {
 
-        struct receiver {
-            constexpr static bool reclaim_trim_complete_receiver_op = true;
+        struct req {
+            tree_mutation_token token{};
+            std::move_only_function<void(reclaim_round_plan&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool prepare_reclaim_round_op = true;
+
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .token = token };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _prepare_reclaim_round
+
+    namespace _finish_reclaim_invalidates {
+
+        struct req {
+            uint64_t round_id = 0;
+            std::vector<reclaim_invalidate_item> invalidated;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+            std::move_only_function<void(reclaim_after_invalidate&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool finish_reclaim_invalidates_op = true;
 
             tree_sched* sched = nullptr;
             uint64_t round_id = 0;
-            bool recycle_range = false;
-            format::range_ref range{};
+            std::vector<reclaim_invalidate_item> invalidated;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
         };
 
-    }  // namespace _reclaim_trim_complete
+        struct sender {
+            tree_sched* sched = nullptr;
+            uint64_t round_id = 0;
+            std::vector<reclaim_invalidate_item> invalidated;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+
+            auto
+            make_op() {
+                return op{
+                    .sched = sched,
+                    .round_id = round_id,
+                    .invalidated = std::move(invalidated),
+                    .reclaim_now = std::move(reclaim_now),
+                    .flush_durable_frontier = flush_durable_frontier,
+                    .processed_tasks = processed_tasks,
+                    .token = token,
+                };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _finish_reclaim_invalidates
+
+    namespace _finish_reclaim_trims {
+
+        struct req {
+            uint64_t round_id = 0;
+            std::vector<reclaim_trim_item> trimmed;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+            std::move_only_function<void(reclaim_after_trim&&)> cb;
+        };
+
+        struct op {
+            constexpr static bool finish_reclaim_trims_op = true;
+
+            tree_sched* sched = nullptr;
+            uint64_t round_id = 0;
+            std::vector<reclaim_trim_item> trimmed;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+            uint64_t round_id = 0;
+            std::vector<reclaim_trim_item> trimmed;
+            std::vector<format::value_ref> reclaim_now;
+            uint64_t flush_durable_frontier = 0;
+            uint32_t processed_tasks = 0;
+            tree_mutation_token token{};
+
+            auto
+            make_op() {
+                return op{
+                    .sched = sched,
+                    .round_id = round_id,
+                    .trimmed = std::move(trimmed),
+                    .reclaim_now = std::move(reclaim_now),
+                    .flush_durable_frontier = flush_durable_frontier,
+                    .processed_tasks = processed_tasks,
+                    .token = token,
+                };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _finish_reclaim_trims
+
+    namespace _finish_reclaim_round {
+
+        struct req {
+            uint64_t round_id = 0;
+            std::move_only_function<void()> cb;
+        };
+
+        struct op {
+            constexpr static bool finish_reclaim_round_op = true;
+
+            tree_sched* sched = nullptr;
+            uint64_t round_id = 0;
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+            uint64_t round_id = 0;
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .round_id = round_id };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _finish_reclaim_round
+
+    namespace _abort_reclaim_round {
+
+        struct req {
+            tree_mutation_token token{};
+            std::move_only_function<void()> cb;
+        };
+
+        struct op {
+            constexpr static bool abort_reclaim_round_op = true;
+
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            template <uint32_t pos, typename ctx_t, typename scope_t>
+            void start(ctx_t& ctx, scope_t& scope);
+        };
+
+        struct sender {
+            tree_sched* sched = nullptr;
+            tree_mutation_token token{};
+
+            auto
+            make_op() {
+                return op{ .sched = sched, .token = token };
+            }
+
+            template <typename ctx_t>
+            auto
+            connect() {
+                return pump::core::builder::op_list_builder<0>()
+                    .push_back(make_op());
+            }
+        };
+
+    }  // namespace _abort_reclaim_round
 
     namespace _owner {
 
@@ -2367,10 +2597,16 @@ namespace apps::inconel::tree {
         static constexpr uint32_t kMaxFinalizeOpsPerAdvance               = 8;
         static constexpr uint32_t kMaxRecoveryFrontierOpsPerAdvance       = 8;
         static constexpr uint32_t kMaxReclaimIngressPerAdvance            = 64;
-        static constexpr uint32_t kMaxReclaimInvalidateCompletePerAdvance = 64;
-        static constexpr uint32_t kMaxReclaimTasksPerAdvance              = 16;
-        static constexpr uint32_t kMaxReclaimTrimCompletePerAdvance       = 64;
+        static constexpr uint32_t kMaxReclaimTasksPerRound                = 16;
+        static constexpr uint32_t kMaxReclaimInvalidateItemsPerRound      = 256;
+        static constexpr uint32_t kReclaimInvalidateItemConcurrency       = 32;
+        static constexpr uint32_t kReclaimTrimConcurrency                 = 32;
         static constexpr uint32_t kMaxValueRefsPerReclaimBatch            = 256;
+        static constexpr uint32_t kMaxPrepareReclaimOpsPerAdvance         = 4;
+        static constexpr uint32_t kMaxFinishReclaimInvalidatesOpsPerAdvance = 4;
+        static constexpr uint32_t kMaxFinishReclaimTrimsOpsPerAdvance     = 4;
+        static constexpr uint32_t kMaxFinishReclaimRoundOpsPerAdvance     = 4;
+        static constexpr uint32_t kMaxAbortReclaimRoundOpsPerAdvance      = 4;
         static constexpr uint32_t kMaxMutationGateOpsPerAdvance           = 16;
         static constexpr uint32_t kWriteBatchConcurrency                  = 32;
 
@@ -2392,6 +2628,11 @@ namespace apps::inconel::tree {
         pump::core::per_core::queue<_finish_update_superblock::req*> finish_update_superblock_q;
         pump::core::per_core::queue<_finalize_flush_round::req*>     finalize_q;
         pump::core::per_core::queue<_recompute_recovery_frontier::req*> recovery_frontier_q;
+        pump::core::per_core::queue<_prepare_reclaim_round::req*>       prepare_reclaim_q;
+        pump::core::per_core::queue<_finish_reclaim_invalidates::req*>   finish_reclaim_invalidates_q;
+        pump::core::per_core::queue<_finish_reclaim_trims::req*>         finish_reclaim_trims_q;
+        pump::core::per_core::queue<_finish_reclaim_round::req*>         finish_reclaim_round_q;
+        pump::core::per_core::queue<_abort_reclaim_round::req*>          abort_reclaim_round_q;
         pump::core::per_core::queue<_mutation_gate_acquire::req*>     mutation_gate_acquire_q;
         pump::core::per_core::queue<_mutation_gate_release::req*>     mutation_gate_release_q;
         // Serializes the superblock begin→finish pair: begin latches
@@ -2430,6 +2671,11 @@ namespace apps::inconel::tree {
             , finish_update_superblock_q(depth)
             , finalize_q(depth)
             , recovery_frontier_q(depth)
+            , prepare_reclaim_q(depth)
+            , finish_reclaim_invalidates_q(depth)
+            , finish_reclaim_trims_q(depth)
+            , finish_reclaim_round_q(depth)
+            , abort_reclaim_round_q(depth)
             , mutation_gate_acquire_q(depth)
             , mutation_gate_release_q(depth)
         {
@@ -2457,10 +2703,19 @@ namespace apps::inconel::tree {
             for (auto* task : state.pending_reclaim) {
                 delete task;
             }
-            while (auto item = state.reclaim_invalidate_done_q.try_dequeue()) {
+            while (auto item = prepare_reclaim_q.try_dequeue()) {
                 delete *item;
             }
-            while (auto item = state.reclaim_trim_done_q.try_dequeue()) {
+            while (auto item = finish_reclaim_invalidates_q.try_dequeue()) {
+                delete *item;
+            }
+            while (auto item = finish_reclaim_trims_q.try_dequeue()) {
+                delete *item;
+            }
+            while (auto item = finish_reclaim_round_q.try_dequeue()) {
+                delete *item;
+            }
+            while (auto item = abort_reclaim_round_q.try_dequeue()) {
                 delete *item;
             }
             while (auto item = mutation_gate_acquire_q.try_dequeue()) {
@@ -2517,118 +2772,6 @@ namespace apps::inconel::tree {
         }
 
         void
-        complete_reclaim_trim(bool ok,
-                              uint64_t round_id,
-                              bool recycle_range,
-                              format::range_ref range) {
-            if (!ok) {
-                core::panic_inconsistency(
-                    "tree::tree_sched::complete_reclaim_trim",
-                    "tree reclaim TRIM failed");
-            }
-            auto* completion = new reclaim_trim_completion{
-                .round_id = round_id,
-                .recycle_range = recycle_range,
-                .range = range,
-            };
-            if (!state.reclaim_trim_done_q.try_enqueue(std::move(completion))) {
-                delete completion;
-                core::panic_inconsistency(
-                    "tree::tree_sched::complete_reclaim_trim",
-                    "trim completion queue full");
-            }
-        }
-
-        void
-        submit_reclaim_trim(uint64_t round_id,
-                            format::range_ref range,
-                            bool recycle_range) {
-            if (geom == nullptr) {
-                core::panic_inconsistency(
-                    "tree::tree_sched::submit_reclaim_trim",
-                    "tree geometry is null");
-            }
-            const uint64_t lbas =
-                static_cast<uint64_t>(range.slot_count) * geom->page_lbas();
-            if (lbas == 0 ||
-                lbas > std::numeric_limits<uint32_t>::max()) {
-                core::panic_inconsistency(
-                    "tree::tree_sched::submit_reclaim_trim",
-                    "invalid trim span lbas=%lu",
-                    static_cast<unsigned long>(lbas));
-            }
-            auto trim_sender = core::registry::local_nvme()->trim(
-                range.base.lba, static_cast<uint32_t>(lbas));
-            pump::sender::submit(
-                std::move(trim_sender),
-                pump::core::make_root_context(),
-                _reclaim_trim_complete::receiver{
-                    .sched = this,
-                    .round_id = round_id,
-                    .recycle_range = recycle_range,
-                    .range = range,
-                });
-        }
-
-        void
-        enqueue_reclaim_invalidate_done(uint64_t round_id,
-                                        bool recycle_range,
-                                        format::range_ref range) {
-            auto* completion = new reclaim_invalidate_completion{
-                .round_id = round_id,
-                .recycle_range = recycle_range,
-                .range = range,
-            };
-            if (!state.reclaim_invalidate_done_q.try_enqueue(completion)) {
-                delete completion;
-                core::panic_inconsistency(
-                    "tree::tree_sched::enqueue_reclaim_invalidate_done",
-                    "invalidate completion queue full");
-            }
-        }
-
-        void
-        submit_reclaim_invalidate(uint64_t round_id,
-                                  format::range_ref range,
-                                  bool recycle_range) {
-            if (geom == nullptr) {
-                core::panic_inconsistency(
-                    "tree::tree_sched::submit_reclaim_invalidate",
-                    "tree geometry is null");
-            }
-            if (read_domains == nullptr) {
-                core::panic_inconsistency(
-                    "tree::tree_sched::submit_reclaim_invalidate",
-                    "read domain list is null");
-            }
-            const uint32_t page_lbas = geom->page_lbas();
-            auto* domains = read_domains;
-            auto fanout = pump::sender::just()
-                >> pump::sender::loop(domains->size())
-                >> pump::sender::concurrent()
-                >> pump::sender::flat_map(
-                    [domains, range, page_lbas](std::size_t i) {
-                        return (*domains)[i]->submit_invalidate_range(
-                            range, page_lbas);
-                    })
-                >> pump::sender::all()
-                >> pump::sender::then(
-                    [this, round_id, recycle_range, range](bool ok) {
-                        if (!ok) {
-                            core::panic_inconsistency(
-                                "tree::tree_sched::submit_reclaim_invalidate",
-                                "read_domain invalidate fan-out failed");
-                        }
-                        enqueue_reclaim_invalidate_done(
-                            round_id, recycle_range, range);
-                    });
-            pump::sender::submit(
-                std::move(fanout),
-                pump::core::make_root_context(),
-                pump::sender::the_null_receiver);
-        }
-
-        void
         invalidate_reclaim_range_locally(format::range_ref range) {
             for (uint32_t slot = 0; slot < range.slot_count; ++slot) {
                 auto base = format::paddr{
@@ -2676,37 +2819,6 @@ namespace apps::inconel::tree {
             }
         }
 
-        void
-        process_reclaim_task(core::reclaim_task& task,
-                             active_reclaim_round& round) {
-            switch (task.k) {
-            case core::reclaim_task::kind::retired:
-                for (auto slot : task.retired.old_slots) {
-                    auto one_slot = format::range_ref{
-                        .base = slot,
-                        .slot_count = 1,
-                    };
-                    ++round.pending_invalidations;
-                    submit_reclaim_invalidate(
-                        round.round_id, one_slot, /*recycle_range=*/false);
-                }
-                for (auto range : task.retired.old_ranges) {
-                    ++round.pending_invalidations;
-                    submit_reclaim_invalidate(
-                        round.round_id, range, /*recycle_range=*/true);
-                }
-                for (auto& ref : task.retired.old_tree_values) {
-                    gate_value_ref(std::move(ref), round.reclaim_now);
-                }
-                break;
-            case core::reclaim_task::kind::gen_losers:
-                for (auto& ref : task.gen_losers) {
-                    gate_value_ref(std::move(ref), round.reclaim_now);
-                }
-                break;
-            }
-        }
-
         bool
         drain_reclaim_ingress() {
             bool progress = false;
@@ -2722,147 +2834,261 @@ namespace apps::inconel::tree {
         }
 
         bool
-        drain_reclaim_invalidate_completions() {
-            bool progress = false;
-            for (uint32_t i = 0;
-                 i < kMaxReclaimInvalidateCompletePerAdvance;
-                 ++i) {
-                auto item = state.reclaim_invalidate_done_q.try_dequeue();
-                if (!item) {
-                    break;
-                }
-                std::unique_ptr<reclaim_invalidate_completion> done(*item);
-                if (!state.active_reclaim.has_value() ||
-                    state.active_reclaim->round_id != done->round_id) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::drain_reclaim_invalidate_completions",
-                        "invalidate completion for inactive reclaim round");
-                }
-                auto& round = *state.active_reclaim;
-                if (round.pending_invalidations == 0) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::drain_reclaim_invalidate_completions",
-                        "pending invalidate underflow");
-                }
-                invalidate_reclaim_range_locally(done->range);
-                --round.pending_invalidations;
-                ++round.pending_trims;
-                submit_reclaim_trim(
-                    round.round_id, done->range, done->recycle_range);
-                progress = true;
+        reclaim_task_empty(const core::reclaim_task& task) const {
+            switch (task.k) {
+            case core::reclaim_task::kind::retired:
+                return task.retired.old_slots.empty() &&
+                       task.retired.old_ranges.empty() &&
+                       task.retired.old_tree_values.empty();
+            case core::reclaim_task::kind::gen_losers:
+                return task.gen_losers.empty();
             }
-            if (progress) {
-                try_finish_reclaim_round();
-            }
-            return progress;
-        }
-
-        bool
-        drain_reclaim_trim_completions() {
-            bool progress = false;
-            for (uint32_t i = 0; i < kMaxReclaimTrimCompletePerAdvance; ++i) {
-                auto item = state.reclaim_trim_done_q.try_dequeue();
-                if (!item) {
-                    break;
-                }
-                std::unique_ptr<reclaim_trim_completion> done(*item);
-                if (!state.active_reclaim.has_value() ||
-                    state.active_reclaim->round_id != done->round_id) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::drain_reclaim_trim_completions",
-                        "TRIM completion for inactive reclaim round");
-                }
-                auto& round = *state.active_reclaim;
-                if (round.pending_trims == 0) {
-                    core::panic_inconsistency(
-                        "tree::tree_sched::drain_reclaim_trim_completions",
-                        "pending TRIM underflow");
-                }
-                if (done->recycle_range) {
-                    state.alloc.recycle(done->range);
-                }
-                --round.pending_trims;
-                progress = true;
-            }
-            if (progress) {
-                try_finish_reclaim_round();
-            }
-            return progress;
-        }
-
-        bool
-        try_finish_reclaim_round() {
-            if (!state.active_reclaim.has_value()) {
-                return false;
-            }
-            auto& round = *state.active_reclaim;
-            if (round.pending_invalidations != 0 || round.pending_trims != 0) {
-                return false;
-            }
-
-            state.recovery_safe_lsn = recompute_recovery_safe_lsn();
-            scan_deferred_values(round.reclaim_now);
-            if (!round.reclaim_now.empty()) {
-                core::registry::post_value_reclaim_values(
-                    std::move(round.reclaim_now));
-            }
-            if (round.processed_tasks != 0) {
-                core::registry::post_wal_reclaim_check(
-                    flush_durable_frontier());
-            }
-
-            const tree_mutation_token token = round.token;
-            state.active_reclaim.reset();
-            schedule_mutation_gate_release(
-                new _mutation_gate_release::req{ token, []() {} });
             return true;
         }
 
-        void
-        begin_reclaim_round(tree_mutation_token token) {
+        bool
+        process_reclaim_task_into_plan(core::reclaim_task& task,
+                                       reclaim_round_plan& plan) {
+            switch (task.k) {
+            case core::reclaim_task::kind::retired:
+                while (!task.retired.old_slots.empty() &&
+                       plan.invalidates.size() <
+                           kMaxReclaimInvalidateItemsPerRound) {
+                    const auto slot = task.retired.old_slots.back();
+                    task.retired.old_slots.pop_back();
+                    plan.invalidates.push_back(reclaim_invalidate_item{
+                        .range = format::range_ref{
+                            .base = slot,
+                            .slot_count = 1,
+                        },
+                        .recycle_range = false,
+                    });
+                }
+                while (!task.retired.old_ranges.empty() &&
+                       plan.invalidates.size() <
+                           kMaxReclaimInvalidateItemsPerRound) {
+                    auto range = task.retired.old_ranges.back();
+                    task.retired.old_ranges.pop_back();
+                    plan.invalidates.push_back(reclaim_invalidate_item{
+                        .range = range,
+                        .recycle_range = true,
+                    });
+                }
+                while (!task.retired.old_tree_values.empty()) {
+                    auto ref = std::move(task.retired.old_tree_values.back());
+                    task.retired.old_tree_values.pop_back();
+                    gate_value_ref(std::move(ref), plan.reclaim_now);
+                }
+                break;
+            case core::reclaim_task::kind::gen_losers:
+                while (!task.gen_losers.empty()) {
+                    auto ref = std::move(task.gen_losers.back());
+                    task.gen_losers.pop_back();
+                    gate_value_ref(std::move(ref), plan.reclaim_now);
+                }
+                break;
+            }
+            return reclaim_task_empty(task);
+        }
+
+        reclaim_round_plan
+        prepare_reclaim_round(tree_mutation_token token) {
+            drain_reclaim_ingress();
             if (state.active_reclaim.has_value()) {
                 core::panic_inconsistency(
-                    "tree::tree_sched::begin_reclaim_round",
+                    "tree::tree_sched::prepare_reclaim_round",
                     "reclaim round already active");
             }
+
+            reclaim_round_plan plan;
+            plan.token = token;
+            state.recovery_safe_lsn = recompute_recovery_safe_lsn();
+            plan.flush_durable_frontier = flush_durable_frontier();
+            plan.invalidates.reserve(kMaxReclaimInvalidateItemsPerRound);
+            plan.reclaim_now.reserve(kMaxValueRefsPerReclaimBatch);
+
+            const bool had_pending_tasks = !state.pending_reclaim.empty();
+            uint32_t processed = 0;
+            if (had_pending_tasks) {
+                while (!state.pending_reclaim.empty() &&
+                       processed < kMaxReclaimTasksPerRound &&
+                       plan.invalidates.size() <
+                           kMaxReclaimInvalidateItemsPerRound) {
+                    std::unique_ptr<core::reclaim_task> task(
+                        state.pending_reclaim.front());
+                    state.pending_reclaim.pop_front();
+                    const bool done =
+                        process_reclaim_task_into_plan(*task, plan);
+                    ++processed;
+                    if (!done) {
+                        state.pending_reclaim.push_front(task.release());
+                        break;
+                    }
+                }
+            }
+
+            scan_deferred_values(plan.reclaim_now);
+            if (!had_pending_tasks && plan.reclaim_now.empty()) {
+                plan.noop = true;
+                return plan;
+            }
+
             auto& round = state.active_reclaim.emplace();
             round.token = token;
             round.round_id = state.next_reclaim_round_id++;
-            round.reclaim_now.reserve(kMaxValueRefsPerReclaimBatch);
-
-            uint32_t processed = 0;
-            while (!state.pending_reclaim.empty() &&
-                   processed < kMaxReclaimTasksPerAdvance) {
-                std::unique_ptr<core::reclaim_task> task(
-                    state.pending_reclaim.front());
-                state.pending_reclaim.pop_front();
-                process_reclaim_task(*task, round);
-                ++processed;
-            }
+            plan.round_id = round.round_id;
+            plan.processed_tasks = processed;
             round.processed_tasks = processed;
-            try_finish_reclaim_round();
+            return plan;
         }
 
-        bool
-        process_pending_reclaim() {
-            if (state.pending_reclaim.empty() ||
-                state.active_reclaim.has_value() ||
-                state.reclaim_gate_requested) {
-                return false;
+        reclaim_after_invalidate
+        finish_reclaim_invalidates(
+            uint64_t round_id,
+            std::vector<reclaim_invalidate_item>&& invalidated,
+            std::vector<format::value_ref>&& reclaim_now,
+            uint64_t flush_durable_frontier,
+            uint32_t processed_tasks,
+            tree_mutation_token token) {
+            if (state.active_reclaim.has_value()) {
+                auto& round = *state.active_reclaim;
+                if (round.round_id != round_id ||
+                    round.token.ticket != token.ticket) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::finish_reclaim_invalidates",
+                        "finish for inactive reclaim round");
+                }
+            } else {
+                core::panic_inconsistency(
+                    "tree::tree_sched::finish_reclaim_invalidates",
+                    "no active reclaim round");
             }
-            state.reclaim_gate_requested = true;
-            schedule_mutation_gate_acquire(
-                new _mutation_gate_acquire::req{
-                    [this](tree_mutation_token token) {
-                        state.reclaim_gate_requested = false;
-                        begin_reclaim_round(token);
-                    } });
-            return true;
+
+            std::vector<reclaim_trim_item> trims;
+            trims.reserve(invalidated.size());
+            for (const auto& item : invalidated) {
+                invalidate_reclaim_range_locally(item.range);
+                trims.push_back(reclaim_trim_item{
+                    .range = item.range,
+                    .recycle_range = item.recycle_range,
+                });
+            }
+            return reclaim_after_invalidate{
+                .round_id = round_id,
+                .token = token,
+                .trims = std::move(trims),
+                .reclaim_now = std::move(reclaim_now),
+                .flush_durable_frontier = flush_durable_frontier,
+                .processed_tasks = processed_tasks,
+            };
+        }
+
+        reclaim_after_trim
+        finish_reclaim_trims(uint64_t round_id,
+                             std::vector<reclaim_trim_item>&& trimmed,
+                             std::vector<format::value_ref>&& reclaim_now,
+                             uint64_t flush_durable_frontier,
+                             uint32_t processed_tasks,
+                             tree_mutation_token token) {
+            if (!state.active_reclaim.has_value() ||
+                state.active_reclaim->round_id != round_id ||
+                state.active_reclaim->token.ticket != token.ticket) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::finish_reclaim_trims",
+                    "finish for inactive reclaim round");
+            }
+            for (const auto& item : trimmed) {
+                if (item.recycle_range) {
+                    state.alloc.recycle(item.range);
+                }
+            }
+            state.active_reclaim->finishing = true;
+            return reclaim_after_trim{
+                .round_id = round_id,
+                .token = token,
+                .reclaim_now = std::move(reclaim_now),
+                .flush_durable_frontier = flush_durable_frontier,
+                .processed_tasks = processed_tasks,
+            };
+        }
+
+        void
+        finish_reclaim_round(uint64_t round_id) {
+            if (!state.active_reclaim.has_value() ||
+                state.active_reclaim->round_id != round_id) {
+                core::panic_inconsistency(
+                    "tree::tree_sched::finish_reclaim_round",
+                    "finish for inactive reclaim round");
+            }
+            state.active_reclaim.reset();
+        }
+
+        void
+        abort_reclaim_round(tree_mutation_token token) {
+            if (state.active_reclaim.has_value()) {
+                if (state.active_reclaim->token.ticket != token.ticket) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::abort_reclaim_round",
+                        "abort token does not match active reclaim round");
+                }
+                state.active_reclaim.reset();
+            }
         }
 
         void
         schedule_fold(_flush_fold::req* r) {
             fold_q.try_enqueue(r);
+        }
+
+        void
+        schedule_prepare_reclaim(_prepare_reclaim_round::req* r) {
+            if (!prepare_reclaim_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_prepare_reclaim",
+                    "prepare reclaim queue full");
+            }
+        }
+
+        void
+        schedule_finish_reclaim_invalidates(
+            _finish_reclaim_invalidates::req* r) {
+            if (!finish_reclaim_invalidates_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_finish_reclaim_invalidates",
+                    "finish reclaim invalidates queue full");
+            }
+        }
+
+        void
+        schedule_finish_reclaim_trims(_finish_reclaim_trims::req* r) {
+            if (!finish_reclaim_trims_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_finish_reclaim_trims",
+                    "finish reclaim trims queue full");
+            }
+        }
+
+        void
+        schedule_finish_reclaim_round(_finish_reclaim_round::req* r) {
+            if (!finish_reclaim_round_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_finish_reclaim_round",
+                    "finish reclaim round queue full");
+            }
+        }
+
+        void
+        schedule_abort_reclaim_round(_abort_reclaim_round::req* r) {
+            if (!abort_reclaim_round_q.try_enqueue(r)) {
+                delete r;
+                core::panic_inconsistency(
+                    "tree::tree_sched::schedule_abort_reclaim_round",
+                    "abort reclaim round queue full");
+            }
         }
 
         void
@@ -2962,6 +3188,59 @@ namespace apps::inconel::tree {
         auto
         submit_recompute_recovery_frontier() {
             return _recompute_recovery_frontier::sender{ this };
+        }
+
+        auto
+        submit_prepare_reclaim_round(tree_mutation_token token) {
+            return _prepare_reclaim_round::sender{ this, token };
+        }
+
+        auto
+        submit_finish_reclaim_invalidates(
+            uint64_t round_id,
+            std::vector<reclaim_invalidate_item> invalidated,
+            std::vector<format::value_ref> reclaim_now,
+            uint64_t flush_durable_frontier,
+            uint32_t processed_tasks,
+            tree_mutation_token token) {
+            return _finish_reclaim_invalidates::sender{
+                .sched = this,
+                .round_id = round_id,
+                .invalidated = std::move(invalidated),
+                .reclaim_now = std::move(reclaim_now),
+                .flush_durable_frontier = flush_durable_frontier,
+                .processed_tasks = processed_tasks,
+                .token = token,
+            };
+        }
+
+        auto
+        submit_finish_reclaim_trims(
+            uint64_t round_id,
+            std::vector<reclaim_trim_item> trimmed,
+            std::vector<format::value_ref> reclaim_now,
+            uint64_t flush_durable_frontier,
+            uint32_t processed_tasks,
+            tree_mutation_token token) {
+            return _finish_reclaim_trims::sender{
+                .sched = this,
+                .round_id = round_id,
+                .trimmed = std::move(trimmed),
+                .reclaim_now = std::move(reclaim_now),
+                .flush_durable_frontier = flush_durable_frontier,
+                .processed_tasks = processed_tasks,
+                .token = token,
+            };
+        }
+
+        auto
+        submit_finish_reclaim_round(uint64_t round_id) {
+            return _finish_reclaim_round::sender{ this, round_id };
+        }
+
+        auto
+        submit_abort_reclaim_round(tree_mutation_token token) {
+            return _abort_reclaim_round::sender{ this, token };
         }
 
         _mutation_gate_acquire::sender
@@ -3813,9 +4092,59 @@ namespace apps::inconel::tree {
                 });
 
             progress |= drain_reclaim_ingress();
-            progress |= drain_reclaim_invalidate_completions();
-            progress |= drain_reclaim_trim_completions();
-            progress |= process_pending_reclaim();
+
+            progress |= drain_queue(
+                prepare_reclaim_q, kMaxPrepareReclaimOpsPerAdvance,
+                [this](_prepare_reclaim_round::req* r) {
+                    auto plan = prepare_reclaim_round(r->token);
+                    r->cb(std::move(plan));
+                    delete r;
+                });
+
+            progress |= drain_queue(
+                finish_reclaim_invalidates_q,
+                kMaxFinishReclaimInvalidatesOpsPerAdvance,
+                [this](_finish_reclaim_invalidates::req* r) {
+                    auto after = finish_reclaim_invalidates(
+                        r->round_id,
+                        std::move(r->invalidated),
+                        std::move(r->reclaim_now),
+                        r->flush_durable_frontier,
+                        r->processed_tasks,
+                        r->token);
+                    r->cb(std::move(after));
+                    delete r;
+                });
+
+            progress |= drain_queue(
+                finish_reclaim_trims_q, kMaxFinishReclaimTrimsOpsPerAdvance,
+                [this](_finish_reclaim_trims::req* r) {
+                    auto after = finish_reclaim_trims(
+                        r->round_id,
+                        std::move(r->trimmed),
+                        std::move(r->reclaim_now),
+                        r->flush_durable_frontier,
+                        r->processed_tasks,
+                        r->token);
+                    r->cb(std::move(after));
+                    delete r;
+                });
+
+            progress |= drain_queue(
+                finish_reclaim_round_q, kMaxFinishReclaimRoundOpsPerAdvance,
+                [this](_finish_reclaim_round::req* r) {
+                    finish_reclaim_round(r->round_id);
+                    r->cb();
+                    delete r;
+                });
+
+            progress |= drain_queue(
+                abort_reclaim_round_q, kMaxAbortReclaimRoundOpsPerAdvance,
+                [this](_abort_reclaim_round::req* r) {
+                    abort_reclaim_round(r->token);
+                    r->cb();
+                    delete r;
+                });
 
             return progress;
         }
@@ -3921,6 +4250,79 @@ namespace apps::inconel::tree {
                         ctx, scope, std::move(snapshot));
                 },
             });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _prepare_reclaim_round::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_prepare_reclaim(new _prepare_reclaim_round::req{
+            token,
+            [ctx = ctx, scope = scope](reclaim_round_plan&& plan) mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope, std::move(plan));
+            },
+        });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _finish_reclaim_invalidates::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_finish_reclaim_invalidates(
+            new _finish_reclaim_invalidates::req{
+                round_id,
+                std::move(invalidated),
+                std::move(reclaim_now),
+                flush_durable_frontier,
+                processed_tasks,
+                token,
+                [ctx = ctx, scope = scope](
+                    reclaim_after_invalidate&& after) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope, std::move(after));
+                },
+            });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _finish_reclaim_trims::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_finish_reclaim_trims(
+            new _finish_reclaim_trims::req{
+                round_id,
+                std::move(trimmed),
+                std::move(reclaim_now),
+                flush_durable_frontier,
+                processed_tasks,
+                token,
+                [ctx = ctx, scope = scope](reclaim_after_trim&& after) mutable {
+                    pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                        ctx, scope, std::move(after));
+                },
+            });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _finish_reclaim_round::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_finish_reclaim_round(new _finish_reclaim_round::req{
+            round_id,
+            [ctx = ctx, scope = scope]() mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope);
+            },
+        });
+    }
+
+    template <uint32_t pos, typename ctx_t, typename scope_t>
+    void
+    _abort_reclaim_round::op::start(ctx_t& ctx, scope_t& scope) {
+        sched->schedule_abort_reclaim_round(new _abort_reclaim_round::req{
+            token,
+            [ctx = ctx, scope = scope]() mutable {
+                pump::core::op_pusher<pos + 1, scope_t>::push_value(
+                    ctx, scope);
+            },
+        });
     }
 
     template <uint32_t pos, typename ctx_t, typename scope_t>
@@ -4161,6 +4563,144 @@ namespace pump::core {
 
     template <uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::prepare_reclaim_round_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_prepare_reclaim_round::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::reclaim_round_plan>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::finish_reclaim_invalidates_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_finish_reclaim_invalidates::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::reclaim_after_invalidate>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::finish_reclaim_trims_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_finish_reclaim_trims::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 1;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<
+                apps::inconel::tree::reclaim_after_trim>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::finish_reclaim_round_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_finish_reclaim_round::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 0;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+        && (get_current_op_type_t<pos, scope_t>::abort_reclaim_round_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        template <typename ctx_t>
+        static void
+        push_value(ctx_t& ctx, scope_t& scope) {
+            std::get<pos>(scope->get_op_tuple()).template start<pos>(ctx, scope);
+        }
+    };
+
+    template <typename ctx_t>
+    struct
+    compute_sender_type<
+        ctx_t,
+        apps::inconel::tree::_abort_reclaim_round::sender> {
+        consteval static uint32_t
+        count_value() {
+            return 0;
+        }
+        consteval static auto
+        get_value_type_identity() {
+            return std::type_identity<void>{};
+        }
+    };
+
+    template <uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
         && (get_current_op_type_t<pos, scope_t>::mutation_gate_acquire_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
@@ -4211,33 +4751,6 @@ namespace pump::core {
         consteval static auto
         get_value_type_identity() {
             return std::type_identity<void>{};
-        }
-    };
-
-    template <uint32_t pos, typename scope_t>
-    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-        && (get_current_op_type_t<pos, scope_t>::reclaim_trim_complete_receiver_op)
-    struct
-    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
-        template <typename context_t>
-        static void
-        push_value(context_t& context, scope_t& scope, bool ok) {
-            static_assert(context_t::element_type::root_flag,
-                          "tree reclaim trim receiver requires root context");
-            auto& op = std::get<pos>(scope->get_op_tuple());
-            op.sched->complete_reclaim_trim(
-                ok, op.round_id, op.recycle_range, op.range);
-            delete scope.get();
-        }
-
-        template <typename context_t>
-        static void
-        push_exception(context_t&, scope_t& scope, std::exception_ptr) {
-            auto& op = std::get<pos>(scope->get_op_tuple());
-            (void)op;
-            apps::inconel::core::panic_inconsistency(
-                "tree::reclaim_trim_complete",
-                "tree reclaim TRIM sender failed");
         }
     };
 

@@ -9,6 +9,7 @@
 #include "../pipeline/flush_round.hh"
 #include "../pipeline/point_get.hh"
 #include "../pipeline/seal_round.hh"
+#include "../tree/sender.hh"
 #include "../value/sender.hh"
 #include "../write_path/write_batch.hh"
 #include "./facade.hh"
@@ -51,6 +52,11 @@ namespace apps::inconel::rt {
             *core::registry::coord_sched_singleton(),
             core::registry::fronts_span(),
             *core::registry::tree_sched_singleton());
+    }
+
+    [[nodiscard]] inline auto
+    reclaim_once() {
+        return tree::reclaim_once(*core::registry::tree_sched_singleton());
     }
 
 }  // namespace apps::inconel::rt

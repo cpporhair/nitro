@@ -219,7 +219,7 @@ WAL 空间管理 scheduler。全局单实例，管理 WAL segment 池。
 | 职责 | handle |
 |------|--------|
 | Segment 分配 | `alloc_segment(stream_id, sealed_info?)` → `segment_runtime*` |
-| 回收检查 | `reclaim_check(recovery_safe_lsn)` → 释放可回收 segment |
+| 回收检查 | `reclaim_check(flush_durable_frontier)` → 释放可回收 segment |
 
 **Owner 状态**：`{ segment_free_pool, alloc_head }`
 

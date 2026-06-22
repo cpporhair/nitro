@@ -515,7 +515,10 @@ struct steady_fixture {
     void drain_maintenance(uint32_t limit = 300000) {
         uint32_t idle = 0;
         for (uint32_t i = 0; i < limit && idle < 1024; ++i) {
+            auto reclaim = expect_ok<tree::reclaim_round_result>(run_reclaim());
             if (advance_all()) {
+                idle = 0;
+            } else if (!reclaim.noop) {
                 idle = 0;
             } else {
                 ++idle;
@@ -570,6 +573,14 @@ struct steady_fixture {
     run_flush() {
         auto sub = submit_result<pipeline::flush_round_result>(
             []() { return rt::flush_once(); });
+        drive_until_ready(sub);
+        return sub.fut.get();
+    }
+
+    op_result<tree::reclaim_round_result>
+    run_reclaim() {
+        auto sub = submit_result<tree::reclaim_round_result>(
+            []() { return rt::reclaim_once(); });
         drive_until_ready(sub);
         return sub.fut.get();
     }
@@ -793,10 +804,7 @@ struct steady_fixture {
         const auto* owner = rt::owner();
         return owner->state.reclaim_q.empty() &&
                owner->state.pending_reclaim.empty() &&
-               !owner->state.active_reclaim.has_value() &&
-               owner->state.reclaim_invalidate_done_q.empty() &&
-               owner->state.reclaim_trim_done_q.empty() &&
-               !owner->state.reclaim_gate_requested;
+               !owner->state.active_reclaim.has_value();
     }
 };
 

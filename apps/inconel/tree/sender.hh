@@ -26,10 +26,14 @@
 // superblock update, and final round publication.
 
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "pump/core/meta.hh"
@@ -41,7 +45,6 @@
 #include "pump/sender/get_context.hh"
 #include "pump/sender/just.hh"
 #include "pump/sender/reduce.hh"
-#include "pump/sender/submit.hh"
 #include "pump/sender/then.hh"
 #include "pump/sender/visit.hh"
 #include "pump/sender/pop_context.hh"
@@ -59,6 +62,7 @@
 #include "../nvme/frame_io.hh"
 #include "../nvme/runtime_scheduler.hh"
 #include "../runtime/facade.hh"
+#include "../value/sender.hh"
 #include "../wal/sender.hh"
 
 namespace apps::inconel::tree {
@@ -776,21 +780,317 @@ namespace apps::inconel::tree {
         rt::publish_shard_partitions(std::move(new_map));
     }
 
+    struct reclaim_noop_plan {
+        tree_mutation_token token{};
+    };
+
+    using reclaim_plan_variant =
+        std::variant<reclaim_noop_plan, reclaim_round_plan>;
+
+    inline reclaim_plan_variant
+    split_reclaim_plan(reclaim_round_plan&& plan) {
+        if (plan.noop) {
+            return reclaim_plan_variant{
+                reclaim_noop_plan{ .token = plan.token }};
+        }
+        return reclaim_plan_variant{std::move(plan)};
+    }
+
     inline auto
-    reclaim_wal_after_flush(tree_flush_result&& result) {
-        auto result_holder =
-            std::make_shared<tree_flush_result>(std::move(result));
-        return rt::owner()->submit_recompute_recovery_frontier()
-            >> flat_map([](recovery_frontier_snapshot snapshot) {
-                return wal::reclaim_check(
-                    *core::registry::wal_space_singleton(),
-                    snapshot.flush_durable_frontier);
+    invalidate_one_reclaim_item(reclaim_invalidate_item item) {
+        auto* owner = rt::owner();
+        if (owner->geom == nullptr) {
+            core::panic_inconsistency(
+                "tree::invalidate_one_reclaim_item",
+                "tree geometry is null");
+        }
+        const uint32_t page_lbas = owner->geom->page_lbas();
+        const uint32_t domain_count = core::registry::tree_read_domain_count();
+        if (domain_count == 0) {
+            core::panic_inconsistency(
+                "tree::invalidate_one_reclaim_item",
+                "no tree read domains registered");
+        }
+        return just()
+            >> loop(domain_count)
+            >> concurrent(domain_count)
+            >> flat_map([item, page_lbas](std::size_t i) {
+                return core::registry::tree_read_domain_at(
+                           static_cast<uint32_t>(i))
+                    ->submit_invalidate_range(item.range, page_lbas);
             })
-            >> flat_map([]() {
-                return rt::owner()->submit_recompute_recovery_frontier();
+            >> all()
+            >> then([item](bool ok) {
+                if (!ok) {
+                    core::panic_inconsistency(
+                        "tree::invalidate_one_reclaim_item",
+                        "read_domain invalidate fan-out failed");
+                }
+                return item;
+            });
+    }
+
+    inline auto
+    trim_one_reclaim_item(reclaim_trim_item item) {
+        auto* owner = rt::owner();
+        if (owner->geom == nullptr) {
+            core::panic_inconsistency(
+                "tree::trim_one_reclaim_item",
+                "tree geometry is null");
+        }
+        const uint64_t lbas =
+            static_cast<uint64_t>(item.range.slot_count) *
+            owner->geom->page_lbas();
+        if (lbas == 0 || lbas > std::numeric_limits<uint32_t>::max()) {
+            core::panic_inconsistency(
+                "tree::trim_one_reclaim_item",
+                "invalid trim span lbas=%lu",
+                static_cast<unsigned long>(lbas));
+        }
+        return rt::local_nvme()
+            ->trim(item.range.base.lba, static_cast<uint32_t>(lbas))
+            >> then([item](bool ok) {
+                if (!ok) {
+                    core::panic_inconsistency(
+                        "tree::trim_one_reclaim_item",
+                        "tree reclaim TRIM failed");
+                }
+                return item;
+            });
+    }
+
+    inline auto
+    finish_reclaim_tail(tree_sched& owner,
+                        reclaim_after_trim&& after,
+                        uint32_t invalidated_count,
+                        uint32_t trimmed_count) {
+        return just()
+            >> with_context(std::move(after))(
+                [&owner, invalidated_count, trimmed_count]() {
+                    return get_context<reclaim_after_trim>()
+                        >> then([](reclaim_after_trim& a) {
+                            return !a.reclaim_now.empty();
+                        })
+                        >> visit()
+                        >> get_context<reclaim_after_trim>()
+                        >> flat_map([]<typename Flag>(
+                                reclaim_after_trim& a, Flag&&) {
+                            if constexpr (std::is_same_v<
+                                    std::decay_t<Flag>, std::true_type>) {
+                                return value::reclaim_values(
+                                    std::span<const format::value_ref>{
+                                        a.reclaim_now.data(),
+                                        a.reclaim_now.size()});
+                            } else {
+                                return just();
+                            }
+                        })
+                        >> get_context<reclaim_after_trim>()
+                        >> flat_map([](reclaim_after_trim& a) {
+                            return wal::reclaim_check(
+                                *core::registry::wal_space_singleton(),
+                                a.flush_durable_frontier);
+                        })
+                        >> flat_map([&owner]() {
+                            return owner.submit_recompute_recovery_frontier();
+                        })
+                        >> then([](recovery_frontier_snapshot&&) {})
+                        >> get_context<reclaim_after_trim>()
+                        >> flat_map([&owner](reclaim_after_trim& a) {
+                            return owner.submit_finish_reclaim_round(
+                                a.round_id);
+                        })
+                        >> get_context<reclaim_after_trim>()
+                        >> flat_map([&owner](reclaim_after_trim& a) {
+                            return owner.submit_release_tree_mutation(
+                                a.token);
+                        })
+                        >> get_context<reclaim_after_trim>()
+                        >> then([invalidated_count, trimmed_count](
+                                reclaim_after_trim& a) {
+                            return reclaim_round_result{
+                                .noop = false,
+                                .processed_tasks = a.processed_tasks,
+                                .invalidated_ranges = invalidated_count,
+                                .trimmed_ranges = trimmed_count,
+                                .reclaimed_values = static_cast<uint32_t>(
+                                    a.reclaim_now.size()),
+                            };
+                        });
+                });
+    }
+
+    inline auto
+    collect_reclaim_invalidated_items(reclaim_round_plan& plan) {
+        return just()
+            >> as_stream(
+                std::span<reclaim_invalidate_item>{
+                    plan.invalidates.data(), plan.invalidates.size()})
+            >> concurrent(tree_sched::kReclaimInvalidateItemConcurrency)
+            >> flat_map([](reclaim_invalidate_item item) {
+                return invalidate_one_reclaim_item(item);
             })
-            >> then([result_holder](recovery_frontier_snapshot&&) {
-                return std::move(*result_holder);
+            >> reduce(
+                std::vector<reclaim_invalidate_item>{},
+                [](std::vector<reclaim_invalidate_item>& out, auto&& v) {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T,
+                                                  reclaim_invalidate_item>) {
+                        out.push_back(v);
+                    } else if constexpr (std::is_same_v<T,
+                                                        std::exception_ptr>) {
+                        std::rethrow_exception(v);
+                    }
+                });
+    }
+
+    inline auto
+    finish_reclaim_invalidates(tree_sched& owner,
+                               reclaim_round_plan& plan,
+                               std::vector<reclaim_invalidate_item>&&
+                                   invalidated) {
+        return owner.submit_finish_reclaim_invalidates(
+            plan.round_id,
+            std::move(invalidated),
+            std::move(plan.reclaim_now),
+            plan.flush_durable_frontier,
+            plan.processed_tasks,
+            plan.token);
+    }
+
+    inline auto
+    drive_reclaim_invalidates(tree_sched& owner) {
+        return get_context<reclaim_round_plan>()
+            >> flat_map([](reclaim_round_plan& plan) {
+                return collect_reclaim_invalidated_items(plan);
+            })
+            >> get_context<reclaim_round_plan>()
+            >> flat_map([&owner](
+                    reclaim_round_plan& plan,
+                    std::vector<reclaim_invalidate_item>&& invalidated) {
+                return finish_reclaim_invalidates(
+                    owner, plan, std::move(invalidated));
+            });
+    }
+
+    inline auto
+    collect_reclaim_trimmed_items(reclaim_after_invalidate& after) {
+        return just()
+            >> as_stream(
+                std::span<reclaim_trim_item>{
+                    after.trims.data(), after.trims.size()})
+            >> concurrent(tree_sched::kReclaimTrimConcurrency)
+            >> flat_map([](reclaim_trim_item item) {
+                return trim_one_reclaim_item(item);
+            })
+            >> reduce(
+                std::vector<reclaim_trim_item>{},
+                [](std::vector<reclaim_trim_item>& out, auto&& v) {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, reclaim_trim_item>) {
+                        out.push_back(v);
+                    } else if constexpr (std::is_same_v<T,
+                                                        std::exception_ptr>) {
+                        std::rethrow_exception(v);
+                    }
+                });
+    }
+
+    inline auto
+    finish_reclaim_trims_and_tail(tree_sched& owner,
+                                  reclaim_after_invalidate& after,
+                                  std::vector<reclaim_trim_item>&& trimmed,
+                                  uint32_t invalidated_count) {
+        const uint32_t trimmed_count =
+            static_cast<uint32_t>(trimmed.size());
+        return owner
+            .submit_finish_reclaim_trims(
+                after.round_id,
+                std::move(trimmed),
+                std::move(after.reclaim_now),
+                after.flush_durable_frontier,
+                after.processed_tasks,
+                after.token)
+            >> flat_map([&owner, invalidated_count, trimmed_count](
+                    reclaim_after_trim&& tail) {
+                return finish_reclaim_tail(
+                    owner,
+                    std::move(tail),
+                    invalidated_count,
+                    trimmed_count);
+            });
+    }
+
+    inline auto
+    drive_reclaim_trims(tree_sched& owner, reclaim_after_invalidate&& after) {
+        const uint32_t invalidated_count =
+            static_cast<uint32_t>(after.trims.size());
+        return just()
+            >> with_context(std::move(after))([&owner, invalidated_count]() {
+                return get_context<reclaim_after_invalidate>()
+                    >> flat_map([](reclaim_after_invalidate& a) {
+                        return collect_reclaim_trimmed_items(a);
+                    })
+                    >> get_context<reclaim_after_invalidate>()
+                    >> flat_map([&owner, invalidated_count](
+                            reclaim_after_invalidate& a,
+                            std::vector<reclaim_trim_item>&& trimmed) {
+                        return finish_reclaim_trims_and_tail(
+                            owner,
+                            a,
+                            std::move(trimmed),
+                            invalidated_count);
+                    });
+            });
+    }
+
+    inline auto
+    drive_reclaim_plan(tree_sched& owner, reclaim_round_plan&& plan) {
+        return just()
+            >> with_context(std::move(plan))([&owner]() {
+                return drive_reclaim_invalidates(owner)
+                    >> flat_map([&owner](reclaim_after_invalidate&& after) {
+                        return drive_reclaim_trims(owner, std::move(after));
+                    });
+            });
+    }
+
+    inline auto
+    reclaim_once(tree_sched& owner) {
+        return owner.submit_acquire_tree_mutation()
+            >> flat_map([&owner](tree_mutation_token token) {
+                return owner.submit_prepare_reclaim_round(token)
+                    >> then(split_reclaim_plan)
+                    >> visit()
+                    >> flat_map([&owner]<typename Alt>(Alt&& alt) {
+                        using alt_t = std::decay_t<Alt>;
+                        if constexpr (std::is_same_v<alt_t,
+                                                      reclaim_noop_plan>) {
+                            return owner.submit_release_tree_mutation(
+                                    alt.token)
+                                >> then([]() {
+                                    return reclaim_round_result{
+                                        .noop = true,
+                                    };
+                                });
+                        } else {
+                            static_assert(std::is_same_v<alt_t,
+                                                         reclaim_round_plan>);
+                            return drive_reclaim_plan(
+                                owner, std::move(alt));
+                        }
+                    })
+                    >> any_exception([&owner, token](std::exception_ptr ep) {
+                        return owner.submit_abort_reclaim_round(token)
+                            >> flat_map([&owner, token]() {
+                                return owner.submit_release_tree_mutation(
+                                    token);
+                            })
+                            >> then([ep = std::move(ep)]()
+                                        -> reclaim_round_result {
+                                std::rethrow_exception(ep);
+                            });
+                    });
             });
     }
 
@@ -840,8 +1140,8 @@ namespace apps::inconel::tree {
                         rebuild_and_publish_shard_partitions(r);
                         return std::forward<decltype(r)>(r);
                     })
-                    >> flat_map([](tree_flush_result&& r) {
-                        return reclaim_wal_after_flush(std::move(r));
+                    >> then([](tree_flush_result&& r) {
+                        return std::move(r);
                     });
             });
     }

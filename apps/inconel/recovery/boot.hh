@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -168,6 +169,7 @@ namespace apps::inconel::recovery {
     struct wal_scan_result {
         std::vector<scanned_wal_entry> entries;
         std::map<uint64_t, wal_lsn_scan_state> lsn_states;
+        std::map<uint64_t, std::set<std::string>> keys_by_lsn;
         uint64_t max_complete_lsn = 0;
         bool saw_nonzero = false;
     };
@@ -217,6 +219,12 @@ namespace apps::inconel::recovery {
             throw std::runtime_error(
                 "inconel recovery: WAL LSN has more entries than "
                 "entry_count");
+        }
+        auto& keys = out.keys_by_lsn[decoded.lsn];
+        auto [_, key_inserted] = keys.insert(std::string(decoded.key));
+        if (!key_inserted) {
+            throw std::runtime_error(
+                "inconel recovery: WAL LSN contains duplicate key");
         }
 
         out.entries.push_back(scanned_wal_entry{

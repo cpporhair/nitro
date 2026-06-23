@@ -97,6 +97,20 @@ namespace apps::inconel::ycsb {
         print_phase_stats(out, stats.run);
     }
 
+    [[nodiscard]] inline uint64_t
+    phase_error_count(const phase_stats& stats) noexcept {
+        return stats.write_errors.load(std::memory_order_relaxed) +
+               stats.read_errors.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] inline uint64_t
+    total_error_count(const all_stats& stats) noexcept {
+        return phase_error_count(stats.load) +
+               phase_error_count(stats.load_flush) +
+               phase_error_count(stats.verify) +
+               phase_error_count(stats.run);
+    }
+
 }  // namespace apps::inconel::ycsb
 
 #endif  // APPS_INCONEL_YCSB_STATS_HH

@@ -223,6 +223,12 @@ namespace apps::inconel::ycsb {
         }
         print_all_stats(std::cout, *state->stats);
         print_maintenance_stats(std::cout, maintenance_stats);
+        const uint64_t error_count = total_error_count(*state->stats);
+        if (error_count != 0) {
+            std::cerr << "inconel_ycsb: completed with error counters="
+                      << error_count << '\n';
+            return 1;
+        }
         return 0;
     }
 

@@ -24,6 +24,7 @@
 #include "../tree/page_builder.hh"
 #include "./state.hh"
 #include "./sync_io.hh"
+#include "./tree_scanner.hh"
 
 namespace apps::inconel::recovery {
 
@@ -809,15 +810,39 @@ namespace apps::inconel::recovery {
         }
 
         auto profile = profile_from_superblock(*choice.chosen);
-        if (choice.chosen->root_base_paddr.lba != 0) {
-            throw std::runtime_error(
-                "inconel recovery: non-empty tree recovery is not "
-                "implemented in 064B");
-        }
+        const auto tree_geometry = tree_geometry_from_profile(profile);
 
         auto runtime_state = make_empty_runtime_state(profile, choice.which);
         const auto scan = scan_wal(device, core, profile);
-        if (scan.saw_nonzero) {
+
+        if (choice.chosen->root_base_paddr.lba != 0 ||
+            choice.chosen->root_base_paddr.device_id != 0) {
+            auto tree_scan = scan_existing_tree(
+                device,
+                core,
+                profile,
+                tree_geometry,
+                choice.chosen->root_base_paddr);
+            if (scan.saw_nonzero) {
+                throw std::runtime_error(
+                    "inconel recovery: WAL delta on existing tree is not "
+                    "implemented in 064C");
+            }
+            if (tree_scan.max_data_ver ==
+                std::numeric_limits<uint64_t>::max()) {
+                throw std::runtime_error(
+                    "inconel recovery: recovered tree LSN overflow");
+            }
+            runtime_state = recovered_runtime_state{
+                .tree = std::move(tree_scan.tree),
+                .live_value_extents =
+                    std::move(tree_scan.live_value_extents),
+                .recovered_durable_lsn = tree_scan.max_data_ver,
+                .next_lsn = tree_scan.max_data_ver + 1,
+                .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
+                .active_superblock_source = choice.which,
+            };
+        } else if (scan.saw_nonzero) {
             const auto records = build_replay_records(scan);
             if (!records.empty()) {
                 if (scan.max_complete_lsn ==
@@ -829,7 +854,7 @@ namespace apps::inconel::recovery {
                     device,
                     core,
                     profile,
-                    tree_geometry_from_profile(profile),
+                    tree_geometry,
                     records);
                 const auto committed_source =
                     write_recovered_superblock_root(
@@ -861,7 +886,7 @@ namespace apps::inconel::recovery {
 
         return recovered_boot_state{
             .profile = profile,
-            .tree_geometry = tree_geometry_from_profile(profile),
+            .tree_geometry = tree_geometry,
             .superblock_source = runtime_state.active_superblock_source,
             .superblock_generation = active_generation,
             .runtime_state = std::move(runtime_state),

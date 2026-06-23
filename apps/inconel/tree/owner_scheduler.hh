@@ -3533,6 +3533,14 @@ namespace apps::inconel::tree {
 
             rs->flushed_max_lsn = 0;
             for (auto& g : rs->pinned_gens) {
+                if (!g->table.empty() && g->min_lsn <= rs->recovery_safe_lsn) {
+                    core::panic_inconsistency(
+                        "tree::tree_sched::allocate_fold_round",
+                        "flush input min_lsn=%lu is not above "
+                        "recovery_safe_lsn=%lu",
+                        static_cast<unsigned long>(g->min_lsn),
+                        static_cast<unsigned long>(rs->recovery_safe_lsn));
+                }
                 rs->flushed_max_lsn = std::max(rs->flushed_max_lsn, g->max_lsn);
             }
 

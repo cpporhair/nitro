@@ -599,6 +599,12 @@ recovery_safe_lsn = recovered_max_lsn  // 所有旧版本都已收敛到 clean t
 
 原因：boot recovery 没有旧 runtime 的 `recovery_safe_lsn`，无法判断 tombstone 的 `data_ver` 是否足够老。但因为 recovery 最终会收敛成唯一的 clean tree，所有 tombstone 都对应真实的"该 key 曾有 value 后被 DELETE"的状态。
 
+另一类必须保留的是 delete-only / no-op tombstone。它读语义上可能只是 absent，
+但 superblock 当前不持久化 durable LSN；WAL reset 后，clean tree records 是下一次
+boot 推导 `recovered_max_lsn` / `next_lsn` 的唯一持久来源。如果这类 tombstone 是
+tree 中唯一的最大 `data_ver`，boot recovery 先丢它再 reset WAL，会让下一次 boot 的
+`next_lsn` 回退。
+
 ### 11.2 Steady-State 中
 
 概要 §10.3 规则 2：后续 flush 中，tombstone 物理删除需满足：
@@ -615,6 +621,13 @@ v1 的 steady-state tombstone GC 是**page-local opportunistic compaction**：
 2. 只要某个 leaf 因本轮 flush 被重写，就会顺带检查该页上的 tombstone records
 3. 满足 `data_ver <= recovery_safe_lsn` 的 tombstone 可以在新 leaf image 中直接省略（变成 absent）
 4. v1 不为旧 tombstone 维护单独的全局 revisit / sweep 队列；未被触达的 leaf 继续保守保留 tombstone
+
+这个规则依赖第 1 点：tombstone GC 只发生在 flush-local leaf rewrite 中。该 rewrite
+由 sealed gen 触发，最终 tree 中会同时出现本轮写入的 winner；这个 winner 的
+`data_ver` 高于 round 开始时的 `recovery_safe_lsn`，因此能替代被省略 tombstone 的
+frontier carrier 职责。禁止在没有新 winner 的 tombstone-only sweep / prune pass 中
+直接套用 `data_ver <= recovery_safe_lsn`，除非已有独立持久 durable frontier 或 final
+tree 中仍能证明 `max_data_ver` 覆盖被删除 tombstone。
 
 ### 11.3 实现
 

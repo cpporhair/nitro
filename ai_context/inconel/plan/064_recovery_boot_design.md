@@ -324,6 +324,20 @@ for each key where winner.source == wal:
 
 如果 `winner` 是 tombstone 且 tree 中没有旧 record，也仍然进入 `wal_delta`。这类 tombstone 读语义上可能是 no-op，但它承担 durable frontier carrier 的职责。未来 compaction 只有在另一个持久 frontier 已经覆盖它时，才能安全丢弃这种 tombstone。
 
+这个限制禁止的是“tombstone-only sweep”：如果 clean tree 中唯一的最大
+`data_ver` 是一个 delete-only/no-op tombstone，WAL 又已经 reset，那么单独把
+这个 tombstone compact 掉会让下一次 boot 只能从剩余 tree records 推出更小的
+`recovered_durable_lsn`，从而让 `next_lsn` 回退。
+
+运行态的 page-local tombstone GC 仍可以使用 boot 后安装的
+`recovery_safe_lsn = recovered_durable_lsn`。原因是当前 production 路径没有独立
+sweep；tombstone 只会在某个 sealed gen 触发同一 leaf rewrite 时被顺手省略，而
+该 flush 同时会把至少一个新的 memtable winner 写入 durable tree。由于新写入从
+`next_lsn = recovered_durable_lsn + 1` 开始，这个新 winner 会成为新的持久
+frontier carrier。若未来增加不携带新 winner 的 tombstone sweep / prune pass，
+必须先引入独立持久 durable frontier（或证明 final tree 中仍有
+`max_data_ver >= dropped_tombstone.data_ver`），否则禁止复用这个 GC 条件。
+
 ### 6. Boot Merge
 
 分三种情况：
@@ -527,6 +541,8 @@ Builder 安装顺序：
    - `flush_max_lsn = durable_lsn`
    - `superblock_safe_lsn = durable_lsn`
    - `recovery_safe_lsn = durable_lsn`
+   - 后续 flush 必须从 tree owner snapshot 这个值传入 worker；不能把
+     `tree_flush_request.recovery_safe_lsn` 固定为 0，否则 tombstone GC 被意外关闭
 7. 构建 value scheduler 后安装 recovered value space。
 8. 构建 WAL scheduler 后确认 empty reusable pool。
 9. 从 `manifest.leaf_order` 构建并发布 shard partition map。

@@ -88,9 +88,9 @@ namespace apps::inconel::recovery {
     };
 
     [[nodiscard]] inline read_superblock_pair
-    read_superblock_pair_from_device(nvme::real_device& device,
+    read_superblock_pair_from_device(auto& device,
                                      uint32_t core) {
-        auto buf = make_zeroed_dma_buffer(
+        auto buf = make_zeroed_sync_io_buffer(device,
             kBootSuperblockReadBytes, kBootSuperblockReadBytes);
         read_superblock_pair out{};
 
@@ -117,7 +117,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline bool
-    wal_region_is_zero(nvme::real_device& device,
+    wal_region_is_zero(auto& device,
                        uint32_t core,
                        const format::format_profile& profile) {
         const uint64_t segment_lbas =
@@ -133,7 +133,7 @@ namespace apps::inconel::recovery {
         if (chunk_lbas == 0) {
             chunk_lbas = 1;
         }
-        auto buf = make_zeroed_dma_buffer(
+        auto buf = make_zeroed_sync_io_buffer(device,
             static_cast<std::size_t>(chunk_lbas) * profile.lba_size,
             profile.lba_size);
 
@@ -237,7 +237,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline wal_scan_result
-    scan_wal(nvme::real_device& device,
+    scan_wal(auto& device,
              uint32_t core,
              const format::format_profile& profile) {
         const auto geometry = wal_geometry_from_profile(profile);
@@ -247,7 +247,8 @@ namespace apps::inconel::recovery {
             profile.wal_segment_size / profile.lba_size;
 
         auto segment_buf =
-            make_zeroed_dma_buffer(profile.wal_segment_size, profile.lba_size);
+            make_zeroed_sync_io_buffer(
+                device, profile.wal_segment_size, profile.lba_size);
         wal_scan_result out;
 
         for (uint32_t idx = 0; idx < profile.wal_segment_count; ++idx) {
@@ -466,7 +467,7 @@ namespace apps::inconel::recovery {
     }
 
     inline void
-    write_replay_page(nvme::real_device& device,
+    write_replay_page(auto& device,
                       uint32_t core,
                       const format::format_profile& profile,
                       const core::tree_geometry& geom,
@@ -505,7 +506,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline std::vector<replay_tree_node*>
-    build_replay_leaves(nvme::real_device& device,
+    build_replay_leaves(auto& device,
                         uint32_t core,
                         const format::format_profile& profile,
                         const core::tree_geometry& geom,
@@ -527,8 +528,8 @@ namespace apps::inconel::recovery {
                 next_range_base,
                 format::node_type::leaf,
                 records[pos].key);
-            auto page = make_zeroed_dma_buffer(
-                geom.tree_page_size, profile.lba_size);
+            auto page = make_zeroed_sync_io_buffer(
+                device, geom.tree_page_size, profile.lba_size);
             tree::leaf_page_builder builder;
             builder.init(page.get(), geom.tree_page_size);
 
@@ -574,7 +575,7 @@ namespace apps::inconel::recovery {
 
     [[nodiscard]] inline std::vector<replay_tree_node*>
     build_replay_internal_layer(
-        nvme::real_device& device,
+        auto& device,
         uint32_t core,
         const format::format_profile& profile,
         const core::tree_geometry& geom,
@@ -585,7 +586,8 @@ namespace apps::inconel::recovery {
         std::size_t pos = 0;
         while (pos < children.size()) {
             auto page =
-                make_zeroed_dma_buffer(geom.tree_page_size, profile.lba_size);
+                make_zeroed_sync_io_buffer(
+                    device, geom.tree_page_size, profile.lba_size);
             tree::internal_page_builder probe;
             probe.init(page.get(), geom.tree_page_size);
 
@@ -616,7 +618,8 @@ namespace apps::inconel::recovery {
                 children[pos]->first_key);
             node->children.reserve(end - pos);
             auto write_page =
-                make_zeroed_dma_buffer(geom.tree_page_size, profile.lba_size);
+                make_zeroed_sync_io_buffer(
+                    device, geom.tree_page_size, profile.lba_size);
             tree::internal_page_builder builder;
             builder.init(write_page.get(), geom.tree_page_size);
             for (std::size_t i = pos + 1; i < end; ++i) {
@@ -739,7 +742,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline replay_tree_build
-    build_replay_tree(nvme::real_device& device,
+    build_replay_tree(auto& device,
                       uint32_t core,
                       const format::format_profile& profile,
                       const core::tree_geometry& geom,
@@ -810,7 +813,7 @@ namespace apps::inconel::recovery {
         format::paddr leaf_range_base{};
         uint32_t next_slot = 0;
         format::paddr next_slot_paddr{};
-        dma_buffer page;
+        sync_io_buffer page;
     };
 
     [[nodiscard]] inline recovered_tree_record
@@ -900,12 +903,13 @@ namespace apps::inconel::recovery {
         return out;
     }
 
-    [[nodiscard]] inline std::optional<dma_buffer>
-    build_leaf_records_page(const format::format_profile& profile,
+    [[nodiscard]] inline std::optional<sync_io_buffer>
+    build_leaf_records_page(auto& device,
+                            const format::format_profile& profile,
                             const core::tree_geometry& geom,
                             const std::vector<recovered_tree_record>& records) {
-        auto page = make_zeroed_dma_buffer(
-            geom.tree_page_size, profile.lba_size);
+        auto page = make_zeroed_sync_io_buffer(
+            device, geom.tree_page_size, profile.lba_size);
         tree::leaf_page_builder builder;
         builder.init(page.get(), geom.tree_page_size);
 
@@ -926,13 +930,13 @@ namespace apps::inconel::recovery {
         }
 
         builder.finalize();
-        std::optional<dma_buffer> out;
+        std::optional<sync_io_buffer> out;
         out.emplace(std::move(page));
         return out;
     }
 
     [[nodiscard]] inline std::optional<recovered_tree_scan>
-    replay_same_shape_wal_delta(nvme::real_device& device,
+    replay_same_shape_wal_delta(auto& device,
                                 uint32_t core,
                                 const format::format_profile& profile,
                                 const core::tree_geometry& geom,
@@ -1014,7 +1018,8 @@ namespace apps::inconel::recovery {
                 return std::nullopt;
             }
 
-            auto page = build_leaf_records_page(profile, geom, merge.records);
+            auto page = build_leaf_records_page(
+                device, profile, geom, merge.records);
             if (!page) {
                 return std::nullopt;
             }
@@ -1202,7 +1207,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline std::vector<char>
-    read_base_internal_page(nvme::real_device& device,
+    read_base_internal_page(auto& device,
                             uint32_t core,
                             const format::format_profile& profile,
                             const core::tree_geometry& geom,
@@ -1214,8 +1219,8 @@ namespace apps::inconel::recovery {
                 "inconel recovery: internal parent missing from slot map");
         }
         const auto slot_paddr = geom.slot_paddr(range_base, slot_it->second);
-        auto page = make_zeroed_dma_buffer(
-            geom.tree_page_size, profile.lba_size);
+        auto page = make_zeroed_sync_io_buffer(
+            device, geom.tree_page_size, profile.lba_size);
         sync_read_logical_lbas(
             device,
             core,
@@ -1498,7 +1503,7 @@ namespace apps::inconel::recovery {
     }
 
     inline void
-    write_cow_nodes(nvme::real_device& device,
+    write_cow_nodes(auto& device,
                     uint32_t core,
                     const format::format_profile& profile,
                     const core::tree_geometry& geom,
@@ -1517,8 +1522,8 @@ namespace apps::inconel::recovery {
                 throw std::logic_error(
                     "inconel recovery: unplaced CoW node reached writeback");
             }
-            auto page = make_zeroed_dma_buffer(
-                geom.tree_page_size, profile.lba_size);
+            auto page = make_zeroed_sync_io_buffer(
+                device, geom.tree_page_size, profile.lba_size);
             std::memcpy(page.get(), node->content.data(), node->content.size());
             write_replay_page(
                 device, core, profile, geom, node->new_paddr, page.get());
@@ -1544,7 +1549,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline std::optional<cow_replay_result>
-    replay_full_cow_wal_delta(nvme::real_device& device,
+    replay_full_cow_wal_delta(auto& device,
                               uint32_t core,
                               const format::format_profile& profile,
                               const core::tree_geometry& geom,
@@ -1887,7 +1892,7 @@ namespace apps::inconel::recovery {
 
     [[nodiscard]] inline format::superblock_choice::source
     write_recovered_superblock_root(
-        nvme::real_device& device,
+        auto& device,
         uint32_t core,
         const format::superblock& chosen,
         format::superblock_choice::source source,
@@ -1913,7 +1918,8 @@ namespace apps::inconel::recovery {
                 ? format::superblock_choice::source::b
                 : format::superblock_choice::source::a;
 
-        auto buf = make_zeroed_dma_buffer(profile.lba_size, profile.lba_size);
+        auto buf = make_zeroed_sync_io_buffer(
+            device, profile.lba_size, profile.lba_size);
         std::memcpy(buf.get(), &next, sizeof(next));
         sync_write_logical_lbas(
             device, core, inactive_lba, 1, buf.get(), profile.lba_size);
@@ -1922,7 +1928,56 @@ namespace apps::inconel::recovery {
     }
 
     inline void
-    reset_wal_region(nvme::real_device& device,
+    scrub_recovered_tree_free_ranges(
+        auto& device,
+        uint32_t core,
+        const format::format_profile& profile,
+        const core::tree_geometry& geom,
+        std::span<const format::range_ref> free_ranges) {
+        if (free_ranges.empty()) {
+            return;
+        }
+        const uint64_t page_lbas = geom.page_lbas();
+        if (page_lbas == 0 || geom.shadow_slots_per_range == 0) {
+            throw std::logic_error(
+                "inconel recovery: invalid tree geometry for free-range "
+                "scrub");
+        }
+        for (const auto& range : free_ranges) {
+            if (range.slot_count != geom.shadow_slots_per_range) {
+                throw std::runtime_error(
+                    "inconel recovery: recovered tree free range slot_count "
+                    "mismatch");
+            }
+            if (range.base.device_id != profile.value_data_area_base.device_id) {
+                throw std::runtime_error(
+                    "inconel recovery: recovered tree free range device "
+                    "mismatch");
+            }
+            const uint64_t lbas =
+                page_lbas * static_cast<uint64_t>(range.slot_count);
+            if (lbas == 0 ||
+                range.base.lba >
+                    std::numeric_limits<uint64_t>::max() - lbas ||
+                range.base.lba < profile.value_data_area_base.lba ||
+                range.base.lba + lbas > profile.value_data_area_end.lba) {
+                throw std::runtime_error(
+                    "inconel recovery: recovered tree free range outside "
+                    "data area");
+            }
+            sync_zero_logical_lbas(
+                device,
+                core,
+                range.base.lba,
+                lbas,
+                profile.lba_size,
+                profile.lba_size);
+        }
+        sync_flush(device, core);
+    }
+
+    inline void
+    reset_wal_region(auto& device,
                      uint32_t core,
                      const format::format_profile& profile) {
         const uint64_t segment_lbas =
@@ -1954,7 +2009,7 @@ namespace apps::inconel::recovery {
     }
 
     [[nodiscard]] inline recovered_boot_state
-    recover_empty_clean_boot(nvme::real_device& device, uint32_t core) {
+    recover_empty_clean_boot(auto& device, uint32_t core) {
         const auto pair = read_superblock_pair_from_device(device, core);
         const auto choice =
             format::choose_newer_superblock(pair.a, pair.b);
@@ -1986,9 +2041,10 @@ namespace apps::inconel::recovery {
                 profile,
                 tree_geometry,
                 choice.chosen->root_base_paddr);
+            bool reset_wal_after_tree = false;
             if (scan.saw_nonzero) {
                 if (existing_tree_wal_delta_is_empty(tree_scan, scan)) {
-                    reset_wal_region(device, core, profile);
+                    reset_wal_after_tree = true;
                 } else if (auto replayed = replay_same_shape_wal_delta(
                                device,
                                core,
@@ -1997,7 +2053,7 @@ namespace apps::inconel::recovery {
                                tree_scan,
                                scan)) {
                     tree_scan = std::move(*replayed);
-                    reset_wal_region(device, core, profile);
+                    reset_wal_after_tree = true;
                 } else if (auto replayed = replay_full_cow_wal_delta(
                                device,
                                core,
@@ -2015,12 +2071,23 @@ namespace apps::inconel::recovery {
                             tree_scan.tree.root_range_base,
                             profile);
                     }
-                    reset_wal_region(device, core, profile);
+                    reset_wal_after_tree = true;
                 } else {
                     throw std::runtime_error(
                         "inconel recovery: WAL delta reached no-op CoW "
                         "fallback after non-empty delta detection");
                 }
+            }
+            scrub_recovered_tree_free_ranges(
+                device,
+                core,
+                profile,
+                tree_geometry,
+                std::span<const format::range_ref>(
+                    tree_scan.tree_free_ranges.data(),
+                    tree_scan.tree_free_ranges.size()));
+            if (reset_wal_after_tree) {
+                reset_wal_region(device, core, profile);
             }
             const uint64_t recovered_durable_lsn =
                 std::max(tree_scan.max_data_ver, scan.max_complete_lsn);

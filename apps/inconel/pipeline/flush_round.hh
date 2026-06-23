@@ -54,6 +54,7 @@ namespace apps::inconel::pipeline {
             core::flush_frontier frontier;
             std::vector<std::vector<std::shared_ptr<core::memtable_gen>>>
                 eligible_by_front;
+            uint64_t recovery_safe_lsn = 0;
             core::flush_release_plan release_plan;
         };
 
@@ -94,7 +95,7 @@ namespace apps::inconel::pipeline {
             tree::tree_flush_request req{
                 .base_guard = st.frontier.old_guard,
                 .sealed_gens = {},
-                .recovery_safe_lsn = 0,
+                .recovery_safe_lsn = st.recovery_safe_lsn,
             };
             for (auto& front_gens : st.eligible_by_front) {
                 req.sealed_gens.reserve(
@@ -226,6 +227,13 @@ namespace apps::inconel::pipeline {
                                     });
                             })
                             >> reduce();
+                    })
+                    >> flat_map([&tree_sched, &st](bool) {
+                        return tree_sched.submit_recompute_recovery_frontier()
+                            >> then([&st](tree::recovery_frontier_snapshot&& s) {
+                                st.recovery_safe_lsn = s.recovery_safe_lsn;
+                                return true;
+                            });
                     })
                     >> then([&st](bool) {
                         return detail::build_flush_branch(st);

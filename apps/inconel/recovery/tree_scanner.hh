@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -21,7 +22,6 @@
 #include "../format/format_profile.hh"
 #include "../format/tree_page.hh"
 #include "../format/types.hh"
-#include "../nvme/real_device.hh"
 #include "../tree/page_reader.hh"
 #include "./state.hh"
 #include "./sync_io.hh"
@@ -67,8 +67,9 @@ namespace apps::inconel::recovery {
             format::paddr parent_range{};
         };
 
+        template <typename Device>
         struct scan_context {
-            nvme::real_device& device;
+            Device& device;
             uint32_t core = 0;
             const format::format_profile& profile;
             const core::tree_geometry& geom;
@@ -87,8 +88,10 @@ namespace apps::inconel::recovery {
             return p.device_id == 0 && p.lba == 0;
         }
 
+        template <typename Device>
         inline void
-        validate_range_base(const scan_context& ctx, format::paddr range_base) {
+        validate_range_base(const scan_context<Device>& ctx,
+                            format::paddr range_base) {
             if (range_base.device_id !=
                 ctx.profile.value_data_area_base.device_id) {
                 throw std::runtime_error(
@@ -113,11 +116,14 @@ namespace apps::inconel::recovery {
             }
         }
 
+        template <typename Device>
         [[nodiscard]] inline scanned_page
-        read_current_page(scan_context& ctx, format::paddr range_base) {
+        read_current_page(scan_context<Device>& ctx,
+                          format::paddr range_base) {
             validate_range_base(ctx, range_base);
             auto page =
-                make_zeroed_dma_buffer(ctx.geom.tree_page_size, ctx.profile.lba_size);
+                make_zeroed_sync_io_buffer(
+                    ctx.device, ctx.geom.tree_page_size, ctx.profile.lba_size);
 
             for (uint32_t rev = 0; rev < ctx.geom.shadow_slots_per_range; ++rev) {
                 const uint32_t slot =
@@ -155,13 +161,15 @@ namespace apps::inconel::recovery {
                 "inconel recovery: selected tree range has no valid slot");
         }
 
+        template <typename Device>
         inline void
-        scan_range(scan_context& ctx,
+        scan_range(scan_context<Device>& ctx,
                    format::paddr range_base,
                    format::paddr parent_range);
 
+        template <typename Device>
         inline void
-        scan_leaf(scan_context& ctx,
+        scan_leaf(scan_context<Device>& ctx,
                   const scanned_page& page,
                   format::paddr parent_range) {
             tree::leaf_page_reader reader;
@@ -218,8 +226,9 @@ namespace apps::inconel::recovery {
             });
         }
 
+        template <typename Device>
         inline void
-        scan_internal(scan_context& ctx,
+        scan_internal(scan_context<Device>& ctx,
                       const scanned_page& page,
                       format::paddr parent_range) {
             tree::internal_page_reader reader;
@@ -260,8 +269,9 @@ namespace apps::inconel::recovery {
             scan_range(ctx, rightmost, page.range_base);
         }
 
+        template <typename Device>
         inline void
-        scan_range(scan_context& ctx,
+        scan_range(scan_context<Device>& ctx,
                    format::paddr range_base,
                    format::paddr parent_range) {
             if (ctx.slot_map.contains(range_base)) {
@@ -425,7 +435,7 @@ namespace apps::inconel::recovery {
     }  // namespace tree_scan_detail
 
     [[nodiscard]] inline recovered_tree_scan
-    scan_existing_tree(nvme::real_device& device,
+    scan_existing_tree(auto& device,
                        uint32_t core,
                        const format::format_profile& profile,
                        const core::tree_geometry& geom,
@@ -441,7 +451,7 @@ namespace apps::inconel::recovery {
             };
         }
 
-        tree_scan_detail::scan_context ctx{
+        tree_scan_detail::scan_context<std::remove_reference_t<decltype(device)>> ctx{
             .device = device,
             .core = core,
             .profile = profile,

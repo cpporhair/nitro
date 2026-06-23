@@ -272,9 +272,7 @@ namespace apps::inconel::recovery {
                 format::inspect_wal_segment_header(
                     header, format::SUPERBLOCK_FORMAT_VERSION_V1);
             if (header_status != format::wal_segment_status::ok) {
-                throw std::runtime_error(
-                    std::string("inconel recovery: bad WAL segment header: ")
-                    + format::wal_segment_status_to_string(header_status));
+                continue;
             }
             if (header.segment_index != idx ||
                 header.device_id != profile.wal_base_paddr.device_id) {
@@ -298,13 +296,8 @@ namespace apps::inconel::recovery {
                     &decoded,
                     &total_len);
 
-                if (status == format::wal_entry_decode_status::truncated) {
-                    break;
-                }
                 if (status != format::wal_entry_decode_status::ok) {
-                    throw std::runtime_error(
-                        std::string("inconel recovery: bad WAL entry: ")
-                        + format::wal_entry_decode_status_to_string(status));
+                    break;
                 }
                 record_wal_entry(out, decoded);
                 cursor += total_len;

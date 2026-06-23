@@ -358,9 +358,10 @@ run_a10() {
         --inflight 1 --verify-samples 0 \
         --expect-all --write-expect-file "$expect_file")"
     assert_real_run_ok "$log"
+    assert_eq "$log" run acked_entries 509
     assert_eq "$log" expect read_errors 0
+    assert_eq "$log" expect read_found 1000
     assert_eq "$log" expect read_miss 0
-    assert_gt_zero "$log" expect read_found
     [[ -s "$expect_file" ]] ||
         fail "$expect_file: expected-state file was not written"
 
@@ -379,9 +380,10 @@ run_a10() {
         --inflight 1 --verify-samples 0 \
         --expect-all --write-expect-file "$expect_file")"
     assert_real_run_ok "$log"
+    assert_eq "$log" run acked_entries 56
     assert_eq "$log" expect read_errors 0
+    assert_eq "$log" expect read_found 1000
     assert_eq "$log" expect read_miss 0
-    assert_gt_zero "$log" expect read_found
     [[ -s "$expect_file" ]] ||
         fail "$expect_file: expected-state file was not written"
 

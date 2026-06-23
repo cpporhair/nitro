@@ -210,7 +210,9 @@ format_real_superblocks(nvme::runtime_device& device) {
 
 enum class scenario_kind : uint8_t {
     c1,
+    c2,
     c3,
+    c4,
 };
 
 struct harness_options {
@@ -222,7 +224,17 @@ struct harness_options {
 
 std::string_view
 scenario_name(scenario_kind scenario) noexcept {
-    return scenario == scenario_kind::c1 ? "c1" : "c3";
+    switch (scenario) {
+    case scenario_kind::c1:
+        return "c1";
+    case scenario_kind::c2:
+        return "c2";
+    case scenario_kind::c3:
+        return "c3";
+    case scenario_kind::c4:
+        return "c4";
+    }
+    return "unknown";
 }
 
 std::string
@@ -261,6 +273,8 @@ struct interval_clock {
 struct write_interval {
     uint64_t key_id = 0;
     uint64_t generation = 0;
+    uint64_t version = 0;
+    bool tombstone = false;
     uint64_t start_seq = 0;
     uint64_t ack_seq = 0;
 };
@@ -318,7 +332,8 @@ class checker_fixture {
         format_real_superblocks(device_);
 
         runtime::maintenance_options maintenance{};
-        if (scenario == scenario_kind::c1) {
+        if (scenario == scenario_kind::c1 ||
+            scenario == scenario_kind::c4) {
             maintenance.enabled = false;
         } else {
             maintenance.enabled = true;
@@ -329,9 +344,16 @@ class checker_fixture {
             maintenance.completion_queue_depth = 8;
             maintenance.policy.auto_seal_flush = true;
             maintenance.policy.seal_active_memtable_bytes = 64ull * 1024ull;
-            maintenance.policy.total_memtable_limit_bytes = 256ull * 1024ull;
-            maintenance.policy.wal_seal_used_ratio = 0.05f;
-            maintenance.policy.max_sealed_gens_per_front = 1;
+            if (scenario == scenario_kind::c2) {
+                maintenance.policy.total_memtable_limit_bytes = 1ull << 40;
+                maintenance.policy.wal_seal_used_ratio = 1.0f;
+                maintenance.policy.max_sealed_gens_per_front = 64;
+            } else {
+                maintenance.policy.total_memtable_limit_bytes =
+                    256ull * 1024ull;
+                maintenance.policy.wal_seal_used_ratio = 0.05f;
+                maintenance.policy.max_sealed_gens_per_front = 1;
+            }
         }
 
         runtime::build_options bopts{
@@ -426,6 +448,8 @@ void
 preload_hot_keys(const ycsb::config& cfg,
                  interval_clock* clock,
                  std::vector<uint64_t>* generations,
+                 std::vector<uint64_t>* versions,
+                 std::vector<bool>* live,
                  std::vector<write_interval>* writes) {
     pump::core::this_core_id = kWriterCore;
 
@@ -433,6 +457,8 @@ preload_hot_keys(const ycsb::config& cfg,
     ops.reserve(kHotKeyCount);
     for (uint64_t id = 0; id < kHotKeyCount; ++id) {
         (*generations)[id] = kInitialGeneration;
+        (*versions)[id] = kInitialGeneration;
+        (*live)[id] = true;
         ops.push_back(ycsb::make_put(cfg, id, kInitialGeneration));
     }
 
@@ -448,6 +474,8 @@ preload_hot_keys(const ycsb::config& cfg,
         writes->push_back(write_interval{
             .key_id = id,
             .generation = kInitialGeneration,
+            .version = kInitialGeneration,
+            .tombstone = false,
             .start_seq = start,
             .ack_seq = end,
         });
@@ -458,9 +486,14 @@ void
 writer_main(const ycsb::config& cfg,
             interval_clock* clock,
             std::vector<uint64_t>* generations,
+            std::vector<uint64_t>* versions,
+            std::vector<bool>* live,
             std::vector<write_interval>* writes,
-            bool stretch_for_maintenance) {
+            scenario_kind scenario) {
     pump::core::this_core_id = kWriterCore;
+    const bool stretch_for_maintenance =
+        scenario == scenario_kind::c2 || scenario == scenario_kind::c3;
+    const bool delete_race = scenario == scenario_kind::c4;
 
     try {
         for (uint32_t batch = 0; batch < kUpdateBatches; ++batch) {
@@ -469,6 +502,8 @@ writer_main(const ycsb::config& cfg,
             struct planned_write {
                 uint64_t key_id;
                 uint64_t generation;
+                uint64_t version;
+                bool tombstone;
             };
             std::vector<planned_write> planned;
             planned.reserve(kWriteBatchSize);
@@ -477,12 +512,26 @@ writer_main(const ycsb::config& cfg,
                 const uint64_t ordinal =
                     static_cast<uint64_t>(batch) * kWriteBatchSize + i;
                 const uint64_t key_id = ordinal % kHotKeyCount;
-                const uint64_t generation = ++(*generations)[key_id];
+                const bool tombstone = delete_race && (*live)[key_id];
+                uint64_t generation = (*generations)[key_id];
+                if (tombstone) {
+                    (*live)[key_id] = false;
+                } else {
+                    generation = ++(*generations)[key_id];
+                    (*live)[key_id] = true;
+                }
+                const uint64_t version = ++(*versions)[key_id];
                 planned.push_back(planned_write{
                     .key_id = key_id,
                     .generation = generation,
+                    .version = version,
+                    .tombstone = tombstone,
                 });
-                ops.push_back(ycsb::make_put(cfg, key_id, generation));
+                if (tombstone) {
+                    ops.push_back(ycsb::make_delete(cfg, key_id));
+                } else {
+                    ops.push_back(ycsb::make_put(cfg, key_id, generation));
+                }
             }
 
             const uint64_t start = clock->mark();
@@ -496,6 +545,8 @@ writer_main(const ycsb::config& cfg,
                 writes->push_back(write_interval{
                     .key_id = op.key_id,
                     .generation = op.generation,
+                    .version = op.version,
+                    .tombstone = op.tombstone,
                     .start_seq = start,
                     .ack_seq = end,
                 });
@@ -561,27 +612,37 @@ reader_main(uint32_t reader_id,
 }
 
 void
-wait_for_c3_maintenance(runtime_t* runtime,
-                        const std::atomic<bool>* writer_done) {
+wait_for_maintenance(runtime_t* runtime,
+                     const std::atomic<bool>* writer_done,
+                     scenario_kind scenario) {
+    const bool require_flush = scenario == scenario_kind::c3;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
         const auto snap = maintenance_snapshot(runtime);
         if (snap.failed_rounds != 0) {
-            throw std::runtime_error("maintenance failed during c3");
+            throw std::runtime_error(
+                std::string("maintenance failed during ") +
+                std::string(scenario_name(scenario)));
         }
-        if (snap.seal_rounds > 0 &&
-            snap.flush_rounds > 0 &&
-            snap.non_noop_flush_rounds > 0) {
+        const bool reached =
+            snap.seal_rounds > 0 &&
+            (!require_flush ||
+             (snap.flush_rounds > 0 && snap.non_noop_flush_rounds > 0));
+        if (reached) {
             if (writer_done->load(std::memory_order_acquire)) {
                 throw std::runtime_error(
-                    "c3 maintenance completed after writer finished");
+                    std::string("maintenance completed after writer finished "
+                                "during ") +
+                    std::string(scenario_name(scenario)));
             }
             return;
         }
         if (writer_done->load(std::memory_order_acquire)) {
             throw std::runtime_error(
-                "writer completed before c3 non-noop maintenance");
+                std::string("writer completed before required maintenance "
+                            "during ") +
+                std::string(scenario_name(scenario)));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -590,8 +651,9 @@ wait_for_c3_maintenance(runtime_t* runtime,
     char buf[256];
     std::snprintf(buf,
                   sizeof(buf),
-                  "timed out waiting for c3 maintenance: failed=%lu "
+                  "timed out waiting for %s maintenance: failed=%lu "
                   "seal=%lu flush=%lu non_noop_flush=%lu completed=%lu",
+                  scenario_name(scenario).data(),
                   static_cast<unsigned long>(snap.failed_rounds),
                   static_cast<unsigned long>(snap.seal_rounds),
                   static_cast<unsigned long>(snap.flush_rounds),
@@ -658,7 +720,8 @@ write_is_prior_or_overlapping(const write_interval& write,
 bool
 run_interval_checker(const ycsb::config& cfg,
                      const std::vector<write_interval>& writes,
-                     const std::vector<std::vector<read_interval>>& readers) {
+                     const std::vector<std::vector<read_interval>>& readers,
+                     bool put_only) {
     std::vector<std::vector<const write_interval*>> writes_by_key(kHotKeyCount);
     for (const auto& w : writes) {
         if (w.key_id >= kHotKeyCount) {
@@ -669,8 +732,8 @@ run_interval_checker(const ycsb::config& cfg,
     }
     for (auto& per_key : writes_by_key) {
         std::sort(per_key.begin(), per_key.end(), [](auto* lhs, auto* rhs) {
-            if (lhs->generation != rhs->generation) {
-                return lhs->generation < rhs->generation;
+            if (lhs->version != rhs->version) {
+                return lhs->version < rhs->version;
             }
             return lhs->ack_seq < rhs->ack_seq;
         });
@@ -679,6 +742,7 @@ run_interval_checker(const ycsb::config& cfg,
     uint64_t read_count = 0;
     for (const auto& reader_reads : readers) {
         std::vector<uint64_t> last_seen(kHotKeyCount, 0);
+        std::vector<uint64_t> last_seen_version(kHotKeyCount, 0);
         for (const auto& read : reader_reads) {
             ++read_count;
             if (read.key_id >= kHotKeyCount) {
@@ -687,12 +751,53 @@ run_interval_checker(const ycsb::config& cfg,
                 return false;
             }
 
+            const auto& per_key_writes = writes_by_key[read.key_id];
+            const write_interval* latest_prior = nullptr;
+            const write_interval* legal_tombstone = nullptr;
+            for (const auto* w : per_key_writes) {
+                if (w->ack_seq <= read.start_seq &&
+                    (latest_prior == nullptr ||
+                     w->version > latest_prior->version)) {
+                    latest_prior = w;
+                }
+                if (w->tombstone && intervals_overlap(*w, read)) {
+                    if (legal_tombstone == nullptr ||
+                        w->version > legal_tombstone->version) {
+                        legal_tombstone = w;
+                    }
+                }
+            }
+            if (latest_prior != nullptr && latest_prior->tombstone) {
+                legal_tombstone = latest_prior;
+            }
+            const uint64_t latest_prior_generation =
+                latest_prior == nullptr ? 0 : latest_prior->generation;
+
             if (!read.found) {
+                if (!put_only &&
+                    legal_tombstone != nullptr &&
+                    (latest_prior == nullptr ||
+                     legal_tombstone->version >= latest_prior->version)) {
+                    if (legal_tombstone->version <
+                        last_seen_version[read.key_id]) {
+                        print_read_failure(
+                            "per-reader/per-key state version regressed",
+                            read,
+                            0,
+                            latest_prior_generation);
+                        return false;
+                    }
+                    last_seen_version[read.key_id] =
+                        legal_tombstone->version;
+                    continue;
+                }
                 print_read_failure(
-                    "point_get returned not_found for put-only key",
+                    put_only
+                        ? "point_get returned not_found for put-only key"
+                        : "point_get returned not_found without legal tombstone",
                     read,
                     0,
-                    last_seen[read.key_id]);
+                    latest_prior_generation);
                 return false;
             }
 
@@ -704,7 +809,7 @@ run_interval_checker(const ycsb::config& cfg,
                     "point_get returned unparsable YCSB value",
                     read,
                     0,
-                    last_seen[read.key_id]);
+                    latest_prior_generation);
                 std::fprintf(stderr, "  value='%s'\n", read.value.c_str());
                 return false;
             }
@@ -715,29 +820,26 @@ run_interval_checker(const ycsb::config& cfg,
                     "point_get returned value for wrong key/generation",
                     read,
                     observed_generation,
-                    last_seen[read.key_id]);
+                    latest_prior_generation);
                 std::fprintf(stderr, "  value='%s'\n", read.value.c_str());
                 return false;
             }
 
-            const auto& per_key_writes = writes_by_key[read.key_id];
-            uint64_t latest_prior = 0;
             const write_interval* observed_write = nullptr;
             for (const auto* w : per_key_writes) {
-                if (w->ack_seq <= read.start_seq) {
-                    latest_prior = std::max(latest_prior, w->generation);
-                }
-                if (w->generation == observed_generation) {
+                if (!w->tombstone && w->generation == observed_generation) {
                     observed_write = w;
                 }
             }
 
-            if (observed_generation < latest_prior) {
+            if (latest_prior != nullptr &&
+                (observed_write == nullptr ||
+                 observed_write->version < latest_prior->version)) {
                 print_read_failure(
-                    "observed generation older than latest prior ACK",
+                    "observed state older than latest prior ACK",
                     read,
                     observed_generation,
-                    latest_prior);
+                    latest_prior_generation);
                 return false;
             }
 
@@ -747,21 +849,34 @@ run_interval_checker(const ycsb::config& cfg,
                     "observed generation is not prior/overlapping ACKed write",
                     read,
                     observed_generation,
-                    latest_prior);
+                    latest_prior_generation);
                 if (observed_write != nullptr) {
                     std::fprintf(stderr,
-                                 "  write=[%lu,%lu] gen=%lu\n",
+                                 "  write=[%lu,%lu] gen=%lu version=%lu\n",
                                  static_cast<unsigned long>(
                                      observed_write->start_seq),
                                  static_cast<unsigned long>(
                                      observed_write->ack_seq),
                                  static_cast<unsigned long>(
-                                     observed_write->generation));
+                                     observed_write->generation),
+                                 static_cast<unsigned long>(
+                                     observed_write->version));
                 }
                 return false;
             }
 
-            if (observed_generation < last_seen[read.key_id]) {
+            if (!put_only &&
+                observed_write->version < last_seen_version[read.key_id]) {
+                print_read_failure(
+                    "per-reader/per-key state version regressed",
+                    read,
+                    observed_generation,
+                    latest_prior_generation);
+                return false;
+            }
+            last_seen_version[read.key_id] = observed_write->version;
+
+            if (put_only && observed_generation < last_seen[read.key_id]) {
                 print_read_failure(
                     "per-reader/per-key generation regressed",
                     read,
@@ -786,10 +901,13 @@ run_workload(checker_fixture* fx,
              scenario_kind scenario) {
     interval_clock clock;
     std::vector<uint64_t> generations(kHotKeyCount, 0);
+    std::vector<uint64_t> versions(kHotKeyCount, 0);
+    std::vector<bool> live(kHotKeyCount, false);
     workload_result result;
     result.reads_by_reader.resize(kReaderCount);
 
-    preload_hot_keys(cfg, &clock, &generations, &result.writes);
+    preload_hot_keys(
+        cfg, &clock, &generations, &versions, &live, &result.writes);
 
     std::atomic<bool> stop_readers{false};
     std::atomic<bool> writer_done{false};
@@ -801,8 +919,10 @@ run_workload(checker_fixture* fx,
             writer_main(cfg,
                         &clock,
                         &generations,
+                        &versions,
+                        &live,
                         &result.writes,
-                        scenario == scenario_kind::c3);
+                        scenario);
         } catch (...) {
             writer_error = std::current_exception();
         }
@@ -827,9 +947,9 @@ run_workload(checker_fixture* fx,
     }
 
     std::exception_ptr maintenance_error;
-    if (scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
         try {
-            wait_for_c3_maintenance(fx->runtime(), &writer_done);
+            wait_for_maintenance(fx->runtime(), &writer_done, scenario);
         } catch (...) {
             maintenance_error = std::current_exception();
         }
@@ -842,7 +962,7 @@ run_workload(checker_fixture* fx,
     if (maintenance_error) {
         std::rethrow_exception(maintenance_error);
     }
-    if (scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
         result.maintenance = maintenance_snapshot(fx->runtime());
     }
 
@@ -855,10 +975,14 @@ run_workload(checker_fixture* fx,
         }
     }
 
-    if (scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
         if (result.maintenance.failed_rounds != 0 ||
-            result.maintenance.seal_rounds == 0 ||
-            result.maintenance.flush_rounds == 0 ||
+            result.maintenance.seal_rounds == 0) {
+            throw std::runtime_error("c2 maintenance counter contract failed");
+        }
+    }
+    if (scenario == scenario_kind::c3) {
+        if (result.maintenance.flush_rounds == 0 ||
             result.maintenance.non_noop_flush_rounds == 0) {
             throw std::runtime_error("c3 maintenance counter contract failed");
         }
@@ -870,12 +994,12 @@ run_workload(checker_fixture* fx,
 void
 print_usage(const char* argv0) {
     std::printf(
-        "usage: %s --pci-addr BDF --scenario c1|c3 "
+        "usage: %s --pci-addr BDF --scenario c1|c2|c3|c4 "
         "[--spdk-core-mask MASK] [--qpair-depth D]\n"
         "  --pci-addr BDF         PCI BDF of the SPDK-bound scratch NVMe\n"
         "                         controller, or INCONEL_NVME_PCI_ADDR\n"
-        "  --scenario c1|c3       c1 disables maintenance; c3 enables "
-        "aggressive maintenance\n"
+        "  --scenario c1|c2|c3|c4 c1 put/read, c2 auto-seal put/read, "
+        "c3 auto-flush put/read, c4 delete/read/put\n"
         "  --spdk-core-mask MASK  optional SPDK env core mask override\n"
         "  --qpair-depth D        NVMe qpair depth (default 256)\n",
         argv0);
@@ -899,11 +1023,20 @@ parse_scenario(std::string_view value) {
         value == "maintenance-off") {
         return scenario_kind::c1;
     }
+    if (value == "c2" || value == "2" || value == "seal" ||
+        value == "auto-seal") {
+        return scenario_kind::c2;
+    }
     if (value == "c3" || value == "3" || value == "on" ||
-        value == "maintenance-on") {
+        value == "maintenance-on" || value == "auto-flush") {
         return scenario_kind::c3;
     }
-    throw std::invalid_argument("unknown --scenario (expected c1 or c3)");
+    if (value == "c4" || value == "4" || value == "delete" ||
+        value == "delete-race") {
+        return scenario_kind::c4;
+    }
+    throw std::invalid_argument(
+        "unknown --scenario (expected c1, c2, c3, or c4)");
 }
 
 harness_options
@@ -960,7 +1093,7 @@ parse_argv(int argc, char** argv) {
                          "--pci-addr or INCONEL_NVME_PCI_ADDR is required\n");
         }
         if (!scenario_set) {
-            std::fprintf(stderr, "--scenario c1|c3 is required\n");
+            std::fprintf(stderr, "--scenario c1|c2|c3|c4 is required\n");
         }
         print_usage(argv[0]);
         std::exit(2);
@@ -992,7 +1125,9 @@ run_checker(const harness_options& opts) {
         opts.pci_addr, opts.spdk_core_mask, opts.qpair_depth, opts.scenario);
     auto result = run_workload(&fx, cfg, opts.scenario);
 
-    if (!run_interval_checker(cfg, result.writes, result.reads_by_reader)) {
+    const bool put_only = opts.scenario != scenario_kind::c4;
+    if (!run_interval_checker(
+            cfg, result.writes, result.reads_by_reader, put_only)) {
         return 1;
     }
 
@@ -1004,7 +1139,8 @@ run_checker(const harness_options& opts) {
                 result.writes.size(),
                 static_cast<unsigned long>(read_count),
                 static_cast<unsigned long>(kHotKeyCount));
-    if (opts.scenario == scenario_kind::c3) {
+    if (opts.scenario == scenario_kind::c2 ||
+        opts.scenario == scenario_kind::c3) {
         std::printf("checker_maintenance failed=%lu seal=%lu flush=%lu "
                     "non_noop_flush=%lu completed=%lu\n",
                     static_cast<unsigned long>(

@@ -17,7 +17,7 @@ LOCK_FILE="/tmp/inconel_ycsb_${BDF//[:.]/_}.lock"
 
 usage() {
     cat <<EOF
-Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c3]
+Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4]
 
 Environment:
   INCONEL_YCSB_BDF                  Scratch BDF, default 0000:04:00.0
@@ -232,6 +232,11 @@ assert_checker_maintenance_ok() {
     local log="$1"
     assert_eq "$log" checker_maintenance failed 0
     assert_gt_zero "$log" checker_maintenance seal
+}
+
+assert_checker_flush_ok() {
+    local log="$1"
+    assert_checker_maintenance_ok "$log"
     assert_gt_zero "$log" checker_maintenance flush
     assert_gt_zero "$log" checker_maintenance non_noop_flush
 }
@@ -446,11 +451,24 @@ run_c1() {
     assert_checker_ok "$log"
 }
 
+run_c2() {
+    local log
+    log="$(run_concurrency_checker "c2_put_read_auto_seal_race" "c2")"
+    assert_checker_ok "$log"
+    assert_checker_maintenance_ok "$log"
+}
+
 run_c3() {
     local log
     log="$(run_concurrency_checker "c3_put_read_auto_flush_race" "c3")"
     assert_checker_ok "$log"
-    assert_checker_maintenance_ok "$log"
+    assert_checker_flush_ok "$log"
+}
+
+run_c4() {
+    local log
+    log="$(run_concurrency_checker "c4_delete_read_put_race" "c4")"
+    assert_checker_ok "$log"
 }
 
 run_all() {
@@ -466,7 +484,9 @@ run_all() {
     run_a9_continuation
     run_a10
     run_c1
+    run_c2
     run_c3
+    run_c4
 }
 
 case "$SCENARIO" in
@@ -474,7 +494,7 @@ case "$SCENARIO" in
         usage
         exit 0
         ;;
-    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c3)
+    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4)
         prepare
         "run_${SCENARIO}"
         echo "PASS: $SCENARIO logs in $LOG_DIR"

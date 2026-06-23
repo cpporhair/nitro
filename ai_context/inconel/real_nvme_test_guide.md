@@ -309,6 +309,8 @@ apps/inconel/scripts/ycsb_consistency.sh c3
 apps/inconel/scripts/ycsb_consistency.sh c4
 apps/inconel/scripts/ycsb_consistency.sh c5
 apps/inconel/scripts/ycsb_consistency.sh c6
+apps/inconel/scripts/ycsb_consistency.sh c7
+apps/inconel/scripts/ycsb_consistency.sh c8
 apps/inconel/scripts/ycsb_consistency.sh all
 ```
 
@@ -321,7 +323,11 @@ YCSB real runs, checks `checker_maintenance.failed=0` for C2/C3/C5/C6, requires
 `checker_barrier.reads=4096`; C6 requires
 ACK-immediate `checker_barrier.reads=64`,
 `checker_frontier_barrier.reads=64`, `generation=2`, and
-`checker_frontier_window.reads>0`.
+`checker_frontier_window.reads>0`. C7/C8 are scripted recovery-continuation
+scenarios with exact expected-state oracle files: C7 verifies update winners
+after existing-tree + WAL-delta recovery, then a post-recovery full PUT and
+second restart; C8 verifies tombstone recovery, post-tombstone PUT, and a
+second restart.
 
 ## Maintenance Cadence Tests
 

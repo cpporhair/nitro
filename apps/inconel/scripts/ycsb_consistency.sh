@@ -17,7 +17,7 @@ LOCK_FILE="/tmp/inconel_ycsb_${BDF//[:.]/_}.lock"
 
 usage() {
     cat <<EOF
-Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5|c6]
+Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5|c6|c7|c8]
 
 Environment:
   INCONEL_YCSB_BDF                  Scratch BDF, default 0000:04:00.0
@@ -504,6 +504,125 @@ run_c6() {
     assert_checker_flush_ok "$log"
 }
 
+run_c7() {
+    local log
+    local base_file="$LOG_DIR/c7_base_expected.json"
+    local delta_file="$LOG_DIR/c7_delta_expected.json"
+    local after_file="$LOG_DIR/c7_after_recovery_expected.json"
+
+    log="$(run_ycsb "c7_1_load_flush_base" \
+        --force-format --workload load --records 1000 --operations 1000 \
+        --inflight 1 --verify-samples 0 --flush-after-load \
+        --expect-all --write-expect-file "$base_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" load-flush ops 1
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+    [[ -s "$base_file" ]] ||
+        fail "$base_file: expected-state file was not written"
+
+    log="$(run_ycsb "c7_2_update_wal_delta" \
+        --workload update --records 1000 --operations 2000 \
+        --inflight 1 --verify-samples 0 \
+        --expect-file "$base_file" --expect-all \
+        --write-expect-file "$delta_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run acked_entries 2000
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+    [[ -s "$delta_file" ]] ||
+        fail "$delta_file: expected-state file was not written"
+
+    log="$(run_ycsb "c7_3_recover_verify_delta" \
+        --workload c --records 1000 --operations 1000 \
+        --expect-file "$delta_file" --expect-all)"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run read_found 1000
+    assert_eq "$log" run read_miss 0
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+
+    log="$(run_ycsb "c7_4_put_after_recovery" \
+        --workload load --records 1000 --operations 1000 \
+        --seed 2 --inflight 1 --verify-samples 0 \
+        --expect-all --write-expect-file "$after_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" load acked_entries 1000
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+    [[ -s "$after_file" ]] ||
+        fail "$after_file: expected-state file was not written"
+
+    log="$(run_ycsb "c7_5_restart_verify_continuation" \
+        --workload c --records 1000 --operations 1000 \
+        --seed 2 --expect-file "$after_file" --expect-all)"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run read_found 1000
+    assert_eq "$log" run read_miss 0
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+}
+
+run_c8() {
+    local log
+    local base_file="$LOG_DIR/c8_base_expected.json"
+    local tomb_file="$LOG_DIR/c8_tombstone_expected.json"
+    local after_file="$LOG_DIR/c8_after_put_expected.json"
+
+    log="$(run_ycsb "c8_1_load_flush_for_tombstones" \
+        --force-format --workload load --records 1000 --operations 1000 \
+        --inflight 1 --verify-samples 0 --flush-after-load \
+        --expect-all --write-expect-file "$base_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" load-flush ops 1
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+    [[ -s "$base_file" ]] ||
+        fail "$base_file: expected-state file was not written"
+
+    log="$(run_ycsb "c8_2_delete_wal_delta" \
+        --workload del --records 1000 --operations 1000 \
+        --inflight 1 --verify-samples 0 \
+        --expect-file "$base_file" --expect-all \
+        --write-expect-file "$tomb_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run acked_entries 1000
+    assert_eq "$log" expect read_found 0
+    assert_eq "$log" expect read_miss 1000
+    [[ -s "$tomb_file" ]] ||
+        fail "$tomb_file: expected-state file was not written"
+
+    log="$(run_ycsb "c8_3_recover_verify_tombstones" \
+        --workload c --records 1000 --operations 1000 \
+        --expect-file "$tomb_file" --expect-all)"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run read_found 0
+    assert_eq "$log" run read_miss 1000
+    assert_eq "$log" expect read_found 0
+    assert_eq "$log" expect read_miss 1000
+
+    log="$(run_ycsb "c8_4_put_after_tombstone_recovery" \
+        --workload load --records 1000 --operations 1000 \
+        --inflight 1 --verify-samples 0 \
+        --expect-file "$tomb_file" --expect-all \
+        --write-expect-file "$after_file")"
+    assert_real_run_ok "$log"
+    assert_eq "$log" load acked_entries 1000
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+    [[ -s "$after_file" ]] ||
+        fail "$after_file: expected-state file was not written"
+
+    log="$(run_ycsb "c8_5_restart_verify_puts" \
+        --workload c --records 1000 --operations 1000 \
+        --expect-file "$after_file" --expect-all)"
+    assert_real_run_ok "$log"
+    assert_eq "$log" run read_found 1000
+    assert_eq "$log" run read_miss 0
+    assert_eq "$log" expect read_found 1000
+    assert_eq "$log" expect read_miss 0
+}
+
 run_all() {
     run_a0
     run_a1
@@ -522,6 +641,8 @@ run_all() {
     run_c4
     run_c5
     run_c6
+    run_c7
+    run_c8
 }
 
 case "$SCENARIO" in
@@ -529,7 +650,7 @@ case "$SCENARIO" in
         usage
         exit 0
         ;;
-    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5|c6)
+    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5|c6|c7|c8)
         prepare
         "run_${SCENARIO}"
         echo "PASS: $SCENARIO logs in $LOG_DIR"

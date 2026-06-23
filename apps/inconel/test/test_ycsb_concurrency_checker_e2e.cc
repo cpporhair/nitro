@@ -214,6 +214,7 @@ enum class scenario_kind : uint8_t {
     c3,
     c4,
     c5,
+    c6,
 };
 
 struct harness_options {
@@ -236,6 +237,8 @@ scenario_name(scenario_kind scenario) noexcept {
         return "c4";
     case scenario_kind::c5:
         return "c5";
+    case scenario_kind::c6:
+        return "c6";
     }
     return "unknown";
 }
@@ -295,6 +298,9 @@ struct workload_result {
     std::vector<write_interval> writes;
     std::vector<std::vector<read_interval>> reads_by_reader;
     uint64_t batch_barrier_reads = 0;
+    uint64_t frontier_barrier_reads = 0;
+    uint64_t frontier_generation = 0;
+    uint64_t frontier_window_reads = 0;
     runtime::maintenance_stats_snapshot maintenance{};
 };
 
@@ -353,6 +359,9 @@ class checker_fixture {
                 maintenance.policy.wal_seal_used_ratio = 1.0f;
                 maintenance.policy.max_sealed_gens_per_front = 64;
             } else {
+                if (scenario == scenario_kind::c6) {
+                    maintenance.policy.seal_active_memtable_bytes = 0;
+                }
                 maintenance.policy.total_memtable_limit_bytes =
                     256ull * 1024ull;
                 maintenance.policy.wal_seal_used_ratio = 0.05f;
@@ -709,6 +718,85 @@ wait_for_maintenance(runtime_t* runtime,
     throw std::runtime_error(buf);
 }
 
+[[noreturn]] void
+throw_maintenance_timeout(const char* label,
+                          runtime::maintenance_stats_snapshot baseline,
+                          runtime::maintenance_stats_snapshot snap) {
+    char buf[512];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "timed out waiting for %s maintenance delta: "
+                  "baseline failed=%lu seal=%lu flush=%lu non_noop=%lu "
+                  "noop=%lu completed=%lu; "
+                  "current failed=%lu seal=%lu flush=%lu non_noop=%lu "
+                  "noop=%lu completed=%lu",
+                  label,
+                  static_cast<unsigned long>(baseline.failed_rounds),
+                  static_cast<unsigned long>(baseline.seal_rounds),
+                  static_cast<unsigned long>(baseline.flush_rounds),
+                  static_cast<unsigned long>(
+                      baseline.non_noop_flush_rounds),
+                  static_cast<unsigned long>(baseline.noop_rounds),
+                  static_cast<unsigned long>(baseline.completed_rounds),
+                  static_cast<unsigned long>(snap.failed_rounds),
+                  static_cast<unsigned long>(snap.seal_rounds),
+                  static_cast<unsigned long>(snap.flush_rounds),
+                  static_cast<unsigned long>(snap.non_noop_flush_rounds),
+                  static_cast<unsigned long>(snap.noop_rounds),
+                  static_cast<unsigned long>(snap.completed_rounds));
+    throw std::runtime_error(buf);
+}
+
+runtime::maintenance_stats_snapshot
+wait_for_non_noop_after(runtime_t* runtime,
+                        runtime::maintenance_stats_snapshot baseline,
+                        const char* label) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    runtime::maintenance_stats_snapshot snap = maintenance_snapshot(runtime);
+    while (std::chrono::steady_clock::now() < deadline) {
+        snap = maintenance_snapshot(runtime);
+        if (snap.failed_rounds != baseline.failed_rounds) {
+            throw std::runtime_error(
+                std::string("maintenance failed during ") + label);
+        }
+        if (snap.completed_rounds > baseline.completed_rounds &&
+            snap.seal_rounds > baseline.seal_rounds &&
+            snap.flush_rounds > baseline.flush_rounds &&
+            snap.non_noop_flush_rounds >
+                baseline.non_noop_flush_rounds) {
+            return snap;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    throw_maintenance_timeout(label, baseline, snap);
+}
+
+runtime::maintenance_stats_snapshot
+wait_for_noop_after(runtime_t* runtime,
+                    runtime::maintenance_stats_snapshot baseline,
+                    const char* label) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    runtime::maintenance_stats_snapshot snap = maintenance_snapshot(runtime);
+    while (std::chrono::steady_clock::now() < deadline) {
+        snap = maintenance_snapshot(runtime);
+        if (snap.failed_rounds != baseline.failed_rounds) {
+            throw std::runtime_error(
+                std::string("maintenance failed during ") + label);
+        }
+        if (snap.non_noop_flush_rounds >
+            baseline.non_noop_flush_rounds) {
+            baseline = snap;
+        } else if (snap.completed_rounds > baseline.completed_rounds &&
+                   snap.noop_rounds > baseline.noop_rounds) {
+            return snap;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    throw_maintenance_timeout(label, baseline, snap);
+}
+
 bool
 parse_ycsb_value(std::string_view value, uint64_t* id, uint64_t* generation) {
     if (!value.starts_with("id=")) return false;
@@ -943,9 +1031,164 @@ run_interval_checker(const ycsb::config& cfg,
 }
 
 workload_result
+run_frontier_barrier_workload(checker_fixture* fx,
+                              const ycsb::config& cfg) {
+    interval_clock clock;
+    std::vector<uint64_t> generations(kHotKeyCount, 0);
+    std::vector<uint64_t> versions(kHotKeyCount, 0);
+    std::vector<bool> live(kHotKeyCount, false);
+    workload_result result;
+    result.reads_by_reader.resize(kReaderCount);
+
+    const auto before_preload = maintenance_snapshot(fx->runtime());
+    preload_hot_keys(
+        cfg, &clock, &generations, &versions, &live, &result.writes);
+    const auto after_preload_flush =
+        wait_for_non_noop_after(fx->runtime(),
+                                before_preload,
+                                "c6 preload flush");
+    const auto baseline =
+        wait_for_noop_after(fx->runtime(),
+                            after_preload_flush,
+                            "c6 clean baseline");
+
+    std::atomic<bool> stop_readers{false};
+    std::vector<std::exception_ptr> reader_errors(kReaderCount);
+    std::vector<std::jthread> readers;
+    readers.reserve(kReaderCount);
+    uint64_t frontier_window_start = 0;
+    uint64_t frontier_window_end = 0;
+    for (uint32_t i = 0; i < kReaderCount; ++i) {
+        readers.emplace_back([&, i]() {
+            try {
+                reader_main(i,
+                            cfg,
+                            &clock,
+                            &stop_readers,
+                            &result.reads_by_reader[i]);
+            } catch (...) {
+                reader_errors[i] = std::current_exception();
+                stop_readers.store(true, std::memory_order_release);
+            }
+        });
+    }
+
+    try {
+        std::vector<core::raw_batch_op> ops;
+        ops.reserve(kHotKeyCount);
+        const uint64_t sentinel_generation = kInitialGeneration + 1;
+        for (uint64_t id = 0; id < kHotKeyCount; ++id) {
+            generations[id] = sentinel_generation;
+            ++versions[id];
+            live[id] = true;
+            ops.push_back(ycsb::make_put(cfg, id, sentinel_generation));
+        }
+
+        pump::core::this_core_id = kWriterCore;
+        const uint64_t start = clock.mark();
+        auto ack = submit_write_batch(std::move(ops));
+        const uint64_t end = clock.mark();
+        if (ack.entry_count != kHotKeyCount || ack.batch_lsn == 0) {
+            throw std::runtime_error(
+                "c6 sentinel write_batch returned bad ack");
+        }
+        for (uint64_t id = 0; id < kHotKeyCount; ++id) {
+            auto got = submit_point_get(ycsb::make_key(cfg, id));
+            const auto expected = ycsb::make_value(
+                cfg, id, sentinel_generation);
+            if (!got.found || got.value != expected) {
+                char buf[320];
+                std::snprintf(
+                    buf,
+                    sizeof(buf),
+                    "c6 ack barrier point_get mismatch: lsn=%lu "
+                    "key=%lu expected_gen=%lu found=%d",
+                    static_cast<unsigned long>(ack.batch_lsn),
+                    static_cast<unsigned long>(id),
+                    static_cast<unsigned long>(sentinel_generation),
+                    got.found ? 1 : 0);
+                throw std::runtime_error(buf);
+            }
+            ++result.batch_barrier_reads;
+        }
+        result.writes.reserve(kHotKeyCount * 2);
+        for (uint64_t id = 0; id < kHotKeyCount; ++id) {
+            result.writes.push_back(write_interval{
+                .key_id = id,
+                .generation = sentinel_generation,
+                .version = versions[id],
+                .tombstone = false,
+                .start_seq = start,
+                .ack_seq = end,
+            });
+        }
+
+        frontier_window_start = clock.mark();
+        const auto after_sentinel_flush =
+            wait_for_non_noop_after(fx->runtime(),
+                                    baseline,
+                                    "c6 sentinel flush");
+        frontier_window_end = clock.mark();
+        result.maintenance = after_sentinel_flush;
+        result.frontier_generation = sentinel_generation;
+
+        for (uint64_t id = 0; id < kHotKeyCount; ++id) {
+            auto got = submit_point_get(ycsb::make_key(cfg, id));
+            const auto expected = ycsb::make_value(
+                cfg, id, sentinel_generation);
+            if (!got.found || got.value != expected) {
+                char buf[320];
+                std::snprintf(
+                    buf,
+                    sizeof(buf),
+                    "c6 frontier barrier point_get mismatch: lsn=%lu "
+                    "key=%lu expected_gen=%lu found=%d",
+                    static_cast<unsigned long>(ack.batch_lsn),
+                    static_cast<unsigned long>(id),
+                    static_cast<unsigned long>(sentinel_generation),
+                    got.found ? 1 : 0);
+                throw std::runtime_error(buf);
+            }
+            ++result.frontier_barrier_reads;
+        }
+    } catch (...) {
+        stop_readers.store(true, std::memory_order_release);
+        readers.clear();
+        throw;
+    }
+
+    stop_readers.store(true, std::memory_order_release);
+    readers.clear();
+
+    for (auto& ep : reader_errors) {
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+    }
+    for (const auto& reads : result.reads_by_reader) {
+        for (const auto& read : reads) {
+            if (frontier_window_start < read.end_seq &&
+                read.start_seq < frontier_window_end) {
+                ++result.frontier_window_reads;
+            }
+        }
+    }
+    if (result.frontier_window_reads == 0) {
+        throw std::runtime_error(
+            "c6 frontier switch window recorded no background reads");
+    }
+    result.maintenance = maintenance_snapshot(fx->runtime());
+    return result;
+}
+
+workload_result
 run_workload(checker_fixture* fx,
              const ycsb::config& cfg,
              scenario_kind scenario) {
+    if (scenario == scenario_kind::c6) {
+        return run_frontier_barrier_workload(fx, cfg);
+    }
+
     interval_clock clock;
     std::vector<uint64_t> generations(kHotKeyCount, 0);
     std::vector<uint64_t> versions(kHotKeyCount, 0);
@@ -1032,13 +1275,13 @@ run_workload(checker_fixture* fx,
         scenario == scenario_kind::c5) {
         if (result.maintenance.failed_rounds != 0 ||
             result.maintenance.seal_rounds == 0) {
-            throw std::runtime_error("c2 maintenance counter contract failed");
+            throw std::runtime_error("maintenance seal counter contract failed");
         }
     }
     if (scenario == scenario_kind::c3 || scenario == scenario_kind::c5) {
         if (result.maintenance.flush_rounds == 0 ||
             result.maintenance.non_noop_flush_rounds == 0) {
-            throw std::runtime_error("c3 maintenance counter contract failed");
+            throw std::runtime_error("maintenance flush counter contract failed");
         }
     }
 
@@ -1048,13 +1291,14 @@ run_workload(checker_fixture* fx,
 void
 print_usage(const char* argv0) {
     std::printf(
-        "usage: %s --pci-addr BDF --scenario c1|c2|c3|c4|c5 "
+        "usage: %s --pci-addr BDF --scenario c1|c2|c3|c4|c5|c6 "
         "[--spdk-core-mask MASK] [--qpair-depth D]\n"
         "  --pci-addr BDF         PCI BDF of the SPDK-bound scratch NVMe\n"
         "                         controller, or INCONEL_NVME_PCI_ADDR\n"
-        "  --scenario c1|c2|c3|c4|c5 c1 put/read, "
+        "  --scenario c1|c2|c3|c4|c5|c6 c1 put/read, "
         "c2 auto-seal put/read, c3 auto-flush put/read, "
-        "c4 delete/read/put, c5 batch barrier\n"
+        "c4 delete/read/put, c5 batch barrier, "
+        "c6 frontier barrier\n"
         "  --spdk-core-mask MASK  optional SPDK env core mask override\n"
         "  --qpair-depth D        NVMe qpair depth (default 256)\n",
         argv0);
@@ -1094,8 +1338,12 @@ parse_scenario(std::string_view value) {
         value == "batch-barrier") {
         return scenario_kind::c5;
     }
+    if (value == "c6" || value == "6" || value == "frontier" ||
+        value == "frontier-barrier") {
+        return scenario_kind::c6;
+    }
     throw std::invalid_argument(
-        "unknown --scenario (expected c1, c2, c3, c4, or c5)");
+        "unknown --scenario (expected c1, c2, c3, c4, c5, or c6)");
 }
 
 harness_options
@@ -1152,7 +1400,8 @@ parse_argv(int argc, char** argv) {
                          "--pci-addr or INCONEL_NVME_PCI_ADDR is required\n");
         }
         if (!scenario_set) {
-            std::fprintf(stderr, "--scenario c1|c2|c3|c4|c5 is required\n");
+            std::fprintf(stderr,
+                         "--scenario c1|c2|c3|c4|c5|c6 is required\n");
         }
         print_usage(argv[0]);
         std::exit(2);
@@ -1200,9 +1449,15 @@ run_checker(const harness_options& opts) {
                 static_cast<unsigned long>(kHotKeyCount));
     std::printf("checker_barrier reads=%lu\n",
                 static_cast<unsigned long>(result.batch_barrier_reads));
+    std::printf("checker_frontier_barrier reads=%lu generation=%lu\n",
+                static_cast<unsigned long>(result.frontier_barrier_reads),
+                static_cast<unsigned long>(result.frontier_generation));
+    std::printf("checker_frontier_window reads=%lu\n",
+                static_cast<unsigned long>(result.frontier_window_reads));
     if (opts.scenario == scenario_kind::c2 ||
         opts.scenario == scenario_kind::c3 ||
-        opts.scenario == scenario_kind::c5) {
+        opts.scenario == scenario_kind::c5 ||
+        opts.scenario == scenario_kind::c6) {
         std::printf("checker_maintenance failed=%lu seal=%lu flush=%lu "
                     "non_noop_flush=%lu completed=%lu\n",
                     static_cast<unsigned long>(

@@ -30,6 +30,7 @@ namespace apps::inconel::recovery {
 
     struct recovered_tree_record {
         std::string key;
+        format::paddr leaf_range_base{};
         uint64_t data_ver = 0;
         format::record_kind kind = format::record_kind::tombstone;
         format::value_ref vr{};
@@ -187,6 +188,7 @@ namespace apps::inconel::recovery {
                 ctx.max_data_ver = std::max(ctx.max_data_ver, rec.data_ver);
                 ctx.records.push_back(recovered_tree_record{
                     .key = std::string(rec.key),
+                    .leaf_range_base = page.range_base,
                     .data_ver = rec.data_ver,
                     .kind = rec.kind,
                     .vr = rec.vr,

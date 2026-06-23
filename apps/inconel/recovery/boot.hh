@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -795,10 +796,24 @@ namespace apps::inconel::recovery {
         };
     }
 
+    struct leaf_merge_result {
+        std::vector<recovered_tree_record> records;
+        bool changed = false;
+    };
+
+    struct same_shape_leaf_replay_plan {
+        format::paddr leaf_range_base{};
+        uint32_t next_slot = 0;
+        format::paddr next_slot_paddr{};
+        dma_buffer page;
+    };
+
     [[nodiscard]] inline recovered_tree_record
-    recovered_record_from_replay(const replay_record& rec) {
+    recovered_record_from_replay(const replay_record& rec,
+                                 format::paddr leaf_range_base) {
         recovered_tree_record out{
             .key = rec.key,
+            .leaf_range_base = leaf_range_base,
             .data_ver = rec.data_ver,
             .kind = record_kind_for_replay(rec),
             .vr = {},
@@ -809,27 +824,32 @@ namespace apps::inconel::recovery {
         return out;
     }
 
-    [[nodiscard]] inline std::vector<recovered_tree_record>
-    merge_single_leaf_records(const recovered_tree_scan& tree_scan,
-                              const std::vector<replay_record>& wal_records) {
+    [[nodiscard]] inline leaf_merge_result
+    merge_leaf_records(std::span<const recovered_tree_record> tree_records,
+                       std::span<const replay_record> wal_records,
+                       format::paddr leaf_range_base) {
         std::map<std::string, recovered_tree_record> by_key;
-        for (const auto& rec : tree_scan.records) {
+        for (const auto& rec : tree_records) {
             auto [_, inserted] = by_key.emplace(rec.key, rec);
             if (!inserted) {
                 throw std::runtime_error(
-                    "inconel recovery: duplicate key in single-leaf scan");
+                    "inconel recovery: duplicate key in same-shape leaf scan");
             }
         }
 
+        bool changed = false;
         for (const auto& wal_rec : wal_records) {
-            auto incoming = recovered_record_from_replay(wal_rec);
+            auto incoming =
+                recovered_record_from_replay(wal_rec, leaf_range_base);
             auto it = by_key.find(incoming.key);
             if (it == by_key.end()) {
                 by_key.emplace(incoming.key, std::move(incoming));
+                changed = true;
                 continue;
             }
             if (it->second.data_ver < incoming.data_ver) {
                 it->second = std::move(incoming);
+                changed = true;
                 continue;
             }
             if (it->second.data_ver == incoming.data_ver) {
@@ -842,7 +862,10 @@ namespace apps::inconel::recovery {
         for (auto& [_, rec] : by_key) {
             out.push_back(std::move(rec));
         }
-        return out;
+        return leaf_merge_result{
+            .records = std::move(out),
+            .changed = changed,
+        };
     }
 
     [[nodiscard]] inline std::vector<value::live_value_extent>
@@ -872,13 +895,10 @@ namespace apps::inconel::recovery {
         return out;
     }
 
-    [[nodiscard]] inline bool
-    write_single_leaf_records(nvme::real_device& device,
-                              uint32_t core,
-                              const format::format_profile& profile,
-                              const core::tree_geometry& geom,
-                              format::paddr slot_paddr,
-                              const std::vector<recovered_tree_record>& records) {
+    [[nodiscard]] inline std::optional<dma_buffer>
+    build_leaf_records_page(const format::format_profile& profile,
+                            const core::tree_geometry& geom,
+                            const std::vector<recovered_tree_record>& records) {
         auto page = make_zeroed_dma_buffer(
             geom.tree_page_size, profile.lba_size);
         tree::leaf_page_builder builder;
@@ -896,75 +916,156 @@ namespace apps::inconel::recovery {
                     "inconel recovery: unknown tree record kind");
             }
             if (!ok) {
-                return false;
+                return std::nullopt;
             }
         }
 
         builder.finalize();
-        write_replay_page(
-            device, core, profile, geom, slot_paddr, page.get());
-        sync_flush(device, core);
-        return true;
+        std::optional<dma_buffer> out;
+        out.emplace(std::move(page));
+        return out;
     }
 
     [[nodiscard]] inline std::optional<recovered_tree_scan>
-    replay_single_leaf_wal_delta(nvme::real_device& device,
-                                 uint32_t core,
-                                 const format::format_profile& profile,
-                                 const core::tree_geometry& geom,
-                                 const recovered_tree_scan& tree_scan,
-                                 const wal_scan_result& wal_scan) {
-        if (tree_scan.tree.reverse_topology.internal_nodes.size() != 0 ||
-            tree_scan.tree.leaf_order.spans.size() != 1) {
+    replay_same_shape_wal_delta(nvme::real_device& device,
+                                uint32_t core,
+                                const format::format_profile& profile,
+                                const core::tree_geometry& geom,
+                                const recovered_tree_scan& tree_scan,
+                                const wal_scan_result& wal_scan) {
+        const auto& leaf_order = tree_scan.tree.leaf_order;
+        if (leaf_order.empty()) {
             return std::nullopt;
         }
 
-        const auto root_range_base = tree_scan.tree.root_range_base;
-        const auto leaf_range_base =
-            tree_scan.tree.leaf_order.spans.front().leaf_range_base;
-        if (!(leaf_range_base == root_range_base)) {
-            throw std::runtime_error(
-                "inconel recovery: single-leaf topology does not match root");
+        absl::flat_hash_map<format::paddr, uint32_t> leaf_idx_by_range;
+        leaf_idx_by_range.reserve(leaf_order.spans.size());
+        for (uint32_t i = 0; i < leaf_order.spans.size(); ++i) {
+            auto [_, inserted] =
+                leaf_idx_by_range.emplace(
+                    leaf_order.spans[i].leaf_range_base, i);
+            if (!inserted) {
+                throw std::runtime_error(
+                    "inconel recovery: duplicate leaf range in leaf_order");
+            }
         }
 
-        auto slot_it = tree_scan.tree.slot_map.find(root_range_base);
-        if (slot_it == tree_scan.tree.slot_map.end()) {
-            throw std::runtime_error(
-                "inconel recovery: single-leaf root missing from slot map");
-        }
-        const uint32_t current_slot = slot_it->second;
-        if (current_slot + 1 >= geom.shadow_slots_per_range) {
-            return std::nullopt;
+        std::vector<std::vector<recovered_tree_record>> tree_by_leaf(
+            leaf_order.spans.size());
+        for (const auto& rec : tree_scan.records) {
+            auto it = leaf_idx_by_range.find(rec.leaf_range_base);
+            if (it == leaf_idx_by_range.end()) {
+                throw std::runtime_error(
+                    "inconel recovery: scanned record points at unknown leaf");
+            }
+            tree_by_leaf[it->second].push_back(rec);
         }
 
         const auto wal_records = build_replay_records(wal_scan);
-        auto merged = merge_single_leaf_records(tree_scan, wal_records);
-        if (merged.empty()) {
+        std::vector<std::vector<replay_record>> wal_by_leaf(
+            leaf_order.spans.size());
+        for (const auto& wal_rec : wal_records) {
+            const auto leaf_idx = leaf_order.find_leaf_for_key(wal_rec.key);
+            if (leaf_idx >= leaf_order.spans.size()) {
+                return std::nullopt;
+            }
+            wal_by_leaf[leaf_idx].push_back(wal_rec);
+        }
+
+        std::vector<same_shape_leaf_replay_plan> plans;
+        plans.reserve(wal_records.size());
+        std::vector<std::vector<recovered_tree_record>> merged_by_leaf(
+            leaf_order.spans.size());
+
+        for (uint32_t leaf_idx = 0; leaf_idx < wal_by_leaf.size(); ++leaf_idx) {
+            if (wal_by_leaf[leaf_idx].empty()) {
+                continue;
+            }
+
+            const auto leaf_range_base =
+                leaf_order.spans[leaf_idx].leaf_range_base;
+            auto merge = merge_leaf_records(
+                std::span<const recovered_tree_record>(
+                    tree_by_leaf[leaf_idx].data(),
+                    tree_by_leaf[leaf_idx].size()),
+                std::span<const replay_record>(
+                    wal_by_leaf[leaf_idx].data(),
+                    wal_by_leaf[leaf_idx].size()),
+                leaf_range_base);
+            if (!merge.changed) {
+                continue;
+            }
+            if (merge.records.empty()) {
+                return std::nullopt;
+            }
+
+            auto slot_it = tree_scan.tree.slot_map.find(leaf_range_base);
+            if (slot_it == tree_scan.tree.slot_map.end()) {
+                throw std::runtime_error(
+                    "inconel recovery: affected leaf missing from slot map");
+            }
+            const uint32_t current_slot = slot_it->second;
+            if (current_slot + 1 >= geom.shadow_slots_per_range) {
+                return std::nullopt;
+            }
+
+            auto page = build_leaf_records_page(profile, geom, merge.records);
+            if (!page) {
+                return std::nullopt;
+            }
+
+            const uint32_t next_slot = current_slot + 1;
+            const auto next_slot_paddr =
+                geom.slot_paddr(leaf_range_base, next_slot);
+            merged_by_leaf[leaf_idx] = merge.records;
+            plans.push_back(same_shape_leaf_replay_plan{
+                .leaf_range_base = leaf_range_base,
+                .next_slot = next_slot,
+                .next_slot_paddr = next_slot_paddr,
+                .page = std::move(*page),
+            });
+        }
+
+        if (plans.empty()) {
             return std::nullopt;
         }
 
-        const uint32_t next_slot = current_slot + 1;
-        const auto next_slot_paddr = geom.slot_paddr(root_range_base, next_slot);
-        if (!write_single_leaf_records(
+        for (const auto& plan : plans) {
+            write_replay_page(
                 device,
                 core,
                 profile,
                 geom,
-                next_slot_paddr,
-                merged)) {
-            return std::nullopt;
+                plan.next_slot_paddr,
+                plan.page.get());
+        }
+        sync_flush(device, core);
+
+        std::vector<recovered_tree_record> next_records;
+        for (uint32_t leaf_idx = 0; leaf_idx < leaf_order.spans.size();
+             ++leaf_idx) {
+            const auto& records =
+                merged_by_leaf[leaf_idx].empty()
+                    ? tree_by_leaf[leaf_idx]
+                    : merged_by_leaf[leaf_idx];
+            next_records.insert(
+                next_records.end(), records.begin(), records.end());
         }
 
         auto out = recovered_tree_scan{
             .tree = tree_scan.tree,
-            .live_value_extents = live_extents_from_records(merged),
-            .records = std::move(merged),
+            .live_value_extents = live_extents_from_records(next_records),
+            .records = std::move(next_records),
             .max_data_ver = 0,
             .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
         };
         out.max_data_ver = max_data_ver_from_records(out.records);
-        out.tree.root_slot = next_slot_paddr;
-        out.tree.slot_map[root_range_base] = next_slot;
+        for (const auto& plan : plans) {
+            out.tree.slot_map[plan.leaf_range_base] = plan.next_slot;
+            if (plan.leaf_range_base == out.tree.root_range_base) {
+                out.tree.root_slot = plan.next_slot_paddr;
+            }
+        }
         return out;
     }
 
@@ -1070,7 +1171,7 @@ namespace apps::inconel::recovery {
             if (scan.saw_nonzero) {
                 if (existing_tree_wal_delta_is_empty(tree_scan, scan)) {
                     reset_wal_region(device, core, profile);
-                } else if (auto replayed = replay_single_leaf_wal_delta(
+                } else if (auto replayed = replay_same_shape_wal_delta(
                                device,
                                core,
                                profile,

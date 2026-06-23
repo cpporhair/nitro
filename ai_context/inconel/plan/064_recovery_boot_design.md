@@ -4,14 +4,17 @@
 
 064A 的 boot skeleton 已提交：`09b6870 nitro: inconel: add recovery boot skeleton`。
 
-当前代码只支持 **empty clean boot**：
+当前代码已覆盖 064B、064C 和 064D 的 same-shape 子集：
 
-- 读取 superblock A/B。
-- 从 superblock 派生 `format_profile` / `tree_geometry`。
-- root 为空且 WAL 全零时允许无 `--force-format` 启动。
-- root 非空或 WAL 非空时 fail-fast，避免半成品静默丢数据。
+- empty clean boot。
+- empty tree + complete WAL replay，包含 delete-only/no-op tombstone frontier carrier。
+- existing tree + WAL empty scanner/install。
+- existing tree + WAL nonempty 时，如果 WAL winners 已被 tree 覆盖，reset WAL 并启动。
+- existing tree + WAL delta 时，支持所有受影响 leaf 都能写同 range next slot、merge 后不 split 的 same-shape replay。
 
-本文是完整 recovery boot 的目标规格，后续 064B/064C/064D 按本文继续实现。
+064D 仍未覆盖的 full CoW merge 场景会继续 fail-fast：leaf split、shadow slot exhausted 需要换新 range、internal propagation、root range change。
+
+本文是完整 recovery boot 的目标规格，并记录当前分阶段实现边界。
 
 ## 背景
 
@@ -357,6 +360,20 @@ for each key where winner.source == wal:
 
 无论哪种方式，都不能在 scheduler handler 内部创建 hidden root submit。Boot merge 在 runtime start 前完成。
 
+当前 064D 已实现 same-shape 子集：
+
+- WAL winner 已被 scanned tree 覆盖：不写 tree，reset WAL。
+- WAL delta 命中 existing tree 时，按 `leaf_order.find_leaf_for_key` 定位 leaf。
+- 每个受影响 leaf 必须仍写原 range 的下一 shadow slot。
+- merge 后 leaf page 必须单页容纳；不做 split。
+- internal/root range 不变时不写 superblock；高 slot 扫描在下一次 boot 识别新 leaf slot。
+
+以下仍 fail-fast，等待 full 064D merge primitive：
+
+- 任一受影响 leaf shadow slot exhausted。
+- 任一 leaf merge 后需要 split。
+- 需要分配新 tree range、更新 internal page、更新 root range 或做 tree height 变化。
+
 Boot merge 输出：
 
 ```cpp
@@ -528,6 +545,8 @@ Builder 安装顺序：
 
 ### 064B: WAL Scanner + Empty Tree Replay
 
+状态：已提交。
+
 目标：
 
 - 增加 `recovery/wal_scanner.hh`。
@@ -546,6 +565,8 @@ Builder 安装顺序：
 
 ### 064C: Existing Tree Scanner
 
+状态：已提交。
+
 目标：
 
 - 增加 `recovery/tree_scanner.hh`。
@@ -561,6 +582,8 @@ Builder 安装顺序：
 - WAL empty 时没有 tree writes。
 
 ### 064D: WAL Delta On Existing Tree
+
+状态：部分提交；same-shape leaf replay 已落地，full CoW merge 未完成。
 
 目标：
 

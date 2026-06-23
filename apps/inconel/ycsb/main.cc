@@ -28,12 +28,23 @@ namespace apps::inconel::ycsb {
     inline void
     print_usage(std::ostream& out) {
         out
-            << "usage: inconel_ycsb --pci-addr BDF [--force-format] [options]\n"
+            << "usage: inconel_ycsb [--config FILE] --pci-addr BDF "
+               "[--force-format] [options]\n"
+            << "\n"
+            << "config:\n"
+            << "  --config FILE --dry-run --print-config --no-print-config\n"
+            << "  --dump-config\n"
+            << "\n"
+            << "device:\n"
+            << "  --pci-addr BDF | --pci BDF\n"
+            << "  --force-format --no-force-format\n"
+            << "  --spdk-core-mask MASK --qpair-depth N\n"
             << "\n"
             << "workload:\n"
             << "  --workload load|a|b|c|update|delete|load-a|load-b|load-c\n"
             << "  --records N --operations N --value-size BYTES\n"
-            << "  --batch-size N --inflight N --seed N --verify-samples N\n"
+            << "  --batch-size N --inflight N --seed N --key-prefix PREFIX\n"
+            << "  --verify-samples N\n"
             << "  --verify-existing-updates --verify-existing-deletes\n"
             << "  --flush-after-load --no-flush-after-load\n"
             << "\n"
@@ -45,7 +56,8 @@ namespace apps::inconel::ycsb {
             << "  --maintenance-total-memtable-bytes N\n"
             << "  --maintenance-wal-seal-percent N\n"
             << "  --maintenance-max-sealed-gens-per-front N\n"
-            << "  --tree-cache clock|slru --value-cache clock|slru\n"
+            << "  --tree-cache clock|slru --tree-cache-policy clock|slru\n"
+            << "  --value-cache clock|slru --value-cache-policy clock|slru\n"
             << "  --tree-cache-capacity N --value-cache-capacity N\n";
     }
 
@@ -269,6 +281,15 @@ main(int argc, char** argv) {
             return 0;
         }
         auto cfg = apps::inconel::ycsb::parse_config(argc, argv);
+        if (cfg.print_config) {
+            apps::inconel::ycsb::print_effective_config(std::cout, cfg);
+        }
+        if (cfg.dump_config) {
+            apps::inconel::ycsb::dump_effective_config_json(std::cout, cfg);
+        }
+        if (cfg.dry_run) {
+            return 0;
+        }
         return apps::inconel::ycsb::run(std::move(cfg));
     } catch (const std::invalid_argument& e) {
         std::cerr << "inconel_ycsb: " << e.what() << "\n\n";

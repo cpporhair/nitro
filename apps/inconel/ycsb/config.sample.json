@@ -1,0 +1,50 @@
+{
+  "device": {
+    "pci_addr": "0000:04:00.0",
+    "force_format": false,
+    "spdk_core_mask": "",
+    "qpair_depth": 128
+  },
+  "runtime": {
+    "cores": [0, 1, 2, 3],
+    "main_core": 0,
+    "front_cores": [0, 1],
+    "value_core": 0,
+    "owner_core": 0,
+    "coord_core": 0,
+    "wal_space_core": 0,
+    "maintenance_core": 0,
+    "tree_cache": {
+      "policy": "clock",
+      "capacity": 1024
+    },
+    "value_cache": {
+      "policy": "clock",
+      "capacity": 4096
+    }
+  },
+  "maintenance": {
+    "seal_active_bytes": "256M",
+    "total_memtable_bytes": "1G",
+    "wal_seal_percent": 70,
+    "max_sealed_gens_per_front": 4
+  },
+  "workload": {
+    "kind": "load-c",
+    "records": 10000,
+    "operations": 10000,
+    "value_size": 256,
+    "batch_size": 1,
+    "inflight": 64,
+    "seed": 1,
+    "key_prefix": "user",
+    "flush_after_load": false
+  },
+  "verification": {
+    "samples": 0,
+    "existing": "none"
+  },
+  "output": {
+    "print_config": true
+  }
+}

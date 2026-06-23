@@ -161,21 +161,39 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   --pci-addr 0000:04:00.0
 ```
 
+YCSB config-based commands:
+
+`apps/inconel/ycsb/config.sample.json` is the default YCSB real-NVMe sample.
+It names the scratch BDF `0000:04:00.0` and keeps `device.force_format=false`
+so opening the config is not destructive by itself. Use CLI overrides for
+per-run workload size and explicit destructive format requests; CLI values win
+over the JSON file. If overriding the BDF with `--pci`, only use the scratch
+device and never `0000:03:00.0`.
+
+YCSB config dry-run:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_ycsb \
+  --config apps/inconel/ycsb/config.sample.json \
+  --dry-run \
+  --records 1000 \
+  --operations 1000 \
+  --verify-samples 32
+```
+
 YCSB execution entry smoke:
 
 ```bash
 sudo -n env XDG_RUNTIME_DIR=/tmp \
   LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
   timeout 300s build_real/inconel_ycsb \
-  --pci-addr 0000:04:00.0 \
+  --config apps/inconel/ycsb/config.sample.json \
   --force-format \
-  --workload load-c \
   --records 1000 \
   --operations 1000 \
-  --value-size 256 \
-  --verify-samples 32 \
-  --cores 0,1,2,3 \
-  --main-core 0
+  --verify-samples 32
 ```
 
 Mixed read/update smoke:
@@ -184,15 +202,12 @@ Mixed read/update smoke:
 sudo -n env XDG_RUNTIME_DIR=/tmp \
   LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
   timeout 300s build_real/inconel_ycsb \
-  --pci-addr 0000:04:00.0 \
+  --config apps/inconel/ycsb/config.sample.json \
   --force-format \
   --workload load-a \
   --records 1000 \
   --operations 1000 \
-  --value-size 256 \
-  --verify-samples 32 \
-  --cores 0,1,2,3 \
-  --main-core 0
+  --verify-samples 32
 ```
 
 ## Maintenance Cadence Tests
@@ -240,8 +255,10 @@ The process inherited the desktop user `XDG_RUNTIME_DIR`. Run with
 
 `--pci-addr BDF or INCONEL_NVME_PCI_ADDR is required`
 
-Pass `--pci-addr 0000:04:00.0` explicitly. Do not rely on a shell-local env var
-unless it is passed through `sudo env`.
+For YCSB, pass `--config apps/inconel/ycsb/config.sample.json` or override the
+sample with `--pci 0000:04:00.0`. For older e2e binaries, pass
+`--pci-addr 0000:04:00.0` explicitly. Do not rely on a shell-local env var
+unless it is passed through `sudo env`, and do not use `0000:03:00.0`.
 
 SPDK cannot find the NVMe controller
 

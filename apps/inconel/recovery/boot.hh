@@ -358,6 +358,77 @@ namespace apps::inconel::recovery {
         return out;
     }
 
+    [[nodiscard]] inline format::record_kind
+    record_kind_for_replay(const replay_record& rec) {
+        switch (rec.op_type) {
+        case format::wal_op_type::put:
+            return format::record_kind::value;
+        case format::wal_op_type::del:
+            return format::record_kind::tombstone;
+        }
+        throw std::runtime_error("inconel recovery: unknown WAL op type");
+    }
+
+    [[nodiscard]] inline bool
+    value_refs_equal(const format::value_ref& lhs,
+                     const format::value_ref& rhs) noexcept {
+        return std::memcmp(&lhs, &rhs, sizeof(format::value_ref)) == 0;
+    }
+
+    [[nodiscard]] inline bool
+    tree_record_covers_replay_record(const recovered_tree_record& tree_rec,
+                                     const replay_record& wal_rec) {
+        if (tree_rec.data_ver > wal_rec.data_ver) {
+            return true;
+        }
+        if (tree_rec.data_ver < wal_rec.data_ver) {
+            return false;
+        }
+
+        const auto wal_kind = record_kind_for_replay(wal_rec);
+        if (tree_rec.kind != wal_kind) {
+            throw std::runtime_error(
+                "inconel recovery: tree/WAL disagree for same key and LSN");
+        }
+        if (wal_kind == format::record_kind::value &&
+            !value_refs_equal(tree_rec.vr, wal_rec.vr)) {
+            throw std::runtime_error(
+                "inconel recovery: tree/WAL value_ref mismatch for same "
+                "key and LSN");
+        }
+        return true;
+    }
+
+    [[nodiscard]] inline bool
+    existing_tree_wal_delta_is_empty(const recovered_tree_scan& tree_scan,
+                                     const wal_scan_result& wal_scan) {
+        const auto wal_records = build_replay_records(wal_scan);
+        if (wal_records.empty()) {
+            return true;
+        }
+
+        std::map<std::string, const recovered_tree_record*> tree_by_key;
+        for (const auto& rec : tree_scan.records) {
+            auto [_, inserted] = tree_by_key.emplace(rec.key, &rec);
+            if (!inserted) {
+                throw std::runtime_error(
+                    "inconel recovery: duplicate key in scanned tree record "
+                    "index");
+            }
+        }
+
+        for (const auto& wal_rec : wal_records) {
+            auto it = tree_by_key.find(wal_rec.key);
+            if (it == tree_by_key.end()) {
+                return false;
+            }
+            if (!tree_record_covers_replay_record(*it->second, wal_rec)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     struct replay_tree_node {
         format::node_type type = format::node_type::leaf;
         format::paddr range_base{};
@@ -824,11 +895,17 @@ namespace apps::inconel::recovery {
                 tree_geometry,
                 choice.chosen->root_base_paddr);
             if (scan.saw_nonzero) {
-                throw std::runtime_error(
-                    "inconel recovery: WAL delta on existing tree is not "
-                    "implemented in 064C");
+                if (!existing_tree_wal_delta_is_empty(tree_scan, scan)) {
+                    throw std::runtime_error(
+                        "inconel recovery: WAL delta on existing tree "
+                        "requires boot CoW merge (064D full merge is not "
+                        "implemented yet)");
+                }
+                reset_wal_region(device, core, profile);
             }
-            if (tree_scan.max_data_ver ==
+            const uint64_t recovered_durable_lsn =
+                std::max(tree_scan.max_data_ver, scan.max_complete_lsn);
+            if (recovered_durable_lsn ==
                 std::numeric_limits<uint64_t>::max()) {
                 throw std::runtime_error(
                     "inconel recovery: recovered tree LSN overflow");
@@ -837,8 +914,8 @@ namespace apps::inconel::recovery {
                 .tree = std::move(tree_scan.tree),
                 .live_value_extents =
                     std::move(tree_scan.live_value_extents),
-                .recovered_durable_lsn = tree_scan.max_data_ver,
-                .next_lsn = tree_scan.max_data_ver + 1,
+                .recovered_durable_lsn = recovered_durable_lsn,
+                .next_lsn = recovered_durable_lsn + 1,
                 .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
                 .active_superblock_source = choice.which,
             };

@@ -28,9 +28,17 @@
 
 namespace apps::inconel::recovery {
 
+    struct recovered_tree_record {
+        std::string key;
+        uint64_t data_ver = 0;
+        format::record_kind kind = format::record_kind::tombstone;
+        format::value_ref vr{};
+    };
+
     struct recovered_tree_scan {
         recovered_tree_snapshot tree;
         std::vector<value::live_value_extent> live_value_extents;
+        std::vector<recovered_tree_record> records;
         uint64_t max_data_ver = 0;
         uint64_t tree_alloc_head_lba = 0;
     };
@@ -66,6 +74,7 @@ namespace apps::inconel::recovery {
             std::vector<leaf_item> leaves;
             std::vector<internal_item> internals;
             std::vector<value::live_value_extent> live_extents;
+            std::vector<recovered_tree_record> records;
             absl::flat_hash_set<std::string> seen_keys;
             uint64_t max_data_ver = 0;
         };
@@ -176,6 +185,12 @@ namespace apps::inconel::recovery {
                         "inconel recovery: duplicate key across tree leaves");
                 }
                 ctx.max_data_ver = std::max(ctx.max_data_ver, rec.data_ver);
+                ctx.records.push_back(recovered_tree_record{
+                    .key = std::string(rec.key),
+                    .data_ver = rec.data_ver,
+                    .kind = rec.kind,
+                    .vr = rec.vr,
+                });
                 if (rec.kind == format::record_kind::value) {
                     ctx.live_extents.push_back(value::live_value_extent{
                         .base = rec.vr.base,
@@ -370,6 +385,7 @@ namespace apps::inconel::recovery {
             return recovered_tree_scan{
                 .tree = {},
                 .live_value_extents = {},
+                .records = {},
                 .max_data_ver = 0,
                 .tree_alloc_head_lba = profile.value_data_area_base.lba,
             };
@@ -413,6 +429,7 @@ namespace apps::inconel::recovery {
         return recovered_tree_scan{
             .tree = std::move(tree),
             .live_value_extents = std::move(ctx.live_extents),
+            .records = std::move(ctx.records),
             .max_data_ver = ctx.max_data_ver,
             .tree_alloc_head_lba = tree_alloc_head,
         };

@@ -39,6 +39,7 @@ namespace apps::inconel::recovery {
     struct recovered_tree_scan {
         recovered_tree_snapshot tree;
         std::vector<value::live_value_extent> live_value_extents;
+        std::vector<format::range_ref> tree_free_ranges;
         std::vector<recovered_tree_record> records;
         uint64_t max_data_ver = 0;
         uint64_t tree_alloc_head_lba = 0;
@@ -57,6 +58,7 @@ namespace apps::inconel::recovery {
         struct leaf_item {
             format::paddr range_base{};
             std::string first_key;
+            std::string last_key;
             format::paddr parent_range{};
         };
 
@@ -169,6 +171,7 @@ namespace apps::inconel::recovery {
             }
 
             std::string first_key;
+            std::string last_key;
             std::optional<std::string> prev_key;
             for (uint16_t i = 0; i < reader.record_count(); ++i) {
                 const auto rec = reader.get(i);
@@ -204,11 +207,13 @@ namespace apps::inconel::recovery {
                         "inconel recovery: unknown leaf record kind");
                 }
                 prev_key = std::string(rec.key);
+                last_key = *prev_key;
             }
 
             ctx.leaves.push_back(leaf_item{
                 .range_base = page.range_base,
                 .first_key = std::move(first_key),
+                .last_key = std::move(last_key),
                 .parent_range = parent_range,
             });
         }
@@ -296,6 +301,18 @@ namespace apps::inconel::recovery {
 
             std::pair<uint32_t, uint16_t> next_lower = append_fence({});
             for (std::size_t i = 0; i < leaves.size(); ++i) {
+                if (i > 0) {
+                    if (leaves[i].first_key.empty()) {
+                        throw std::runtime_error(
+                            "inconel recovery: non-first leaf is empty");
+                    }
+                    if (!leaves[i - 1].last_key.empty() &&
+                        leaves[i - 1].last_key >= leaves[i].first_key) {
+                        throw std::runtime_error(
+                            "inconel recovery: leaf ranges are not globally "
+                            "ordered");
+                    }
+                }
                 auto lower = next_lower;
                 std::pair<uint32_t, uint16_t> upper;
                 if (i + 1 < leaves.size()) {
@@ -375,6 +392,36 @@ namespace apps::inconel::recovery {
             return head;
         }
 
+        [[nodiscard]] inline std::vector<format::range_ref>
+        compute_tree_free_ranges(
+            const format::format_profile& profile,
+            const core::tree_geometry& geom,
+            const absl::flat_hash_map<format::paddr, uint32_t>& slot_map,
+            uint64_t tree_alloc_head_lba) {
+            std::vector<format::range_ref> out;
+            const uint64_t range_lbas = geom.range_lbas();
+            if (range_lbas == 0) {
+                throw std::runtime_error(
+                    "inconel recovery: tree range_lbas is 0");
+            }
+            for (uint64_t lba = profile.value_data_area_base.lba;
+                 lba < tree_alloc_head_lba;
+                 lba += range_lbas) {
+                if (tree_alloc_head_lba - lba < range_lbas) {
+                    throw std::runtime_error(
+                        "inconel recovery: tree_alloc_head is not range-aligned");
+                }
+                format::paddr range_base{
+                    profile.value_data_area_base.device_id,
+                    lba,
+                };
+                if (!slot_map.contains(range_base)) {
+                    out.push_back(geom.range_ref_from_base(range_base));
+                }
+            }
+            return out;
+        }
+
     }  // namespace tree_scan_detail
 
     [[nodiscard]] inline recovered_tree_scan
@@ -387,6 +434,7 @@ namespace apps::inconel::recovery {
             return recovered_tree_scan{
                 .tree = {},
                 .live_value_extents = {},
+                .tree_free_ranges = {},
                 .records = {},
                 .max_data_ver = 0,
                 .tree_alloc_head_lba = profile.value_data_area_base.lba,
@@ -427,10 +475,14 @@ namespace apps::inconel::recovery {
         const uint64_t tree_alloc_head =
             tree_scan_detail::compute_tree_alloc_head_lba(
                 profile, geom, tree.slot_map);
+        auto tree_free_ranges =
+            tree_scan_detail::compute_tree_free_ranges(
+                profile, geom, tree.slot_map, tree_alloc_head);
 
         return recovered_tree_scan{
             .tree = std::move(tree),
             .live_value_extents = std::move(ctx.live_extents),
+            .tree_free_ranges = std::move(tree_free_ranges),
             .records = std::move(ctx.records),
             .max_data_ver = ctx.max_data_ver,
             .tree_alloc_head_lba = tree_alloc_head,

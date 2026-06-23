@@ -30,6 +30,7 @@ namespace apps::inconel::recovery {
     struct recovered_runtime_state {
         recovered_tree_snapshot tree;
         std::vector<value::live_value_extent> live_value_extents;
+        std::vector<format::range_ref> tree_free_ranges;
         uint64_t recovered_durable_lsn = 0;
         uint64_t next_lsn = 1;
         uint64_t tree_alloc_head_lba = 0;

@@ -119,9 +119,10 @@ namespace apps::inconel::ycsb {
     }
 
     [[nodiscard]] inline auto
-    submit_verify_read(std::shared_ptr<phase_stats> stats,
-                       std::string key,
-                       std::string expected) {
+    submit_verify_point(std::shared_ptr<phase_stats> stats,
+                        std::string key,
+                        std::string expected,
+                        bool expect_found) {
         auto key_holder = std::make_shared<std::string>(std::move(key));
         auto expected_holder =
             std::make_shared<std::string>(std::move(expected));
@@ -132,24 +133,49 @@ namespace apps::inconel::ycsb {
             >> pump::sender::then(
                 [stats,
                  key_holder,
-                 expected_holder](pipeline::point_get_result result) {
+                 expected_holder,
+                 expect_found](pipeline::point_get_result result) {
                     stats->generated_ops.fetch_add(
                         1, std::memory_order_relaxed);
-                    if (!result.found || result.value != *expected_holder) {
+                    if (expect_found &&
+                        (!result.found || result.value != *expected_holder)) {
                         stats->read_errors.fetch_add(
                             1, std::memory_order_relaxed);
                         throw std::runtime_error(
                             "inconel_ycsb: verification point_get mismatch "
                             "for key " + *key_holder);
                     }
+                    if (!expect_found && result.found) {
+                        stats->read_errors.fetch_add(
+                            1, std::memory_order_relaxed);
+                        throw std::runtime_error(
+                            "inconel_ycsb: verification expected tombstone "
+                            "for key " + *key_holder);
+                    }
                     stats->read_found.fetch_add(
-                        1, std::memory_order_relaxed);
+                        result.found ? 1 : 0, std::memory_order_relaxed);
+                    stats->read_miss.fetch_add(
+                        result.found ? 0 : 1, std::memory_order_relaxed);
                     return true;
                 })
             >> pump::sender::any_exception(
                 [stats](std::exception_ptr ep) mutable {
                     return rethrow_bool_sender(std::move(ep));
                 });
+    }
+
+    [[nodiscard]] inline auto
+    submit_verify_read(std::shared_ptr<phase_stats> stats,
+                       std::string key,
+                       std::string expected) {
+        return submit_verify_point(
+            std::move(stats), std::move(key), std::move(expected), true);
+    }
+
+    [[nodiscard]] inline auto
+    submit_verify_miss(std::shared_ptr<phase_stats> stats, std::string key) {
+        return submit_verify_point(
+            std::move(stats), std::move(key), std::string{}, false);
     }
 
     [[nodiscard]] inline auto
@@ -250,18 +276,35 @@ namespace apps::inconel::ycsb {
             })
             >> pump::sender::flat_map([cfg, stats](bool) {
                 const uint64_t samples =
-                    cfg->includes_load() ? cfg->verify_samples : 0;
+                    (cfg->includes_load() ||
+                     cfg->verify_existing_updates ||
+                     cfg->verify_existing_deletes)
+                        ? cfg->verify_samples
+                        : 0;
                 return pump::sender::just()
                     >> pump::sender::loop(samples)
                     >> pump::sender::concurrent(cfg->inflight)
-                    >> pump::sender::flat_map([cfg, stats](std::size_t i) {
+                    >> pump::sender::flat_map(
+                        [cfg, stats, samples](std::size_t i) {
                         const uint64_t id =
-                            splitmix64(cfg->seed ^ 0x564552494659ULL ^ i)
-                            % cfg->records;
+                            samples >= cfg->records
+                                ? static_cast<uint64_t>(i) % cfg->records
+                                : splitmix64(
+                                      cfg->seed ^ 0x564552494659ULL ^ i)
+                                      % cfg->records;
+                        if (cfg->verify_existing_deletes) {
+                            return submit_verify_miss(
+                                stats, make_key(*cfg, id));
+                        }
+                        const uint64_t generation =
+                            cfg->verify_existing_updates
+                                ? expected_update_generation_for_key(
+                                      *cfg, id)
+                                : 0;
                         return submit_verify_read(
                             stats,
                             make_key(*cfg, id),
-                            make_value(*cfg, id, 0));
+                            make_value(*cfg, id, generation));
                     })
                     >> pump::sender::reduce();
             })
@@ -284,14 +327,19 @@ namespace apps::inconel::ycsb {
                 std::vector<core::raw_batch_op>{make_put(*cfg, id, op_index + 1)},
                 1));
 
-        if (choose_operation(*cfg, op_index) == operation_kind::read) {
+        const auto op_kind = choose_operation(*cfg, op_index);
+        if (op_kind == operation_kind::read) {
             return std::variant<read_sender_t, write_sender_t>(
                 std::in_place_index<0>,
                 submit_read(stats, make_key(*cfg, id)));
         }
 
         std::vector<core::raw_batch_op> ops;
-        ops.push_back(make_put(*cfg, id, op_index + 1));
+        if (op_kind == operation_kind::del) {
+            ops.push_back(make_delete(*cfg, id));
+        } else {
+            ops.push_back(make_put(*cfg, id, op_index + 1));
+        }
         return std::variant<read_sender_t, write_sender_t>(
             std::in_place_index<1>,
             submit_write_ops(stats, std::move(ops), 1));

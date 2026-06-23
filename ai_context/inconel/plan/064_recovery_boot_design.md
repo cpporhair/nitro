@@ -4,15 +4,17 @@
 
 064A 的 boot skeleton 已提交：`09b6870 nitro: inconel: add recovery boot skeleton`。
 
-当前代码已覆盖 064B、064C 和 064D 的 same-shape 子集：
+当前代码已覆盖 064B、064C 和 064D 的 recovery-local CoW merge prototype：
 
 - empty clean boot。
 - empty tree + complete WAL replay，包含 delete-only/no-op tombstone frontier carrier。
 - existing tree + WAL empty scanner/install。
 - existing tree + WAL nonempty 时，如果 WAL winners 已被 tree 覆盖，reset WAL 并启动。
 - existing tree + WAL delta 时，支持所有受影响 leaf 都能写同 range next slot、merge 后不 split 的 same-shape replay。
+- same-shape 不适用时，走 recovery-local full CoW prototype：按 affected leaf 合并 WAL delta，必要时 leaf split，逐层 CoW 重写 internal/root，root range 变化时更新 inactive superblock，然后 reset WAL。
+- full CoW 新分配 tree range 时会以当前 live value refs 推导出的最小 value LBA 作为上界，避免 recovery tree 写入覆盖 value area。
 
-064D 仍未覆盖的 full CoW merge 场景会继续 fail-fast：leaf split、shadow slot exhausted 需要换新 range、internal propagation、root range change。
+064D 仍会对盘面不变量破坏、tree allocation 空间不足、selected tree 无法解析等场景 fail-fast。full CoW prototype 已通过 `build_real` 编译和 scratch NVMe tree+WAL mixed smoke；YCSB smoke 已补 `update` / `delete` workload 与 existing-state expected-value / tombstone 校验。
 
 本文是完整 recovery boot 的目标规格，并记录当前分阶段实现边界。
 
@@ -44,8 +46,8 @@
 - `runtime::build_runtime` 在 064A 后可接受 superblock 派生出的 profile/geometry。
 - `coord_sched` 构造函数支持 `initial_cat` 和 `next_lsn`。
 - `value_alloc_sched::install_recovered_value_space(...)` 已存在，且不会扫描 Value Area。
-- `tree_sched` 还缺 recovered manifest/allocator/frontier installer。
-- `wal_space_sched` 还缺 boot-time scanner/reset installer。
+- `runtime::build_runtime` 已能安装 recovered manifest、tree allocator head/free ranges、frontiers 与 active superblock slot。
+- boot-time WAL scanner/reset 由 recovery module 同步完成；runtime 启动时看到空 WAL work。
 
 ## 术语
 
@@ -360,19 +362,23 @@ for each key where winner.source == wal:
 
 无论哪种方式，都不能在 scheduler handler 内部创建 hidden root submit。Boot merge 在 runtime start 前完成。
 
-当前 064D 已实现 same-shape 子集：
+当前 064D 已实现以下 CoW merge 路径：
 
 - WAL winner 已被 scanned tree 覆盖：不写 tree，reset WAL。
 - WAL delta 命中 existing tree 时，按 `leaf_order.find_leaf_for_key` 定位 leaf。
-- 每个受影响 leaf 必须仍写原 range 的下一 shadow slot。
-- merge 后 leaf page 必须单页容纳；不做 split。
-- internal/root range 不变时不写 superblock；高 slot 扫描在下一次 boot 识别新 leaf slot。
+- same-shape 子集优先：受影响 leaf 若能单页容纳且原 range 还有下一 shadow slot，则写同 range next slot；internal/root range 不变时不写 superblock，下一次 boot 扫描最高有效 slot。
+- same-shape 不适用时，full CoW prototype 会把受影响 leaf 合并成一个或多个新 leaf node；slot exhausted 或 split 时分配新 range。
+- split group 的第一个 page 也必须写 fresh range，不能先通过旧 range next slot 暴露 split fragment；否则父/root durable 前 crash 会让旧路径只看见 split 后第一段。
+- parent internal 逐层读旧 page、替换 changed child、必要时 split internal；root split 时允许 tree height 增长。
+- 写回按 child-before-parent 顺序提交所有 CoW page，flush 后如 root range 改变则更新 inactive superblock，再 reset WAL。
+- merge 完成后 rescan clean root，重建 manifest、live value refs、tree free ranges，再安装 runtime。
 
-以下仍 fail-fast，等待 full 064D merge primitive：
+以下仍 fail-fast：
 
-- 任一受影响 leaf shadow slot exhausted。
-- 任一 leaf merge 后需要 split。
-- 需要分配新 tree range、更新 internal page、更新 root range 或做 tree height 变化。
+- scanned tree 拓扑、leaf ordering、slot_map 或 internal child pointer 不自洽。
+- WAL key 无法映射到 scanned `leaf_order`。
+- 新 tree range 会覆盖当前 live value area，或 data area 无足够 tree range。
+- 单条 leaf/internal record 无法放入空 page。
 
 Boot merge 输出：
 
@@ -583,7 +589,7 @@ Builder 安装顺序：
 
 ### 064D: WAL Delta On Existing Tree
 
-状态：部分提交；same-shape leaf replay 已落地，full CoW merge 未完成。
+状态：prototype 已提交到工作树；same-shape leaf replay 和 recovery-local full CoW replay 已接入，scratch NVMe tree+WAL mixed smoke 已通过，并补了 update value / tombstone expected-state 验证入口。
 
 目标：
 

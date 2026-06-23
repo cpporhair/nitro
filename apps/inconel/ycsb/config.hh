@@ -20,6 +20,8 @@ namespace apps::inconel::ycsb {
         a,
         b,
         c,
+        update,
+        del,
         load_a,
         load_b,
         load_c,
@@ -39,6 +41,8 @@ namespace apps::inconel::ycsb {
         std::string key_prefix = "user";
         bool flush_after_load = false;
         uint64_t verify_samples = 0;
+        bool verify_existing_updates = false;
+        bool verify_existing_deletes = false;
 
         std::vector<uint32_t> cores = {0, 1, 2, 3};
         std::vector<uint32_t> front_cores;
@@ -73,6 +77,8 @@ namespace apps::inconel::ycsb {
             return workload == workload_kind::a ||
                    workload == workload_kind::b ||
                    workload == workload_kind::c ||
+                   workload == workload_kind::update ||
+                   workload == workload_kind::del ||
                    workload == workload_kind::load_a ||
                    workload == workload_kind::load_b ||
                    workload == workload_kind::load_c;
@@ -90,6 +96,10 @@ namespace apps::inconel::ycsb {
             case workload_kind::c:
             case workload_kind::load_c:
                 return workload_kind::c;
+            case workload_kind::update:
+                return workload_kind::update;
+            case workload_kind::del:
+                return workload_kind::del;
             case workload_kind::load:
                 return workload_kind::load;
             }
@@ -121,6 +131,8 @@ namespace apps::inconel::ycsb {
         if (v == "a") return workload_kind::a;
         if (v == "b") return workload_kind::b;
         if (v == "c") return workload_kind::c;
+        if (v == "update") return workload_kind::update;
+        if (v == "delete") return workload_kind::del;
         if (v == "load-a") return workload_kind::load_a;
         if (v == "load-b") return workload_kind::load_b;
         if (v == "load-c") return workload_kind::load_c;
@@ -301,6 +313,28 @@ namespace apps::inconel::ycsb {
         if (cfg.qpair_depth == 0) {
             throw std::invalid_argument("--qpair-depth must be > 0");
         }
+        if (cfg.verify_existing_updates && cfg.verify_existing_deletes) {
+            throw std::invalid_argument(
+                "--verify-existing-updates and --verify-existing-deletes "
+                "are mutually exclusive");
+        }
+        if ((cfg.verify_existing_updates || cfg.verify_existing_deletes) &&
+            cfg.verify_samples == 0) {
+            throw std::invalid_argument(
+                "--verify-samples must be > 0 for existing-state verify");
+        }
+        if (cfg.verify_existing_updates && cfg.workload != workload_kind::c) {
+            throw std::invalid_argument(
+                "--verify-existing-updates expects --workload c");
+        }
+        if (cfg.verify_existing_deletes && cfg.workload != workload_kind::c) {
+            throw std::invalid_argument(
+                "--verify-existing-deletes expects --workload c");
+        }
+        if (cfg.verify_existing_deletes && cfg.operations < cfg.records) {
+            throw std::invalid_argument(
+                "--verify-existing-deletes requires --operations >= --records");
+        }
     }
 
     inline config
@@ -351,6 +385,12 @@ namespace apps::inconel::ycsb {
                 cfg.verify_samples = parse_integer<uint64_t>(
                     args.take_value("--verify-samples"),
                     "invalid --verify-samples");
+            } else if (arg == "--verify-existing-updates") {
+                args.take();
+                cfg.verify_existing_updates = true;
+            } else if (arg == "--verify-existing-deletes") {
+                args.take();
+                cfg.verify_existing_deletes = true;
             } else if (option_matches(arg, "--cores")) {
                 cfg.cores = parse_core_csv(
                     args.take_value("--cores"), "invalid --cores");

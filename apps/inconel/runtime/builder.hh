@@ -528,6 +528,39 @@ namespace apps::inconel::runtime {
             profile.value_data_area_base.device_id,
             recovered.tree_alloc_head_lba,
         };
+        const uint64_t range_lbas =
+            tree_sched->state.alloc.range_lbas;
+        if (range_lbas == 0) {
+            throw std::logic_error(
+                "runtime::build_runtime: recovered tree range_lbas is 0");
+        }
+        // Recovery reconstructs the semantic free set from the clean
+        // manifest, but the runtime allocator still owns a bounded
+        // queue. If a cold tree has more holes than that existing owner
+        // capacity, fail fast rather than silently leaking ranges.
+        for (const auto& range : recovered.tree_free_ranges) {
+            if (range.slot_count !=
+                tree_sched->state.alloc.shadow_slots) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: recovered tree free range "
+                    "slot_count mismatch");
+            }
+            if (range.base.device_id !=
+                profile.value_data_area_base.device_id ||
+                range.base.lba < profile.value_data_area_base.lba ||
+                range.base.lba >= recovered.tree_alloc_head_lba ||
+                (range.base.lba - profile.value_data_area_base.lba) %
+                    range_lbas != 0) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: recovered tree free range "
+                    "outside allocated tree prefix");
+            }
+            if (!tree_sched->state.alloc.free_ranges.try_enqueue(range)) {
+                throw std::runtime_error(
+                    "runtime::build_runtime: recovered tree free range queue "
+                    "capacity exceeded");
+            }
+        }
         tree_sched->state.flush_max_lsn = recovered.recovered_durable_lsn;
         tree_sched->state.superblock_safe_lsn =
             recovered.recovered_durable_lsn;

@@ -15,6 +15,7 @@ namespace apps::inconel::ycsb {
     enum class operation_kind : uint8_t {
         read,
         update,
+        del,
     };
 
     [[nodiscard]] inline uint64_t
@@ -76,7 +77,27 @@ namespace apps::inconel::ycsb {
 
     [[nodiscard]] inline uint64_t
     operation_key_id(const config& cfg, uint64_t op_index) noexcept {
+        if (cfg.run_kind() == workload_kind::del) {
+            return op_index % cfg.records;
+        }
         return splitmix64(cfg.seed ^ 0xC001D00DULL ^ op_index) % cfg.records;
+    }
+
+    [[nodiscard]] inline uint64_t
+    update_operation_key_id(const config& cfg, uint64_t op_index) noexcept {
+        return splitmix64(cfg.seed ^ 0xC001D00DULL ^ op_index) % cfg.records;
+    }
+
+    [[nodiscard]] inline uint64_t
+    expected_update_generation_for_key(const config& cfg,
+                                       uint64_t key_id) noexcept {
+        uint64_t generation = 0;
+        for (uint64_t op_index = 0; op_index < cfg.operations; ++op_index) {
+            if (update_operation_key_id(cfg, op_index) == key_id) {
+                generation = op_index + 1;
+            }
+        }
+        return generation;
     }
 
     [[nodiscard]] inline operation_kind
@@ -94,6 +115,12 @@ namespace apps::inconel::ycsb {
         if (kind == workload_kind::b) {
             return roll < 95 ? operation_kind::read : operation_kind::update;
         }
+        if (kind == workload_kind::update) {
+            return operation_kind::update;
+        }
+        if (kind == workload_kind::del) {
+            return operation_kind::del;
+        }
         return operation_kind::read;
     }
 
@@ -103,6 +130,15 @@ namespace apps::inconel::ycsb {
             .op = core::write_op_type::put,
             .key = make_key(cfg, id),
             .value = make_value(cfg, id, generation),
+        };
+    }
+
+    [[nodiscard]] inline core::raw_batch_op
+    make_delete(const config& cfg, uint64_t id) {
+        return core::raw_batch_op{
+            .op = core::write_op_type::del,
+            .key = make_key(cfg, id),
+            .value = {},
         };
     }
 

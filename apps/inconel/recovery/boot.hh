@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../core/tree_geometry.hh"
@@ -443,6 +444,7 @@ namespace apps::inconel::recovery {
     struct replay_tree_build {
         recovered_tree_snapshot tree;
         std::vector<value::live_value_extent> live_value_extents;
+        std::vector<format::range_ref> tree_free_ranges;
         uint64_t tree_alloc_head_lba = 0;
     };
 
@@ -759,6 +761,7 @@ namespace apps::inconel::recovery {
             return replay_tree_build{
                 .tree = {},
                 .live_value_extents = std::move(live_extents),
+                .tree_free_ranges = {},
                 .tree_alloc_head_lba = next_range_base.lba,
             };
         }
@@ -793,6 +796,7 @@ namespace apps::inconel::recovery {
         return replay_tree_build{
             .tree = std::move(tree),
             .live_value_extents = std::move(live_extents),
+            .tree_free_ranges = {},
             .tree_alloc_head_lba = next_range_base.lba,
         };
     }
@@ -1056,6 +1060,7 @@ namespace apps::inconel::recovery {
         auto out = recovered_tree_scan{
             .tree = tree_scan.tree,
             .live_value_extents = live_extents_from_records(next_records),
+            .tree_free_ranges = tree_scan.tree_free_ranges,
             .records = std::move(next_records),
             .max_data_ver = 0,
             .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
@@ -1068,6 +1073,816 @@ namespace apps::inconel::recovery {
             }
         }
         return out;
+    }
+
+    struct cow_replay_node;
+
+    struct cow_replay_child_ref {
+        std::variant<format::paddr, std::unique_ptr<cow_replay_node>> target;
+    };
+
+    struct cow_replay_node {
+        format::node_type type = format::node_type::leaf;
+        std::vector<char> content;
+        std::vector<cow_replay_child_ref> children;
+        std::vector<std::string> separators;
+        format::paddr new_range_base{};
+        uint32_t new_slot_index = 0;
+        format::paddr new_paddr{};
+    };
+
+    struct cow_child_delta {
+        format::paddr old_child_range_base{};
+        core::internal_idx parent_idx = core::kInvalidInternalIdx;
+        std::vector<std::unique_ptr<cow_replay_node>> nodes;
+        std::vector<std::string> sibling_seps;
+    };
+
+    struct cow_leaf_work_item {
+        uint32_t old_leaf_idx = 0;
+        format::paddr old_range_base{};
+        core::internal_idx parent_idx = core::kInvalidInternalIdx;
+        std::vector<std::unique_ptr<cow_replay_node>> nodes;
+    };
+
+    struct cow_replay_result {
+        recovered_tree_scan tree_scan;
+        bool root_range_changed = false;
+    };
+
+    [[nodiscard]] inline bool
+    paddr_is_null(format::paddr p) noexcept {
+        return p.device_id == 0 && p.lba == 0;
+    }
+
+    [[nodiscard]] inline format::paddr
+    cow_child_range_base(const cow_replay_child_ref& child) {
+        if (const auto* p = std::get_if<format::paddr>(&child.target)) {
+            return *p;
+        }
+        const auto* node =
+            std::get<std::unique_ptr<cow_replay_node>>(child.target).get();
+        if (paddr_is_null(node->new_range_base)) {
+            throw std::logic_error(
+                "inconel recovery: unplaced CoW child reached internal "
+                "page builder");
+        }
+        return node->new_range_base;
+    }
+
+    [[nodiscard]] inline std::string
+    cow_first_key_of_leaf_node(const cow_replay_node* node,
+                               uint32_t page_size) {
+        if (node == nullptr || node->type != format::node_type::leaf) {
+            throw std::logic_error(
+                "inconel recovery: expected leaf node for first key");
+        }
+        tree::leaf_page_reader reader;
+        if (!reader.parse(node->content.data(), page_size)) {
+            throw std::runtime_error(
+                "inconel recovery: built leaf page failed validation");
+        }
+        if (reader.record_count() == 0) {
+            return {};
+        }
+        return std::string(reader.get(0).key);
+    }
+
+    [[nodiscard]] inline std::vector<std::unique_ptr<cow_replay_node>>
+    build_cow_leaf_nodes_from_records(
+        const format::format_profile& profile,
+        const core::tree_geometry& geom,
+        const std::vector<recovered_tree_record>& records) {
+        if (records.empty()) {
+            throw std::runtime_error(
+                "inconel recovery: full CoW merge would create an empty "
+                "leaf; recovery tombstones must remain frontier carriers");
+        }
+
+        std::vector<std::unique_ptr<cow_replay_node>> out;
+        std::size_t pos = 0;
+        while (pos < records.size()) {
+            auto node = std::make_unique<cow_replay_node>();
+            node->type = format::node_type::leaf;
+            node->content.resize(geom.tree_page_size);
+
+            tree::leaf_page_builder builder;
+            builder.init(node->content.data(), geom.tree_page_size);
+
+            bool wrote_any = false;
+            while (pos < records.size()) {
+                const auto& rec = records[pos];
+                validate_replay_key_size(rec.key);
+                bool ok = false;
+                if (rec.kind == format::record_kind::value) {
+                    ok = builder.add_value(rec.key, rec.data_ver, rec.vr);
+                } else if (rec.kind == format::record_kind::tombstone) {
+                    ok = builder.add_tombstone(rec.key, rec.data_ver);
+                } else {
+                    throw std::runtime_error(
+                        "inconel recovery: unknown record kind in CoW leaf");
+                }
+                if (!ok) {
+                    if (!wrote_any) {
+                        throw std::runtime_error(
+                            "inconel recovery: single CoW leaf record does "
+                            "not fit a tree page");
+                    }
+                    break;
+                }
+                wrote_any = true;
+                ++pos;
+            }
+
+            builder.finalize();
+            (void)profile;
+            out.push_back(std::move(node));
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline std::vector<char>
+    read_base_internal_page(nvme::real_device& device,
+                            uint32_t core,
+                            const format::format_profile& profile,
+                            const core::tree_geometry& geom,
+                            const recovered_tree_snapshot& tree,
+                            format::paddr range_base) {
+        auto slot_it = tree.slot_map.find(range_base);
+        if (slot_it == tree.slot_map.end()) {
+            throw std::runtime_error(
+                "inconel recovery: internal parent missing from slot map");
+        }
+        const auto slot_paddr = geom.slot_paddr(range_base, slot_it->second);
+        auto page = make_zeroed_dma_buffer(
+            geom.tree_page_size, profile.lba_size);
+        sync_read_logical_lbas(
+            device,
+            core,
+            slot_paddr.lba,
+            geom.page_lbas(),
+            page.get(),
+            profile.lba_size);
+
+        std::vector<char> bytes(geom.tree_page_size);
+        std::memcpy(bytes.data(), page.get(), bytes.size());
+        format::tree_slot_header header{};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        if (header.type != format::node_type::internal) {
+            throw std::runtime_error(
+                "inconel recovery: expected internal parent page");
+        }
+        tree::internal_page_reader reader;
+        if (!reader.parse(bytes.data(), geom.tree_page_size)) {
+            throw std::runtime_error(
+                "inconel recovery: failed to parse internal parent page");
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] inline format::paddr
+    allocate_cow_replay_range(const format::format_profile& profile,
+                              const core::tree_geometry& geom,
+                              format::paddr& next_range_base,
+                              uint64_t allocation_limit_lba) {
+        const uint64_t range_lbas = geom.range_lbas();
+        if (range_lbas == 0 ||
+            next_range_base.lba >
+                std::numeric_limits<uint64_t>::max() - range_lbas ||
+            next_range_base.lba + range_lbas > allocation_limit_lba ||
+            next_range_base.lba + range_lbas >
+                profile.value_data_area_end.lba) {
+            throw std::runtime_error(
+                "inconel recovery: full CoW merge exhausted tree space "
+                "before live value area");
+        }
+        auto out = next_range_base;
+        next_range_base.lba += range_lbas;
+        return out;
+    }
+
+    inline void
+    plan_fresh_cow_node(cow_replay_node* node,
+                        const format::format_profile& profile,
+                        const core::tree_geometry& geom,
+                        format::paddr& next_range_base,
+                        uint64_t allocation_limit_lba) {
+        node->new_range_base = allocate_cow_replay_range(
+            profile, geom, next_range_base, allocation_limit_lba);
+        node->new_slot_index = 0;
+        node->new_paddr = node->new_range_base;
+    }
+
+    template <typename NodeVec>
+    inline void
+    plan_cow_group_against_old_range(
+        NodeVec& nodes,
+        format::paddr old_range_base,
+        const recovered_tree_snapshot& tree,
+        const format::format_profile& profile,
+        const core::tree_geometry& geom,
+        format::paddr& next_range_base,
+        uint64_t allocation_limit_lba) {
+        if (nodes.empty()) {
+            throw std::runtime_error(
+                "inconel recovery: full CoW merge produced zero child "
+                "pages for an existing range");
+        }
+
+        auto slot_it = tree.slot_map.find(old_range_base);
+        if (slot_it == tree.slot_map.end()) {
+            throw std::runtime_error(
+                "inconel recovery: CoW target range missing from slot map");
+        }
+        const uint32_t cur_slot = slot_it->second;
+        if (cur_slot >= geom.shadow_slots_per_range) {
+            throw std::runtime_error(
+                "inconel recovery: CoW target slot is out of range");
+        }
+
+        // A split group must not publish its first sibling through the old
+        // range before the parent update is durable. Otherwise a crash can
+        // make the old parent/root see only the first split fragment while
+        // the WAL does not necessarily contain unchanged records that moved
+        // to later siblings. Single-page replacements are shape-preserving
+        // and may safely reuse the next shadow slot.
+        if (nodes.size() == 1 &&
+            cur_slot + 1 < geom.shadow_slots_per_range) {
+            auto* first = nodes.front().get();
+            first->new_range_base = old_range_base;
+            first->new_slot_index = cur_slot + 1;
+            first->new_paddr = geom.slot_paddr(old_range_base, cur_slot + 1);
+        } else {
+            plan_fresh_cow_node(
+                nodes.front().get(),
+                profile,
+                geom,
+                next_range_base,
+                allocation_limit_lba);
+        }
+
+        for (std::size_t i = 1; i < nodes.size(); ++i) {
+            plan_fresh_cow_node(
+                nodes[i].get(),
+                profile,
+                geom,
+                next_range_base,
+                allocation_limit_lba);
+        }
+    }
+
+    [[nodiscard]] inline std::vector<std::unique_ptr<cow_replay_node>>
+    move_cow_node_vector(
+        std::vector<std::unique_ptr<cow_replay_node>>&& nodes) {
+        std::vector<std::unique_ptr<cow_replay_node>> out;
+        out.reserve(nodes.size());
+        for (auto& node : nodes) {
+            out.push_back(std::move(node));
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline std::vector<std::unique_ptr<cow_replay_node>>
+    build_cow_internal_pages(std::vector<cow_replay_child_ref>&& children,
+                             std::vector<std::string>&& separators,
+                             format::paddr replaces_old_range,
+                             bool is_new_layer,
+                             uint32_t page_size,
+                             std::vector<std::string>& sibling_seps_out) {
+        sibling_seps_out.clear();
+        if (children.empty()) {
+            throw std::runtime_error(
+                "inconel recovery: CoW internal page has no children");
+        }
+        if (separators.size() + 1 != children.size()) {
+            throw std::runtime_error(
+                "inconel recovery: CoW internal separator count mismatch");
+        }
+
+        std::vector<std::unique_ptr<cow_replay_node>> result;
+        std::size_t next = 0;
+        while (next < children.size()) {
+            uint32_t used = sizeof(format::tree_slot_header);
+            uint32_t count = 0;
+            for (std::size_t j = next; j < children.size(); ++j) {
+                uint32_t add = 0;
+                if (count == 0) {
+                    add = sizeof(format::paddr);
+                } else {
+                    add = format::internal_record_size(
+                              static_cast<uint16_t>(
+                                  separators[next + count - 1].size()))
+                        + sizeof(uint16_t);
+                }
+                if (used + add > page_size) {
+                    break;
+                }
+                used += add;
+                ++count;
+            }
+            if (count == 0) {
+                throw std::runtime_error(
+                    "inconel recovery: CoW internal child does not fit page");
+            }
+
+            auto node = std::make_unique<cow_replay_node>();
+            node->type = format::node_type::internal;
+            node->content.resize(page_size);
+
+            tree::internal_page_builder builder;
+            builder.init(node->content.data(), page_size);
+            for (uint32_t j = 0; j + 1 < count; ++j) {
+                const auto child_range = cow_child_range_base(children[next + j]);
+                if (!builder.add_child(separators[next + j], child_range)) {
+                    throw std::logic_error(
+                        "inconel recovery: CoW internal builder/probe drift");
+                }
+            }
+            builder.set_rightmost_child(
+                cow_child_range_base(children[next + count - 1]));
+            builder.finalize();
+
+            node->children.reserve(count);
+            for (uint32_t j = 0; j < count; ++j) {
+                node->children.push_back(std::move(children[next + j]));
+            }
+            node->separators.reserve(count > 0 ? count - 1 : 0);
+            for (uint32_t j = 0; j + 1 < count; ++j) {
+                node->separators.push_back(std::move(separators[next + j]));
+            }
+            if (!is_new_layer && result.empty()) {
+                (void)replaces_old_range;
+            }
+            result.push_back(std::move(node));
+
+            if (next + count < children.size()) {
+                sibling_seps_out.push_back(
+                    std::move(separators[next + count - 1]));
+            }
+            next += count;
+        }
+        return result;
+    }
+
+    [[nodiscard]] inline cow_replay_child_ref
+    finalize_cow_root_group(
+        std::vector<std::unique_ptr<cow_replay_node>>&& nodes,
+        std::vector<std::string>&& sibling_seps,
+        const format::format_profile& profile,
+        const core::tree_geometry& geom,
+        format::paddr& next_range_base,
+        uint64_t allocation_limit_lba) {
+        if (nodes.empty()) {
+            throw std::runtime_error(
+                "inconel recovery: full CoW merge produced an empty root");
+        }
+        if (nodes.size() == 1) {
+            return cow_replay_child_ref{ .target = std::move(nodes.front()) };
+        }
+
+        std::vector<cow_replay_child_ref> children;
+        children.reserve(nodes.size());
+        for (auto& node : nodes) {
+            children.push_back(cow_replay_child_ref{
+                .target = std::move(node),
+            });
+        }
+        std::vector<std::string> separators = std::move(sibling_seps);
+        while (true) {
+            std::vector<std::string> next_sibling_seps;
+            auto layer = build_cow_internal_pages(
+                std::move(children),
+                std::move(separators),
+                format::paddr{0, 0},
+                /*is_new_layer=*/true,
+                geom.tree_page_size,
+                next_sibling_seps);
+            for (auto& node : layer) {
+                plan_fresh_cow_node(
+                    node.get(),
+                    profile,
+                    geom,
+                    next_range_base,
+                    allocation_limit_lba);
+            }
+            if (layer.size() == 1) {
+                return cow_replay_child_ref{
+                    .target = std::move(layer.front()),
+                };
+            }
+
+            children.clear();
+            children.reserve(layer.size());
+            for (auto& node : layer) {
+                children.push_back(cow_replay_child_ref{
+                    .target = std::move(node),
+                });
+            }
+            separators = std::move(next_sibling_seps);
+        }
+    }
+
+    inline void
+    collect_cow_nodes_for_write(const cow_replay_child_ref& ref,
+                                std::vector<const cow_replay_node*>& out) {
+        const auto* node_up =
+            std::get_if<std::unique_ptr<cow_replay_node>>(&ref.target);
+        if (node_up == nullptr) {
+            return;
+        }
+        const auto* node = node_up->get();
+        for (const auto& child : node->children) {
+            collect_cow_nodes_for_write(child, out);
+        }
+        out.push_back(node);
+    }
+
+    inline void
+    write_cow_nodes(nvme::real_device& device,
+                    uint32_t core,
+                    const format::format_profile& profile,
+                    const core::tree_geometry& geom,
+                    const cow_replay_child_ref* root,
+                    const std::vector<cow_replay_child_ref>& detached) {
+        std::vector<const cow_replay_node*> nodes;
+        if (root != nullptr) {
+            collect_cow_nodes_for_write(*root, nodes);
+        }
+        for (const auto& subtree : detached) {
+            collect_cow_nodes_for_write(subtree, nodes);
+        }
+
+        for (const auto* node : nodes) {
+            if (paddr_is_null(node->new_paddr)) {
+                throw std::logic_error(
+                    "inconel recovery: unplaced CoW node reached writeback");
+            }
+            auto page = make_zeroed_dma_buffer(
+                geom.tree_page_size, profile.lba_size);
+            std::memcpy(page.get(), node->content.data(), node->content.size());
+            write_replay_page(
+                device, core, profile, geom, node->new_paddr, page.get());
+        }
+        if (!nodes.empty()) {
+            sync_flush(device, core);
+        }
+    }
+
+    [[nodiscard]] inline uint64_t
+    allocation_limit_from_records(
+        const format::format_profile& profile,
+        const std::vector<std::vector<recovered_tree_record>>& records_by_leaf) {
+        uint64_t limit = profile.value_data_area_end.lba;
+        for (const auto& records : records_by_leaf) {
+            for (const auto& rec : records) {
+                if (rec.kind == format::record_kind::value) {
+                    limit = std::min(limit, rec.vr.base.lba);
+                }
+            }
+        }
+        return limit;
+    }
+
+    [[nodiscard]] inline std::optional<cow_replay_result>
+    replay_full_cow_wal_delta(nvme::real_device& device,
+                              uint32_t core,
+                              const format::format_profile& profile,
+                              const core::tree_geometry& geom,
+                              const recovered_tree_scan& tree_scan,
+                              const wal_scan_result& wal_scan) {
+        const auto& leaf_order = tree_scan.tree.leaf_order;
+        if (leaf_order.empty()) {
+            return std::nullopt;
+        }
+
+        absl::flat_hash_map<format::paddr, uint32_t> leaf_idx_by_range;
+        leaf_idx_by_range.reserve(leaf_order.spans.size());
+        for (uint32_t i = 0; i < leaf_order.spans.size(); ++i) {
+            if (!leaf_idx_by_range
+                     .emplace(leaf_order.spans[i].leaf_range_base, i)
+                     .second) {
+                throw std::runtime_error(
+                    "inconel recovery: duplicate leaf range in CoW replay");
+            }
+        }
+
+        std::vector<std::vector<recovered_tree_record>> tree_by_leaf(
+            leaf_order.spans.size());
+        std::map<std::string, const recovered_tree_record*> tree_by_key;
+        for (const auto& rec : tree_scan.records) {
+            auto leaf_it = leaf_idx_by_range.find(rec.leaf_range_base);
+            if (leaf_it == leaf_idx_by_range.end()) {
+                throw std::runtime_error(
+                    "inconel recovery: scanned tree record points at "
+                    "unknown CoW leaf");
+            }
+            tree_by_leaf[leaf_it->second].push_back(rec);
+            if (!tree_by_key.emplace(rec.key, &rec).second) {
+                throw std::runtime_error(
+                    "inconel recovery: duplicate scanned tree key in CoW "
+                    "index");
+            }
+        }
+
+        const auto wal_records = build_replay_records(wal_scan);
+        std::vector<std::vector<replay_record>> wal_by_leaf(
+            leaf_order.spans.size());
+        bool saw_delta = false;
+        for (const auto& wal_rec : wal_records) {
+            auto tree_it = tree_by_key.find(wal_rec.key);
+            if (tree_it != tree_by_key.end() &&
+                tree_record_covers_replay_record(
+                    *tree_it->second, wal_rec)) {
+                continue;
+            }
+            const auto leaf_idx = leaf_order.find_leaf_for_key(wal_rec.key);
+            if (leaf_idx >= leaf_order.spans.size()) {
+                throw std::runtime_error(
+                    "inconel recovery: WAL key did not map to a CoW leaf");
+            }
+            wal_by_leaf[leaf_idx].push_back(wal_rec);
+            saw_delta = true;
+        }
+        if (!saw_delta) {
+            return std::nullopt;
+        }
+
+        std::vector<std::vector<recovered_tree_record>> final_by_leaf =
+            tree_by_leaf;
+        std::vector<cow_leaf_work_item> leaf_work;
+        leaf_work.reserve(leaf_order.spans.size());
+        for (uint32_t leaf_idx = 0; leaf_idx < wal_by_leaf.size(); ++leaf_idx) {
+            if (wal_by_leaf[leaf_idx].empty()) {
+                continue;
+            }
+            const auto old_range =
+                leaf_order.spans[leaf_idx].leaf_range_base;
+            auto merge = merge_leaf_records(
+                std::span<const recovered_tree_record>(
+                    tree_by_leaf[leaf_idx].data(),
+                    tree_by_leaf[leaf_idx].size()),
+                std::span<const replay_record>(
+                    wal_by_leaf[leaf_idx].data(),
+                    wal_by_leaf[leaf_idx].size()),
+                old_range);
+            if (!merge.changed) {
+                continue;
+            }
+            auto nodes = build_cow_leaf_nodes_from_records(
+                profile, geom, merge.records);
+            final_by_leaf[leaf_idx] = std::move(merge.records);
+            const auto parent_idx =
+                tree_scan.tree.reverse_topology.leaf_parent_idx.at(leaf_idx);
+            leaf_work.push_back(cow_leaf_work_item{
+                .old_leaf_idx = leaf_idx,
+                .old_range_base = old_range,
+                .parent_idx = parent_idx,
+                .nodes = std::move(nodes),
+            });
+        }
+        if (leaf_work.empty()) {
+            return std::nullopt;
+        }
+
+        auto next_range_base = format::paddr{
+            profile.value_data_area_base.device_id,
+            tree_scan.tree_alloc_head_lba,
+        };
+        const uint64_t allocation_limit_lba =
+            allocation_limit_from_records(profile, final_by_leaf);
+        if (next_range_base.lba > allocation_limit_lba) {
+            throw std::runtime_error(
+                "inconel recovery: scanned tree already overlaps live "
+                "value space");
+        }
+
+        std::sort(
+            leaf_work.begin(),
+            leaf_work.end(),
+            [](const cow_leaf_work_item& a, const cow_leaf_work_item& b) {
+                return a.old_leaf_idx < b.old_leaf_idx;
+            });
+
+        std::vector<cow_child_delta> current_level;
+        std::optional<cow_replay_child_ref> final_root;
+        std::vector<cow_replay_child_ref> detached_subtrees;
+
+        for (auto& item : leaf_work) {
+            plan_cow_group_against_old_range(
+                item.nodes,
+                item.old_range_base,
+                tree_scan.tree,
+                profile,
+                geom,
+                next_range_base,
+                allocation_limit_lba);
+
+            if (item.parent_idx == core::kInvalidInternalIdx) {
+                std::vector<std::string> sibling_seps;
+                sibling_seps.reserve(
+                    item.nodes.size() > 0 ? item.nodes.size() - 1 : 0);
+                for (std::size_t i = 1; i < item.nodes.size(); ++i) {
+                    auto sep = cow_first_key_of_leaf_node(
+                        item.nodes[i].get(), geom.tree_page_size);
+                    if (sep.empty()) {
+                        throw std::runtime_error(
+                            "inconel recovery: split root leaf has empty "
+                            "separator");
+                    }
+                    sibling_seps.push_back(std::move(sep));
+                }
+                final_root.emplace(finalize_cow_root_group(
+                    std::move(item.nodes),
+                    std::move(sibling_seps),
+                    profile,
+                    geom,
+                    next_range_base,
+                    allocation_limit_lba));
+                continue;
+            }
+
+            if (item.nodes.size() == 1 &&
+                item.nodes.front()->new_range_base == item.old_range_base) {
+                detached_subtrees.push_back(cow_replay_child_ref{
+                    .target = std::move(item.nodes.front()),
+                });
+                continue;
+            }
+
+            cow_child_delta delta;
+            delta.old_child_range_base = item.old_range_base;
+            delta.parent_idx = item.parent_idx;
+            delta.nodes = std::move(item.nodes);
+            delta.sibling_seps.reserve(
+                delta.nodes.size() > 0 ? delta.nodes.size() - 1 : 0);
+            for (std::size_t i = 1; i < delta.nodes.size(); ++i) {
+                auto sep = cow_first_key_of_leaf_node(
+                    delta.nodes[i].get(), geom.tree_page_size);
+                if (sep.empty()) {
+                    throw std::runtime_error(
+                        "inconel recovery: split leaf has empty separator");
+                }
+                delta.sibling_seps.push_back(std::move(sep));
+            }
+            current_level.push_back(std::move(delta));
+        }
+
+        const auto& topo = tree_scan.tree.reverse_topology;
+        while (!current_level.empty()) {
+            absl::flat_hash_map<
+                core::internal_idx,
+                std::vector<cow_child_delta>> grouped;
+            for (auto& delta : current_level) {
+                grouped[delta.parent_idx].push_back(std::move(delta));
+            }
+            current_level.clear();
+
+            std::vector<cow_child_delta> next_level;
+            for (auto& [parent_idx, deltas] : grouped) {
+                if (parent_idx >= topo.internal_nodes.size()) {
+                    throw std::runtime_error(
+                        "inconel recovery: CoW parent index out of range");
+                }
+                const auto parent_rb =
+                    topo.internal_nodes[parent_idx].range_base;
+                auto parent_bytes = read_base_internal_page(
+                    device,
+                    core,
+                    profile,
+                    geom,
+                    tree_scan.tree,
+                    parent_rb);
+                tree::internal_page_reader reader;
+                if (!reader.parse(parent_bytes.data(), geom.tree_page_size)) {
+                    throw std::runtime_error(
+                        "inconel recovery: failed to parse CoW parent page");
+                }
+
+                absl::flat_hash_map<format::paddr, std::size_t> delta_by_child;
+                delta_by_child.reserve(deltas.size());
+                for (std::size_t i = 0; i < deltas.size(); ++i) {
+                    if (!delta_by_child
+                             .emplace(deltas[i].old_child_range_base, i)
+                             .second) {
+                        throw std::runtime_error(
+                            "inconel recovery: multiple CoW deltas target "
+                            "one parent child");
+                    }
+                }
+
+                std::vector<cow_replay_child_ref> new_children;
+                std::vector<std::string> new_separators;
+                const uint16_t old_separator_count = reader.record_count();
+                const uint32_t old_child_count =
+                    static_cast<uint32_t>(old_separator_count) + 1;
+                new_children.reserve(old_child_count + deltas.size());
+                new_separators.reserve(old_separator_count + deltas.size());
+
+                for (uint32_t i = 0; i < old_child_count; ++i) {
+                    if (!new_children.empty()) {
+                        const auto sep =
+                            reader.get(static_cast<uint16_t>(i - 1));
+                        new_separators.emplace_back(sep.separator_key);
+                    }
+
+                    const format::paddr old_child =
+                        (i < old_separator_count)
+                            ? reader.get(static_cast<uint16_t>(i)).child_base
+                            : reader.rightmost_child();
+                    auto delta_it = delta_by_child.find(old_child);
+                    if (delta_it == delta_by_child.end()) {
+                        new_children.push_back(cow_replay_child_ref{
+                            .target = old_child,
+                        });
+                        continue;
+                    }
+
+                    auto& delta = deltas[delta_it->second];
+                    for (std::size_t n = 0; n < delta.nodes.size(); ++n) {
+                        if (!new_children.empty() && n > 0) {
+                            new_separators.push_back(
+                                std::move(delta.sibling_seps[n - 1]));
+                        }
+                        new_children.push_back(cow_replay_child_ref{
+                            .target = std::move(delta.nodes[n]),
+                        });
+                    }
+                }
+
+                std::vector<std::string> sibling_seps;
+                auto built = build_cow_internal_pages(
+                    std::move(new_children),
+                    std::move(new_separators),
+                    parent_rb,
+                    /*is_new_layer=*/false,
+                    geom.tree_page_size,
+                    sibling_seps);
+                plan_cow_group_against_old_range(
+                    built,
+                    parent_rb,
+                    tree_scan.tree,
+                    profile,
+                    geom,
+                    next_range_base,
+                    allocation_limit_lba);
+
+                const auto parent_parent_idx =
+                    topo.internal_nodes[parent_idx].parent_idx;
+                if (parent_parent_idx == core::kInvalidInternalIdx) {
+                    final_root.emplace(finalize_cow_root_group(
+                        std::move(built),
+                        std::move(sibling_seps),
+                        profile,
+                        geom,
+                        next_range_base,
+                        allocation_limit_lba));
+                    continue;
+                }
+
+                if (built.size() == 1 &&
+                    built.front()->new_range_base == parent_rb) {
+                    detached_subtrees.push_back(cow_replay_child_ref{
+                        .target = std::move(built.front()),
+                    });
+                    continue;
+                }
+
+                next_level.push_back(cow_child_delta{
+                    .old_child_range_base = parent_rb,
+                    .parent_idx = parent_parent_idx,
+                    .nodes = move_cow_node_vector(std::move(built)),
+                    .sibling_seps = std::move(sibling_seps),
+                });
+            }
+
+            current_level = std::move(next_level);
+        }
+
+        const format::paddr old_root_range = tree_scan.tree.root_range_base;
+        cow_replay_child_ref root_ref{
+            .target = old_root_range,
+        };
+        cow_replay_child_ref* root_to_write = nullptr;
+        if (final_root.has_value()) {
+            root_ref = std::move(*final_root);
+            root_to_write = &root_ref;
+        }
+
+        write_cow_nodes(
+            device,
+            core,
+            profile,
+            geom,
+            root_to_write,
+            detached_subtrees);
+
+        const format::paddr final_root_range = cow_child_range_base(root_ref);
+        auto rescanned = scan_existing_tree(
+            device, core, profile, geom, final_root_range);
+        return cow_replay_result{
+            .tree_scan = std::move(rescanned),
+            .root_range_changed = final_root_range != old_root_range,
+        };
     }
 
     [[nodiscard]] inline format::superblock_choice::source
@@ -1130,6 +1945,7 @@ namespace apps::inconel::recovery {
         return recovered_runtime_state{
             .tree = {},
             .live_value_extents = {},
+            .tree_free_ranges = {},
             .recovered_durable_lsn = 0,
             .next_lsn = 1,
             .tree_alloc_head_lba = profile.value_data_area_base.lba,
@@ -1163,6 +1979,7 @@ namespace apps::inconel::recovery {
 
         if (choice.chosen->root_base_paddr.lba != 0 ||
             choice.chosen->root_base_paddr.device_id != 0) {
+            auto active_source = choice.which;
             auto tree_scan = scan_existing_tree(
                 device,
                 core,
@@ -1181,11 +1998,28 @@ namespace apps::inconel::recovery {
                                scan)) {
                     tree_scan = std::move(*replayed);
                     reset_wal_region(device, core, profile);
+                } else if (auto replayed = replay_full_cow_wal_delta(
+                               device,
+                               core,
+                               profile,
+                               tree_geometry,
+                               tree_scan,
+                               scan)) {
+                    tree_scan = std::move(replayed->tree_scan);
+                    if (replayed->root_range_changed) {
+                        active_source = write_recovered_superblock_root(
+                            device,
+                            core,
+                            *choice.chosen,
+                            choice.which,
+                            tree_scan.tree.root_range_base,
+                            profile);
+                    }
+                    reset_wal_region(device, core, profile);
                 } else {
                     throw std::runtime_error(
-                        "inconel recovery: WAL delta on existing tree "
-                        "requires boot CoW merge (064D full merge is not "
-                        "implemented yet)");
+                        "inconel recovery: WAL delta reached no-op CoW "
+                        "fallback after non-empty delta detection");
                 }
             }
             const uint64_t recovered_durable_lsn =
@@ -1199,10 +2033,12 @@ namespace apps::inconel::recovery {
                 .tree = std::move(tree_scan.tree),
                 .live_value_extents =
                     std::move(tree_scan.live_value_extents),
+                .tree_free_ranges =
+                    std::move(tree_scan.tree_free_ranges),
                 .recovered_durable_lsn = recovered_durable_lsn,
                 .next_lsn = recovered_durable_lsn + 1,
                 .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
-                .active_superblock_source = choice.which,
+                .active_superblock_source = active_source,
             };
         } else if (scan.saw_nonzero) {
             const auto records = build_replay_records(scan);
@@ -1231,6 +2067,8 @@ namespace apps::inconel::recovery {
                     .tree = std::move(replay.tree),
                     .live_value_extents =
                         std::move(replay.live_value_extents),
+                    .tree_free_ranges =
+                        std::move(replay.tree_free_ranges),
                     .recovered_durable_lsn = scan.max_complete_lsn,
                     .next_lsn = scan.max_complete_lsn + 1,
                     .tree_alloc_head_lba = replay.tree_alloc_head_lba,

@@ -210,6 +210,23 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   --verify-samples 32
 ```
 
+YCSB consistency suite:
+
+`apps/inconel/scripts/ycsb_consistency.sh` runs the 066 real-NVMe consistency
+suite serially, checks the scratch BDF safety precondition, rejects the known
+system disk BDF, and parses YCSB counters. Use individual scenarios while
+debugging and `all` only when the device can be destructively reused for the
+full sequence:
+
+```bash
+apps/inconel/scripts/ycsb_consistency.sh a0
+apps/inconel/scripts/ycsb_consistency.sh a5
+apps/inconel/scripts/ycsb_consistency.sh all
+```
+
+The default scratch BDF is `0000:04:00.0`. To override it, set
+`INCONEL_YCSB_BDF`, but never set it to `0000:03:00.0`.
+
 ## Maintenance Cadence Tests
 
 061 enables production maintenance by default. When a test uses the default

@@ -795,6 +795,179 @@ namespace apps::inconel::recovery {
         };
     }
 
+    [[nodiscard]] inline recovered_tree_record
+    recovered_record_from_replay(const replay_record& rec) {
+        recovered_tree_record out{
+            .key = rec.key,
+            .data_ver = rec.data_ver,
+            .kind = record_kind_for_replay(rec),
+            .vr = {},
+        };
+        if (out.kind == format::record_kind::value) {
+            out.vr = rec.vr;
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline std::vector<recovered_tree_record>
+    merge_single_leaf_records(const recovered_tree_scan& tree_scan,
+                              const std::vector<replay_record>& wal_records) {
+        std::map<std::string, recovered_tree_record> by_key;
+        for (const auto& rec : tree_scan.records) {
+            auto [_, inserted] = by_key.emplace(rec.key, rec);
+            if (!inserted) {
+                throw std::runtime_error(
+                    "inconel recovery: duplicate key in single-leaf scan");
+            }
+        }
+
+        for (const auto& wal_rec : wal_records) {
+            auto incoming = recovered_record_from_replay(wal_rec);
+            auto it = by_key.find(incoming.key);
+            if (it == by_key.end()) {
+                by_key.emplace(incoming.key, std::move(incoming));
+                continue;
+            }
+            if (it->second.data_ver < incoming.data_ver) {
+                it->second = std::move(incoming);
+                continue;
+            }
+            if (it->second.data_ver == incoming.data_ver) {
+                (void)tree_record_covers_replay_record(it->second, wal_rec);
+            }
+        }
+
+        std::vector<recovered_tree_record> out;
+        out.reserve(by_key.size());
+        for (auto& [_, rec] : by_key) {
+            out.push_back(std::move(rec));
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline std::vector<value::live_value_extent>
+    live_extents_from_records(
+        const std::vector<recovered_tree_record>& records) {
+        std::vector<value::live_value_extent> out;
+        for (const auto& rec : records) {
+            if (rec.kind != format::record_kind::value) {
+                continue;
+            }
+            out.push_back(value::live_value_extent{
+                .base = rec.vr.base,
+                .byte_offset = rec.vr.byte_offset,
+                .len = rec.vr.len,
+            });
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline uint64_t
+    max_data_ver_from_records(
+        const std::vector<recovered_tree_record>& records) noexcept {
+        uint64_t out = 0;
+        for (const auto& rec : records) {
+            out = std::max(out, rec.data_ver);
+        }
+        return out;
+    }
+
+    [[nodiscard]] inline bool
+    write_single_leaf_records(nvme::real_device& device,
+                              uint32_t core,
+                              const format::format_profile& profile,
+                              const core::tree_geometry& geom,
+                              format::paddr slot_paddr,
+                              const std::vector<recovered_tree_record>& records) {
+        auto page = make_zeroed_dma_buffer(
+            geom.tree_page_size, profile.lba_size);
+        tree::leaf_page_builder builder;
+        builder.init(page.get(), geom.tree_page_size);
+
+        for (const auto& rec : records) {
+            validate_replay_key_size(rec.key);
+            bool ok = false;
+            if (rec.kind == format::record_kind::value) {
+                ok = builder.add_value(rec.key, rec.data_ver, rec.vr);
+            } else if (rec.kind == format::record_kind::tombstone) {
+                ok = builder.add_tombstone(rec.key, rec.data_ver);
+            } else {
+                throw std::runtime_error(
+                    "inconel recovery: unknown tree record kind");
+            }
+            if (!ok) {
+                return false;
+            }
+        }
+
+        builder.finalize();
+        write_replay_page(
+            device, core, profile, geom, slot_paddr, page.get());
+        sync_flush(device, core);
+        return true;
+    }
+
+    [[nodiscard]] inline std::optional<recovered_tree_scan>
+    replay_single_leaf_wal_delta(nvme::real_device& device,
+                                 uint32_t core,
+                                 const format::format_profile& profile,
+                                 const core::tree_geometry& geom,
+                                 const recovered_tree_scan& tree_scan,
+                                 const wal_scan_result& wal_scan) {
+        if (tree_scan.tree.reverse_topology.internal_nodes.size() != 0 ||
+            tree_scan.tree.leaf_order.spans.size() != 1) {
+            return std::nullopt;
+        }
+
+        const auto root_range_base = tree_scan.tree.root_range_base;
+        const auto leaf_range_base =
+            tree_scan.tree.leaf_order.spans.front().leaf_range_base;
+        if (!(leaf_range_base == root_range_base)) {
+            throw std::runtime_error(
+                "inconel recovery: single-leaf topology does not match root");
+        }
+
+        auto slot_it = tree_scan.tree.slot_map.find(root_range_base);
+        if (slot_it == tree_scan.tree.slot_map.end()) {
+            throw std::runtime_error(
+                "inconel recovery: single-leaf root missing from slot map");
+        }
+        const uint32_t current_slot = slot_it->second;
+        if (current_slot + 1 >= geom.shadow_slots_per_range) {
+            return std::nullopt;
+        }
+
+        const auto wal_records = build_replay_records(wal_scan);
+        auto merged = merge_single_leaf_records(tree_scan, wal_records);
+        if (merged.empty()) {
+            return std::nullopt;
+        }
+
+        const uint32_t next_slot = current_slot + 1;
+        const auto next_slot_paddr = geom.slot_paddr(root_range_base, next_slot);
+        if (!write_single_leaf_records(
+                device,
+                core,
+                profile,
+                geom,
+                next_slot_paddr,
+                merged)) {
+            return std::nullopt;
+        }
+
+        auto out = recovered_tree_scan{
+            .tree = tree_scan.tree,
+            .live_value_extents = live_extents_from_records(merged),
+            .records = std::move(merged),
+            .max_data_ver = 0,
+            .tree_alloc_head_lba = tree_scan.tree_alloc_head_lba,
+        };
+        out.max_data_ver = max_data_ver_from_records(out.records);
+        out.tree.root_slot = next_slot_paddr;
+        out.tree.slot_map[root_range_base] = next_slot;
+        return out;
+    }
+
     [[nodiscard]] inline format::superblock_choice::source
     write_recovered_superblock_root(
         nvme::real_device& device,
@@ -895,13 +1068,23 @@ namespace apps::inconel::recovery {
                 tree_geometry,
                 choice.chosen->root_base_paddr);
             if (scan.saw_nonzero) {
-                if (!existing_tree_wal_delta_is_empty(tree_scan, scan)) {
+                if (existing_tree_wal_delta_is_empty(tree_scan, scan)) {
+                    reset_wal_region(device, core, profile);
+                } else if (auto replayed = replay_single_leaf_wal_delta(
+                               device,
+                               core,
+                               profile,
+                               tree_geometry,
+                               tree_scan,
+                               scan)) {
+                    tree_scan = std::move(*replayed);
+                    reset_wal_region(device, core, profile);
+                } else {
                     throw std::runtime_error(
                         "inconel recovery: WAL delta on existing tree "
                         "requires boot CoW merge (064D full merge is not "
                         "implemented yet)");
                 }
-                reset_wal_region(device, core, profile);
             }
             const uint64_t recovered_durable_lsn =
                 std::max(tree_scan.max_data_ver, scan.max_complete_lsn);

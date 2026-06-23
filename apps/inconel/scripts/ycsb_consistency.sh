@@ -17,7 +17,7 @@ LOCK_FILE="/tmp/inconel_ycsb_${BDF//[:.]/_}.lock"
 
 usage() {
     cat <<EOF
-Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4]
+Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5]
 
 Environment:
   INCONEL_YCSB_BDF                  Scratch BDF, default 0000:04:00.0
@@ -162,7 +162,7 @@ assert_real_run_ok() {
 
 print_summary() {
     local log="$1"
-    grep -E '^(load|load-flush|verify|run|expect|maintenance|checker|checker_maintenance) ' "$log" || true
+    grep -E '^(load|load-flush|verify|run|expect|maintenance|checker|checker_barrier|checker_maintenance) ' "$log" || true
 }
 
 run_local() {
@@ -239,6 +239,11 @@ assert_checker_flush_ok() {
     assert_checker_maintenance_ok "$log"
     assert_gt_zero "$log" checker_maintenance flush
     assert_gt_zero "$log" checker_maintenance non_noop_flush
+}
+
+assert_checker_batch_barrier_ok() {
+    local log="$1"
+    assert_eq "$log" checker_barrier reads 4096
 }
 
 run_a0() {
@@ -471,6 +476,14 @@ run_c4() {
     assert_checker_ok "$log"
 }
 
+run_c5() {
+    local log
+    log="$(run_concurrency_checker "c5_batch_ack_barrier" "c5")"
+    assert_checker_ok "$log"
+    assert_checker_batch_barrier_ok "$log"
+    assert_checker_flush_ok "$log"
+}
+
 run_all() {
     run_a0
     run_a1
@@ -487,6 +500,7 @@ run_all() {
     run_c2
     run_c3
     run_c4
+    run_c5
 }
 
 case "$SCENARIO" in
@@ -494,7 +508,7 @@ case "$SCENARIO" in
         usage
         exit 0
         ;;
-    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4)
+    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c2|c3|c4|c5)
         prepare
         "run_${SCENARIO}"
         echo "PASS: $SCENARIO logs in $LOG_DIR"

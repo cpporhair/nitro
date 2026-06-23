@@ -172,6 +172,12 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   timeout 300s build_real/inconel_test_ycsb_concurrency_checker_e2e \
   --pci-addr 0000:04:00.0 \
   --scenario c4
+
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_test_ycsb_concurrency_checker_e2e \
+  --pci-addr 0000:04:00.0 \
+  --scenario c5
 ```
 
 Flush e2e:
@@ -295,6 +301,7 @@ apps/inconel/scripts/ycsb_consistency.sh c1
 apps/inconel/scripts/ycsb_consistency.sh c2
 apps/inconel/scripts/ycsb_consistency.sh c3
 apps/inconel/scripts/ycsb_consistency.sh c4
+apps/inconel/scripts/ycsb_consistency.sh c5
 apps/inconel/scripts/ycsb_consistency.sh all
 ```
 
@@ -303,7 +310,8 @@ The default scratch BDF is `0000:04:00.0`. To override it, set
 The script also takes a per-BDF `flock`, checks `maintenance.failed=0` for
 YCSB real runs, checks `checker_maintenance.failed=0` for C2/C3, requires
 `checker_maintenance.seal > 0` for C2, and requires
-`checker_maintenance.flush/non_noop_flush > 0` for C3.
+`checker_maintenance.flush/non_noop_flush > 0` for C3/C5. C5 also requires
+`checker_barrier.reads=4096`.
 
 ## Maintenance Cadence Tests
 

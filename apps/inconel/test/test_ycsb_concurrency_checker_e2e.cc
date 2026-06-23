@@ -213,6 +213,7 @@ enum class scenario_kind : uint8_t {
     c2,
     c3,
     c4,
+    c5,
 };
 
 struct harness_options {
@@ -233,6 +234,8 @@ scenario_name(scenario_kind scenario) noexcept {
         return "c3";
     case scenario_kind::c4:
         return "c4";
+    case scenario_kind::c5:
+        return "c5";
     }
     return "unknown";
 }
@@ -291,6 +294,7 @@ struct read_interval {
 struct workload_result {
     std::vector<write_interval> writes;
     std::vector<std::vector<read_interval>> reads_by_reader;
+    uint64_t batch_barrier_reads = 0;
     runtime::maintenance_stats_snapshot maintenance{};
 };
 
@@ -444,6 +448,21 @@ submit_write_batch(std::vector<core::raw_batch_op> ops) {
         sub.fut.get(), "write_batch");
 }
 
+pipeline::point_get_result
+submit_point_get(std::string key) {
+    auto key_holder = std::make_shared<std::string>(std::move(key));
+    auto sub = submit_result<pipeline::point_get_result>(
+        [key_holder]() {
+            return rt::point_get(std::string_view(*key_holder))
+                >> pump::sender::then(
+                       [key_holder](pipeline::point_get_result result) {
+                           (void)key_holder;
+                           return result;
+                       });
+        });
+    return expect_ok<pipeline::point_get_result>(sub.fut.get(), "point_get");
+}
+
 void
 preload_hot_keys(const ycsb::config& cfg,
                  interval_clock* clock,
@@ -489,11 +508,15 @@ writer_main(const ycsb::config& cfg,
             std::vector<uint64_t>* versions,
             std::vector<bool>* live,
             std::vector<write_interval>* writes,
+            uint64_t* batch_barrier_reads,
             scenario_kind scenario) {
     pump::core::this_core_id = kWriterCore;
     const bool stretch_for_maintenance =
-        scenario == scenario_kind::c2 || scenario == scenario_kind::c3;
+        scenario == scenario_kind::c2 ||
+        scenario == scenario_kind::c3 ||
+        scenario == scenario_kind::c5;
     const bool delete_race = scenario == scenario_kind::c4;
+    const bool batch_barrier = scenario == scenario_kind::c5;
 
     try {
         for (uint32_t batch = 0; batch < kUpdateBatches; ++batch) {
@@ -539,6 +562,29 @@ writer_main(const ycsb::config& cfg,
             const uint64_t end = clock->mark();
             if (ack.entry_count != planned.size() || ack.batch_lsn == 0) {
                 throw std::runtime_error("writer write_batch returned bad ack");
+            }
+
+            if (batch_barrier) {
+                for (const auto& op : planned) {
+                    auto got = submit_point_get(ycsb::make_key(cfg, op.key_id));
+                    const auto expected =
+                        ycsb::make_value(cfg, op.key_id, op.generation);
+                    if (!got.found || got.value != expected) {
+                        char buf[256];
+                        std::snprintf(
+                            buf,
+                            sizeof(buf),
+                            "batch barrier point_get mismatch: batch=%u "
+                            "lsn=%lu key=%lu expected_gen=%lu found=%d",
+                            batch,
+                            static_cast<unsigned long>(ack.batch_lsn),
+                            static_cast<unsigned long>(op.key_id),
+                            static_cast<unsigned long>(op.generation),
+                            got.found ? 1 : 0);
+                        throw std::runtime_error(buf);
+                    }
+                    ++(*batch_barrier_reads);
+                }
             }
 
             for (const auto& op : planned) {
@@ -615,7 +661,8 @@ void
 wait_for_maintenance(runtime_t* runtime,
                      const std::atomic<bool>* writer_done,
                      scenario_kind scenario) {
-    const bool require_flush = scenario == scenario_kind::c3;
+    const bool require_flush =
+        scenario == scenario_kind::c3 || scenario == scenario_kind::c5;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -922,6 +969,7 @@ run_workload(checker_fixture* fx,
                         &versions,
                         &live,
                         &result.writes,
+                        &result.batch_barrier_reads,
                         scenario);
         } catch (...) {
             writer_error = std::current_exception();
@@ -947,7 +995,9 @@ run_workload(checker_fixture* fx,
     }
 
     std::exception_ptr maintenance_error;
-    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 ||
+        scenario == scenario_kind::c3 ||
+        scenario == scenario_kind::c5) {
         try {
             wait_for_maintenance(fx->runtime(), &writer_done, scenario);
         } catch (...) {
@@ -962,7 +1012,9 @@ run_workload(checker_fixture* fx,
     if (maintenance_error) {
         std::rethrow_exception(maintenance_error);
     }
-    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 ||
+        scenario == scenario_kind::c3 ||
+        scenario == scenario_kind::c5) {
         result.maintenance = maintenance_snapshot(fx->runtime());
     }
 
@@ -975,13 +1027,15 @@ run_workload(checker_fixture* fx,
         }
     }
 
-    if (scenario == scenario_kind::c2 || scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c2 ||
+        scenario == scenario_kind::c3 ||
+        scenario == scenario_kind::c5) {
         if (result.maintenance.failed_rounds != 0 ||
             result.maintenance.seal_rounds == 0) {
             throw std::runtime_error("c2 maintenance counter contract failed");
         }
     }
-    if (scenario == scenario_kind::c3) {
+    if (scenario == scenario_kind::c3 || scenario == scenario_kind::c5) {
         if (result.maintenance.flush_rounds == 0 ||
             result.maintenance.non_noop_flush_rounds == 0) {
             throw std::runtime_error("c3 maintenance counter contract failed");
@@ -994,12 +1048,13 @@ run_workload(checker_fixture* fx,
 void
 print_usage(const char* argv0) {
     std::printf(
-        "usage: %s --pci-addr BDF --scenario c1|c2|c3|c4 "
+        "usage: %s --pci-addr BDF --scenario c1|c2|c3|c4|c5 "
         "[--spdk-core-mask MASK] [--qpair-depth D]\n"
         "  --pci-addr BDF         PCI BDF of the SPDK-bound scratch NVMe\n"
         "                         controller, or INCONEL_NVME_PCI_ADDR\n"
-        "  --scenario c1|c2|c3|c4 c1 put/read, c2 auto-seal put/read, "
-        "c3 auto-flush put/read, c4 delete/read/put\n"
+        "  --scenario c1|c2|c3|c4|c5 c1 put/read, "
+        "c2 auto-seal put/read, c3 auto-flush put/read, "
+        "c4 delete/read/put, c5 batch barrier\n"
         "  --spdk-core-mask MASK  optional SPDK env core mask override\n"
         "  --qpair-depth D        NVMe qpair depth (default 256)\n",
         argv0);
@@ -1035,8 +1090,12 @@ parse_scenario(std::string_view value) {
         value == "delete-race") {
         return scenario_kind::c4;
     }
+    if (value == "c5" || value == "5" || value == "batch" ||
+        value == "batch-barrier") {
+        return scenario_kind::c5;
+    }
     throw std::invalid_argument(
-        "unknown --scenario (expected c1, c2, c3, or c4)");
+        "unknown --scenario (expected c1, c2, c3, c4, or c5)");
 }
 
 harness_options
@@ -1093,7 +1152,7 @@ parse_argv(int argc, char** argv) {
                          "--pci-addr or INCONEL_NVME_PCI_ADDR is required\n");
         }
         if (!scenario_set) {
-            std::fprintf(stderr, "--scenario c1|c2|c3|c4 is required\n");
+            std::fprintf(stderr, "--scenario c1|c2|c3|c4|c5 is required\n");
         }
         print_usage(argv[0]);
         std::exit(2);
@@ -1139,8 +1198,11 @@ run_checker(const harness_options& opts) {
                 result.writes.size(),
                 static_cast<unsigned long>(read_count),
                 static_cast<unsigned long>(kHotKeyCount));
+    std::printf("checker_barrier reads=%lu\n",
+                static_cast<unsigned long>(result.batch_barrier_reads));
     if (opts.scenario == scenario_kind::c2 ||
-        opts.scenario == scenario_kind::c3) {
+        opts.scenario == scenario_kind::c3 ||
+        opts.scenario == scenario_kind::c5) {
         std::printf("checker_maintenance failed=%lu seal=%lu flush=%lu "
                     "non_noop_flush=%lu completed=%lu\n",
                     static_cast<unsigned long>(

@@ -176,6 +176,10 @@ namespace apps::inconel::ycsb {
             .device = &device,
             .disk_profile =
                 recovered_boot.has_value() ? &recovered_boot->profile : nullptr,
+            .recovered_state =
+                recovered_boot.has_value()
+                    ? &recovered_boot->runtime_state
+                    : nullptr,
             .read_domain_cores = {},
             .value_core = state->cfg->value_core,
             .owner_core = state->cfg->owner_core,

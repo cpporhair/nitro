@@ -29,6 +29,7 @@
 #include "../front/scheduler.hh"
 #include "../memory/spdk_dma_page_allocator.hh"
 #include "../nvme/runtime_scheduler.hh"
+#include "../recovery/state.hh"
 #include "../tree/scheduler.hh"
 #include "../value/scheduler.hh"
 #include "../wal/scheduler.hh"
@@ -122,6 +123,9 @@ namespace apps::inconel::runtime {
         wal::segment_geometry wal_geometry;
         core::wal_reclaim_frontier* wal_reclaim_frontier = nullptr;
         const core::tree_geometry* tree_geometry = nullptr;
+        std::shared_ptr<const core::tree_manifest> initial_manifest;
+        uint64_t initial_durable_lsn = 0;
+        uint64_t coord_next_lsn = 1;
         std::size_t front_queue_depth = 1024;
         std::size_t coord_queue_depth = 1024;
         std::size_t coord_ready_window = 65536;
@@ -260,6 +264,11 @@ namespace apps::inconel::runtime {
         }
         validate_tree_geometry_for_front_topology(opts.tree_geometry);
         wal::validate_wal_append_config(opts.front_wal_config);
+        if (opts.coord_next_lsn <= opts.initial_durable_lsn) {
+            throw std::invalid_argument(
+                "runtime::build_front_topology: coord_next_lsn must "
+                "advance beyond initial_durable_lsn");
+        }
 
         if (!core::registry::front_scheds.list.empty() ||
             core::registry::coord_sched_singleton_ptr != nullptr ||
@@ -285,8 +294,11 @@ namespace apps::inconel::runtime {
                 owner, front_count, 0, core::memtable_gen::state::active));
         }
 
-        auto manifest = std::make_shared<const core::tree_manifest>(
-            core::tree_manifest::empty(opts.tree_geometry));
+        auto manifest = opts.initial_manifest;
+        if (!manifest) {
+            manifest = std::make_shared<const core::tree_manifest>(
+                core::tree_manifest::empty(opts.tree_geometry));
+        }
         auto guard = std::make_shared<core::checkpoint_guard>();
         guard->manifest = std::move(manifest);
 
@@ -308,7 +320,7 @@ namespace apps::inconel::runtime {
                 .epoch = 1,
             });
         auto cat = std::make_shared<const core::publish_catalog>(
-            prs, 0, 1);
+            prs, opts.initial_durable_lsn, 1);
 
         front_topology topology;
         topology.front_cores = std::move(front_cores);
@@ -345,7 +357,7 @@ namespace apps::inconel::runtime {
         topology.coord = new coord::coord_sched(
             std::move(cat),
             front_count,
-            1,
+            opts.coord_next_lsn,
             opts.coord_ready_window,
             opts.coord_queue_depth);
         core::registry::coord_sched_singleton_ptr = topology.coord;
@@ -383,6 +395,7 @@ namespace apps::inconel::runtime {
         std::span<const uint32_t> cores;             // which cores to populate
         nvme::runtime_device*     device;            // nvme backing device
         const format::format_profile* disk_profile = nullptr;
+        const recovery::recovered_runtime_state* recovered_state = nullptr;
 
         // Optional per-role topology. Leave default for the symmetric
         // layout (read_domain on every core, value + owner on cores[0]).
@@ -431,6 +444,109 @@ namespace apps::inconel::runtime {
         int                       nvme_numa_id = SPDK_ENV_NUMA_ID_ANY;
     };
 
+    [[nodiscard]] inline std::shared_ptr<const core::tree_manifest>
+    make_initial_manifest(
+        const recovery::recovered_runtime_state* recovered,
+        const core::tree_geometry* geom) {
+        if (geom == nullptr) {
+            throw std::invalid_argument(
+                "runtime::make_initial_manifest: tree_geometry is null");
+        }
+        if (recovered == nullptr || !recovered->tree.has_root()) {
+            return std::make_shared<const core::tree_manifest>(
+                core::tree_manifest::empty(geom));
+        }
+
+        const auto& tree = recovered->tree;
+        if (!tree.slot_map.contains(tree.root_range_base)) {
+            throw std::invalid_argument(
+                "runtime::make_initial_manifest: recovered root range "
+                "missing from slot_map");
+        }
+        return std::make_shared<const core::tree_manifest>(
+            core::tree_manifest{
+                .root_slot = tree.root_slot,
+                .slot_map = tree.slot_map,
+                .geom = geom,
+                .leaf_order = tree.leaf_order,
+                .root_range_base = tree.root_range_base,
+                .reverse_topology = tree.reverse_topology,
+            });
+    }
+
+    [[nodiscard]] inline tree::superblock_slot
+    superblock_slot_from_recovery_source(
+        format::superblock_choice::source source) {
+        switch (source) {
+        case format::superblock_choice::source::a:
+            return tree::superblock_slot::A;
+        case format::superblock_choice::source::b:
+            return tree::superblock_slot::B;
+        case format::superblock_choice::source::none:
+            break;
+        }
+        throw std::invalid_argument(
+            "runtime::build_runtime: recovered active superblock source is none");
+    }
+
+    template <typename ValueSched>
+    inline void
+    install_recovered_runtime_state(
+        const recovery::recovered_runtime_state& recovered,
+        const format::format_profile& profile,
+        tree::tree_sched* tree_sched,
+        ValueSched* value_sched,
+        core::data_area_heads* shared_heads) {
+        if (tree_sched == nullptr) {
+            throw std::logic_error(
+                "runtime::build_runtime: tree scheduler missing during "
+                "recovery install");
+        }
+        if (value_sched == nullptr) {
+            throw std::logic_error(
+                "runtime::build_runtime: value scheduler missing during "
+                "recovery install");
+        }
+        if (shared_heads == nullptr) {
+            throw std::logic_error(
+                "runtime::build_runtime: shared_heads missing during "
+                "recovery install");
+        }
+        if (recovered.next_lsn <= recovered.recovered_durable_lsn) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: recovered next_lsn must advance "
+                "beyond durable_lsn");
+        }
+        if (recovered.tree_alloc_head_lba < profile.value_data_area_base.lba ||
+            recovered.tree_alloc_head_lba > profile.value_data_area_end.lba) {
+            throw std::invalid_argument(
+                "runtime::build_runtime: recovered tree_alloc_head_lba "
+                "outside data area");
+        }
+
+        tree_sched->state.alloc.head = format::paddr{
+            profile.value_data_area_base.device_id,
+            recovered.tree_alloc_head_lba,
+        };
+        tree_sched->state.flush_max_lsn = recovered.recovered_durable_lsn;
+        tree_sched->state.superblock_safe_lsn =
+            recovered.recovered_durable_lsn;
+        tree_sched->state.recovery_safe_lsn =
+            recovered.recovered_durable_lsn;
+        tree_sched->state.active_superblock_slot =
+            superblock_slot_from_recovery_source(
+                recovered.active_superblock_source);
+        shared_heads->tree_head_lba.store(
+            recovered.tree_alloc_head_lba, std::memory_order_relaxed);
+
+        value_sched->install_recovered_value_space(
+            std::span<const value::live_value_extent>(
+                recovered.live_value_extents.data(),
+                recovered.live_value_extents.size()),
+            recovered.tree_alloc_head_lba,
+            std::span<const value::dead_class_hint>{});
+    }
+
     // ── validate_build_inputs ──
     //
     // Upfront fail-fast check for every invariant build_runtime relies on.
@@ -461,6 +577,20 @@ namespace apps::inconel::runtime {
         if (opts.cores.empty()) {
             throw std::invalid_argument(
                 "runtime::build_runtime: opts.cores is empty");
+        }
+        if (opts.recovered_state != nullptr) {
+            if (opts.recovered_state->active_superblock_source ==
+                format::superblock_choice::source::none) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: recovered active superblock "
+                    "source is none");
+            }
+            if (opts.recovered_state->next_lsn <=
+                opts.recovered_state->recovered_durable_lsn) {
+                throw std::invalid_argument(
+                    "runtime::build_runtime: recovered next_lsn must "
+                    "advance beyond durable_lsn");
+            }
         }
 
         // ── tier 2: profile self-consistency ──
@@ -815,6 +945,16 @@ namespace apps::inconel::runtime {
                 tree_geometry_from_profile(profile));
         const core::tree_geometry* tree_geometry =
             core::registry::tree_geometry_ptr.get();
+        auto initial_manifest =
+            make_initial_manifest(opts.recovered_state, tree_geometry);
+        const uint64_t initial_durable_lsn =
+            opts.recovered_state == nullptr
+                ? 0
+                : opts.recovered_state->recovered_durable_lsn;
+        const uint64_t initial_next_lsn =
+            opts.recovered_state == nullptr
+                ? 1
+                : opts.recovered_state->next_lsn;
 
         auto* rt = new inconel_runtime_t<TreeCache, ValueCache>();
         auto shared_heads = std::make_shared<core::data_area_heads>();
@@ -862,9 +1002,8 @@ namespace apps::inconel::runtime {
         // every read_domain for parity with the rebuild path.
         std::shared_ptr<const core::shard_partition_map> bootstrap_map;
         {
-            core::leaf_order_index empty_leaf_order;
             auto map = core::build_initial_shard_partition_map(
-                empty_leaf_order,
+                initial_manifest->leaf_order,
                 static_cast<uint32_t>(read_domain_cores.size()));
             bootstrap_map = std::make_shared<const core::shard_partition_map>(
                 std::move(map));
@@ -885,6 +1024,9 @@ namespace apps::inconel::runtime {
             .wal_geometry = wal_geometry_from_profile(profile),
             .wal_reclaim_frontier = wal_reclaim_frontier.get(),
             .tree_geometry = tree_geometry,
+            .initial_manifest = initial_manifest,
+            .initial_durable_lsn = initial_durable_lsn,
+            .coord_next_lsn = initial_next_lsn,
             .front_queue_depth = opts.front_queue_depth,
             .coord_queue_depth = opts.coord_queue_depth,
             .coord_ready_window = opts.coord_ready_window,
@@ -1026,6 +1168,15 @@ namespace apps::inconel::runtime {
                     "nvme scheduler");
             }
             core::registry::nvme_by_front_owner[owner] = nvme_for_owner;
+        }
+
+        if (opts.recovered_state != nullptr) {
+            install_recovered_runtime_state(
+                *opts.recovered_state,
+                profile,
+                tsched_singleton,
+                value_sched_singleton,
+                shared_heads.get());
         }
 
         // Suppress unused-variable warnings when the helper singletons

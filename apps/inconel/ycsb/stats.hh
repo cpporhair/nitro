@@ -59,6 +59,7 @@ namespace apps::inconel::ycsb {
         phase_stats load_flush{"load-flush"};
         phase_stats verify{"verify"};
         phase_stats run{"run"};
+        phase_stats expect{"expect"};
     };
 
     inline void
@@ -95,6 +96,7 @@ namespace apps::inconel::ycsb {
         print_phase_stats(out, stats.load_flush);
         print_phase_stats(out, stats.verify);
         print_phase_stats(out, stats.run);
+        print_phase_stats(out, stats.expect);
     }
 
     [[nodiscard]] inline uint64_t
@@ -108,7 +110,8 @@ namespace apps::inconel::ycsb {
         return phase_error_count(stats.load) +
                phase_error_count(stats.load_flush) +
                phase_error_count(stats.verify) +
-               phase_error_count(stats.run);
+               phase_error_count(stats.run) +
+               phase_error_count(stats.expect);
     }
 
 }  // namespace apps::inconel::ycsb

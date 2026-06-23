@@ -56,6 +56,10 @@ namespace apps::inconel::ycsb {
         uint64_t verify_samples = 0;
         bool verify_existing_updates = false;
         bool verify_existing_deletes = false;
+        std::string expect_file;
+        std::string write_expect_file;
+        uint64_t expect_samples = 0;
+        bool expect_all = false;
 
         std::vector<uint32_t> cores = {0, 1, 2, 3};
         std::vector<uint32_t> front_cores;
@@ -645,7 +649,9 @@ namespace apps::inconel::ycsb {
 
         if (const json* verification = json_find(root, "verification")) {
             reject_unknown_json_keys(
-                *verification, "config.verification", {"samples", "existing"});
+                *verification,
+                "config.verification",
+                {"samples", "existing", "expected"});
             if (const json* v = json_find(*verification, "samples")) {
                 cfg.verify_samples =
                     json_u64(*v, "config.verification.samples");
@@ -665,6 +671,30 @@ namespace apps::inconel::ycsb {
                 } else {
                     throw_json_error("config.verification.existing",
                                      "must be none, updates, or deletes");
+                }
+            }
+            if (const json* expected = json_find(*verification, "expected")) {
+                reject_unknown_json_keys(*expected,
+                                         "config.verification.expected",
+                                         {"file",
+                                          "write_file",
+                                          "samples",
+                                          "all"});
+                if (const json* v = json_find(*expected, "file")) {
+                    cfg.expect_file =
+                        json_string(*v, "config.verification.expected.file");
+                }
+                if (const json* v = json_find(*expected, "write_file")) {
+                    cfg.write_expect_file = json_string(
+                        *v, "config.verification.expected.write_file");
+                }
+                if (const json* v = json_find(*expected, "samples")) {
+                    cfg.expect_samples =
+                        json_u64(*v, "config.verification.expected.samples");
+                }
+                if (const json* v = json_find(*expected, "all")) {
+                    cfg.expect_all =
+                        json_bool(*v, "config.verification.expected.all");
                 }
             }
         }
@@ -846,6 +876,35 @@ namespace apps::inconel::ycsb {
             throw std::invalid_argument(
                 "--verify-existing-deletes requires --operations >= --records");
         }
+        const bool expect_verify = cfg.expect_all || cfg.expect_samples != 0;
+        const bool expect_active = expect_verify ||
+                                   !cfg.expect_file.empty() ||
+                                   !cfg.write_expect_file.empty();
+        if (cfg.expect_all && cfg.expect_samples != 0) {
+            throw std::invalid_argument(
+                "--expect-all and --expect-samples are mutually exclusive");
+        }
+        if (expect_active &&
+            (cfg.includes_load() ||
+             (cfg.includes_run() && cfg.run_kind() != workload_kind::c)) &&
+            cfg.inflight != 1) {
+            throw std::invalid_argument(
+                "expected-state oracle for mutating workloads requires "
+                "--inflight 1; use 066C interval checker for concurrent "
+                "mutations");
+        }
+        if (expect_verify && cfg.expect_file.empty() &&
+            !cfg.force_format && !cfg.includes_load()) {
+            throw std::invalid_argument(
+                "--expect-file is required for expected-state verify unless "
+                "the run starts from --force-format or includes load");
+        }
+        if (!cfg.write_expect_file.empty() && cfg.expect_file.empty() &&
+            !cfg.force_format && !cfg.includes_load()) {
+            throw std::invalid_argument(
+                "--write-expect-file without --expect-file requires "
+                "--force-format or a load workload");
+        }
     }
 
     inline void
@@ -909,6 +968,19 @@ namespace apps::inconel::ycsb {
                 cfg.verify_samples = parse_integer<uint64_t>(
                     args.take_value("--verify-samples"),
                     "invalid --verify-samples");
+            } else if (option_matches(arg, "--expect-file")) {
+                cfg.expect_file =
+                    std::string(args.take_value("--expect-file"));
+            } else if (option_matches(arg, "--write-expect-file")) {
+                cfg.write_expect_file =
+                    std::string(args.take_value("--write-expect-file"));
+            } else if (option_matches(arg, "--expect-samples")) {
+                cfg.expect_samples = parse_integer<uint64_t>(
+                    args.take_value("--expect-samples"),
+                    "invalid --expect-samples");
+            } else if (arg == "--expect-all") {
+                args.take();
+                cfg.expect_all = true;
             } else if (arg == "--verify-existing-updates") {
                 args.take();
                 cfg.verify_existing_updates = true;
@@ -1070,7 +1142,12 @@ namespace apps::inconel::ycsb {
               {"flush_after_load", cfg.flush_after_load}}},
             {"verification",
              {{"samples", cfg.verify_samples},
-              {"existing", std::string(verification_mode(cfg))}}},
+              {"existing", std::string(verification_mode(cfg))},
+              {"expected",
+               {{"file", cfg.expect_file},
+                {"write_file", cfg.write_expect_file},
+                {"samples", cfg.expect_samples},
+                {"all", cfg.expect_all}}}}},
             {"output",
              {{"print_config", cfg.print_config},
               {"dump_config", cfg.dump_config}}},
@@ -1113,6 +1190,16 @@ namespace apps::inconel::ycsb {
             << (cfg.flush_after_load ? 1 : 0) << "\n"
             << "  verification.samples: " << cfg.verify_samples << "\n"
             << "  verification.existing: " << verification_mode(cfg) << "\n"
+            << "  verification.expected.file: "
+            << (cfg.expect_file.empty() ? "<none>" : cfg.expect_file) << "\n"
+            << "  verification.expected.write_file: "
+            << (cfg.write_expect_file.empty() ? "<none>"
+                                              : cfg.write_expect_file)
+            << "\n"
+            << "  verification.expected.samples: " << cfg.expect_samples
+            << "\n"
+            << "  verification.expected.all: " << (cfg.expect_all ? 1 : 0)
+            << "\n"
             << "  runtime.cores: ";
         print_u32_vector(out, cfg.cores);
         out << "\n"

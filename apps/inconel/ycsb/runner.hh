@@ -1,9 +1,11 @@
 #ifndef APPS_INCONEL_YCSB_RUNNER_HH
 #define APPS_INCONEL_YCSB_RUNNER_HH
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -25,6 +27,7 @@
 #include "../runtime/run.hh"
 #include "../write_path/write_batch.hh"
 #include "./config.hh"
+#include "./expected_state.hh"
 #include "./stats.hh"
 #include "./workload.hh"
 
@@ -33,6 +36,7 @@ namespace apps::inconel::ycsb {
     struct run_state {
         std::shared_ptr<config> cfg;
         std::shared_ptr<all_stats> stats;
+        std::shared_ptr<expected_state> expected;
         std::exception_ptr error;
         std::atomic<bool> completed{false};
     };
@@ -68,17 +72,24 @@ namespace apps::inconel::ycsb {
     [[nodiscard]] inline auto
     submit_write_ops(std::shared_ptr<phase_stats> stats,
                      std::vector<core::raw_batch_op> ops,
-                     uint64_t logical_ops) {
+                     uint64_t logical_ops,
+                     std::function<void()> on_ack = {}) {
         auto input = encode_ops(ops);
         return rt::write_batch(std::move(input))
             >> pump::sender::then(
-                [stats, logical_ops](write_path::write_batch_result result) {
+                [stats,
+                 logical_ops,
+                 on_ack = std::move(on_ack)](
+                    write_path::write_batch_result result) mutable {
                     stats->generated_ops.fetch_add(
                         logical_ops, std::memory_order_relaxed);
                     stats->submitted_batches.fetch_add(
                         1, std::memory_order_relaxed);
                     stats->acked_entries.fetch_add(
                         result.entry_count, std::memory_order_relaxed);
+                    if (on_ack) {
+                        on_ack();
+                    }
                     return true;
                 })
             >> pump::sender::any_exception(
@@ -179,21 +190,23 @@ namespace apps::inconel::ycsb {
     }
 
     [[nodiscard]] inline auto
-    run_load_phase(std::shared_ptr<config> cfg,
+    run_load_phase(std::shared_ptr<run_state> state,
                    std::shared_ptr<phase_stats> stats) {
         return pump::sender::just()
             >> pump::sender::then([stats]() {
                 stats->start();
                 return true;
             })
-            >> pump::sender::flat_map([cfg, stats](bool) {
+            >> pump::sender::flat_map([state, stats](bool) {
+                auto cfg = state->cfg;
                 const uint64_t records = cfg->load_records();
                 const uint64_t batch_count =
                     ceil_div(records, cfg->batch_size);
                 return pump::sender::just()
                     >> pump::sender::loop(batch_count)
                     >> pump::sender::concurrent(cfg->inflight)
-                    >> pump::sender::flat_map([cfg, stats](std::size_t idx) {
+                    >> pump::sender::flat_map(
+                        [cfg, state, stats](std::size_t idx) {
                         const uint64_t first =
                             static_cast<uint64_t>(idx) * cfg->batch_size;
                         const uint64_t last =
@@ -205,14 +218,27 @@ namespace apps::inconel::ycsb {
                         for (uint64_t id = first; id < last; ++id) {
                             ops.push_back(make_put(*cfg, id, 0));
                         }
+                        std::function<void()> on_ack;
+                        if (state->expected) {
+                            auto expected = state->expected;
+                            on_ack = [expected, cfg, first, last]() {
+                                apply_expected_load_range(
+                                    *expected, *cfg, first, last);
+                            };
+                        }
                         return submit_write_ops(
                             stats,
                             std::move(ops),
-                            last - first);
+                            last - first,
+                            std::move(on_ack));
                     })
                     >> pump::sender::reduce();
             })
-            >> pump::sender::then([stats](bool ok) {
+            >> pump::sender::then([state, stats](bool ok) {
+                if (state->expected) {
+                    append_expected_load_phase(
+                        *state->expected, *state->cfg);
+                }
                 stats->stop();
                 return ok;
             });
@@ -315,9 +341,10 @@ namespace apps::inconel::ycsb {
     }
 
     [[nodiscard]] inline auto
-    submit_run_operation(std::shared_ptr<config> cfg,
+    submit_run_operation(std::shared_ptr<run_state> state,
                          std::shared_ptr<phase_stats> stats,
                          uint64_t op_index) {
+        auto cfg = state->cfg;
         const uint64_t id = operation_key_id(*cfg, op_index);
         using read_sender_t =
             decltype(submit_read(stats, make_key(*cfg, id)));
@@ -340,27 +367,92 @@ namespace apps::inconel::ycsb {
         } else {
             ops.push_back(make_put(*cfg, id, op_index + 1));
         }
+        std::function<void()> on_ack;
+        if (state->expected) {
+            auto expected = state->expected;
+            on_ack = [expected, cfg, op_index]() {
+                apply_expected_run_operation(*expected, *cfg, op_index);
+            };
+        }
         return std::variant<read_sender_t, write_sender_t>(
             std::in_place_index<1>,
-            submit_write_ops(stats, std::move(ops), 1));
+            submit_write_ops(stats, std::move(ops), 1, std::move(on_ack)));
     }
 
     [[nodiscard]] inline auto
-    run_mixed_phase(std::shared_ptr<config> cfg,
+    run_mixed_phase(std::shared_ptr<run_state> state,
                     std::shared_ptr<phase_stats> stats) {
         return pump::sender::just()
             >> pump::sender::then([stats]() {
                 stats->start();
                 return true;
             })
-            >> pump::sender::flat_map([cfg, stats](bool) {
+            >> pump::sender::flat_map([state, stats](bool) {
+                auto cfg = state->cfg;
                 const uint64_t ops = cfg->run_operations();
                 return pump::sender::just()
                     >> pump::sender::loop(ops)
                     >> pump::sender::concurrent(cfg->inflight)
-                    >> pump::sender::flat_map([cfg, stats](std::size_t i) {
+                    >> pump::sender::flat_map([state, stats](std::size_t i) {
                         return submit_run_operation(
-                            cfg, stats, static_cast<uint64_t>(i));
+                            state, stats, static_cast<uint64_t>(i));
+                    })
+                    >> pump::sender::reduce();
+            })
+            >> pump::sender::then([state, stats](bool ok) {
+                if (state->expected) {
+                    append_expected_run_phase(
+                        *state->expected, *state->cfg);
+                }
+                stats->stop();
+                return ok;
+            });
+    }
+
+    [[nodiscard]] inline auto
+    run_expected_verify_phase(std::shared_ptr<run_state> state,
+                              std::shared_ptr<phase_stats> stats) {
+        auto noop = pump::sender::just(true);
+        auto verify = pump::sender::just()
+            >> pump::sender::then([stats]() {
+                stats->start();
+                return true;
+            })
+            >> pump::sender::flat_map([state, stats](bool) {
+                auto cfg = state->cfg;
+                auto ids = std::make_shared<std::vector<uint64_t>>(
+                    select_expected_verify_ids(*cfg));
+                return pump::sender::just()
+                    >> pump::sender::loop(ids->size())
+                    >> pump::sender::concurrent(cfg->inflight)
+                    >> pump::sender::flat_map(
+                        [state, stats, ids](std::size_t i) {
+                        auto cfg = state->cfg;
+                        const uint64_t id = (*ids)[i];
+                        if (id >= state->expected->entries.size()) {
+                            throw std::logic_error(
+                                "expected verify id out of range");
+                        }
+                        const auto& entry =
+                            state->expected->entries[
+                                static_cast<std::size_t>(id)];
+                        using read_sender_t = decltype(submit_verify_read(
+                            stats,
+                            make_key(*cfg, id),
+                            make_value(*cfg, id, entry.generation)));
+                        using miss_sender_t = decltype(submit_verify_miss(
+                            stats, make_key(*cfg, id)));
+                        if (entry.kind == expected_kind::value) {
+                            return std::variant<read_sender_t, miss_sender_t>(
+                                std::in_place_index<0>,
+                                submit_verify_read(
+                                    stats,
+                                    make_key(*cfg, id),
+                                    make_value(*cfg, id, entry.generation)));
+                        }
+                        return std::variant<read_sender_t, miss_sender_t>(
+                            std::in_place_index<1>,
+                            submit_verify_miss(stats, make_key(*cfg, id)));
                     })
                     >> pump::sender::reduce();
             })
@@ -368,12 +460,21 @@ namespace apps::inconel::ycsb {
                 stats->stop();
                 return ok;
             });
+        using noop_t = decltype(noop);
+        using verify_t = decltype(verify);
+        if (state->expected &&
+            (state->cfg->expect_all || state->cfg->expect_samples != 0)) {
+            return std::variant<noop_t, verify_t>(
+                std::in_place_index<1>, std::move(verify));
+        }
+        return std::variant<noop_t, verify_t>(
+            std::in_place_index<0>, std::move(noop));
     }
 
     [[nodiscard]] inline auto
     run_workload(std::shared_ptr<run_state> state) {
-        return run_load_phase(state->cfg, std::shared_ptr<phase_stats>(
-                                              state->stats, &state->stats->load))
+        return run_load_phase(state, std::shared_ptr<phase_stats>(
+                                         state->stats, &state->stats->load))
             >> pump::sender::flat_map([state](bool) {
                 return maybe_load_flush_phase(
                     state->cfg,
@@ -388,9 +489,15 @@ namespace apps::inconel::ycsb {
             })
             >> pump::sender::flat_map([state](bool) {
                 return run_mixed_phase(
-                    state->cfg,
+                    state,
                     std::shared_ptr<phase_stats>(
                         state->stats, &state->stats->run));
+            })
+            >> pump::sender::flat_map([state](bool) {
+                return run_expected_verify_phase(
+                    state,
+                    std::shared_ptr<phase_stats>(
+                        state->stats, &state->stats->expect));
             })
             >> pump::sender::then([](bool) {
                 return true;

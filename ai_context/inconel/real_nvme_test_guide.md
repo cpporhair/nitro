@@ -210,6 +210,40 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   --verify-samples 32
 ```
 
+YCSB expected-state oracle smoke:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_ycsb \
+  --config apps/inconel/ycsb/config.sample.json \
+  --force-format \
+  --workload load-a \
+  --records 1000 \
+  --operations 1000 \
+  --inflight 1 \
+  --expect-all \
+  --write-expect-file /tmp/inconel_ycsb_expected.json
+```
+
+Then restart without formatting and verify the persisted expected state:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_ycsb \
+  --config apps/inconel/ycsb/config.sample.json \
+  --workload c \
+  --records 1000 \
+  --operations 1000 \
+  --expect-file /tmp/inconel_ycsb_expected.json \
+  --expect-all
+```
+
+For mutating workloads, expected-state oracle mode intentionally requires
+`--inflight 1`. Concurrent mutation consistency belongs to the 066C interval
+checker, not this phase-level YCSB oracle.
+
 YCSB consistency suite:
 
 `apps/inconel/scripts/ycsb_consistency.sh` runs the 066 real-NVMe consistency
@@ -221,11 +255,14 @@ full sequence:
 ```bash
 apps/inconel/scripts/ycsb_consistency.sh a0
 apps/inconel/scripts/ycsb_consistency.sh a5
+apps/inconel/scripts/ycsb_consistency.sh a10
 apps/inconel/scripts/ycsb_consistency.sh all
 ```
 
 The default scratch BDF is `0000:04:00.0`. To override it, set
 `INCONEL_YCSB_BDF`, but never set it to `0000:03:00.0`.
+The script also takes a per-BDF `flock` and checks `maintenance.failed=0` for
+every real run.
 
 ## Maintenance Cadence Tests
 

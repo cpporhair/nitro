@@ -19,6 +19,7 @@
 #include "../runtime/builder.hh"
 #include "../runtime/run.hh"
 #include "./config.hh"
+#include "./expected_state.hh"
 #include "./format_device.hh"
 #include "./runner.hh"
 #include "./stats.hh"
@@ -46,6 +47,8 @@ namespace apps::inconel::ycsb {
             << "  --batch-size N --inflight N --seed N --key-prefix PREFIX\n"
             << "  --verify-samples N\n"
             << "  --verify-existing-updates --verify-existing-deletes\n"
+            << "  --expect-file FILE --write-expect-file FILE\n"
+            << "  --expect-samples N --expect-all\n"
             << "  --flush-after-load --no-flush-after-load\n"
             << "\n"
             << "runtime:\n"
@@ -143,6 +146,18 @@ namespace apps::inconel::ycsb {
     template <core::cache_concept TreeCache, core::cache_concept ValueCache>
     int
     run_with_cache_policy(config cfg) {
+        std::shared_ptr<expected_state> expected;
+        if (!cfg.expect_file.empty() || !cfg.write_expect_file.empty() ||
+            cfg.expect_samples != 0 || cfg.expect_all) {
+            if (!cfg.expect_file.empty()) {
+                expected = std::make_shared<expected_state>(
+                    load_expected_state_file(cfg, cfg.expect_file));
+            } else {
+                expected = std::make_shared<expected_state>(
+                    make_empty_expected_state(cfg));
+            }
+        }
+
         nvme::real_device device(nvme::real_device_options{
             .pci_addr = cfg.pci_addr.c_str(),
             .cores = std::span<const uint32_t>(cfg.cores.data(),
@@ -167,6 +182,7 @@ namespace apps::inconel::ycsb {
         auto state = std::make_shared<run_state>();
         state->cfg = std::make_shared<config>(std::move(cfg));
         state->stats = std::make_shared<all_stats>();
+        state->expected = std::move(expected);
         auto cores = std::make_shared<const std::vector<uint32_t>>(
             state->cfg->cores);
 
@@ -240,6 +256,10 @@ namespace apps::inconel::ycsb {
             std::cerr << "inconel_ycsb: completed with error counters="
                       << error_count << '\n';
             return 1;
+        }
+        if (state->expected && !state->cfg->write_expect_file.empty()) {
+            write_expected_state_file(
+                *state->cfg, *state->expected, state->cfg->write_expect_file);
         }
         return 0;
     }

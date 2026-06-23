@@ -47,6 +47,12 @@ sudo -n env PCI_ALLOWED="0000:04:00.0" HUGEMEM=512 /usr/bin/spdk-setup config
 The setup script only handles VFIO and hugepages. It does not select the
 runtime SPDK/DPDK libraries for the test process.
 
+The 066C YCSB concurrency checker has an additional positive allowlist. It
+allows `0000:04:00.0` by default; if a different scratch BDF is intentionally
+used, pass `INCONEL_ALLOWED_SCRATCH_BDF=<BDF>` through `sudo env` only after
+the status check above confirms that the BDF is not mounted and not
+`0000:03:00.0`.
+
 ## Build
 
 Rebuild real-NVMe targets from `build_real/`, not `build/`:
@@ -56,6 +62,7 @@ cmake --build build_real --target \
   inconel_ycsb \
   inconel_test_steady_e2e \
   inconel_test_concurrent_runtime_e2e \
+  inconel_test_ycsb_concurrency_checker_e2e \
   inconel_test_flush_e2e \
   inconel_test_value_placement_e2e \
   inconel_test_write_backpressure_e2e \
@@ -137,6 +144,22 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
   timeout 300s build_real/inconel_test_concurrent_runtime_e2e \
   --pci-addr 0000:04:00.0
+```
+
+YCSB concurrency checker e2e:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_test_ycsb_concurrency_checker_e2e \
+  --pci-addr 0000:04:00.0 \
+  --scenario c1
+
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 300s build_real/inconel_test_ycsb_concurrency_checker_e2e \
+  --pci-addr 0000:04:00.0 \
+  --scenario c3
 ```
 
 Flush e2e:
@@ -256,13 +279,16 @@ full sequence:
 apps/inconel/scripts/ycsb_consistency.sh a0
 apps/inconel/scripts/ycsb_consistency.sh a5
 apps/inconel/scripts/ycsb_consistency.sh a10
+apps/inconel/scripts/ycsb_consistency.sh c1
+apps/inconel/scripts/ycsb_consistency.sh c3
 apps/inconel/scripts/ycsb_consistency.sh all
 ```
 
 The default scratch BDF is `0000:04:00.0`. To override it, set
 `INCONEL_YCSB_BDF`, but never set it to `0000:03:00.0`.
-The script also takes a per-BDF `flock` and checks `maintenance.failed=0` for
-every real run.
+The script also takes a per-BDF `flock`, checks `maintenance.failed=0` for
+YCSB real runs, and checks `checker_maintenance.failed=0` for the C3
+concurrency checker.
 
 ## Maintenance Cadence Tests
 

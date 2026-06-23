@@ -127,6 +127,12 @@ target_include_directories(inconel_test_concurrent_runtime_e2e PRIVATE ${CMAKE_S
 target_link_libraries(inconel_test_concurrent_runtime_e2e PRIVATE
         inconel_real_nvme ${INCONEL_ABSL_LIBS})
 
+add_executable(inconel_test_ycsb_concurrency_checker_e2e
+        apps/inconel/test/test_ycsb_concurrency_checker_e2e.cc)
+target_include_directories(inconel_test_ycsb_concurrency_checker_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(inconel_test_ycsb_concurrency_checker_e2e PRIVATE
+        inconel_real_nvme ${INCONEL_ABSL_LIBS})
+
 add_executable(inconel_test_value_placement_e2e
         apps/inconel/test/test_value_placement_e2e.cc)
 target_include_directories(inconel_test_value_placement_e2e PRIVATE ${CMAKE_SOURCE_DIR})

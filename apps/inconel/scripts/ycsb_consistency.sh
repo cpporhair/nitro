@@ -9,20 +9,20 @@ BDF="${INCONEL_YCSB_BDF:-0000:04:00.0}"
 SYSTEM_BDF="0000:03:00.0"
 CONFIG="$ROOT/apps/inconel/ycsb/config.sample.json"
 YCSB="$ROOT/build_real/inconel_ycsb"
+CONCURRENCY="$ROOT/build_real/inconel_test_ycsb_concurrency_checker_e2e"
 SPDK_STATUS="/home/null/work/kv/spdk/scripts/setup.sh"
 LIBS="${INCONEL_REAL_NVME_LIBS:-/home/null/work/kv/spdk/build/lib:/home/null/work/kv/spdk/dpdk/build/lib}"
 LOG_DIR="${INCONEL_YCSB_CONSISTENCY_LOG_DIR:-/tmp/inconel_ycsb_consistency.$$}"
-LOCK_FILE="${INCONEL_YCSB_LOCK_FILE:-/tmp/inconel_ycsb_${BDF//[:.]/_}.lock}"
+LOCK_FILE="/tmp/inconel_ycsb_${BDF//[:.]/_}.lock"
 
 usage() {
     cat <<EOF
-Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10]
+Usage: $0 [all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c3]
 
 Environment:
   INCONEL_YCSB_BDF                  Scratch BDF, default 0000:04:00.0
   INCONEL_REAL_NVME_LIBS            SPDK/DPDK library path
   INCONEL_YCSB_CONSISTENCY_LOG_DIR  Output log directory
-  INCONEL_YCSB_LOCK_FILE            Per-BDF lock file
 EOF
 }
 
@@ -47,7 +47,10 @@ acquire_bdf_lock() {
 
 build_targets() {
     cmake --build "$ROOT/build_real" \
-        --target inconel_ycsb inconel_real_nvme_compile_check \
+        --target \
+        inconel_ycsb \
+        inconel_real_nvme_compile_check \
+        inconel_test_ycsb_concurrency_checker_e2e \
         -j2
 }
 
@@ -56,10 +59,16 @@ check_device_status() {
     local status
     status="$(sudo -n "$SPDK_STATUS" status)"
     echo "$status"
-    if ! grep -qE "${BDF}.*vfio-pci" <<<"$status"; then
+    if ! awk -v bdf="$BDF" '
+        index($0, bdf) && index($0, "vfio-pci") { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' <<<"$status"; then
         fail "$BDF is not bound to vfio-pci"
     fi
-    if ! grep -qE "${SYSTEM_BDF}.*Active devices: mount@" <<<"$status"; then
+    if ! awk -v bdf="$SYSTEM_BDF" '
+        index($0, bdf) && index($0, "Active devices: mount@") { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' <<<"$status"; then
         fail "$SYSTEM_BDF did not appear as the mounted system disk; refusing"
     fi
 }
@@ -74,6 +83,9 @@ prepare() {
     build_targets
     if [[ ! -x "$YCSB" ]]; then
         fail "missing executable: $YCSB"
+    fi
+    if [[ ! -x "$CONCURRENCY" ]]; then
+        fail "missing executable: $CONCURRENCY"
     fi
     check_device_status >"$LOG_DIR/spdk_status.txt"
 }
@@ -125,7 +137,10 @@ assert_gt_zero() {
     local key="$3"
     local actual
     actual="$(require_metric "$log" "$line" "$key")"
-    if [[ "$actual" == "0" ]]; then
+    if ! [[ "$actual" =~ ^[0-9]+$ ]]; then
+        fail "$log: expected numeric ${line}.${key}, got $actual"
+    fi
+    if (( actual == 0 )); then
         fail "$log: expected ${line}.${key} > 0"
     fi
 }
@@ -147,7 +162,7 @@ assert_real_run_ok() {
 
 print_summary() {
     local log="$1"
-    grep -E '^(load|load-flush|verify|run|expect|maintenance) ' "$log" || true
+    grep -E '^(load|load-flush|verify|run|expect|maintenance|checker|checker_maintenance) ' "$log" || true
 }
 
 run_local() {
@@ -191,6 +206,34 @@ run_ycsb() {
         --pci "$BDF" \
         --no-print-config \
         "$@"
+}
+
+run_concurrency_checker() {
+    local name="$1"
+    local scenario="$2"
+    run_local "$name" \
+        sudo -n env XDG_RUNTIME_DIR=/tmp LD_LIBRARY_PATH="$LIBS" \
+        INCONEL_ALLOWED_SCRATCH_BDF="$BDF" \
+        timeout 300s "$CONCURRENCY" \
+        --pci-addr "$BDF" \
+        --scenario "$scenario"
+}
+
+assert_checker_ok() {
+    local log="$1"
+    grep -q "^all passed$" "$log" ||
+        fail "$log: checker did not report all passed"
+    assert_eq "$log" checker writes 4160
+    assert_eq "$log" checker hot_keys 64
+    assert_gt_zero "$log" checker reads
+}
+
+assert_checker_maintenance_ok() {
+    local log="$1"
+    assert_eq "$log" checker_maintenance failed 0
+    assert_gt_zero "$log" checker_maintenance seal
+    assert_gt_zero "$log" checker_maintenance flush
+    assert_gt_zero "$log" checker_maintenance non_noop_flush
 }
 
 run_a0() {
@@ -397,6 +440,19 @@ run_a10() {
     assert_eq "$log" expect read_miss 0
 }
 
+run_c1() {
+    local log
+    log="$(run_concurrency_checker "c1_put_read_race" "c1")"
+    assert_checker_ok "$log"
+}
+
+run_c3() {
+    local log
+    log="$(run_concurrency_checker "c3_put_read_auto_flush_race" "c3")"
+    assert_checker_ok "$log"
+    assert_checker_maintenance_ok "$log"
+}
+
 run_all() {
     run_a0
     run_a1
@@ -409,6 +465,8 @@ run_all() {
     run_a8
     run_a9_continuation
     run_a10
+    run_c1
+    run_c3
 }
 
 case "$SCENARIO" in
@@ -416,7 +474,7 @@ case "$SCENARIO" in
         usage
         exit 0
         ;;
-    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10)
+    all|a0|a1|a2|a3|a4|a5|a6|a7|a8|a9|a10|c1|c3)
         prepare
         "run_${SCENARIO}"
         echo "PASS: $SCENARIO logs in $LOG_DIR"

@@ -29,6 +29,11 @@ tombstone frontier carrier、各种版本切换和后续写入不回退。
 - `apps/inconel/scripts/ycsb_consistency.sh` 已覆盖 C7/C8 脚本级 recovery
   continuation：existing tree + WAL update delta recovery 后继续写入并重启
   校验；tombstone WAL delta recovery 后继续 PUT 并重启校验。
+- `inconel_test_recovery_boot_ram_device` 已作为 066D deterministic RAM-image
+  harness 覆盖首批 recovery crash-point image oracle：WAL torn tail、
+  incomplete batch、duplicate key fail-fast、same-shape next-slot before WAL
+  reset、full-CoW superblock switch before WAL reset、partial WAL reset，以及
+  tree free range scrub continuation。
 
 这些 smoke 证明了当前路径能工作，但还不是完整一致性测试体系。066
 的目标是把这些场景固化成可复跑、可审查、可扩展的测试标准。
@@ -1068,14 +1073,25 @@ timeout >= 1800s
 - `apps/inconel/scripts/ycsb_consistency.sh c8` 校验 tombstone WAL delta
   recovery 后继续 PUT，并在第二次 no-force restart 后按 exact expected-state
   oracle 读回所有 key。
-- 尚未落地：跨 process interval history checker、fault-injection crash-point
-  oracle。
+- 尚未落地：跨 process interval history checker；066D fault-image oracle 已有
+  RAM recovery target 覆盖，尚未扩展到 real-NVMe chaos/soak。
 
 066D 完成条件：
 
 - fault-point image harness 能稳定复现每个 persistence boundary。
 - torn WAL / incomplete batch / superblock switch / WAL reset interruption
   都有 positive 或 fail-fast oracle。
+
+066D 当前状态：
+
+- `apps/inconel/test/test_recovery_boot_ram_device.cc` 已扩展为 boot-phase
+  deterministic RAM-image fault harness；它不依赖 real NVMe kill timing。
+- 已覆盖 WAL torn tail、incomplete batch discard、duplicate key fail-fast、
+  same-shape leaf next-slot 已落盘但 WAL 未 reset、full-CoW 新 root 已写但
+  superblock 未切换、full-CoW inactive superblock 已切换但 WAL 未 reset、
+  WAL reset 只写了前缀、tree free range scrub continuation。
+- 这不是 C7/C8 的跨进程 interval checker，也不是 real-NVMe SIGKILL crash
+  test；后者只适合作为后续 soak/chaos 层。
 
 ## 当前相邻项
 

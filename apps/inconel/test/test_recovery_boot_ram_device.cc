@@ -196,6 +196,25 @@ write_lbas(ram_recovery_device& device,
 }
 
 void
+zero_lbas(ram_recovery_device& device,
+          uint64_t lba,
+          uint32_t lba_count,
+          uint32_t lba_size) {
+    std::vector<char> bytes(
+        static_cast<std::size_t>(lba_count) * lba_size, char{0});
+    write_lbas(device, lba, bytes, lba_size);
+}
+
+void
+write_nonzero_lba(ram_recovery_device& device,
+                  uint64_t lba,
+                  uint32_t lba_size) {
+    std::vector<char> bytes(lba_size, char{0});
+    bytes.front() = char{0x5a};
+    write_lbas(device, lba, bytes, lba_size);
+}
+
+void
 read_lbas(ram_recovery_device& device,
           uint64_t lba,
           std::span<char> bytes,
@@ -237,6 +256,16 @@ write_superblock_pair(ram_recovery_device& device,
     std::fill(page.begin(), page.end(), char{0});
     std::memcpy(page.data(), &sb_b, sizeof(sb_b));
     write_lbas(device, 1, page, profile.lba_size);
+}
+
+void
+write_superblock_slot(ram_recovery_device& device,
+                      const format::format_profile& profile,
+                      uint64_t lba,
+                      const format::superblock& sb) {
+    std::vector<char> page(profile.lba_size, char{0});
+    std::memcpy(page.data(), &sb, sizeof(sb));
+    write_lbas(device, lba, page, profile.lba_size);
 }
 
 struct seed_record {
@@ -348,6 +377,18 @@ append_wal_delete(std::vector<char>& segment,
 }
 
 void
+write_wal_segment(ram_recovery_device& device,
+                  const format::format_profile& profile,
+                  const std::vector<char>& segment) {
+    CHECK(segment.size() == profile.wal_segment_size);
+    write_lbas(
+        device,
+        profile.wal_base_paddr.lba,
+        segment,
+        profile.lba_size);
+}
+
+void
 write_wal_delta(ram_recovery_device& device,
                 const format::format_profile& profile,
                 const format::value_ref& updated_value) {
@@ -368,6 +409,85 @@ write_wal_delta(ram_recovery_device& device,
         profile.wal_base_paddr.lba,
         segment,
         profile.lba_size);
+}
+
+void
+write_single_put_wal(ram_recovery_device& device,
+                     const format::format_profile& profile,
+                     uint64_t lsn,
+                     std::string_view key,
+                     const format::value_ref& value) {
+    constexpr uint32_t kSegmentGen = 1;
+    std::vector<char> segment(profile.wal_segment_size, char{0});
+    auto header =
+        format::make_wal_segment_header(0, 0, 0, kSegmentGen);
+    std::memcpy(segment.data(), &header, sizeof(header));
+
+    uint32_t cursor = format::WAL_SEGMENT_HEADER_SIZE;
+    append_wal_put(segment, cursor, kSegmentGen, lsn, 1, key, value);
+    write_wal_segment(device, profile, segment);
+}
+
+void
+write_wal_with_torn_tail(ram_recovery_device& device,
+                         const format::format_profile& profile,
+                         const format::value_ref& complete_value) {
+    constexpr uint32_t kSegmentGen = 1;
+    std::vector<char> segment(profile.wal_segment_size, char{0});
+    auto header =
+        format::make_wal_segment_header(0, 0, 0, kSegmentGen);
+    std::memcpy(segment.data(), &header, sizeof(header));
+
+    uint32_t cursor = format::WAL_SEGMENT_HEADER_SIZE;
+    append_wal_put(
+        segment, cursor, kSegmentGen, 10, 1, "key-a", complete_value);
+
+    const auto geometry = recovery::wal_geometry_from_profile(profile);
+    const uint32_t usable_end = wal::segment_usable_end_offset(geometry);
+    CHECK(cursor + sizeof(format::wal_entry_header) < usable_end);
+
+    format::wal_entry_header torn{};
+    torn.total_len = usable_end - cursor + 16;
+    torn.segment_gen = kSegmentGen;
+    torn.lsn = 20;
+    torn.entry_count = 1;
+    torn.op_type = static_cast<uint8_t>(format::wal_op_type::put);
+    torn.key_len = 1;
+    std::memcpy(segment.data() + cursor, &torn, sizeof(torn));
+
+    write_wal_segment(device, profile, segment);
+}
+
+void
+write_incomplete_wal_batch(ram_recovery_device& device,
+                           const format::format_profile& profile,
+                           const format::value_ref& value) {
+    constexpr uint32_t kSegmentGen = 1;
+    std::vector<char> segment(profile.wal_segment_size, char{0});
+    auto header =
+        format::make_wal_segment_header(0, 0, 0, kSegmentGen);
+    std::memcpy(segment.data(), &header, sizeof(header));
+
+    uint32_t cursor = format::WAL_SEGMENT_HEADER_SIZE;
+    append_wal_put(segment, cursor, kSegmentGen, 10, 2, "key-a", value);
+    write_wal_segment(device, profile, segment);
+}
+
+void
+write_duplicate_key_wal_batch(ram_recovery_device& device,
+                              const format::format_profile& profile,
+                              const format::value_ref& first,
+                              const format::value_ref& second) {
+    constexpr uint32_t kSegmentGen = 1;
+    std::vector<char> segment(profile.wal_segment_size, char{0});
+    auto header =
+        format::make_wal_segment_header(0, 0, 0, kSegmentGen);
+    std::memcpy(segment.data(), &header, sizeof(header));
+
+    uint32_t cursor = format::WAL_SEGMENT_HEADER_SIZE;
+    append_wal_put(segment, cursor, kSegmentGen, 10, 2, "key-a", first);
+    append_wal_put(segment, cursor, kSegmentGen, 10, 2, "key-a", second);
+    write_wal_segment(device, profile, segment);
 }
 
 [[nodiscard]] std::map<std::string, recovery::recovered_tree_record>
@@ -413,6 +533,18 @@ live_extents_contain(const std::vector<value::live_value_extent>& extents,
                    e.byte_offset == value.byte_offset &&
                    e.len == value.len;
         });
+}
+
+template <typename Fn>
+void
+expect_runtime_error(Fn&& fn, std::string_view needle) {
+    try {
+        fn();
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string_view(e.what()).find(needle) != std::string_view::npos);
+        return;
+    }
+    CHECK(false);
 }
 
 void
@@ -530,11 +662,244 @@ run_existing_tree_boot_scrubs_free_shadow_ranges() {
         profile.lba_size));
 }
 
+void
+run_wal_torn_tail_replays_complete_prefix() {
+    const auto profile = test_profile();
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    const auto value = vr(4000);
+    write_superblock_pair(device, profile, format::paddr{0, 0});
+    write_wal_with_torn_tail(device, profile, value);
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(recovered.runtime_state.next_lsn == 11);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 10);
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+
+    auto scan = recovery::scan_existing_tree(
+        device,
+        kCore,
+        recovered.profile,
+        recovered.tree_geometry,
+        recovered.runtime_state.tree.root_range_base);
+    auto records = records_by_key(scan);
+    CHECK(records.size() == 1);
+    expect_value(records, "key-a", 10, value);
+}
+
+void
+run_incomplete_wal_batch_is_discarded() {
+    const auto profile = test_profile();
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    write_superblock_pair(device, profile, format::paddr{0, 0});
+    write_incomplete_wal_batch(device, profile, vr(4000));
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(!recovered.runtime_state.tree.has_root());
+    CHECK(recovered.runtime_state.next_lsn == 1);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 0);
+    CHECK(recovered.runtime_state.live_value_extents.empty());
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+}
+
+void
+run_duplicate_wal_key_fails_fast() {
+    const auto profile = test_profile();
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    write_superblock_pair(device, profile, format::paddr{0, 0});
+    write_duplicate_key_wal_batch(device, profile, vr(4000), vr(4001));
+
+    expect_runtime_error(
+        [&] { (void)recovery::recover_empty_clean_boot(device, kCore); },
+        "duplicate key");
+}
+
+void
+run_same_shape_leaf_crash_before_wal_reset_is_idempotent() {
+    const auto profile = test_profile(/*shadow_slots_per_range=*/2);
+    const auto geom = recovery::tree_geometry_from_profile(profile);
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    const format::paddr root_leaf{0, 64};
+    const auto old_value = vr(4000);
+    const auto new_value = vr(4001);
+    const std::vector<seed_record> old_records{
+        seed_record{.key = "key-a", .data_ver = 10, .value = old_value},
+    };
+    const std::vector<seed_record> new_records{
+        seed_record{.key = "key-a", .data_ver = 20, .value = new_value},
+    };
+    write_leaf_slot(
+        device,
+        profile,
+        geom,
+        root_leaf,
+        /*slot_index=*/0,
+        old_records);
+    write_leaf_slot(
+        device,
+        profile,
+        geom,
+        root_leaf,
+        /*slot_index=*/1,
+        new_records);
+    write_superblock_pair(device, profile, root_leaf);
+    write_single_put_wal(device, profile, 20, "key-a", new_value);
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(recovered.runtime_state.tree.root_range_base == root_leaf);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 20);
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+
+    auto scan = recovery::scan_existing_tree(
+        device,
+        kCore,
+        recovered.profile,
+        recovered.tree_geometry,
+        root_leaf);
+    auto records = records_by_key(scan);
+    CHECK(records.size() == 1);
+    expect_value(records, "key-a", 20, new_value);
+}
+
+void
+run_full_cow_orphan_root_before_superblock_update_replays_wal() {
+    const auto profile = test_profile(/*shadow_slots_per_range=*/1);
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    const format::paddr old_root{0, 64};
+    const format::paddr orphan_new_root{0, 65};
+    const auto old_value = vr(4000);
+    const auto new_value = vr(4001);
+    const std::vector<seed_record> old_records{
+        seed_record{.key = "key-a", .data_ver = 10, .value = old_value},
+    };
+    const std::vector<seed_record> orphan_records{
+        seed_record{.key = "key-a", .data_ver = 20, .value = new_value},
+    };
+    write_leaf(device, profile, old_root, old_records);
+    write_leaf(device, profile, orphan_new_root, orphan_records);
+    write_superblock_pair(device, profile, old_root);
+    write_single_put_wal(device, profile, 20, "key-a", new_value);
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(recovered.runtime_state.tree.root_range_base != old_root);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 20);
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+
+    auto scan = recovery::scan_existing_tree(
+        device,
+        kCore,
+        recovered.profile,
+        recovered.tree_geometry,
+        recovered.runtime_state.tree.root_range_base);
+    auto records = records_by_key(scan);
+    CHECK(records.size() == 1);
+    expect_value(records, "key-a", 20, new_value);
+}
+
+void
+run_full_cow_superblock_update_before_wal_reset_is_idempotent() {
+    const auto profile = test_profile(/*shadow_slots_per_range=*/1);
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    const format::paddr old_root{0, 64};
+    const format::paddr new_root{0, 65};
+    const auto old_value = vr(4000);
+    const auto new_value = vr(4001);
+    const std::vector<seed_record> old_records{
+        seed_record{.key = "key-a", .data_ver = 10, .value = old_value},
+    };
+    const std::vector<seed_record> new_records{
+        seed_record{.key = "key-a", .data_ver = 20, .value = new_value},
+    };
+    write_leaf(device, profile, old_root, old_records);
+    write_leaf(device, profile, new_root, new_records);
+
+    const auto sb_a =
+        make_superblock(profile, 1, old_root, device.size_bytes());
+    const auto sb_b =
+        make_superblock(profile, 2, new_root, device.size_bytes());
+    write_superblock_slot(device, profile, 0, sb_a);
+    write_superblock_slot(device, profile, 1, sb_b);
+    write_single_put_wal(device, profile, 20, "key-a", new_value);
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(recovered.superblock_source == format::superblock_choice::source::b);
+    CHECK(recovered.superblock_generation == 2);
+    CHECK(recovered.runtime_state.tree.root_range_base == new_root);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 20);
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+
+    auto scan = recovery::scan_existing_tree(
+        device,
+        kCore,
+        recovered.profile,
+        recovered.tree_geometry,
+        new_root);
+    auto records = records_by_key(scan);
+    CHECK(records.size() == 1);
+    expect_value(records, "key-a", 20, new_value);
+}
+
+void
+run_partial_wal_reset_after_clean_tree_is_ignored() {
+    const auto profile = test_profile();
+    ram_recovery_device device(
+        profile.value_data_area_end.lba, profile.lba_size);
+
+    const format::paddr root_leaf{0, 64};
+    const auto value = vr(4000);
+    const std::vector<seed_record> records{
+        seed_record{.key = "key-a", .data_ver = 20, .value = value},
+    };
+    write_leaf(device, profile, root_leaf, records);
+    write_superblock_pair(device, profile, root_leaf);
+    write_single_put_wal(device, profile, 20, "key-a", value);
+    zero_lbas(device, profile.wal_base_paddr.lba, 1, profile.lba_size);
+    write_nonzero_lba(device, profile.wal_base_paddr.lba + 1, profile.lba_size);
+    CHECK(!range_is_zero(
+        device,
+        profile.wal_base_paddr.lba,
+        profile.wal_segment_size / profile.lba_size,
+        profile.lba_size));
+
+    const auto recovered = recovery::recover_empty_clean_boot(device, kCore);
+    CHECK(recovered.runtime_state.tree.root_range_base == root_leaf);
+    CHECK(recovered.runtime_state.recovered_durable_lsn == 20);
+    CHECK(recovery::wal_region_is_zero(device, kCore, profile));
+
+    auto scan = recovery::scan_existing_tree(
+        device,
+        kCore,
+        recovered.profile,
+        recovered.tree_geometry,
+        root_leaf);
+    auto recovered_records = records_by_key(scan);
+    CHECK(recovered_records.size() == 1);
+    expect_value(recovered_records, "key-a", 20, value);
+}
+
 }  // namespace
 
 int
 main() {
     run_existing_tree_wal_update_delete_recovery();
     run_existing_tree_boot_scrubs_free_shadow_ranges();
+    run_wal_torn_tail_replays_complete_prefix();
+    run_incomplete_wal_batch_is_discarded();
+    run_duplicate_wal_key_fails_fast();
+    run_same_shape_leaf_crash_before_wal_reset_is_idempotent();
+    run_full_cow_orphan_root_before_superblock_update_replays_wal();
+    run_full_cow_superblock_update_before_wal_reset_is_idempotent();
+    run_partial_wal_reset_after_clean_tree_is_ignored();
     return 0;
 }

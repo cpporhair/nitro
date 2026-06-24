@@ -6,6 +6,8 @@
 
 - **[Sider](apps/sider/)**
    > NVMe 扩容的 Redis 兼容 KV 存储。冷数据透明落盘，热读 7.23M ops/s（5.16× Redis），冷读 3.75M ops/s。
+- **[Inconel](apps/inconel/)**
+   > Shadow CoW B+ Tree 持久化 KV 引擎。前台 per-front WAL + memtable，后台单棵有序 CoW B+ Tree，普通更新在节点 shadow range 内滚动写不级联；全异步无锁、多 batch 并发、WAL group commit、crash-safe。面向 10 亿+ KV。
 - **[KV](apps/kv/)** 
    > 快照隔离 KV 存储引擎。五类 Scheduler 协作，MVCC 多版本并发，Leader/Follower 批量合并写入。
 - **[AiSAQ](apps/aisaq/)** 

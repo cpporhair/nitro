@@ -236,6 +236,20 @@ namespace apps::inconel::nvme {
             return size_bytes() / logical_lba_size;
         }
 
+        [[nodiscard]] bool
+        namespace_supports_deallocate() const noexcept {
+            return ssd_ != nullptr && ssd_->ns != nullptr &&
+                   (spdk_nvme_ns_get_flags(ssd_->ns) &
+                    SPDK_NVME_NS_DEALLOCATE_SUPPORTED) != 0;
+        }
+
+        [[nodiscard]] bool
+        deallocate_reads_zero() const noexcept {
+            return ssd_ != nullptr && ssd_->ns != nullptr &&
+                   spdk_nvme_ns_get_dealloc_logical_block_read_value(
+                       ssd_->ns) == SPDK_NVME_DEALLOC_READ_00;
+        }
+
     private:
         void
         allocate_qpairs(std::span<const uint32_t> cores, uint32_t depth) {

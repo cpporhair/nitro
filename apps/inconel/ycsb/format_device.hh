@@ -5,7 +5,9 @@
 
 namespace apps::inconel::ycsb {
 
-    using ::apps::inconel::runtime::bootstrap_layout_for_device;
+    using ::apps::inconel::runtime::format_disk;
+    using ::apps::inconel::runtime::format_disk_policy;
+    using ::apps::inconel::runtime::format_disk_request;
     using ::apps::inconel::runtime::force_format_device;
 
 }  // namespace apps::inconel::ycsb

@@ -157,6 +157,96 @@ namespace apps::inconel::recovery {
     }
 
     inline void
+    sync_trim_logical_lbas(nvme::real_device& device,
+                           uint32_t core,
+                           uint64_t logical_lba,
+                           uint64_t logical_lba_count,
+                           uint32_t logical_lba_size) {
+        if (logical_lba_count == 0) {
+            return;
+        }
+        if (device.sector_size() == 0 ||
+            logical_lba_size == 0 ||
+            logical_lba_size % device.sector_size() != 0) {
+            throw std::invalid_argument(
+                "inconel recovery: trim logical LBA size is not sector aligned");
+        }
+        if (!device.namespace_supports_deallocate()) {
+            throw std::runtime_error(
+                "inconel recovery: NVMe namespace does not support deallocate");
+        }
+
+        auto* qpair = device.qpair_for_core(core);
+        const uint64_t sectors_per_lba =
+            static_cast<uint64_t>(logical_lba_size) / device.sector_size();
+        if (sectors_per_lba == 0 ||
+            sectors_per_lba > std::numeric_limits<uint32_t>::max()) {
+            throw std::invalid_argument(
+                "inconel recovery: trim sectors_per_lba overflows");
+        }
+        const uint64_t max_lbas_per_range =
+            std::numeric_limits<uint32_t>::max() / sectors_per_lba;
+        if (max_lbas_per_range == 0) {
+            throw std::invalid_argument(
+                "inconel recovery: trim DSM range cannot hold one logical LBA");
+        }
+
+        uint64_t remaining = logical_lba_count;
+        uint64_t cursor = logical_lba;
+        while (remaining != 0) {
+            if (cursor >
+                std::numeric_limits<uint64_t>::max() / sectors_per_lba) {
+                throw std::invalid_argument(
+                    "inconel recovery: trim starting LBA overflows");
+            }
+            const uint64_t now_lbas =
+                remaining < max_lbas_per_range ? remaining : max_lbas_per_range;
+            const uint64_t now_sectors = now_lbas * sectors_per_lba;
+            const bool has_more = remaining != now_lbas;
+            if ((now_lbas - 1) >
+                std::numeric_limits<uint64_t>::max() - cursor) {
+                throw std::invalid_argument(
+                    "inconel recovery: trim logical LBA range overflows");
+            }
+            if (has_more &&
+                cursor > std::numeric_limits<uint64_t>::max() - now_lbas) {
+                throw std::invalid_argument(
+                    "inconel recovery: trim logical LBA range overflows");
+            }
+
+            spdk_nvme_dsm_range range{};
+            range.starting_lba = cursor * sectors_per_lba;
+            if ((now_sectors - 1) >
+                std::numeric_limits<uint64_t>::max() - range.starting_lba) {
+                throw std::invalid_argument(
+                    "inconel recovery: trim namespace LBA range overflows");
+            }
+            range.length = static_cast<uint32_t>(now_sectors);
+
+            sync_completion done;
+            const int rc = spdk_nvme_ns_cmd_dataset_management(
+                qpair->owner->ns,
+                qpair->impl,
+                SPDK_NVME_DSM_ATTR_DEALLOCATE,
+                &range,
+                1,
+                sync_completion_cb,
+                &done);
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "inconel recovery: "
+                    "spdk_nvme_ns_cmd_dataset_management failed");
+            }
+            wait_for_completion(qpair, done, "trim");
+
+            remaining -= now_lbas;
+            if (has_more) {
+                cursor += now_lbas;
+            }
+        }
+    }
+
+    inline void
     sync_read_logical_lbas(nvme::real_device& device,
                            uint32_t core,
                            uint64_t logical_lba,

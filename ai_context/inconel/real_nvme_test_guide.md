@@ -217,6 +217,14 @@ per-run workload size and explicit destructive format requests; CLI values win
 over the JSON file. If overriding the BDF with `--pci`, only use the scratch
 device and never `0000:03:00.0`.
 
+As of 069 / INC-035, `--force-format` and `device.force_format=true` run the
+production full-device format path. It clears the whole namespace, derives the
+Inconel layout from the live namespace capacity, and writes fresh superblock
+A/B before the runtime starts. Treat it as destructive for every LBA on the
+target namespace. The current YCSB config output exposes whether force-format
+is enabled, but the per-run result does not yet print a format layout summary
+such as `data_area_end_lba` or `clear_method`.
+
 YCSB config dry-run:
 
 ```bash
@@ -256,6 +264,35 @@ sudo -n env XDG_RUNTIME_DIR=/tmp \
   --operations 1000 \
   --verify-samples 32
 ```
+
+Long `load + workload a` run:
+
+```bash
+sudo -n env XDG_RUNTIME_DIR=/tmp \
+  LD_LIBRARY_PATH="$INCONEL_REAL_NVME_LIBS" \
+  timeout 12h build_real/inconel_ycsb \
+  --config apps/inconel/ycsb/config.sample.json \
+  --force-format \
+  --workload load-a \
+  --records 1000000 \
+  --operations 1000000 \
+  --value-size 256 \
+  --batch-size 1 \
+  --inflight 64 \
+  --seed 1 \
+  --verify-samples 1024
+```
+
+If the next run is meant to verify recovery over the just-written data, omit
+`--force-format`; otherwise it will intentionally clear the device again.
+
+For RocksDB comparison, keep more than the throughput line. Record the exact
+Inconel commit, build directory, BDF, namespace capacity, full
+`inconel_ycsb --print-config` output, workload kind, records, operations,
+value size, batch size, inflight, seed, load/run throughput, error counters,
+and maintenance stats. The RocksDB run must use the same key/value generator
+settings and the same client pressure sweep, otherwise the numbers are not
+comparable.
 
 YCSB expected-state oracle smoke:
 

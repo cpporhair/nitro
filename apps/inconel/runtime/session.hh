@@ -92,8 +92,17 @@ namespace apps::inconel::runtime {
 
         void format_or_recover() {
             if (opts.boot_mode == db_boot_mode::force_format) {
-                force_format_device(*device, opts.topology.main_core);
-                recovered_boot.reset();
+                auto formatted =
+                    force_format_device(*device, opts.topology.main_core);
+                recovered_boot.emplace(recovery::recovered_boot_state{
+                    .profile = formatted.profile,
+                    .tree_geometry =
+                        recovery::tree_geometry_from_profile(
+                            formatted.profile),
+                    .superblock_source = formatted.active_superblock_source,
+                    .superblock_generation = formatted.superblock_generation,
+                    .runtime_state = std::move(formatted.clean_runtime),
+                });
                 return;
             }
             recovered_boot.emplace(

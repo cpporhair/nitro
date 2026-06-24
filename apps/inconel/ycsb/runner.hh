@@ -24,7 +24,6 @@
 
 #include "../pipeline/point_get.hh"
 #include "../runtime/operations.hh"
-#include "../runtime/run.hh"
 #include "../write_path/write_batch.hh"
 #include "./config.hh"
 #include "./expected_state.hh"
@@ -37,18 +36,7 @@ namespace apps::inconel::ycsb {
         std::shared_ptr<config> cfg;
         std::shared_ptr<all_stats> stats;
         std::shared_ptr<expected_state> expected;
-        std::exception_ptr error;
-        std::atomic<bool> completed{false};
     };
-
-    template <typename Runtime>
-    inline void
-    stop_runtime(Runtime* rt, const std::shared_ptr<const std::vector<uint32_t>>& cores) {
-        for (uint32_t core : *cores) {
-            rt->is_running_by_core[core].store(
-                false, std::memory_order_release);
-        }
-    }
 
     [[nodiscard]] inline auto
     rethrow_bool_sender(std::exception_ptr ep) {

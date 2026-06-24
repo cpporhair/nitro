@@ -231,9 +231,11 @@ Scheduler handler 只能做本 owner 的同步状态变更、plan/finish/abort s
 - 需要跨 read_domain / NVMe / value / WAL 的异步步骤时，必须暴露为 first-class sender，由 L3 pipeline 显式组合。
 - 背压必须落在 sender 链的 `concurrent(N)` / batch budget 上，不能落在私有 completion queue 容量上。
 
-061 起新增唯一 production allowlist：`apps/inconel/runtime/maintenance_scheduler.hh::maintenance_sched::launch_round()` 可以创建 root context 并 submit `rt::maintenance_once()`。这是 L3 runtime cadence boundary，不是 L2 owner handler；pipeline 的 finish/fail 必须回到 `maintenance_sched` owner seam 更新 inflight / backoff / stats。
+061 起新增 production allowlist：`apps/inconel/runtime/maintenance_scheduler.hh::maintenance_sched::launch_round()` 可以创建 root context 并 submit `rt::maintenance_once()`。这是 L3 runtime cadence boundary，不是 L2 owner handler；pipeline 的 finish/fail 必须回到 `maintenance_sched` owner seam 更新 inflight / backoff / stats。
 
-**Review gate（必跑）**：`rg -n 'pump::sender::submit|make_root_context|the_null_receiver' apps/inconel -g'*.hh' -g'*.cc' -g'!apps/inconel/test/**'`。除 `runtime/maintenance_scheduler.hh` 的 061 allowlist 外，production 命中默认 fail。
+067 起新增 production allowlist：`apps/inconel/runtime/start_db.hh::run_db_with_cache(...)` 可以创建 root context 并 submit 应用入口 sender。这是 L3 runtime lifecycle boundary，负责把 `db_session_view` 放入 PUMP context 并统一 stop/destroy；业务入口（例如 YCSB）不得自己创建系统 root context 或直接清 runtime run flags。
+
+**Review gate（必跑）**：`rg -n 'pump::sender::submit|make_root_context|the_null_receiver' apps/inconel -g'*.hh' -g'*.cc' -g'!apps/inconel/test/**'`。除 `runtime/maintenance_scheduler.hh` 的 061 allowlist 与 `runtime/start_db.hh` 的 067 allowlist 外，production 命中默认 fail。
 
 ### 3.11 禁止 `virtual` / 类多态分发（step 3 / 057 立）
 

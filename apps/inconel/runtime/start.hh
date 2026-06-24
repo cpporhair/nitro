@@ -15,7 +15,13 @@
 
 namespace apps::inconel::runtime {
 
-    // ── start_runtime: top-level entry point ──
+    // ── start_runtime: compatibility low-level entry point ──
+    //
+    // New application-facing code should use `runtime/start_db.hh`.
+    // `start_runtime()` is retained for low-level scheduler bring-up callers
+    // that already own a live device and do not need boot recovery,
+    // app-root submit, or lifecycle stats. It is no longer the canonical DB
+    // entry point.
     //
     // Parses tree+value cache policies from strings, instantiates the
     // corresponding inconel_runtime_t<TreeCache, ValueCache> specialization

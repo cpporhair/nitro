@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include <absl/container/flat_hash_map.h>
+#include <absl/container/btree_map.h>
 #include <absl/container/inlined_vector.h>
 
 #include "../format/types.hh"
@@ -264,8 +264,7 @@ namespace apps::inconel::core {
 
         inline std::vector<uint32_t>
         build_canonical_positions(std::span<const client_batch_op_view> ops) {
-            absl::flat_hash_map<std::string_view, uint32_t> last;
-            last.reserve(ops.size());
+            absl::btree_map<std::string_view, uint32_t> last;
             for (uint32_t i = 0; i < ops.size(); ++i) {
                 last[ops[i].key] = i;
             }
@@ -340,18 +339,42 @@ namespace apps::inconel::core {
                     client_batch_view&& view,
                     uint64_t batch_lsn,
                     uint32_t front_count) {
-        // The parsed view must have been produced from this exact input buffer;
-        // its string_views are moved into ctx after ctx takes input ownership.
+        // The parsed view must have been produced from this exact input buffer.
+        // Do not rely on string_views into `input.bytes` surviving the vector
+        // move below: compute canonical positions first, then rebase views by
+        // byte offset into `ctx.input`.
         if (front_count == 0) {
             throw std::invalid_argument("build_batch_ctx: front_count must be nonzero");
         }
+
+        const auto ops = view.ops();
+        const auto keep = detail::build_canonical_positions(ops);
+        const auto* old_base =
+            reinterpret_cast<const char*>(input.bytes.data());
+        const auto old_begin = reinterpret_cast<std::uintptr_t>(old_base);
+        const std::size_t old_size = input.bytes.size();
+        const auto old_end = old_begin + old_size;
 
         batch_ctx ctx;
         ctx.input = std::move(input);
         ctx.batch_lsn = batch_lsn;
 
-        const auto ops = view.ops();
-        const auto keep = detail::build_canonical_positions(ops);
+        const auto* new_base =
+            reinterpret_cast<const char*>(ctx.input.bytes.data());
+        auto rebase_view = [&](std::string_view sv) -> std::string_view {
+            if (sv.empty()) return {};
+            const auto* p = sv.data();
+            const auto begin = reinterpret_cast<std::uintptr_t>(p);
+            if (begin < old_begin) {
+                throw std::logic_error("build_batch_ctx: view precedes input buffer");
+            }
+            const auto end = begin + sv.size();
+            if (end < begin || end > old_end) {
+                throw std::logic_error("build_batch_ctx: view exceeds input buffer");
+            }
+            const auto off = static_cast<std::size_t>(begin - old_begin);
+            return {new_base + off, sv.size()};
+        };
 
         ctx.canonical_entries.reserve(keep.size());
         ctx.put_entry_indices.reserve(keep.size());
@@ -362,10 +385,10 @@ namespace apps::inconel::core {
                 static_cast<uint32_t>(ctx.canonical_entries.size());
             ctx.canonical_entries.push_back(canonical_entry{
                 .op           = op.op,
-                .key          = op.key,
+                .key          = rebase_view(op.key),
                 .value        = (op.op == write_op_type::del)
                                     ? std::string_view{}
-                                    : op.value,
+                                    : rebase_view(op.value),
                 .allocated_vr = {},
             });
             if (op.op == write_op_type::put) {

@@ -528,6 +528,7 @@ struct topology_fixture {
             .coord_queue_depth = coord_queue_depth,
             .coord_ready_window = ready_window,
             .front_wal_config = wal_config,
+            .front_wal_dma_allocator = memory::make_heap_dma_page_allocator(),
         });
 
         fake_nvme_by_owner.assign(topology.fronts.size(), &nvme);

@@ -131,6 +131,7 @@ namespace apps::inconel::runtime {
         std::size_t coord_ready_window = 65536;
         wal::wal_append_config front_wal_config =
             { .pending_prepare_capacity = 64 };
+        memory::dma_page_allocator front_wal_dma_allocator = {};
     };
 
     struct front_topology {
@@ -339,6 +340,11 @@ namespace apps::inconel::runtime {
         for (uint32_t owner = 0; owner < front_count; ++owner) {
             const uint32_t home_core = topology.front_cores[owner];
             pump::core::this_core_id = home_core;
+            auto wal_dma_allocator = opts.front_wal_dma_allocator;
+            if (wal_dma_allocator.alloc == nullptr ||
+                wal_dma_allocator.free == nullptr) {
+                wal_dma_allocator = make_runtime_dma_page_allocator();
+            }
             auto* fs = new front::front_sched(
                 owner,
                 front_count,
@@ -347,7 +353,7 @@ namespace apps::inconel::runtime {
                 opts.wal_geometry,
                 opts.front_wal_config,
                 opts.front_queue_depth,
-                make_runtime_dma_page_allocator());
+                wal_dma_allocator);
             topology.fronts[owner] = fs;
             core::registry::front_scheds.list[owner] = fs;
             core::registry::front_scheds.by_core[home_core] = fs;
